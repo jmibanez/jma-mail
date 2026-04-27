@@ -68,6 +68,14 @@ pub struct WatchConfig {
     /// SSE ping interval (seconds)
     #[serde(default = "default_ping_interval")]
     pub ping_interval: u64,
+    /// Shell command to run (via `sh -c`) after a sync cycle that
+    /// downloaded new messages. Useful for triggering a mail indexer
+    /// (mu, notmuch, etc.) once new files land in the maildir. The
+    /// command runs asynchronously; if a sync completes while a prior
+    /// invocation is still running, a single follow-up run is queued
+    /// (multiple events coalesce into one). Only fires in `watch` mode.
+    #[serde(default)]
+    pub post_arrival_command: Option<String>,
 }
 
 fn default_session_url() -> String {
@@ -103,6 +111,7 @@ impl Default for WatchConfig {
         Self {
             debounce_secs: default_debounce_secs(),
             ping_interval: default_ping_interval(),
+            post_arrival_command: None,
         }
     }
 }
@@ -187,5 +196,9 @@ db_path = "~/.local/share/jmapsync/state.db"
 debounce_secs = 2
 # SSE ping interval (seconds)
 ping_interval = 60
+# Command to run (via `sh -c`) after a watch-mode sync that downloaded
+# new messages. Runs asynchronously; overlapping events coalesce into
+# a single follow-up run. Leave unset to disable.
+# post_arrival_command = "mu index"
 "#
 }

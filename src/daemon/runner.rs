@@ -22,10 +22,20 @@ pub enum SyncTrigger {
 pub async fn run(client: &Client, conn: &Connection, config: &Config) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<SyncTrigger>(32);
 
+    let hook = super::hook::Hook::new(config.watch.post_arrival_command.clone());
+    if hook.is_enabled() {
+        info!("Post-arrival hook configured");
+    }
+
     // Run initial sync
     info!("Running initial sync before entering watch mode");
-    if let Err(e) = engine::sync(client, conn, config, false).await {
-        error!("Initial sync failed: {}", e);
+    match engine::sync(client, conn, config, false).await {
+        Ok(outcome) => {
+            if outcome.downloaded > 0 {
+                hook.trigger().await;
+            }
+        }
+        Err(e) => error!("Initial sync failed: {}", e),
     }
 
     // Get session info for EventSource URL
@@ -80,8 +90,13 @@ pub async fn run(client: &Client, conn: &Connection, config: &Config) -> Result<
     // Main event loop
     while let Some(trigger) = rx.recv().await {
         info!("Sync triggered by {:?}", trigger);
-        if let Err(e) = engine::sync(client, conn, config, false).await {
-            error!("Sync failed: {}", e);
+        match engine::sync(client, conn, config, false).await {
+            Ok(outcome) => {
+                if outcome.downloaded > 0 {
+                    hook.trigger().await;
+                }
+            }
+            Err(e) => error!("Sync failed: {}", e),
         }
     }
 

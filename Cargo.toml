@@ -54,3 +54,6 @@ futures-util = "0.3"
 # Filesystem watcher for daemon mode
 notify = "8"
 notify-debouncer-mini = "0.7"
+
+[dev-dependencies]
+tempfile = "3"
