@@ -122,6 +122,74 @@ pub fn get_message_by_jmap_id(
     Ok(result)
 }
 
+/// Look up a message by RFC 5322 Message-ID. If multiple JMAP records share
+/// the same Message-ID (e.g. the same email referenced in different mailboxes),
+/// returns the first one.
+pub fn get_message_by_message_id(
+    conn: &Connection,
+    message_id: &str,
+) -> Result<Option<MessageRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT jmap_email_id, jmap_blob_id, jmap_thread_id, mailbox_id,
+                maildir_id, maildir_folder, message_id, flags, jmap_keywords,
+                size, received_at
+         FROM message_map WHERE message_id = ?1 LIMIT 1",
+    )?;
+    let result = stmt
+        .query_row(params![message_id], |row| {
+            Ok(MessageRecord {
+                jmap_email_id: row.get(0)?,
+                jmap_blob_id: row.get(1)?,
+                jmap_thread_id: row.get(2)?,
+                mailbox_id: row.get(3)?,
+                maildir_id: row.get(4)?,
+                maildir_folder: row.get(5)?,
+                message_id: row.get(6)?,
+                flags: row.get(7)?,
+                jmap_keywords: row.get(8)?,
+                size: row.get(9)?,
+                received_at: row.get(10)?,
+            })
+        })
+        .optional()?;
+    Ok(result)
+}
+
+/// Look up a message by Message-ID scoped to a specific maildir folder.
+/// Used by the pull path so that a JMAP delivery for folder B never rebinds
+/// against a local copy that lives in folder A — cross-folder copies are
+/// distinct instances by design.
+pub fn get_message_by_message_id_in_folder(
+    conn: &Connection,
+    message_id: &str,
+    folder: &str,
+) -> Result<Option<MessageRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT jmap_email_id, jmap_blob_id, jmap_thread_id, mailbox_id,
+                maildir_id, maildir_folder, message_id, flags, jmap_keywords,
+                size, received_at
+         FROM message_map WHERE message_id = ?1 AND maildir_folder = ?2 LIMIT 1",
+    )?;
+    let result = stmt
+        .query_row(params![message_id, folder], |row| {
+            Ok(MessageRecord {
+                jmap_email_id: row.get(0)?,
+                jmap_blob_id: row.get(1)?,
+                jmap_thread_id: row.get(2)?,
+                mailbox_id: row.get(3)?,
+                maildir_id: row.get(4)?,
+                maildir_folder: row.get(5)?,
+                message_id: row.get(6)?,
+                flags: row.get(7)?,
+                jmap_keywords: row.get(8)?,
+                size: row.get(9)?,
+                received_at: row.get(10)?,
+            })
+        })
+        .optional()?;
+    Ok(result)
+}
+
 /// Look up a message by maildir ID.
 pub fn get_message_by_maildir_id(
     conn: &Connection,

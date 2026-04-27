@@ -4,6 +4,8 @@ use rusqlite::Connection;
 use tracing::{debug, info};
 
 use crate::jmap::email as jmap_email;
+use crate::jmap::types::EmailObject;
+use crate::maildir_ops::dedupe::LocalIndex;
 use crate::maildir_ops::{flags::keywords_to_flags, store};
 use crate::state::queries::{self, MessageRecord};
 
@@ -16,17 +18,36 @@ pub async fn pull(
     mailboxes: &[(String, String)], // (jmap_mailbox_id, maildir_folder)
     maildir_root: &std::path::Path,
     max_messages: u64,
+    index: &LocalIndex,
 ) -> Result<String> {
     let current_state = queries::get_jmap_state(conn, account_id, "Email")?;
 
     match current_state {
         None => {
             info!("No previous state -- performing initial pull");
-            initial_pull(client, conn, account_id, mailboxes, maildir_root, max_messages).await
+            initial_pull(
+                client,
+                conn,
+                account_id,
+                mailboxes,
+                maildir_root,
+                max_messages,
+                index,
+            )
+            .await
         }
         Some(state) => {
             info!("Delta pull from state: {}", state);
-            delta_pull(client, conn, account_id, &state, mailboxes, maildir_root).await
+            delta_pull(
+                client,
+                conn,
+                account_id,
+                &state,
+                mailboxes,
+                maildir_root,
+                index,
+            )
+            .await
         }
     }
 }
@@ -39,11 +60,9 @@ async fn initial_pull(
     mailboxes: &[(String, String)],
     maildir_root: &std::path::Path,
     max_messages: u64,
+    index: &LocalIndex,
 ) -> Result<String> {
     for (mailbox_id, folder_name) in mailboxes {
-        let maildir_path = maildir_root.join(folder_name);
-        let maildir = store::ensure_maildir(&maildir_path)?;
-
         let max = if max_messages > 0 {
             Some(max_messages)
         } else {
@@ -52,7 +71,7 @@ async fn initial_pull(
         let email_ids = jmap_email::query_mailbox(client, mailbox_id, max).await?;
 
         info!(
-            "Downloading {} messages from {} into {}/",
+            "Reconciling {} messages from {} into {}/",
             email_ids.len(),
             folder_name,
             folder_name
@@ -64,45 +83,18 @@ async fn initial_pull(
             let emails = jmap_email::get_by_ids(client, &id_refs).await?;
 
             for email in &emails {
-                let flags = keywords_to_flags(&email.keywords);
-                let blob = jmap_email::download_blob(client, &email.blob_id).await?;
-                let maildir_id = store::store_message(&maildir, &blob, &flags)?;
-
-                let message_id = email
-                    .message_id
-                    .as_ref()
-                    .and_then(|ids| ids.first())
-                    .cloned();
-                let keywords_json = serde_json::to_string(&email.keywords)?;
-
-                queries::upsert_message(
+                ingest_email(
+                    client,
                     conn,
-                    &MessageRecord {
-                        jmap_email_id: email.id.clone(),
-                        jmap_blob_id: Some(email.blob_id.clone()),
-                        jmap_thread_id: Some(email.thread_id.clone()),
-                        mailbox_id: mailbox_id.clone(),
-                        maildir_id: Some(maildir_id.clone()),
-                        maildir_folder: Some(folder_name.clone()),
-                        message_id,
-                        flags: flags.clone(),
-                        jmap_keywords: keywords_json,
-                        size: Some(email.size as i64),
-                        received_at: email.received_at.clone(),
-                    },
-                )?;
-
-                queries::upsert_local_state(
-                    conn,
-                    &maildir_id,
+                    email,
+                    mailbox_id,
                     folder_name,
-                    &flags,
-                    Some(email.size as i64),
-                    None,
-                )?;
+                    maildir_root,
+                    index,
+                )
+                .await?;
             }
         }
-
     }
 
     // Bootstrap delta-sync state with a real Email state from the server.
@@ -124,6 +116,7 @@ async fn delta_pull(
     since_state: &str,
     mailboxes: &[(String, String)],
     maildir_root: &std::path::Path,
+    index: &LocalIndex,
 ) -> Result<String> {
     let mut state = since_state.to_string();
 
@@ -143,6 +136,7 @@ async fn delta_pull(
                         mailboxes,
                         maildir_root,
                         0,
+                        index,
                     ))
                     .await;
                 }
@@ -152,7 +146,8 @@ async fn delta_pull(
 
         // Handle created messages
         if !changes.created.is_empty() {
-            process_created(client, conn, &changes.created, mailboxes, maildir_root).await?;
+            process_created(client, conn, &changes.created, mailboxes, maildir_root, index)
+                .await?;
         }
 
         // Handle updated messages (keyword/mailbox changes)
@@ -184,6 +179,7 @@ async fn process_created(
     created_ids: &[String],
     mailboxes: &[(String, String)],
     maildir_root: &std::path::Path,
+    index: &LocalIndex,
 ) -> Result<()> {
     let id_refs: Vec<&str> = created_ids.iter().map(|s| s.as_str()).collect();
 
@@ -198,51 +194,125 @@ async fn process_created(
                 continue;
             };
 
-            let maildir_path = maildir_root.join(&folder_name);
-            let maildir = store::ensure_maildir(&maildir_path)?;
-
-            let flags = keywords_to_flags(&email.keywords);
-            let blob = jmap_email::download_blob(client, &email.blob_id).await?;
-            let maildir_id = store::store_message(&maildir, &blob, &flags)?;
-
-            let message_id = email
-                .message_id
-                .as_ref()
-                .and_then(|ids| ids.first())
-                .cloned();
-            let keywords_json = serde_json::to_string(&email.keywords)?;
-
-            queries::upsert_message(
+            ingest_email(
+                client,
                 conn,
-                &MessageRecord {
-                    jmap_email_id: email.id.clone(),
-                    jmap_blob_id: Some(email.blob_id.clone()),
-                    jmap_thread_id: Some(email.thread_id.clone()),
-                    mailbox_id,
-                    maildir_id: Some(maildir_id.clone()),
-                    maildir_folder: Some(folder_name.clone()),
-                    message_id,
-                    flags: flags.clone(),
-                    jmap_keywords: keywords_json,
-                    size: Some(email.size as i64),
-                    received_at: email.received_at.clone(),
-                },
-            )?;
-
-            queries::upsert_local_state(
-                conn,
-                &maildir_id,
+                email,
+                &mailbox_id,
                 &folder_name,
-                &flags,
-                Some(email.size as i64),
-                None,
-            )?;
-
-            info!("Downloaded new email {} -> {}/{}", email.id, folder_name, maildir_id);
+                maildir_root,
+                index,
+            )
+            .await?;
         }
     }
 
     Ok(())
+}
+
+/// Reconcile a single remote email into the local maildir + DB.
+/// If we already have this Message-ID locally (per `message_map` or the
+/// pre-built `LocalIndex`), rebind the JMAP fields to the existing file
+/// instead of re-downloading.
+async fn ingest_email(
+    client: &Client,
+    conn: &Connection,
+    email: &EmailObject,
+    mailbox_id: &str,
+    folder_name: &str,
+    maildir_root: &std::path::Path,
+    index: &LocalIndex,
+) -> Result<()> {
+    let flags = keywords_to_flags(&email.keywords);
+    let message_id = email
+        .message_id
+        .as_ref()
+        .and_then(|ids| ids.first())
+        .cloned();
+
+    let existing = message_id
+        .as_deref()
+        .and_then(|m| lookup_existing(conn, index, m, folder_name));
+
+    let (maildir_id, recorded_folder) = match existing {
+        Some((mid, folder)) => {
+            debug!(
+                "Rebinding existing local copy for email {} (Message-ID <{}>) at {}/{}",
+                email.id,
+                message_id.as_deref().unwrap_or("?"),
+                folder,
+                mid
+            );
+            (mid, folder)
+        }
+        None => {
+            let maildir_path = maildir_root.join(folder_name);
+            let maildir = store::ensure_maildir(&maildir_path)?;
+            let blob = jmap_email::download_blob(client, &email.blob_id).await?;
+            let mid = store::store_message(&maildir, &blob, &flags)?;
+            info!("Downloaded new email {} -> {}/{}", email.id, folder_name, mid);
+            (mid, folder_name.to_string())
+        }
+    };
+
+    let keywords_json = serde_json::to_string(&email.keywords)?;
+
+    queries::upsert_message(
+        conn,
+        &MessageRecord {
+            jmap_email_id: email.id.clone(),
+            jmap_blob_id: Some(email.blob_id.clone()),
+            jmap_thread_id: Some(email.thread_id.clone()),
+            mailbox_id: mailbox_id.to_string(),
+            maildir_id: Some(maildir_id.clone()),
+            maildir_folder: Some(recorded_folder.clone()),
+            message_id,
+            flags: flags.clone(),
+            jmap_keywords: keywords_json,
+            size: Some(email.size as i64),
+            received_at: email.received_at.clone(),
+        },
+    )?;
+
+    queries::upsert_local_state(
+        conn,
+        &maildir_id,
+        &recorded_folder,
+        &flags,
+        Some(email.size as i64),
+        None,
+    )?;
+
+    Ok(())
+}
+
+/// Look up an existing local file for a Message-ID **in a specific folder**.
+/// Tries the persistent `message_map` first, then falls back to the
+/// in-memory index built by the dedupe pass (which covers the "DB nuked but
+/// maildir intact" case). Folder-scoped because cross-folder copies of the
+/// same Message-ID are distinct instances — a JMAP delivery for folder B
+/// must not rebind against a local copy that happens to live in folder A.
+fn lookup_existing(
+    conn: &Connection,
+    index: &LocalIndex,
+    message_id: &str,
+    target_folder: &str,
+) -> Option<(String, String)> {
+    if let Ok(Some(rec)) =
+        queries::get_message_by_message_id_in_folder(conn, message_id, target_folder)
+    {
+        if let (Some(mid), Some(folder)) = (rec.maildir_id, rec.maildir_folder) {
+            return Some((mid, folder));
+        }
+    }
+
+    if let Some(entries) = index.by_message_id.get(message_id) {
+        if let Some(entry) = entries.iter().find(|e| e.folder == target_folder) {
+            return Some((entry.maildir_id.clone(), entry.folder.clone()));
+        }
+    }
+
+    None
 }
 
 async fn process_updated(

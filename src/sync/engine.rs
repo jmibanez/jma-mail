@@ -6,7 +6,7 @@ use tracing::info;
 
 use crate::config::Config;
 use crate::jmap::{email as jmap_email, mailbox as jmap_mailbox};
-use crate::maildir_ops::{scan, store};
+use crate::maildir_ops::{dedupe, scan, store};
 use crate::state::queries;
 use crate::sync::{pull, push, reconcile};
 
@@ -64,6 +64,14 @@ pub async fn sync(
     let account_id = client.default_account_id().to_string();
     let mailboxes = resolve_mailboxes(client, conn, config).await?;
     let maildir_root = config.maildir_path();
+
+    // Phase 0: dedupe local maildir by Message-ID and build an index for the
+    // pull phase. Running this before scan/pull guarantees that any duplicate
+    // jmapsync wrote in a previous run is removed before it can be picked up
+    // as a "new local message" and pushed back to the server.
+    let folder_names: Vec<String> =
+        mailboxes.iter().map(|(_, f)| f.clone()).collect();
+    let local_index = dedupe::dedupe_and_index(&maildir_root, &folder_names)?;
 
     // Phase 1: Get remote changes
     let email_state = queries::get_jmap_state(conn, &account_id, "Email")?;
@@ -152,6 +160,7 @@ pub async fn sync(
             &mailboxes,
             &maildir_root,
             config.sync.max_messages,
+            &local_index,
         )
         .await?;
 
@@ -171,6 +180,7 @@ pub async fn sync(
             &mailboxes,
             &maildir_root,
             config.sync.max_messages,
+            &local_index,
         )
         .await?;
 
@@ -191,6 +201,10 @@ pub async fn pull_only(
     let mailboxes = resolve_mailboxes(client, conn, config).await?;
     let maildir_root = config.maildir_path();
 
+    let folder_names: Vec<String> =
+        mailboxes.iter().map(|(_, f)| f.clone()).collect();
+    let local_index = dedupe::dedupe_and_index(&maildir_root, &folder_names)?;
+
     pull::pull(
         client,
         conn,
@@ -198,6 +212,7 @@ pub async fn pull_only(
         &mailboxes,
         &maildir_root,
         config.sync.max_messages,
+        &local_index,
     )
     .await?;
 
@@ -213,6 +228,10 @@ pub async fn push_only(
 ) -> Result<()> {
     let mailboxes = resolve_mailboxes(client, conn, config).await?;
     let maildir_root = config.maildir_path();
+
+    let folder_names: Vec<String> =
+        mailboxes.iter().map(|(_, f)| f.clone()).collect();
+    dedupe::dedupe_and_index(&maildir_root, &folder_names)?;
 
     let mut all_local_changes = Vec::new();
     for (_, folder_name) in &mailboxes {
