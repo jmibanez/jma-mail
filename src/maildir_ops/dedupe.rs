@@ -129,3 +129,24 @@ pub fn dedupe_and_index(
 
     Ok(index)
 }
+
+/// Heuristic: do any synced folders carry mbsync's per-channel state files?
+/// Purely a hint for log clarity -- the adoption path works regardless of
+/// what populated the maildir.
+pub fn detect_mbsync_state(maildir_root: &Path, folders: &[String]) -> bool {
+    const MARKERS: &[&str] = &[
+        ".mbsyncstate",
+        ".mbsyncstate.new",
+        ".mbsyncstate.lock",
+        ".uidvalidity",
+    ];
+    for folder in folders {
+        let folder_path = maildir_root.join(folder);
+        for marker in MARKERS {
+            if folder_path.join(marker).exists() {
+                return true;
+            }
+        }
+    }
+    false
+}

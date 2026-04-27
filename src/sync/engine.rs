@@ -163,6 +163,7 @@ pub async fn sync(
             &maildir_root,
             config.sync.max_messages,
             &local_index,
+            config.sync.download_concurrency,
         )
         .await?;
 
@@ -183,6 +184,7 @@ pub async fn sync(
             &maildir_root,
             config.sync.max_messages,
             &local_index,
+            config.sync.download_concurrency,
         )
         .await?;
 
@@ -215,6 +217,7 @@ pub async fn pull_only(
         &maildir_root,
         config.sync.max_messages,
         &local_index,
+        config.sync.download_concurrency,
     )
     .await?;
 

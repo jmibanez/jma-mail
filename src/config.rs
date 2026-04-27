@@ -38,6 +38,10 @@ pub struct SyncConfig {
     /// `INBOX` is always treated as an alias for the inbox role regardless.
     #[serde(default)]
     pub case_insensitive_match: bool,
+    /// Max concurrent blob downloads during pull. Clamped at runtime to the
+    /// server's advertised `maxConcurrentRequests`.
+    #[serde(default = "default_download_concurrency")]
+    pub download_concurrency: usize,
 }
 
 #[derive(Debug, Deserialize, Default, Clone, Copy)]
@@ -80,6 +84,10 @@ fn default_debounce_secs() -> u64 {
 
 fn default_ping_interval() -> u64 {
     60
+}
+
+fn default_download_concurrency() -> usize {
+    8
 }
 
 impl Default for StateConfig {
@@ -166,6 +174,9 @@ case_insensitive_match = false
 conflict_strategy = "server-wins"
 # Max messages per sync run (0 = unlimited)
 max_messages = 0
+# Max concurrent blob downloads during pull. Clamped to the server's
+# advertised maxConcurrentRequests (Fastmail: 10).
+download_concurrency = 8
 
 [state]
 # Path to SQLite state database

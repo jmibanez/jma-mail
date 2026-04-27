@@ -1,6 +1,6 @@
 use anyhow::Result;
 use rusqlite::{params, Connection};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 // --- JMAP State ---
 
@@ -219,6 +219,18 @@ pub fn get_message_by_maildir_id(
         })
         .optional()?;
     Ok(result)
+}
+
+/// All JMAP email IDs we currently have mapped, as a set for fast contains
+/// checks during the adoption-aware initial pull.
+pub fn get_all_jmap_email_ids(conn: &Connection) -> Result<HashSet<String>> {
+    let mut stmt = conn.prepare("SELECT jmap_email_id FROM message_map")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut out = HashSet::new();
+    for row in rows {
+        out.insert(row?);
+    }
+    Ok(out)
 }
 
 /// Delete a message mapping by JMAP email ID.

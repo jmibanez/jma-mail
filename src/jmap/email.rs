@@ -117,6 +117,68 @@ pub async fn query_mailbox(
     Ok(all_ids)
 }
 
+/// Reverse-resolve RFC 5322 Message-IDs to JMAP email IDs.
+///
+/// Issues batched `Email/query` requests with a `header:Message-ID` filter
+/// (substring match per JMAP spec). Returns a map of `Message-ID -> email_id`
+/// for those the server recognises. Used by the adoption path that bootstraps
+/// `message_map` from a pre-populated maildir.
+pub async fn resolve_by_message_ids(
+    client: &Client,
+    message_ids: &[String],
+) -> Result<HashMap<String, String>> {
+    let mut out: HashMap<String, String> = HashMap::new();
+    if message_ids.is_empty() {
+        return Ok(out);
+    }
+    // Stay conservative; JMAP servers commonly cap maxCallsInRequest at ~16.
+    const BATCH: usize = 16;
+
+    for chunk in message_ids.chunks(BATCH) {
+        let mut request = client.build();
+        for mid in chunk {
+            let q = request
+                .query_email()
+                .account_id(client.default_account_id());
+            q.filter(email::query::Filter::header(
+                "Message-ID",
+                Some(mid.as_str()),
+            ));
+            q.limit(1);
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed batched Message-ID resolve: {}", e))?;
+
+        let responses = response.unwrap_method_responses();
+        if responses.len() != chunk.len() {
+            return Err(anyhow::anyhow!(
+                "Batched response length mismatch: expected {}, got {}",
+                chunk.len(),
+                responses.len()
+            ));
+        }
+
+        for (mid, resp) in chunk.iter().zip(responses) {
+            let qr = resp.unwrap_query_email().map_err(|e| {
+                anyhow::anyhow!("Failed to parse query for <{}>: {}", mid, e)
+            })?;
+            if let Some(id) = qr.ids().first() {
+                out.insert(mid.clone(), id.to_string());
+            }
+        }
+    }
+
+    debug!(
+        "Resolved {} of {} Message-IDs to email IDs",
+        out.len(),
+        message_ids.len()
+    );
+    Ok(out)
+}
+
 /// Fetch the current Email state by issuing Email/get with an empty id list.
 /// Use this to bootstrap the state for delta sync after a full initial pull.
 pub async fn get_current_state(client: &Client) -> Result<String> {
