@@ -72,8 +72,9 @@ pub async fn sync(
             Ok(changes) => Some(changes),
             Err(e) => {
                 let err_str = e.to_string();
-                if err_str.contains("cannotCalculateChanges") {
-                    info!("Cannot calculate changes, falling back to full pull");
+                if err_str.contains("Cannot calculate changes") {
+                    info!("Server cannot calculate changes; clearing state for full re-sync");
+                    queries::set_jmap_state(conn, &account_id, "Email", "")?;
                     None
                 } else {
                     return Err(e);

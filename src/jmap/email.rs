@@ -117,6 +117,31 @@ pub async fn query_mailbox(
     Ok(all_ids)
 }
 
+/// Fetch the current Email state by issuing Email/get with an empty id list.
+/// Use this to bootstrap the state for delta sync after a full initial pull.
+pub async fn get_current_state(client: &Client) -> Result<String> {
+    let mut request = client.build();
+    let get_request = request.get_email().account_id(client.default_account_id());
+    get_request.ids(Vec::<String>::new());
+    get_request.properties(vec![email::Property::Id]);
+
+    let response = request
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to fetch email state: {}", e))?;
+
+    let email_response = response
+        .unwrap_method_responses()
+        .pop()
+        .context("No response for email state get")?;
+
+    let get_response = email_response
+        .unwrap_get_email()
+        .map_err(|e| anyhow::anyhow!("Failed to parse email state response: {}", e))?;
+
+    Ok(get_response.state().to_string())
+}
+
 /// Fetch email changes since a given state using convenience helper.
 pub async fn get_changes(client: &Client, since_state: &str) -> Result<ChangesResponse> {
     let changes = client

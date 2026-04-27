@@ -40,8 +40,6 @@ async fn initial_pull(
     maildir_root: &std::path::Path,
     max_messages: u64,
 ) -> Result<String> {
-    let mut latest_state: Option<String> = None;
-
     for (mailbox_id, folder_name) in mailboxes {
         let maildir_path = maildir_root.join(folder_name);
         let maildir = store::ensure_maildir(&maildir_path)?;
@@ -105,16 +103,12 @@ async fn initial_pull(
             }
         }
 
-        // Get current state after fetching this mailbox
-        let changes = jmap_email::get_changes(client, "0").await;
-        if let Ok(c) = changes {
-            latest_state = Some(c.new_state);
-        }
     }
 
-    // We need to get the actual current state
-    // Fetch it via a minimal Email/query + state
-    let state = latest_state.unwrap_or_else(|| "0".to_string());
+    // Bootstrap delta-sync state with a real Email state from the server.
+    // Email/changes since "0" returns cannotCalculateChanges; use Email/get
+    // with an empty id list to read the current state instead.
+    let state = jmap_email::get_current_state(client).await?;
 
     queries::set_jmap_state(conn, account_id, "Email", &state)?;
     info!("Initial pull complete. State: {}", state);
@@ -138,7 +132,7 @@ async fn delta_pull(
             Ok(c) => c,
             Err(e) => {
                 let err_str = e.to_string();
-                if err_str.contains("cannotCalculateChanges") {
+                if err_str.contains("Cannot calculate changes") {
                     info!("Server cannot calculate changes; falling back to full re-sync");
                     // Clear state and re-do initial pull
                     queries::set_jmap_state(conn, account_id, "Email", "")?;

@@ -13,10 +13,11 @@ pub fn get_jmap_state(
     let mut stmt = conn.prepare(
         "SELECT state FROM jmap_state WHERE account_id = ?1 AND entity_type = ?2",
     )?;
-    let result = stmt
+    let result: Option<String> = stmt
         .query_row(params![account_id, entity_type], |row| row.get(0))
         .optional()?;
-    Ok(result)
+    // Treat empty-string sentinel (used to force a full re-sync) as "no state".
+    Ok(result.filter(|s| !s.is_empty()))
 }
 
 /// Set/update the JMAP state string for an entity type.
