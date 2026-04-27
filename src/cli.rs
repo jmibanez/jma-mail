@@ -5,19 +5,19 @@ use std::path::PathBuf;
 #[command(name = "jmapsync", version, about = "Bidirectional JMAP-to-Maildir email sync")]
 pub struct Cli {
     /// Config file path
-    #[arg(short, long, default_value = "~/.config/jmapsync/config.toml")]
+    #[arg(short, long, global = true, default_value = "~/.config/jmapsync/config.toml")]
     pub config: PathBuf,
 
     /// Increase logging verbosity (-v, -vv, -vvv)
-    #[arg(short, long, action = clap::ArgAction::Count)]
+    #[arg(short, long, global = true, action = clap::ArgAction::Count)]
     pub verbose: u8,
 
     /// Show what would be done without making changes
-    #[arg(short = 'n', long)]
+    #[arg(short = 'n', long, global = true)]
     pub dry_run: bool,
 
     /// Suppress all output except errors
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     pub quiet: bool,
 
     #[command(subcommand)]
