@@ -5,6 +5,37 @@ use tracing::{debug, info};
 
 use crate::jmap::types::MailboxObject;
 
+/// Decide whether `mb` matches any entry in the user's configured mailbox
+/// list. An empty list means "sync everything".
+///
+/// `INBOX` is treated as a magic alias for the JMAP inbox role -- this
+/// is the IMAP convention and matches what most users expect when they
+/// see "INBOX" in a config file. Other entries match by name, exactly
+/// or case-insensitively depending on `case_insensitive`.
+pub fn is_mailbox_synced(
+    config_entries: &[String],
+    mb: &MailboxObject,
+    case_insensitive: bool,
+) -> bool {
+    if config_entries.is_empty() {
+        return true;
+    }
+    for entry in config_entries {
+        if entry == "INBOX" && mb.role.as_deref() == Some("inbox") {
+            return true;
+        }
+        let matches_name = if case_insensitive {
+            entry.eq_ignore_ascii_case(&mb.name)
+        } else {
+            entry == &mb.name
+        };
+        if matches_name {
+            return true;
+        }
+    }
+    false
+}
+
 /// Fetch all mailboxes from the server using the convenience helper.
 pub async fn get_all(client: &Client) -> Result<Vec<MailboxObject>> {
     let mut request = client.build();
@@ -74,4 +105,63 @@ pub async fn get_all(client: &Client) -> Result<Vec<MailboxObject>> {
     );
 
     Ok(mailboxes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mb(name: &str, role: Option<&str>) -> MailboxObject {
+        MailboxObject {
+            id: "mb1".to_string(),
+            name: name.to_string(),
+            parent_id: None,
+            role: role.map(str::to_string),
+            sort_order: 0,
+            total_emails: 0,
+            unread_emails: 0,
+        }
+    }
+
+    #[test]
+    fn empty_config_syncs_everything() {
+        assert!(is_mailbox_synced(&[], &mb("Inbox", Some("inbox")), false));
+        assert!(is_mailbox_synced(&[], &mb("Random", None), false));
+    }
+
+    #[test]
+    fn inbox_alias_matches_inbox_role() {
+        let entries = vec!["INBOX".to_string()];
+        assert!(is_mailbox_synced(&entries, &mb("Inbox", Some("inbox")), false));
+        // Even if the server localized the name:
+        assert!(is_mailbox_synced(&entries, &mb("Indbakke", Some("inbox")), false));
+    }
+
+    #[test]
+    fn inbox_alias_does_not_match_non_inbox_role() {
+        let entries = vec!["INBOX".to_string()];
+        assert!(!is_mailbox_synced(&entries, &mb("Inbox", Some("archive")), false));
+        assert!(!is_mailbox_synced(&entries, &mb("Inbox", None), false));
+    }
+
+    #[test]
+    fn exact_name_match_is_case_sensitive_by_default() {
+        let entries = vec!["Archive".to_string()];
+        assert!(is_mailbox_synced(&entries, &mb("Archive", Some("archive")), false));
+        assert!(!is_mailbox_synced(&entries, &mb("archive", Some("archive")), false));
+    }
+
+    #[test]
+    fn case_insensitive_flag_loosens_name_match() {
+        let entries = vec!["archive".to_string()];
+        assert!(is_mailbox_synced(&entries, &mb("Archive", Some("archive")), true));
+        assert!(!is_mailbox_synced(&entries, &mb("Archive", Some("archive")), false));
+    }
+
+    #[test]
+    fn unmatched_entry_does_not_sync() {
+        let entries = vec!["Sent".to_string(), "Drafts".to_string()];
+        assert!(!is_mailbox_synced(&entries, &mb("Spam", Some("junk")), false));
+        assert!(!is_mailbox_synced(&entries, &mb("Spam", Some("junk")), true));
+    }
 }

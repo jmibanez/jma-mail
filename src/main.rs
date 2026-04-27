@@ -70,9 +70,11 @@ async fn cmd_mailboxes(cli: &Cli) -> Result<()> {
     println!("{:<40} {:>8} {:>8}  {}", "Name", "Total", "Unread", "Role");
     println!("{}", "-".repeat(70));
     for mb in &mailboxes {
-        let synced = if config.sync.mailboxes.is_empty()
-            || config.sync.mailboxes.iter().any(|m| m == &mb.name)
-        {
+        let synced = if jmapsync::jmap::mailbox::is_mailbox_synced(
+            &config.sync.mailboxes,
+            mb,
+            config.sync.case_insensitive_match,
+        ) {
             "*"
         } else {
             " "

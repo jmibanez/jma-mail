@@ -34,6 +34,10 @@ pub struct SyncConfig {
     /// Max messages to fetch per sync run (0 = unlimited)
     #[serde(default)]
     pub max_messages: u64,
+    /// If true, match `mailboxes` entries against server names case-insensitively.
+    /// `INBOX` is always treated as an alias for the inbox role regardless.
+    #[serde(default)]
+    pub case_insensitive_match: bool,
 }
 
 #[derive(Debug, Deserialize, Default, Clone, Copy)]
@@ -151,8 +155,13 @@ session_url = "https://api.fastmail.com/jmap/session"
 [sync]
 # Root directory for local maildir storage
 maildir_path = "~/Mail/Fastmail"
-# Which mailboxes to sync (empty = all)
+# Which mailboxes to sync (empty = all). The literal "INBOX" is a magic
+# alias for whichever mailbox has the JMAP "inbox" role; other entries
+# match the mailbox's name (case-sensitively unless case_insensitive_match
+# is true).
 mailboxes = ["INBOX", "Archive", "Sent", "Drafts", "Trash"]
+# Match `mailboxes` entries case-insensitively against server names.
+case_insensitive_match = false
 # Conflict resolution: server-wins, local-wins, or newest-wins
 conflict_strategy = "server-wins"
 # Max messages per sync run (0 = unlimited)

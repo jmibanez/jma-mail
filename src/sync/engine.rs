@@ -24,9 +24,11 @@ pub async fn resolve_mailboxes(
         let folder_name = &mb.name;
 
         // If mailboxes filter is set, only sync those
-        if !config.sync.mailboxes.is_empty()
-            && !config.sync.mailboxes.iter().any(|m| m == folder_name)
-        {
+        if !jmap_mailbox::is_mailbox_synced(
+            &config.sync.mailboxes,
+            mb,
+            config.sync.case_insensitive_match,
+        ) {
             continue;
         }
 
