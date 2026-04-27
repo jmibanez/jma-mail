@@ -56,13 +56,20 @@ pub async fn resolve_mailboxes(
     Ok(synced)
 }
 
+/// Outcome of one sync iteration -- enough for the daemon loop to know
+/// whether to fire the post-arrival hook.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SyncOutcome {
+    pub downloaded: usize,
+}
+
 /// Run a full bidirectional sync.
 pub async fn sync(
     client: &Client,
     conn: &Connection,
     config: &Config,
     dry_run: bool,
-) -> Result<()> {
+) -> Result<SyncOutcome> {
     let account_id = client.default_account_id().to_string();
     let mailboxes = resolve_mailboxes(client, conn, config).await?;
     let maildir_root = config.maildir_path();
@@ -146,16 +153,16 @@ pub async fn sync(
 
         if dry_run {
             print!("{}", plan);
-            return Ok(());
+            return Ok(SyncOutcome::default());
         }
 
         if plan.is_empty() && all_local_changes.is_empty() {
             info!("Already in sync");
-            return Ok(());
+            return Ok(SyncOutcome::default());
         }
 
         // Execute: pull phase
-        pull::pull(
+        let outcome = pull::pull(
             client,
             conn,
             &account_id,
@@ -169,14 +176,19 @@ pub async fn sync(
 
         // Execute: push phase
         push::push(client, conn, all_local_changes, &mailboxes).await?;
+
+        info!("Sync complete");
+        Ok(SyncOutcome {
+            downloaded: outcome.downloaded,
+        })
     } else {
         // No previous state or cannotCalculateChanges -- do full pull then push
         if dry_run {
             println!("Full sync required (no previous state). Use without --dry-run to execute.");
-            return Ok(());
+            return Ok(SyncOutcome::default());
         }
 
-        pull::pull(
+        let outcome = pull::pull(
             client,
             conn,
             &account_id,
@@ -189,10 +201,12 @@ pub async fn sync(
         .await?;
 
         push::push(client, conn, all_local_changes, &mailboxes).await?;
-    }
 
-    info!("Sync complete");
-    Ok(())
+        info!("Sync complete");
+        Ok(SyncOutcome {
+            downloaded: outcome.downloaded,
+        })
+    }
 }
 
 /// Run pull only (server -> local).
@@ -200,7 +214,7 @@ pub async fn pull_only(
     client: &Client,
     conn: &Connection,
     config: &Config,
-) -> Result<()> {
+) -> Result<SyncOutcome> {
     let account_id = client.default_account_id().to_string();
     let mailboxes = resolve_mailboxes(client, conn, config).await?;
     let maildir_root = config.maildir_path();
@@ -209,7 +223,7 @@ pub async fn pull_only(
         mailboxes.iter().map(|(_, f)| f.clone()).collect();
     let local_index = dedupe::dedupe_and_index(&maildir_root, &folder_names)?;
 
-    pull::pull(
+    let outcome = pull::pull(
         client,
         conn,
         &account_id,
@@ -222,7 +236,9 @@ pub async fn pull_only(
     .await?;
 
     info!("Pull complete");
-    Ok(())
+    Ok(SyncOutcome {
+        downloaded: outcome.downloaded,
+    })
 }
 
 /// Run push only (local -> server).

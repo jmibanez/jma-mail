@@ -41,8 +41,17 @@ fn is_rate_limit_error(err: &anyhow::Error) -> bool {
         || s.contains("rateLimit")
 }
 
+/// Outcome of a pull cycle.
+pub struct PullOutcome {
+    /// New JMAP Email state cursor to persist.
+    pub state: String,
+    /// Number of messages actually downloaded + written to the maildir
+    /// in this cycle. Excludes rebinds (Message-ID already present
+    /// locally) and pure flag updates.
+    pub downloaded: usize,
+}
+
 /// Pull new and changed messages from server to local maildir.
-/// Returns the new JMAP email state string.
 pub async fn pull(
     client: &Client,
     conn: &Connection,
@@ -52,7 +61,7 @@ pub async fn pull(
     max_messages: u64,
     index: &LocalIndex,
     download_concurrency: usize,
-) -> Result<String> {
+) -> Result<PullOutcome> {
     let mut concurrency = effective_concurrency(client, download_concurrency);
     if concurrency != download_concurrency {
         info!(
@@ -111,7 +120,8 @@ async fn initial_pull(
     max_messages: u64,
     index: &LocalIndex,
     concurrency: &mut usize,
-) -> Result<String> {
+) -> Result<PullOutcome> {
+    let mut downloaded = 0usize;
     // Adoption pass: if the maildir already has messages, populate
     // message_map by reverse-querying JMAP rather than walking the full
     // mailbox and Email/get'ing every metadata record.
@@ -171,7 +181,8 @@ async fn initial_pull(
                     folder_name: folder_name.clone(),
                 })
                 .collect();
-            ingest_emails(client, conn, plans, maildir_root, index, concurrency).await?;
+            downloaded +=
+                ingest_emails(client, conn, plans, maildir_root, index, concurrency).await?;
         }
     }
 
@@ -181,9 +192,12 @@ async fn initial_pull(
     let state = jmap_email::get_current_state(client).await?;
 
     queries::set_jmap_state(conn, account_id, "Email", &state)?;
-    info!("Initial pull complete. State: {}", state);
+    info!(
+        "Initial pull complete. State: {} ({} downloaded)",
+        state, downloaded
+    );
 
-    Ok(state)
+    Ok(PullOutcome { state, downloaded })
 }
 
 /// Reverse-resolve local Message-IDs to JMAP email IDs and populate
@@ -304,8 +318,9 @@ async fn delta_pull(
     maildir_root: &std::path::Path,
     index: &LocalIndex,
     concurrency: &mut usize,
-) -> Result<String> {
+) -> Result<PullOutcome> {
     let mut state = since_state.to_string();
+    let mut downloaded = 0usize;
 
     loop {
         let changes = match jmap_email::get_changes(client, &state).await {
@@ -334,7 +349,7 @@ async fn delta_pull(
 
         // Handle created messages
         if !changes.created.is_empty() {
-            process_created(
+            downloaded += process_created(
                 client,
                 conn,
                 &changes.created,
@@ -364,9 +379,12 @@ async fn delta_pull(
     }
 
     queries::set_jmap_state(conn, account_id, "Email", &state)?;
-    info!("Delta pull complete. New state: {}", state);
+    info!(
+        "Delta pull complete. New state: {} ({} downloaded)",
+        state, downloaded
+    );
 
-    Ok(state)
+    Ok(PullOutcome { state, downloaded })
 }
 
 async fn process_created(
@@ -377,8 +395,9 @@ async fn process_created(
     maildir_root: &std::path::Path,
     index: &LocalIndex,
     concurrency: &mut usize,
-) -> Result<()> {
+) -> Result<usize> {
     let id_refs: Vec<&str> = created_ids.iter().map(|s| s.as_str()).collect();
+    let mut downloaded = 0usize;
 
     for chunk in id_refs.chunks(50) {
         let emails = jmap_email::get_by_ids(client, chunk).await?;
@@ -401,10 +420,11 @@ async fn process_created(
         if plans.is_empty() {
             continue;
         }
-        ingest_emails(client, conn, plans, maildir_root, index, concurrency).await?;
+        downloaded +=
+            ingest_emails(client, conn, plans, maildir_root, index, concurrency).await?;
     }
 
-    Ok(())
+    Ok(downloaded)
 }
 
 /// One unit of pull-side work: an `EmailObject` that should land in the
@@ -433,10 +453,11 @@ async fn ingest_emails(
     maildir_root: &std::path::Path,
     index: &LocalIndex,
     concurrency: &mut usize,
-) -> Result<()> {
+) -> Result<usize> {
     if plans.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
+    let mut downloaded = 0usize;
 
     let mut downloads: Vec<IngestPlan> = Vec::with_capacity(plans.len());
     for plan in plans {
@@ -517,6 +538,7 @@ async fn ingest_emails(
                 plan.email.id, plan.folder_name, mid
             );
             commit_email(conn, &plan.email, &plan.mailbox_id, &mid, &plan.folder_name)?;
+            downloaded += 1;
         }
 
         if let Some(e) = hard_error {
@@ -560,7 +582,7 @@ async fn ingest_emails(
         }
     }
 
-    Ok(())
+    Ok(downloaded)
 }
 
 /// Persist a single email's mapping + local_state. Used by both the
