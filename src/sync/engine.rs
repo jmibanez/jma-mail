@@ -1,0 +1,229 @@
+use anyhow::Result;
+use jmap_client::client::Client;
+use rusqlite::Connection;
+use std::collections::HashMap;
+use tracing::info;
+
+use crate::config::Config;
+use crate::jmap::{email as jmap_email, mailbox as jmap_mailbox};
+use crate::maildir_ops::{scan, store};
+use crate::state::queries;
+use crate::sync::{pull, push, reconcile};
+
+/// Resolve the list of mailboxes to sync, returning (jmap_id, folder_name) pairs.
+pub async fn resolve_mailboxes(
+    client: &Client,
+    conn: &Connection,
+    config: &Config,
+) -> Result<Vec<(String, String)>> {
+    let remote_mailboxes = jmap_mailbox::get_all(client).await?;
+
+    let mut synced = Vec::new();
+
+    for mb in &remote_mailboxes {
+        let folder_name = &mb.name;
+
+        // If mailboxes filter is set, only sync those
+        if !config.sync.mailboxes.is_empty()
+            && !config.sync.mailboxes.iter().any(|m| m == folder_name)
+        {
+            continue;
+        }
+
+        // Store in DB
+        queries::upsert_mailbox(
+            conn,
+            &queries::MailboxRecord {
+                jmap_mailbox_id: mb.id.clone(),
+                name: mb.name.clone(),
+                role: mb.role.clone(),
+                parent_id: mb.parent_id.clone(),
+                maildir_folder: folder_name.clone(),
+                sort_order: mb.sort_order as i32,
+            },
+        )?;
+
+        // Ensure local maildir exists
+        let maildir_path = config.maildir_path().join(folder_name);
+        store::ensure_maildir(&maildir_path)?;
+
+        synced.push((mb.id.clone(), folder_name.clone()));
+    }
+
+    info!("Syncing {} mailboxes", synced.len());
+    Ok(synced)
+}
+
+/// Run a full bidirectional sync.
+pub async fn sync(
+    client: &Client,
+    conn: &Connection,
+    config: &Config,
+    dry_run: bool,
+) -> Result<()> {
+    let account_id = client.default_account_id().to_string();
+    let mailboxes = resolve_mailboxes(client, conn, config).await?;
+    let maildir_root = config.maildir_path();
+
+    // Phase 1: Get remote changes
+    let email_state = queries::get_jmap_state(conn, &account_id, "Email")?;
+    let remote_changes = if let Some(ref state) = email_state {
+        match jmap_email::get_changes(client, state).await {
+            Ok(changes) => Some(changes),
+            Err(e) => {
+                let err_str = e.to_string();
+                if err_str.contains("cannotCalculateChanges") {
+                    info!("Cannot calculate changes, falling back to full pull");
+                    None
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+    } else {
+        None
+    };
+
+    // Phase 2: Scan local changes
+    let mut all_local_changes = Vec::new();
+    for (_, folder_name) in &mailboxes {
+        let maildir_path = maildir_root.join(folder_name);
+        let maildir = store::ensure_maildir(&maildir_path)?;
+        let known_state = queries::get_local_state_for_folder(conn, folder_name)?;
+        let (changes, _seen) = scan::scan_folder(&maildir, folder_name, &known_state)?;
+        all_local_changes.extend(changes);
+    }
+
+    if let Some(ref remote) = remote_changes {
+        // Phase 3: Reconcile and build plan
+        let mut known_by_maildir: HashMap<String, queries::MessageRecord> = HashMap::new();
+        let mut known_by_jmap: HashMap<String, queries::MessageRecord> = HashMap::new();
+
+        for (_, folder_name) in &mailboxes {
+            let messages = queries::get_messages_by_folder(conn, folder_name)?;
+            for msg in messages {
+                if let Some(ref mid) = msg.maildir_id {
+                    known_by_maildir.insert(mid.clone(), queries::MessageRecord {
+                        jmap_email_id: msg.jmap_email_id.clone(),
+                        jmap_blob_id: msg.jmap_blob_id.clone(),
+                        jmap_thread_id: msg.jmap_thread_id.clone(),
+                        mailbox_id: msg.mailbox_id.clone(),
+                        maildir_id: msg.maildir_id.clone(),
+                        maildir_folder: msg.maildir_folder.clone(),
+                        message_id: msg.message_id.clone(),
+                        flags: msg.flags.clone(),
+                        jmap_keywords: msg.jmap_keywords.clone(),
+                        size: msg.size,
+                        received_at: msg.received_at.clone(),
+                    });
+                }
+                known_by_jmap.insert(msg.jmap_email_id.clone(), msg);
+            }
+        }
+
+        let plan = reconcile::reconcile(
+            &remote.created,
+            &remote.updated,
+            &remote.destroyed,
+            &all_local_changes,
+            &known_by_maildir,
+            &known_by_jmap,
+            config.sync.conflict_strategy,
+            &mailboxes,
+            Some(remote.new_state.clone()),
+        );
+
+        if dry_run {
+            print!("{}", plan);
+            return Ok(());
+        }
+
+        if plan.is_empty() && all_local_changes.is_empty() {
+            info!("Already in sync");
+            return Ok(());
+        }
+
+        // Execute: pull phase
+        pull::pull(
+            client,
+            conn,
+            &account_id,
+            &mailboxes,
+            &maildir_root,
+            config.sync.max_messages,
+        )
+        .await?;
+
+        // Execute: push phase
+        push::push(client, conn, all_local_changes, &mailboxes).await?;
+    } else {
+        // No previous state or cannotCalculateChanges -- do full pull then push
+        if dry_run {
+            println!("Full sync required (no previous state). Use without --dry-run to execute.");
+            return Ok(());
+        }
+
+        pull::pull(
+            client,
+            conn,
+            &account_id,
+            &mailboxes,
+            &maildir_root,
+            config.sync.max_messages,
+        )
+        .await?;
+
+        push::push(client, conn, all_local_changes, &mailboxes).await?;
+    }
+
+    info!("Sync complete");
+    Ok(())
+}
+
+/// Run pull only (server -> local).
+pub async fn pull_only(
+    client: &Client,
+    conn: &Connection,
+    config: &Config,
+) -> Result<()> {
+    let account_id = client.default_account_id().to_string();
+    let mailboxes = resolve_mailboxes(client, conn, config).await?;
+    let maildir_root = config.maildir_path();
+
+    pull::pull(
+        client,
+        conn,
+        &account_id,
+        &mailboxes,
+        &maildir_root,
+        config.sync.max_messages,
+    )
+    .await?;
+
+    info!("Pull complete");
+    Ok(())
+}
+
+/// Run push only (local -> server).
+pub async fn push_only(
+    client: &Client,
+    conn: &Connection,
+    config: &Config,
+) -> Result<()> {
+    let mailboxes = resolve_mailboxes(client, conn, config).await?;
+    let maildir_root = config.maildir_path();
+
+    let mut all_local_changes = Vec::new();
+    for (_, folder_name) in &mailboxes {
+        let maildir_path = maildir_root.join(folder_name);
+        let maildir = store::ensure_maildir(&maildir_path)?;
+        let known_state = queries::get_local_state_for_folder(conn, folder_name)?;
+        let (changes, _seen) = scan::scan_folder(&maildir, folder_name, &known_state)?;
+        all_local_changes.extend(changes);
+    }
+
+    push::push(client, conn, all_local_changes, &mailboxes).await?;
+
+    info!("Push complete");
+    Ok(())
+}

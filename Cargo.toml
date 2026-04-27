@@ -1,0 +1,56 @@
+[package]
+name = "jmapsync"
+version = "0.1.0"
+edition = "2021"
+description = "Bidirectional JMAP-to-Maildir email sync for Fastmail"
+
+[dependencies]
+# JMAP client
+jmap-client = { version = "0.4", default-features = false, features = ["async", "ring"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP (for blob downloads and raw requests)
+reqwest = { version = "0.12", features = ["json"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Config
+toml = "0.8"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# State DB
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Maildir
+maildir = "0.6"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Paths
+dirs = "5"
+
+# Unique IDs
+uuid = { version = "1", features = ["v4"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# SSE for JMAP push
+reqwest-eventsource = "0.6"
+futures-util = "0.3"
+
+# Filesystem watcher for daemon mode
+notify = "8"
+notify-debouncer-mini = "0.7"
