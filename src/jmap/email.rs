@@ -230,6 +230,22 @@ pub async fn destroy(client: &Client, email_ids: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// Normalize line endings to CRLF for RFC 5322 wire format.
+/// Maildir messages are typically stored with bare LF; JMAP servers
+/// reject those with `invalidEmail: Message contains bare newlines`.
+fn normalize_crlf(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len() + input.len() / 32);
+    let mut prev = 0u8;
+    for &b in input {
+        if b == b'\n' && prev != b'\r' {
+            out.push(b'\r');
+        }
+        out.push(b);
+        prev = b;
+    }
+    out
+}
+
 /// Import a raw email message (RFC 5322) into a mailbox using convenience helper.
 pub async fn import_email(
     client: &Client,
@@ -249,9 +265,11 @@ pub async fn import_email(
         Some(keyword_list)
     };
 
+    let normalized = normalize_crlf(raw_message);
+
     let email = client
         .email_import(
-            raw_message.to_vec(),
+            normalized,
             [mailbox_id.to_string()],
             keyword_opt,
             None,
