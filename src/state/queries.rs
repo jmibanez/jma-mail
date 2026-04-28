@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use std::collections::{HashMap, HashSet};
 
 // --- JMAP State ---
@@ -10,9 +10,8 @@ pub fn get_jmap_state(
     account_id: &str,
     entity_type: &str,
 ) -> Result<Option<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT state FROM jmap_state WHERE account_id = ?1 AND entity_type = ?2",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT state FROM jmap_state WHERE account_id = ?1 AND entity_type = ?2")?;
     let result: Option<String> = stmt
         .query_row(params![account_id, entity_type], |row| row.get(0))
         .optional()?;
@@ -243,10 +242,7 @@ pub fn delete_message_by_jmap_id(conn: &Connection, jmap_email_id: &str) -> Resu
 }
 
 /// Get all messages in a given mailbox folder.
-pub fn get_messages_by_folder(
-    conn: &Connection,
-    folder: &str,
-) -> Result<Vec<MessageRecord>> {
+pub fn get_messages_by_folder(conn: &Connection, folder: &str) -> Result<Vec<MessageRecord>> {
     let mut stmt = conn.prepare(
         "SELECT jmap_email_id, jmap_blob_id, jmap_thread_id, mailbox_id,
                 maildir_id, maildir_folder, message_id, flags, jmap_keywords,
@@ -357,10 +353,7 @@ pub fn get_mailbox_by_jmap_id(
 }
 
 /// Look up a mailbox by its local folder name.
-pub fn get_mailbox_by_folder(
-    conn: &Connection,
-    folder: &str,
-) -> Result<Option<MailboxRecord>> {
+pub fn get_mailbox_by_folder(conn: &Connection, folder: &str) -> Result<Option<MailboxRecord>> {
     let mut stmt = conn.prepare(
         "SELECT jmap_mailbox_id, name, role, parent_id, maildir_folder, sort_order
          FROM mailbox_map WHERE maildir_folder = ?1",

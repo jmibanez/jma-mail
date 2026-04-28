@@ -41,11 +41,7 @@ pub async fn get_by_ids(client: &Client, ids: &[&str]) -> Result<Vec<EmailObject
         .unwrap_get_email()
         .map_err(|e| anyhow::anyhow!("Failed to parse email response: {}", e))?;
 
-    let emails = get_response
-        .list()
-        .iter()
-        .map(parse_email_object)
-        .collect();
+    let emails = get_response.list().iter().map(parse_email_object).collect();
 
     Ok(emails)
 }
@@ -162,9 +158,9 @@ pub async fn resolve_by_message_ids(
         }
 
         for (mid, resp) in chunk.iter().zip(responses) {
-            let qr = resp.unwrap_query_email().map_err(|e| {
-                anyhow::anyhow!("Failed to parse query for <{}>: {}", mid, e)
-            })?;
+            let qr = resp
+                .unwrap_query_email()
+                .map_err(|e| anyhow::anyhow!("Failed to parse query for <{}>: {}", mid, e))?;
             if let Some(id) = qr.ids().first() {
                 out.insert(mid.clone(), id.to_string());
             }
@@ -248,7 +244,12 @@ pub async fn set_keywords(
             .email_set_keyword(email_id, keyword, *value)
             .await
             .map_err(|e| {
-                anyhow::anyhow!("Failed to set keyword {} on email {}: {}", keyword, email_id, e)
+                anyhow::anyhow!(
+                    "Failed to set keyword {} on email {}: {}",
+                    keyword,
+                    email_id,
+                    e
+                )
             })?;
     }
 
@@ -330,12 +331,7 @@ pub async fn import_email(
     let normalized = normalize_crlf(raw_message);
 
     let email = client
-        .email_import(
-            normalized,
-            [mailbox_id.to_string()],
-            keyword_opt,
-            None,
-        )
+        .email_import(normalized, [mailbox_id.to_string()], keyword_opt, None)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to import email: {}", e))?;
 

@@ -17,10 +17,7 @@ pub enum LocalChange {
         path: PathBuf,
     },
     /// A message file we had recorded is now missing.
-    DeletedMessage {
-        maildir_id: String,
-        folder: String,
-    },
+    DeletedMessage { maildir_id: String, folder: String },
     /// The flags on a message file changed.
     FlagsChanged {
         maildir_id: String,

@@ -133,8 +133,7 @@ impl Config {
         let path = expand_tilde(path);
         let contents = std::fs::read_to_string(&path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
-        let config: Config =
-            toml::from_str(&contents).context("Failed to parse config file")?;
+        let config: Config = toml::from_str(&contents).context("Failed to parse config file")?;
         Ok(config)
     }
 

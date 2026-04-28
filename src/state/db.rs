@@ -54,8 +54,9 @@ CREATE TABLE IF NOT EXISTS local_state (
 /// Open (or create) the state database and run schema migrations.
 pub fn open(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create state DB directory: {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!("Failed to create state DB directory: {}", parent.display())
+        })?;
     }
 
     let conn = Connection::open(path)

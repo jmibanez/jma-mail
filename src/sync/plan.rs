@@ -127,12 +127,20 @@ impl fmt::Display for SyncPlan {
                     jmap_email_id,
                     maildir_folder,
                     ..
-                } => writeln!(f, "  [PULL]  Download {} -> {}/", jmap_email_id, maildir_folder)?,
+                } => writeln!(
+                    f,
+                    "  [PULL]  Download {} -> {}/",
+                    jmap_email_id, maildir_folder
+                )?,
                 SyncAction::UpdateLocalFlags {
                     maildir_id,
                     new_flags,
                     ..
-                } => writeln!(f, "  [PULL]  Update flags on {}: '{}'", maildir_id, new_flags)?,
+                } => writeln!(
+                    f,
+                    "  [PULL]  Update flags on {}: '{}'",
+                    maildir_id, new_flags
+                )?,
                 SyncAction::DeleteLocal { maildir_id, .. } => {
                     writeln!(f, "  [PULL]  Delete local {}", maildir_id)?
                 }
@@ -150,9 +158,9 @@ impl fmt::Display for SyncPlan {
                     maildir_folder,
                     ..
                 } => writeln!(f, "  [PUSH] Upload {} from {}/", maildir_id, maildir_folder)?,
-                SyncAction::UpdateRemoteKeywords {
-                    jmap_email_id, ..
-                } => writeln!(f, "  [PUSH] Update keywords on {}", jmap_email_id)?,
+                SyncAction::UpdateRemoteKeywords { jmap_email_id, .. } => {
+                    writeln!(f, "  [PUSH] Update keywords on {}", jmap_email_id)?
+                }
                 SyncAction::DestroyRemote { jmap_email_id } => {
                     writeln!(f, "  [PUSH] Destroy {}", jmap_email_id)?
                 }

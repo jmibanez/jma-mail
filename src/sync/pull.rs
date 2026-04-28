@@ -128,7 +128,11 @@ async fn initial_pull(
     let folders: Vec<String> = mailboxes.iter().map(|(_, f)| f.clone()).collect();
     if !index.by_message_id.is_empty() {
         let mbsync = dedupe::detect_mbsync_state(maildir_root, &folders);
-        let suffix = if mbsync { " (mbsync state detected)" } else { "" };
+        let suffix = if mbsync {
+            " (mbsync state detected)"
+        } else {
+            ""
+        };
         info!(
             "Adopting {} existing local message(s) before initial pull{}",
             index.by_message_id.len(),
@@ -229,14 +233,11 @@ async fn adopt_existing(
         for email in &emails {
             // Find which of our local Message-IDs this email actually carries.
             // Drops substring-match false positives.
-            let local_mid = email
-                .message_id
-                .as_ref()
-                .and_then(|ids| {
-                    ids.iter()
-                        .find(|m| index.by_message_id.contains_key(*m))
-                        .cloned()
-                });
+            let local_mid = email.message_id.as_ref().and_then(|ids| {
+                ids.iter()
+                    .find(|m| index.by_message_id.contains_key(*m))
+                    .cloned()
+            });
             let Some(local_mid) = local_mid else {
                 debug!(
                     "Adopt: server email {} has no Message-ID matching the local index, skipping",
@@ -420,8 +421,7 @@ async fn process_created(
         if plans.is_empty() {
             continue;
         }
-        downloaded +=
-            ingest_emails(client, conn, plans, maildir_root, index, concurrency).await?;
+        downloaded += ingest_emails(client, conn, plans, maildir_root, index, concurrency).await?;
     }
 
     Ok(downloaded)
@@ -676,7 +676,10 @@ async fn process_updated(
             let existing = queries::get_message_by_jmap_id(conn, &email.id)?;
             let Some(existing) = existing else {
                 // Message is new to us (maybe was in a mailbox we weren't syncing before)
-                debug!("Updated email {} not in local DB, treating as new", email.id);
+                debug!(
+                    "Updated email {} not in local DB, treating as new",
+                    email.id
+                );
                 continue;
             };
 
@@ -744,7 +747,10 @@ fn process_destroyed(
                 let maildir_path = maildir_root.join(folder);
                 let maildir = store::ensure_maildir(&maildir_path)?;
                 if let Err(e) = store::delete_message(&maildir, maildir_id) {
-                    debug!("Failed to delete local message {} (may already be gone): {}", maildir_id, e);
+                    debug!(
+                        "Failed to delete local message {} (may already be gone): {}",
+                        maildir_id, e
+                    );
                 }
                 queries::delete_local_state(conn, maildir_id)?;
             }

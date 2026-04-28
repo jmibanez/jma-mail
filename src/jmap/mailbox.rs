@@ -39,7 +39,9 @@ pub fn is_mailbox_synced(
 /// Fetch all mailboxes from the server using the convenience helper.
 pub async fn get_all(client: &Client) -> Result<Vec<MailboxObject>> {
     let mut request = client.build();
-    let get_request = request.get_mailbox().account_id(client.default_account_id());
+    let get_request = request
+        .get_mailbox()
+        .account_id(client.default_account_id());
     get_request.properties([
         mailbox::Property::Id,
         mailbox::Property::Name,
@@ -98,11 +100,7 @@ pub async fn get_all(client: &Client) -> Result<Vec<MailboxObject>> {
         })
         .collect();
 
-    info!(
-        "Fetched {} mailboxes (state: {})",
-        mailboxes.len(),
-        state
-    );
+    info!("Fetched {} mailboxes (state: {})", mailboxes.len(), state);
 
     Ok(mailboxes)
 }
@@ -132,36 +130,72 @@ mod tests {
     #[test]
     fn inbox_alias_matches_inbox_role() {
         let entries = vec!["INBOX".to_string()];
-        assert!(is_mailbox_synced(&entries, &mb("Inbox", Some("inbox")), false));
+        assert!(is_mailbox_synced(
+            &entries,
+            &mb("Inbox", Some("inbox")),
+            false
+        ));
         // Even if the server localized the name:
-        assert!(is_mailbox_synced(&entries, &mb("Indbakke", Some("inbox")), false));
+        assert!(is_mailbox_synced(
+            &entries,
+            &mb("Indbakke", Some("inbox")),
+            false
+        ));
     }
 
     #[test]
     fn inbox_alias_does_not_match_non_inbox_role() {
         let entries = vec!["INBOX".to_string()];
-        assert!(!is_mailbox_synced(&entries, &mb("Inbox", Some("archive")), false));
+        assert!(!is_mailbox_synced(
+            &entries,
+            &mb("Inbox", Some("archive")),
+            false
+        ));
         assert!(!is_mailbox_synced(&entries, &mb("Inbox", None), false));
     }
 
     #[test]
     fn exact_name_match_is_case_sensitive_by_default() {
         let entries = vec!["Archive".to_string()];
-        assert!(is_mailbox_synced(&entries, &mb("Archive", Some("archive")), false));
-        assert!(!is_mailbox_synced(&entries, &mb("archive", Some("archive")), false));
+        assert!(is_mailbox_synced(
+            &entries,
+            &mb("Archive", Some("archive")),
+            false
+        ));
+        assert!(!is_mailbox_synced(
+            &entries,
+            &mb("archive", Some("archive")),
+            false
+        ));
     }
 
     #[test]
     fn case_insensitive_flag_loosens_name_match() {
         let entries = vec!["archive".to_string()];
-        assert!(is_mailbox_synced(&entries, &mb("Archive", Some("archive")), true));
-        assert!(!is_mailbox_synced(&entries, &mb("Archive", Some("archive")), false));
+        assert!(is_mailbox_synced(
+            &entries,
+            &mb("Archive", Some("archive")),
+            true
+        ));
+        assert!(!is_mailbox_synced(
+            &entries,
+            &mb("Archive", Some("archive")),
+            false
+        ));
     }
 
     #[test]
     fn unmatched_entry_does_not_sync() {
         let entries = vec!["Sent".to_string(), "Drafts".to_string()];
-        assert!(!is_mailbox_synced(&entries, &mb("Spam", Some("junk")), false));
-        assert!(!is_mailbox_synced(&entries, &mb("Spam", Some("junk")), true));
+        assert!(!is_mailbox_synced(
+            &entries,
+            &mb("Spam", Some("junk")),
+            false
+        ));
+        assert!(!is_mailbox_synced(
+            &entries,
+            &mb("Spam", Some("junk")),
+            true
+        ));
     }
 }

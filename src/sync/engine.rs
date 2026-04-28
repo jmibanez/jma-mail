@@ -86,8 +86,7 @@ pub async fn sync(
     // pull phase. Running this before scan/pull guarantees that any duplicate
     // jmapsync wrote in a previous run is removed before it can be picked up
     // as a "new local message" and pushed back to the server.
-    let folder_names: Vec<String> =
-        mailboxes.iter().map(|(_, f)| f.clone()).collect();
+    let folder_names: Vec<String> = mailboxes.iter().map(|(_, f)| f.clone()).collect();
     let local_index = dedupe::dedupe_and_index(&maildir_root, &folder_names)?;
 
     // Phase 1: Get remote changes
@@ -129,19 +128,22 @@ pub async fn sync(
             let messages = queries::get_messages_by_folder(conn, folder_name)?;
             for msg in messages {
                 if let Some(ref mid) = msg.maildir_id {
-                    known_by_maildir.insert(mid.clone(), queries::MessageRecord {
-                        jmap_email_id: msg.jmap_email_id.clone(),
-                        jmap_blob_id: msg.jmap_blob_id.clone(),
-                        jmap_thread_id: msg.jmap_thread_id.clone(),
-                        mailbox_id: msg.mailbox_id.clone(),
-                        maildir_id: msg.maildir_id.clone(),
-                        maildir_folder: msg.maildir_folder.clone(),
-                        message_id: msg.message_id.clone(),
-                        flags: msg.flags.clone(),
-                        jmap_keywords: msg.jmap_keywords.clone(),
-                        size: msg.size,
-                        received_at: msg.received_at.clone(),
-                    });
+                    known_by_maildir.insert(
+                        mid.clone(),
+                        queries::MessageRecord {
+                            jmap_email_id: msg.jmap_email_id.clone(),
+                            jmap_blob_id: msg.jmap_blob_id.clone(),
+                            jmap_thread_id: msg.jmap_thread_id.clone(),
+                            mailbox_id: msg.mailbox_id.clone(),
+                            maildir_id: msg.maildir_id.clone(),
+                            maildir_folder: msg.maildir_folder.clone(),
+                            message_id: msg.message_id.clone(),
+                            flags: msg.flags.clone(),
+                            jmap_keywords: msg.jmap_keywords.clone(),
+                            size: msg.size,
+                            received_at: msg.received_at.clone(),
+                        },
+                    );
                 }
                 known_by_jmap.insert(msg.jmap_email_id.clone(), msg);
             }
@@ -218,17 +220,12 @@ pub async fn sync(
 }
 
 /// Run pull only (server -> local).
-pub async fn pull_only(
-    client: &Client,
-    conn: &Connection,
-    config: &Config,
-) -> Result<SyncOutcome> {
+pub async fn pull_only(client: &Client, conn: &Connection, config: &Config) -> Result<SyncOutcome> {
     let account_id = client.default_account_id().to_string();
     let mailboxes = resolve_mailboxes(client, conn, config).await?;
     let maildir_root = config.maildir_path();
 
-    let folder_names: Vec<String> =
-        mailboxes.iter().map(|(_, f)| f.clone()).collect();
+    let folder_names: Vec<String> = mailboxes.iter().map(|(_, f)| f.clone()).collect();
     let local_index = dedupe::dedupe_and_index(&maildir_root, &folder_names)?;
 
     let outcome = pull::pull(
@@ -250,16 +247,11 @@ pub async fn pull_only(
 }
 
 /// Run push only (local -> server).
-pub async fn push_only(
-    client: &Client,
-    conn: &Connection,
-    config: &Config,
-) -> Result<()> {
+pub async fn push_only(client: &Client, conn: &Connection, config: &Config) -> Result<()> {
     let mailboxes = resolve_mailboxes(client, conn, config).await?;
     let maildir_root = config.maildir_path();
 
-    let folder_names: Vec<String> =
-        mailboxes.iter().map(|(_, f)| f.clone()).collect();
+    let folder_names: Vec<String> = mailboxes.iter().map(|(_, f)| f.clone()).collect();
     dedupe::dedupe_and_index(&maildir_root, &folder_names)?;
 
     let mut all_local_changes = Vec::new();

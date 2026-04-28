@@ -95,9 +95,7 @@ pub fn reconcile(
     // Process remote destroyed
     for jmap_id in remote_destroyed {
         if let Some(msg) = known_messages_by_jmap.get(jmap_id) {
-            if let (Some(maildir_id), Some(folder)) =
-                (&msg.maildir_id, &msg.maildir_folder)
-            {
+            if let (Some(maildir_id), Some(folder)) = (&msg.maildir_id, &msg.maildir_folder) {
                 plan.actions.push(SyncAction::DeleteLocal {
                     maildir_id: maildir_id.clone(),
                     maildir_folder: folder.clone(),

@@ -42,15 +42,12 @@ pub fn parse_message_id(raw: &[u8]) -> Option<String> {
 
         if header_name_matches(line_slice, b"Message-ID") {
             // Capture the value, possibly across folded continuation lines.
-            let mut value: Vec<u8> =
-                line_slice[b"Message-ID:".len()..].to_vec();
+            let mut value: Vec<u8> = line_slice[b"Message-ID:".len()..].to_vec();
 
             // Folded headers: subsequent lines starting with WSP belong to this
             // header.
             let mut j = line_end + 1;
-            while j < headers.len()
-                && (headers[j] == b' ' || headers[j] == b'\t')
-            {
+            while j < headers.len() && (headers[j] == b' ' || headers[j] == b'\t') {
                 let next_end = headers[j..]
                     .iter()
                     .position(|&b| b == b'\n')
@@ -128,10 +125,7 @@ mod tests {
     #[test]
     fn parses_simple_message_id() {
         let raw = b"Subject: hi\r\nMessage-ID: <abc@example.com>\r\n\r\nbody";
-        assert_eq!(
-            parse_message_id(raw),
-            Some("abc@example.com".to_string())
-        );
+        assert_eq!(parse_message_id(raw), Some("abc@example.com".to_string()));
     }
 
     #[test]
@@ -142,8 +136,7 @@ mod tests {
 
     #[test]
     fn parses_folded_value() {
-        let raw =
-            b"Message-ID:\r\n <wrapped@x>\r\nSubject: hi\r\n\r\nbody";
+        let raw = b"Message-ID:\r\n <wrapped@x>\r\nSubject: hi\r\n\r\nbody";
         assert_eq!(parse_message_id(raw), Some("wrapped@x".to_string()));
     }
 

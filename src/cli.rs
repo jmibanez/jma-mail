@@ -2,10 +2,19 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "jmapsync", version, about = "Bidirectional JMAP-to-Maildir email sync")]
+#[command(
+    name = "jmapsync",
+    version,
+    about = "Bidirectional JMAP-to-Maildir email sync"
+)]
 pub struct Cli {
     /// Config file path
-    #[arg(short, long, global = true, default_value = "~/.config/jmapsync/config.toml")]
+    #[arg(
+        short,
+        long,
+        global = true,
+        default_value = "~/.config/jmapsync/config.toml"
+    )]
     pub config: PathBuf,
 
     /// Increase logging verbosity (-v, -vv, -vvv)

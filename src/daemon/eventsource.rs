@@ -30,8 +30,7 @@ pub async fn listen(
     // Build the SSE URL with parameters
     let url = format!(
         "{}?types=*&closeafter=no&ping={}",
-        event_source_url,
-        ping_interval
+        event_source_url, ping_interval
     );
 
     let client = reqwest::Client::new();
@@ -56,16 +55,15 @@ pub async fn listen(
                     continue;
                 }
 
-                let should_trigger = match decide_trigger(
-                    &msg.data,
-                    account_id,
-                    &mut last_states,
-                ) {
+                let should_trigger = match decide_trigger(&msg.data, account_id, &mut last_states) {
                     Ok(decision) => decision,
                     Err(e) => {
                         // Don't drop events because of a payload quirk;
                         // fall through and forward the trigger.
-                        warn!("Failed to parse StateChange payload ({}); forwarding trigger anyway", e);
+                        warn!(
+                            "Failed to parse StateChange payload ({}); forwarding trigger anyway",
+                            e
+                        );
                         true
                     }
                 };
@@ -114,11 +112,7 @@ fn decide_trigger(
         if prev.map(|s| s.as_str()) == Some(new_state) {
             continue;
         }
-        advanced.push((
-            type_name.to_string(),
-            prev.cloned(),
-            new_state.to_string(),
-        ));
+        advanced.push((type_name.to_string(), prev.cloned(), new_state.to_string()));
     }
 
     if advanced.is_empty() {
@@ -149,7 +143,12 @@ mod tests {
     fn make_event(account: &str, types: &[(&str, &str)]) -> String {
         let inner: serde_json::Map<String, serde_json::Value> = types
             .iter()
-            .map(|(k, v)| ((*k).to_string(), serde_json::Value::String((*v).to_string())))
+            .map(|(k, v)| {
+                (
+                    (*k).to_string(),
+                    serde_json::Value::String((*v).to_string()),
+                )
+            })
             .collect();
         serde_json::json!({
             "@type": "StateChange",

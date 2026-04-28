@@ -17,7 +17,10 @@ pub async fn connect(account: &AccountConfig) -> Result<Client> {
         .await
         .map_err(|e| anyhow::anyhow!("Failed to connect to JMAP server: {}", e))?;
 
-    info!("JMAP session established for {}", client.session().username());
+    info!(
+        "JMAP session established for {}",
+        client.session().username()
+    );
 
     Ok(client)
 }

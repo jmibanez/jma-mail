@@ -32,15 +32,10 @@ pub struct LocalIndex {
 /// existing file). Cross-folder copies of the same Message-ID are preserved
 /// — a user copying a message into another mailbox is a distinct instance.
 /// The kept file (oldest mtime) per folder becomes an entry in the index.
-pub fn dedupe_and_index(
-    maildir_root: &Path,
-    folders: &[String],
-) -> Result<LocalIndex> {
+pub fn dedupe_and_index(maildir_root: &Path, folders: &[String]) -> Result<LocalIndex> {
     // Group by (folder, msgid) so dedupe is per-folder.
-    let mut groups: HashMap<
-        (String, String),
-        Vec<(PathBuf, std::time::SystemTime, String)>,
-    > = HashMap::new();
+    let mut groups: HashMap<(String, String), Vec<(PathBuf, std::time::SystemTime, String)>> =
+        HashMap::new();
 
     for folder in folders {
         let folder_path = maildir_root.join(folder);
@@ -106,10 +101,7 @@ pub fn dedupe_and_index(
             // maildir API so any maildir-level bookkeeping is honored.
             let md = store::ensure_maildir(&maildir_root.join(&folder))?;
             if let Err(e) = store::delete_message(&md, &dup_id) {
-                warn!(
-                    "Failed to delete duplicate {} in {}: {}",
-                    dup_id, folder, e
-                );
+                warn!("Failed to delete duplicate {} in {}: {}", dup_id, folder, e);
                 continue;
             }
 

@@ -153,10 +153,7 @@ mod tests {
         // Use a marker file in a tempdir to count invocations.
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("count");
-        let cmd = format!(
-            "sleep 0.2; printf x >> {}",
-            marker.display()
-        );
+        let cmd = format!("sleep 0.2; printf x >> {}", marker.display());
         let hook = Hook::new(Some(cmd));
 
         // Fire 5 triggers in quick succession.
@@ -197,7 +194,11 @@ mod tests {
         hook.trigger().await;
 
         wait_for(
-            || std::fs::read(&marker).map(|b| !b.is_empty()).unwrap_or(false),
+            || {
+                std::fs::read(&marker)
+                    .map(|b| !b.is_empty())
+                    .unwrap_or(false)
+            },
             Duration::from_secs(2),
         )
         .await;

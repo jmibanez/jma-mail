@@ -152,17 +152,10 @@ async fn push_flag_change(
     Ok(())
 }
 
-async fn push_delete(
-    client: &Client,
-    conn: &Connection,
-    maildir_id: &str,
-) -> Result<()> {
+async fn push_delete(client: &Client, conn: &Connection, maildir_id: &str) -> Result<()> {
     let msg = queries::get_message_by_maildir_id(conn, maildir_id)?;
     let Some(msg) = msg else {
-        info!(
-            "Skipping delete for {} - not in message map",
-            maildir_id
-        );
+        info!("Skipping delete for {} - not in message map", maildir_id);
         return Ok(());
     };
 
