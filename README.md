@@ -36,6 +36,20 @@ cargo install --path .
 
 Note this also applies to the names of the mailboxes in `[sync].mailboxes` (see below), so if your mailbox is e.g. named `Posteingang` it will be synced locally as `INBOX`.
 
+## How jmapsync Tracks State
+
+`jmapsync` tracks state between your local Maildirs and the upstream JMAP server on an SQLite database in `[state].db_path` (by default in `~/.local/share/jmapsync/state.db`). State is intentionally disposable: you should be able to delete its state and rerun a `jmapsync pull` to reconverge.
+
+If you delete `state.db` and run `jmapsync pull`, `jmapsync` will re-walk the server. It parses the `Message-ID` of each existing local message and "adopts" messages if they exist on the server, instead of re-downloading them. If you previously killed `jmapsync` in the middle of a previous initial `pull` and then deleted `state.db`, `jmapsync` does The Right Thing and continues where it left off (i.e. it doesn't redownload previously downloaded messages).
+
+So what's stored in `state.db`?
+
+  * A bidirectional `message_map`, mapping between a JMAP email and its local maildir file. `jmapsync` stores the name of the local Maildir file and its corresponding `message_id` as a fast lookup cache
+  * A mapping between JMAP mailbox IDs and local Maildir folder names in `mailbox_map`, including role and parent
+  * `jmap_state` containing per-entity sync cursors so `jmapsync` only needs to ask for changes since the last sync
+  * And `local_state`, which is a snapshot of the local state (flags, size, mtime) so any local filesystem changes are quickly detected
+
+None of `state.db`'s contents are required to do a `pull`.
 
 ## Configuration
 
