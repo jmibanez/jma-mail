@@ -683,7 +683,7 @@ async fn process_updated(
             let new_flags = keywords_to_flags(&email.keywords);
 
             // Update flags if changed
-            if let (Some(ref maildir_id), Some(ref folder)) =
+            if let (Some(maildir_id), Some(folder)) =
                 (&existing.maildir_id, &existing.maildir_folder)
             {
                 if existing.flags != new_flags {
@@ -738,7 +738,7 @@ fn process_destroyed(
     for jmap_id in destroyed_ids {
         let existing = queries::get_message_by_jmap_id(conn, jmap_id)?;
         if let Some(existing) = existing {
-            if let (Some(ref maildir_id), Some(ref folder)) =
+            if let (Some(maildir_id), Some(folder)) =
                 (&existing.maildir_id, &existing.maildir_folder)
             {
                 let maildir_path = maildir_root.join(folder);
