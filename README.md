@@ -59,7 +59,7 @@ Configuration for `jmapsync` lives in `~/.config/jmapsync/config.toml`. The key 
 
 `jmapsync` currently only supports Bearer tokens, AKA API tokens. On Fastmail, go to **Settings -> Privacy & Security (under Account) -> Manage API tokens** to generate a token. Under the `[account]` settings group, fill in the `token` key  with your API token, then point `session_url` to your provider's JMAP session endpoint.
 
-  * `token`: The API token that jmapsync should use
+  * `token`: The API token that jmapsync should use. Note this is optional: you can also use the environment variable `JMAPSYNC_TOKEN` if you don't mant to keep your API key in the clear inside a config file.
   * `session_url`: The JMAP session URL for your provider; `jmapsync` defaults to the Fastmail session URL
 
 ### Sync `[sync]`
