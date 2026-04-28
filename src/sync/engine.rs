@@ -21,7 +21,15 @@ pub async fn resolve_mailboxes(
     let mut synced = Vec::new();
 
     for mb in &remote_mailboxes {
-        let folder_name = &mb.name;
+        // Use the literal "INBOX" for the inbox role to match the mbsync
+        // convention (and the magic alias accepted in [sync].mailboxes), so
+        // pre-provisioned and sync-created folders agree regardless of the
+        // server's display name (e.g. "Inbox", "Indbakke").
+        let folder_name: String = if mb.role.as_deref() == Some("inbox") {
+            "INBOX".to_string()
+        } else {
+            mb.name.clone()
+        };
 
         // If mailboxes filter is set, only sync those
         if !jmap_mailbox::is_mailbox_synced(
@@ -46,10 +54,10 @@ pub async fn resolve_mailboxes(
         )?;
 
         // Ensure local maildir exists
-        let maildir_path = config.maildir_path().join(folder_name);
+        let maildir_path = config.maildir_path().join(&folder_name);
         store::ensure_maildir(&maildir_path)?;
 
-        synced.push((mb.id.clone(), folder_name.clone()));
+        synced.push((mb.id.clone(), folder_name));
     }
 
     info!("Syncing {} mailboxes", synced.len());
