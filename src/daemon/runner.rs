@@ -43,6 +43,7 @@ pub async fn run(client: &Client, conn: &Connection, config: &Config) -> Result<
     let token = config.account.token()?;
     let maildir_root = config.maildir_path();
     let account_id = client.default_account_id().to_string();
+    let ping_interval = config.watch.ping_interval;
 
     // Seed the SSE dedup cache from current DB state so the first event
     // after the initial sync isn't a guaranteed redundant trigger.
@@ -63,6 +64,7 @@ pub async fn run(client: &Client, conn: &Connection, config: &Config) -> Result<
             &es_url,
             &es_token,
             &es_account,
+            ping_interval,
             initial_states,
             sse_tx,
         )

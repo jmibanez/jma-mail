@@ -21,6 +21,7 @@ pub async fn listen(
     event_source_url: &str,
     auth_token: &str,
     account_id: &str,
+    ping_interval: u64,
     initial_states: HashMap<String, String>,
     tx: mpsc::Sender<SyncTrigger>,
 ) -> Result<()> {
@@ -28,8 +29,9 @@ pub async fn listen(
 
     // Build the SSE URL with parameters
     let url = format!(
-        "{}?types=*&closeafter=no&ping=60",
-        event_source_url
+        "{}?types=*&closeafter=no&ping={}",
+        event_source_url,
+        ping_interval
     );
 
     let client = reqwest::Client::new();
