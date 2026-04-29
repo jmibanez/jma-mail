@@ -4,6 +4,7 @@ use jmap_client::email;
 use std::collections::HashMap;
 use tracing::{debug, info};
 
+use crate::jmap::retry::with_retry;
 use crate::jmap::types::{ChangesResponse, EmailObject};
 
 /// Properties we request for Email/get calls.
@@ -22,28 +23,29 @@ fn email_properties() -> Vec<email::Property> {
 
 /// Fetch emails by IDs using the request builder.
 pub async fn get_by_ids(client: &Client, ids: &[&str]) -> Result<Vec<EmailObject>> {
-    let mut request = client.build();
-    let get_request = request.get_email().account_id(client.default_account_id());
-    get_request.ids(ids.iter().map(|s| s.to_string()));
-    get_request.properties(email_properties());
+    with_retry("Email/get", || async {
+        let mut request = client.build();
+        let get_request = request.get_email().account_id(client.default_account_id());
+        get_request.ids(ids.iter().map(|s| s.to_string()));
+        get_request.properties(email_properties());
 
-    let response = request
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to fetch emails: {}", e))?;
+        let response = request
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to fetch emails: {}", e))?;
 
-    let email_response = response
-        .unwrap_method_responses()
-        .pop()
-        .context("No response for email get")?;
+        let email_response = response
+            .unwrap_method_responses()
+            .pop()
+            .context("No response for email get")?;
 
-    let get_response = email_response
-        .unwrap_get_email()
-        .map_err(|e| anyhow::anyhow!("Failed to parse email response: {}", e))?;
+        let get_response = email_response
+            .unwrap_get_email()
+            .map_err(|e| anyhow::anyhow!("Failed to parse email response: {}", e))?;
 
-    let emails = get_response.list().iter().map(parse_email_object).collect();
-
-    Ok(emails)
+        Ok(get_response.list().iter().map(parse_email_object).collect())
+    })
+    .await
 }
 
 /// Query all email IDs in a mailbox, paginated.
@@ -57,30 +59,33 @@ pub async fn query_mailbox(
     let page_size: usize = 100;
 
     loop {
-        let mut request = client.build();
-        let query = request
-            .query_email()
-            .account_id(client.default_account_id());
-        query
-            .filter(email::query::Filter::in_mailbox(mailbox_id))
-            .position(position as i32)
-            .limit(page_size);
+        let ids: Vec<String> = with_retry("Email/query", || async {
+            let mut request = client.build();
+            let query = request
+                .query_email()
+                .account_id(client.default_account_id());
+            query
+                .filter(email::query::Filter::in_mailbox(mailbox_id))
+                .position(position as i32)
+                .limit(page_size);
 
-        let response = request
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to query emails: {}", e))?;
+            let response = request
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to query emails: {}", e))?;
 
-        let query_response = response
-            .unwrap_method_responses()
-            .pop()
-            .context("No response for email query")?;
+            let query_response = response
+                .unwrap_method_responses()
+                .pop()
+                .context("No response for email query")?;
 
-        let result = query_response
-            .unwrap_query_email()
-            .map_err(|e| anyhow::anyhow!("Failed to parse email query response: {}", e))?;
+            let result = query_response
+                .unwrap_query_email()
+                .map_err(|e| anyhow::anyhow!("Failed to parse email query response: {}", e))?;
 
-        let ids: Vec<String> = result.ids().iter().map(|id| id.to_string()).collect();
+            Ok(result.ids().iter().map(|id| id.to_string()).collect())
+        })
+        .await?;
         let count = ids.len();
         all_ids.extend(ids);
 
@@ -178,34 +183,40 @@ pub async fn resolve_by_message_ids(
 /// Fetch the current Email state by issuing Email/get with an empty id list.
 /// Use this to bootstrap the state for delta sync after a full initial pull.
 pub async fn get_current_state(client: &Client) -> Result<String> {
-    let mut request = client.build();
-    let get_request = request.get_email().account_id(client.default_account_id());
-    get_request.ids(Vec::<String>::new());
-    get_request.properties(vec![email::Property::Id]);
+    with_retry("Email/get (state bootstrap)", || async {
+        let mut request = client.build();
+        let get_request = request.get_email().account_id(client.default_account_id());
+        get_request.ids(Vec::<String>::new());
+        get_request.properties(vec![email::Property::Id]);
 
-    let response = request
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to fetch email state: {}", e))?;
+        let response = request
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to fetch email state: {}", e))?;
 
-    let email_response = response
-        .unwrap_method_responses()
-        .pop()
-        .context("No response for email state get")?;
+        let email_response = response
+            .unwrap_method_responses()
+            .pop()
+            .context("No response for email state get")?;
 
-    let get_response = email_response
-        .unwrap_get_email()
-        .map_err(|e| anyhow::anyhow!("Failed to parse email state response: {}", e))?;
+        let get_response = email_response
+            .unwrap_get_email()
+            .map_err(|e| anyhow::anyhow!("Failed to parse email state response: {}", e))?;
 
-    Ok(get_response.state().to_string())
+        Ok(get_response.state().to_string())
+    })
+    .await
 }
 
 /// Fetch email changes since a given state using convenience helper.
 pub async fn get_changes(client: &Client, since_state: &str) -> Result<ChangesResponse> {
-    let changes = client
-        .email_changes(since_state, Some(500))
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to fetch email changes: {}", e))?;
+    let changes = with_retry("Email/changes", || async {
+        client
+            .email_changes(since_state, Some(500))
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to fetch email changes: {}", e))
+    })
+    .await?;
 
     let result = ChangesResponse {
         old_state: changes.old_state().to_string(),
@@ -240,17 +251,20 @@ pub async fn set_keywords(
 ) -> Result<()> {
     // Use individual keyword set/unset
     for (keyword, value) in keywords {
-        client
-            .email_set_keyword(email_id, keyword, *value)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to set keyword {} on email {}: {}",
-                    keyword,
-                    email_id,
-                    e
-                )
-            })?;
+        with_retry("Email/set (keyword)", || async {
+            client
+                .email_set_keyword(email_id, keyword, *value)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to set keyword {} on email {}: {}",
+                        keyword,
+                        email_id,
+                        e
+                    )
+                })
+        })
+        .await?;
     }
 
     debug!("Updated keywords for email {}", email_id);
@@ -264,14 +278,20 @@ pub async fn move_to_mailbox(
     from_mailbox_id: &str,
     to_mailbox_id: &str,
 ) -> Result<()> {
-    client
-        .email_set_mailbox(email_id, from_mailbox_id, false)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to remove from mailbox: {}", e))?;
-    client
-        .email_set_mailbox(email_id, to_mailbox_id, true)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to add to mailbox: {}", e))?;
+    with_retry("Email/set (mailbox remove)", || async {
+        client
+            .email_set_mailbox(email_id, from_mailbox_id, false)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to remove from mailbox: {}", e))
+    })
+    .await?;
+    with_retry("Email/set (mailbox add)", || async {
+        client
+            .email_set_mailbox(email_id, to_mailbox_id, true)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to add to mailbox: {}", e))
+    })
+    .await?;
 
     debug!(
         "Moved email {} from mailbox {} to {}",
@@ -283,10 +303,13 @@ pub async fn move_to_mailbox(
 /// Destroy (permanently delete) emails using convenience helper.
 pub async fn destroy(client: &Client, email_ids: &[&str]) -> Result<()> {
     for id in email_ids {
-        client
-            .email_destroy(id)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to destroy email {}: {}", id, e))?;
+        with_retry("Email/set (destroy)", || async {
+            client
+                .email_destroy(id)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to destroy email {}: {}", id, e))
+        })
+        .await?;
     }
 
     info!("Destroyed {} emails", email_ids.len());
@@ -330,10 +353,18 @@ pub async fn import_email(
 
     let normalized = normalize_crlf(raw_message);
 
-    let email = client
-        .email_import(normalized, [mailbox_id.to_string()], keyword_opt, None)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to import email: {}", e))?;
+    let email = with_retry("Email/import", || async {
+        client
+            .email_import(
+                normalized.clone(),
+                [mailbox_id.to_string()],
+                keyword_opt.clone(),
+                None,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to import email: {}", e))
+    })
+    .await?;
 
     let email_id = email.id().unwrap_or_default().to_string();
 
