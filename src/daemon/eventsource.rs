@@ -2,10 +2,22 @@ use anyhow::Result;
 use futures_util::StreamExt;
 use reqwest_eventsource::{Event, EventSource};
 use std::collections::HashMap;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use super::runner::SyncTrigger;
+
+const RECONNECT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(60);
+
+/// Outcome of a single SSE connection attempt.
+enum ConnectOutcome {
+    /// The trigger channel was closed (daemon shutting down). Stop reconnecting.
+    ChannelClosed,
+    /// The SSE stream ended (server closed, HTTP error, etc.). Reconnect after backoff.
+    StreamEnded,
+}
 
 /// Entity types whose state changes should drive a sync. Other types
 /// (EmailDelivery, Identity, ...) appear in StateChange payloads but
@@ -16,7 +28,9 @@ const TRACKED_TYPES: &[&str] = &["Email", "Mailbox"];
 /// Listen to JMAP EventSource (SSE) for state changes and send triggers.
 ///
 /// `initial_states` seeds the dedup cache from the state DB so the first
-/// event after an initial sync isn't a guaranteed redundant trigger.
+/// event after an initial sync isn't a guaranteed redundant trigger. The
+/// cache is preserved across reconnects so dedup still works after a
+/// transient disconnect.
 pub async fn listen(
     event_source_url: &str,
     auth_token: &str,
@@ -25,9 +39,53 @@ pub async fn listen(
     initial_states: HashMap<String, String>,
     tx: mpsc::Sender<SyncTrigger>,
 ) -> Result<()> {
+    let mut last_states = initial_states;
+    let mut backoff = RECONNECT_INITIAL_BACKOFF;
+
+    loop {
+        match connect_and_listen(
+            event_source_url,
+            auth_token,
+            account_id,
+            ping_interval,
+            &mut last_states,
+            &mut backoff,
+            &tx,
+        )
+        .await
+        {
+            Ok(ConnectOutcome::ChannelClosed) => {
+                info!("SSE listener shutting down (channel closed)");
+                return Ok(());
+            }
+            Ok(ConnectOutcome::StreamEnded) => {
+                warn!("SSE stream ended; reconnecting in {:?}", backoff);
+            }
+            Err(e) => {
+                warn!("SSE listener error ({}); reconnecting in {:?}", e, backoff);
+            }
+        }
+
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(RECONNECT_MAX_BACKOFF);
+    }
+}
+
+/// One SSE connection attempt: open the stream, dispatch events, and
+/// return when the stream ends or the trigger channel closes. Resets
+/// `*backoff` to the initial value once the connection opens so a flaky
+/// link that recovers doesn't stay stuck at the cap.
+async fn connect_and_listen(
+    event_source_url: &str,
+    auth_token: &str,
+    account_id: &str,
+    ping_interval: u64,
+    last_states: &mut HashMap<String, String>,
+    backoff: &mut Duration,
+    tx: &mpsc::Sender<SyncTrigger>,
+) -> Result<ConnectOutcome> {
     info!("Connecting to JMAP EventSource: {}", event_source_url);
 
-    // Build the SSE URL with parameters
     let url = format!(
         "{}?types=*&closeafter=no&ping={}",
         event_source_url, ping_interval
@@ -39,14 +97,12 @@ pub async fn listen(
         .header("Authorization", format!("Bearer {}", auth_token));
 
     let mut es = EventSource::new(request)?;
-    let mut last_states: HashMap<String, String> = initial_states;
-
-    info!("SSE connection established, listening for state changes");
 
     while let Some(event) = es.next().await {
         match event {
             Ok(Event::Open) => {
                 info!("SSE connection opened");
+                *backoff = RECONNECT_INITIAL_BACKOFF;
             }
             Ok(Event::Message(msg)) => {
                 debug!("SSE event: type={}, data={}", msg.event, msg.data);
@@ -55,7 +111,7 @@ pub async fn listen(
                     continue;
                 }
 
-                let should_trigger = match decide_trigger(&msg.data, account_id, &mut last_states) {
+                let should_trigger = match decide_trigger(&msg.data, account_id, last_states) {
                     Ok(decision) => decision,
                     Err(e) => {
                         // Don't drop events because of a payload quirk;
@@ -73,19 +129,20 @@ pub async fn listen(
                 }
 
                 if tx.send(SyncTrigger::RemoteChange).await.is_err() {
-                    info!("Sync channel closed, shutting down SSE listener");
-                    break;
+                    return Ok(ConnectOutcome::ChannelClosed);
                 }
             }
             Err(e) => {
+                // reqwest-eventsource retries transport errors internally,
+                // but on HTTP errors (e.g. 503) it terminates the stream;
+                // bubble out so the outer loop reconnects with backoff.
                 warn!("SSE error: {}", e);
-                // reqwest-eventsource handles reconnection
+                return Ok(ConnectOutcome::StreamEnded);
             }
         }
     }
 
-    info!("SSE listener ended");
-    Ok(())
+    Ok(ConnectOutcome::StreamEnded)
 }
 
 /// Decide whether a StateChange event represents a real advance for an
