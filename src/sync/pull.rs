@@ -7,6 +7,7 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::jmap::email as jmap_email;
+use crate::jmap::retry::is_transient_error;
 use crate::jmap::types::EmailObject;
 use crate::maildir_ops::dedupe::{self, LocalIndex};
 use crate::maildir_ops::{flags::keywords_to_flags, store};
@@ -26,19 +27,6 @@ fn effective_concurrency(client: &Client, configured: usize) -> usize {
         Some(server) => configured.min(server).max(1),
         None => configured.max(1),
     }
-}
-
-/// Substring-match the jmap-client error Display to detect a JMAP
-/// request-level "limit" problem (RFC 8620 §3.6.1) or HTTP 429/503.
-/// jmap-client formats `JMAPError::Limit` as the literal "Limit" inside
-/// a `ProblemDetails` Display; for transport errors we fall back to
-/// status code substrings since the typed status isn't surfaced.
-fn is_rate_limit_error(err: &anyhow::Error) -> bool {
-    let s = err.to_string();
-    s.contains("Request failed: Limit")
-        || s.contains("status 429")
-        || s.contains("status 503")
-        || s.contains("rateLimit")
 }
 
 /// Outcome of a pull cycle.
@@ -511,7 +499,7 @@ async fn ingest_emails(
             match result {
                 Ok(blob) => succeeded.push((i, blob)),
                 Err(e) => {
-                    if is_rate_limit_error(&e) {
+                    if is_transient_error(&e) {
                         rate_limited = true;
                         debug!(
                             "Rate-limited downloading email {}: {}",
