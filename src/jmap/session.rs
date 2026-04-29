@@ -3,19 +3,25 @@ use jmap_client::client::{Client, Credentials};
 use tracing::info;
 
 use crate::config::AccountConfig;
+use crate::jmap::retry::with_retry;
 use crate::jmap::types::SessionInfo;
 
-/// Establish a JMAP session with the server.
+/// Establish a JMAP session with the server. Retries on transient
+/// failures with bounded backoff so a 503 at startup doesn't fail the
+/// whole `watch` invocation outright.
 pub async fn connect(account: &AccountConfig) -> Result<Client> {
     let token = account.token()?;
 
     info!("Connecting to JMAP server at {}", account.session_url);
 
-    let client = Client::new()
-        .credentials(Credentials::bearer(token))
-        .connect(&account.session_url)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to connect to JMAP server: {}", e))?;
+    let client = with_retry("session connect", || async {
+        Client::new()
+            .credentials(Credentials::bearer(token.clone()))
+            .connect(&account.session_url)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to connect to JMAP server: {}", e))
+    })
+    .await?;
 
     info!(
         "JMAP session established for {}",
