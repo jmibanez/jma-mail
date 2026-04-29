@@ -66,3 +66,5 @@ SQLite, schema in `db.rs::SCHEMA`. Tables: `jmap_state` (per-entity sync cursor)
 ## Git / commit conventions
 
 This repo uses **LKML-style commit messages**: subsystem-prefixed subject (`sync:`, `jmap:`, `state:`, `maildir:`, `daemon:`), blank line, body that explains the **problem before the fix**, wrapped at ~72 chars. One logical change per commit. See `git log` for examples.
+
+**Always run `cargo fmt` before committing** so the diff stays formatting-noise-free.
