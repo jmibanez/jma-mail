@@ -276,19 +276,10 @@ async fn adopt_existing(
                     message_id: Some(local_mid.clone()),
                     flags: flags.clone(),
                     jmap_keywords: keywords_json,
-                    size: Some(email.size as i64),
-                    received_at: email.received_at.clone(),
                 },
             )?;
 
-            queries::upsert_local_state(
-                conn,
-                &entry.maildir_id,
-                &entry.folder,
-                &flags,
-                Some(email.size as i64),
-                None,
-            )?;
+            queries::upsert_local_state(conn, &entry.maildir_id, &entry.folder, &flags, None)?;
 
             adopted += 1;
         }
@@ -602,19 +593,10 @@ fn commit_email(
             message_id,
             flags: flags.clone(),
             jmap_keywords: keywords_json,
-            size: Some(email.size as i64),
-            received_at: email.received_at.clone(),
         },
     )?;
 
-    queries::upsert_local_state(
-        conn,
-        maildir_id,
-        recorded_folder,
-        &flags,
-        Some(email.size as i64),
-        None,
-    )?;
+    queries::upsert_local_state(conn, maildir_id, recorded_folder, &flags, None)?;
 
     Ok(())
 }
@@ -682,7 +664,7 @@ async fn process_updated(
                     let maildir = store::ensure_maildir(&maildir_path)?;
                     store::set_flags(&maildir, maildir_id, &new_flags)?;
 
-                    queries::upsert_local_state(conn, maildir_id, folder, &new_flags, None, None)?;
+                    queries::upsert_local_state(conn, maildir_id, folder, &new_flags, None)?;
 
                     info!(
                         "Updated flags for {} ({}): '{}' -> '{}'",
@@ -711,8 +693,6 @@ async fn process_updated(
                     message_id: existing.message_id.clone(),
                     flags: new_flags,
                     jmap_keywords: keywords_json,
-                    size: Some(email.size as i64),
-                    received_at: email.received_at.clone(),
                 },
             )?;
         }

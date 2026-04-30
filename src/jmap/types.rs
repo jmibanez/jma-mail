@@ -9,8 +9,6 @@ pub struct EmailObject {
     pub thread_id: String,
     pub mailbox_ids: HashMap<String, bool>,
     pub keywords: HashMap<String, bool>,
-    pub size: u64,
-    pub received_at: Option<String>,
     pub message_id: Option<Vec<String>>,
     pub subject: Option<String>,
 }

@@ -22,8 +22,6 @@ CREATE TABLE IF NOT EXISTS message_map (
     message_id      TEXT,
     flags           TEXT NOT NULL DEFAULT '',
     jmap_keywords   TEXT NOT NULL DEFAULT '{}',
-    size            INTEGER,
-    received_at     TEXT,
     last_synced_at  TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (jmap_email_id)
 );
@@ -45,7 +43,6 @@ CREATE TABLE IF NOT EXISTS local_state (
     maildir_id     TEXT NOT NULL PRIMARY KEY,
     maildir_folder TEXT NOT NULL,
     flags          TEXT NOT NULL DEFAULT '',
-    file_size      INTEGER,
     mtime          INTEGER,
     recorded_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );

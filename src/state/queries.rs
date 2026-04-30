@@ -49,8 +49,6 @@ pub struct MessageRecord {
     pub message_id: Option<String>,
     pub flags: String,
     pub jmap_keywords: String,
-    pub size: Option<i64>,
-    pub received_at: Option<String>,
 }
 
 /// Insert or update a message mapping.
@@ -59,8 +57,8 @@ pub fn upsert_message(conn: &Connection, msg: &MessageRecord) -> Result<()> {
         "INSERT INTO message_map (
             jmap_email_id, jmap_blob_id, jmap_thread_id, mailbox_id,
             maildir_id, maildir_folder, message_id, flags, jmap_keywords,
-            size, received_at, last_synced_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, datetime('now'))
+            last_synced_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'))
         ON CONFLICT(jmap_email_id) DO UPDATE SET
             jmap_blob_id = excluded.jmap_blob_id,
             jmap_thread_id = excluded.jmap_thread_id,
@@ -70,8 +68,6 @@ pub fn upsert_message(conn: &Connection, msg: &MessageRecord) -> Result<()> {
             message_id = excluded.message_id,
             flags = excluded.flags,
             jmap_keywords = excluded.jmap_keywords,
-            size = excluded.size,
-            received_at = excluded.received_at,
             last_synced_at = datetime('now')",
         params![
             msg.jmap_email_id,
@@ -83,8 +79,6 @@ pub fn upsert_message(conn: &Connection, msg: &MessageRecord) -> Result<()> {
             msg.message_id,
             msg.flags,
             msg.jmap_keywords,
-            msg.size,
-            msg.received_at,
         ],
     )?;
     Ok(())
@@ -97,8 +91,7 @@ pub fn get_message_by_jmap_id(
 ) -> Result<Option<MessageRecord>> {
     let mut stmt = conn.prepare(
         "SELECT jmap_email_id, jmap_blob_id, jmap_thread_id, mailbox_id,
-                maildir_id, maildir_folder, message_id, flags, jmap_keywords,
-                size, received_at
+                maildir_id, maildir_folder, message_id, flags, jmap_keywords
          FROM message_map WHERE jmap_email_id = ?1",
     )?;
     let result = stmt
@@ -113,8 +106,6 @@ pub fn get_message_by_jmap_id(
                 message_id: row.get(6)?,
                 flags: row.get(7)?,
                 jmap_keywords: row.get(8)?,
-                size: row.get(9)?,
-                received_at: row.get(10)?,
             })
         })
         .optional()?;
@@ -130,8 +121,7 @@ pub fn get_message_by_message_id(
 ) -> Result<Option<MessageRecord>> {
     let mut stmt = conn.prepare(
         "SELECT jmap_email_id, jmap_blob_id, jmap_thread_id, mailbox_id,
-                maildir_id, maildir_folder, message_id, flags, jmap_keywords,
-                size, received_at
+                maildir_id, maildir_folder, message_id, flags, jmap_keywords
          FROM message_map WHERE message_id = ?1 LIMIT 1",
     )?;
     let result = stmt
@@ -146,8 +136,6 @@ pub fn get_message_by_message_id(
                 message_id: row.get(6)?,
                 flags: row.get(7)?,
                 jmap_keywords: row.get(8)?,
-                size: row.get(9)?,
-                received_at: row.get(10)?,
             })
         })
         .optional()?;
@@ -165,8 +153,7 @@ pub fn get_message_by_message_id_in_folder(
 ) -> Result<Option<MessageRecord>> {
     let mut stmt = conn.prepare(
         "SELECT jmap_email_id, jmap_blob_id, jmap_thread_id, mailbox_id,
-                maildir_id, maildir_folder, message_id, flags, jmap_keywords,
-                size, received_at
+                maildir_id, maildir_folder, message_id, flags, jmap_keywords
          FROM message_map WHERE message_id = ?1 AND maildir_folder = ?2 LIMIT 1",
     )?;
     let result = stmt
@@ -181,8 +168,6 @@ pub fn get_message_by_message_id_in_folder(
                 message_id: row.get(6)?,
                 flags: row.get(7)?,
                 jmap_keywords: row.get(8)?,
-                size: row.get(9)?,
-                received_at: row.get(10)?,
             })
         })
         .optional()?;
@@ -196,8 +181,7 @@ pub fn get_message_by_maildir_id(
 ) -> Result<Option<MessageRecord>> {
     let mut stmt = conn.prepare(
         "SELECT jmap_email_id, jmap_blob_id, jmap_thread_id, mailbox_id,
-                maildir_id, maildir_folder, message_id, flags, jmap_keywords,
-                size, received_at
+                maildir_id, maildir_folder, message_id, flags, jmap_keywords
          FROM message_map WHERE maildir_id = ?1",
     )?;
     let result = stmt
@@ -212,8 +196,6 @@ pub fn get_message_by_maildir_id(
                 message_id: row.get(6)?,
                 flags: row.get(7)?,
                 jmap_keywords: row.get(8)?,
-                size: row.get(9)?,
-                received_at: row.get(10)?,
             })
         })
         .optional()?;
@@ -245,8 +227,7 @@ pub fn delete_message_by_jmap_id(conn: &Connection, jmap_email_id: &str) -> Resu
 pub fn get_messages_by_folder(conn: &Connection, folder: &str) -> Result<Vec<MessageRecord>> {
     let mut stmt = conn.prepare(
         "SELECT jmap_email_id, jmap_blob_id, jmap_thread_id, mailbox_id,
-                maildir_id, maildir_folder, message_id, flags, jmap_keywords,
-                size, received_at
+                maildir_id, maildir_folder, message_id, flags, jmap_keywords
          FROM message_map WHERE maildir_folder = ?1",
     )?;
     let rows = stmt.query_map(params![folder], |row| {
@@ -260,8 +241,6 @@ pub fn get_messages_by_folder(conn: &Connection, folder: &str) -> Result<Vec<Mes
             message_id: row.get(6)?,
             flags: row.get(7)?,
             jmap_keywords: row.get(8)?,
-            size: row.get(9)?,
-            received_at: row.get(10)?,
         })
     })?;
     let mut messages = Vec::new();
@@ -390,19 +369,17 @@ pub fn upsert_local_state(
     maildir_id: &str,
     maildir_folder: &str,
     flags: &str,
-    file_size: Option<i64>,
     mtime: Option<i64>,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO local_state (maildir_id, maildir_folder, flags, file_size, mtime, recorded_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))
+        "INSERT INTO local_state (maildir_id, maildir_folder, flags, mtime, recorded_at)
+         VALUES (?1, ?2, ?3, ?4, datetime('now'))
          ON CONFLICT(maildir_id) DO UPDATE SET
             maildir_folder = excluded.maildir_folder,
             flags = excluded.flags,
-            file_size = excluded.file_size,
             mtime = excluded.mtime,
             recorded_at = datetime('now')",
-        params![maildir_id, maildir_folder, flags, file_size, mtime],
+        params![maildir_id, maildir_folder, flags, mtime],
     )?;
     Ok(())
 }

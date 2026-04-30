@@ -96,19 +96,10 @@ async fn push_new_message(
             message_id: None,
             flags: flags.to_string(),
             jmap_keywords: keywords_json,
-            size: Some(raw_message.len() as i64),
-            received_at: None,
         },
     )?;
 
-    queries::upsert_local_state(
-        conn,
-        maildir_id,
-        folder,
-        flags,
-        Some(raw_message.len() as i64),
-        None,
-    )?;
+    queries::upsert_local_state(conn, maildir_id, folder, flags, None)?;
 
     info!(
         "Uploaded local message {} -> JMAP {}",
@@ -146,7 +137,7 @@ async fn push_flag_change(
         },
     )?;
 
-    queries::upsert_local_state(conn, maildir_id, folder, new_flags, None, None)?;
+    queries::upsert_local_state(conn, maildir_id, folder, new_flags, None)?;
 
     info!("Pushed flag change for {} -> '{}'", maildir_id, new_flags);
     Ok(())

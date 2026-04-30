@@ -140,8 +140,6 @@ pub async fn sync(
                             message_id: msg.message_id.clone(),
                             flags: msg.flags.clone(),
                             jmap_keywords: msg.jmap_keywords.clone(),
-                            size: msg.size,
-                            received_at: msg.received_at.clone(),
                         },
                     );
                 }

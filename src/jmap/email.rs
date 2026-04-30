@@ -15,8 +15,6 @@ fn email_properties() -> Vec<email::Property> {
         email::Property::ThreadId,
         email::Property::MailboxIds,
         email::Property::Keywords,
-        email::Property::Size,
-        email::Property::ReceivedAt,
         email::Property::MessageId,
     ]
 }
@@ -387,8 +385,6 @@ fn parse_email_object(email: &jmap_client::email::Email<jmap_client::Get>) -> Em
     let id = email.id().unwrap_or_default().to_string();
     let blob_id = email.blob_id().unwrap_or_default().to_string();
     let thread_id = email.thread_id().unwrap_or_default().to_string();
-    let size = email.size() as u64;
-    let received_at = email.received_at().map(|d| d.to_string());
     let message_id = email
         .message_id()
         .map(|ids| ids.iter().map(|s| s.to_string()).collect());
@@ -411,8 +407,6 @@ fn parse_email_object(email: &jmap_client::email::Email<jmap_client::Get>) -> Em
         thread_id,
         mailbox_ids,
         keywords,
-        size,
-        received_at,
         message_id,
         subject: None,
     }
