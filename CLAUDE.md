@@ -33,7 +33,7 @@ The orchestration lives in `src/sync/` and is layered:
 - **`engine.rs`** is the entry point for all three sync modes (`sync`, `pull_only`, `push_only`). It resolves which mailboxes to sync, runs the **dedupe pass** at the top of every cycle, fetches remote changes via `Email/changes`, scans local maildirs for changes, builds a reconciliation `SyncPlan`, then dispatches to `pull` and `push`.
 - **`pull.rs`** has two paths: `initial_pull` (full `Email/query` + `Email/get` per mailbox) and `delta_pull` (loop on `Email/changes` until `has_more_changes` is false). Both go through an `ingest_email` helper that consults `message_map` first, then the in-memory `LocalIndex`, before downloading. State is persisted only after the pull completes.
 - **`push.rs`** uploads local-only messages via `Email/import`, applies flag changes via `Email/set` keywords, and handles destroys.
-- **`reconcile.rs`** turns remote changes + local changes + DB state into a `SyncPlan`, applying the configured `ConflictStrategy` (server-wins / local-wins / newest-wins).
+- **`reconcile.rs`** turns remote changes + local changes + DB state into a `SyncPlan`, applying the configured `ConflictStrategy` (server-wins / local-wins).
 
 ### Idempotency model — read this before touching pull/push
 

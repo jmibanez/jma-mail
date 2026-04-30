@@ -83,10 +83,6 @@ pub fn reconcile(
                         }
                     }
                 }
-                ConflictStrategy::NewestWins => {
-                    // For now, default to server-wins for newest-wins
-                    // (would need timestamps comparison for proper implementation)
-                }
             }
         }
         // Non-conflicting remote updates are handled by the pull phase

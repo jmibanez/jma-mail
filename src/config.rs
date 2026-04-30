@@ -50,7 +50,6 @@ pub enum ConflictStrategy {
     #[default]
     ServerWins,
     LocalWins,
-    NewestWins,
 }
 
 #[derive(Debug, Deserialize)]
@@ -178,7 +177,7 @@ maildir_path = "~/Mail/Fastmail"
 mailboxes = ["INBOX", "Archive", "Sent", "Drafts", "Trash"]
 # Match `mailboxes` entries case-insensitively against server names.
 case_insensitive_match = false
-# Conflict resolution: server-wins, local-wins, or newest-wins
+# Conflict resolution: server-wins or local-wins
 conflict_strategy = "server-wins"
 # Max messages per sync run (0 = unlimited)
 max_messages = 0
