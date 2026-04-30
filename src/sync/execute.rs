@@ -454,13 +454,21 @@ async fn apply_remote_set(
         }
     }
 
-    // Mirror destroys.
+    // Mirror destroys. Look up the maildir_id binding before
+    // deleting the message_map row so we can also clear the
+    // matching local_state row -- otherwise scan would keep
+    // emitting DeletedMessage for the orphan every cycle.
     for action in destroys {
         let SyncAction::DestroyRemote { jmap_email_id } = action else {
             continue;
         };
         if outcome.failed_destroys.contains(&jmap_email_id) {
             continue;
+        }
+        if let Some(rec) = queries::get_message_by_jmap_id(conn, &jmap_email_id)?
+            && let Some(mid) = rec.maildir_id.as_deref()
+        {
+            queries::delete_local_state(conn, mid)?;
         }
         queries::delete_message_by_jmap_id(conn, &jmap_email_id)?;
         info!("Destroyed remote {}", jmap_email_id);
