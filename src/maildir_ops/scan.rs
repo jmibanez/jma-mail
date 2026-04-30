@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use tracing::debug;
 
 use crate::maildir_ops::flags::{extract_flags, extract_id};
+use crate::maildir_ops::headers::parse_message_id_from_file;
 
 /// A change detected in the local maildir.
 #[derive(Debug)]
@@ -15,6 +16,11 @@ pub enum LocalChange {
         folder: String,
         flags: String,
         path: PathBuf,
+        /// RFC 5322 Message-ID parsed from the file at scan time. None if
+        /// the header was missing or unreadable; reconcile treats that as
+        /// "not safe to dedupe against the server" and falls through to a
+        /// plain upload.
+        message_id: Option<String>,
     },
     /// A message file we had recorded is now missing.
     DeletedMessage { maildir_id: String, folder: String },
@@ -69,11 +75,24 @@ pub fn scan_folder(
             }
             None => {
                 debug!("New message in cur/: {}", maildir_id);
+                let path = entry.path().to_path_buf();
+                let message_id = match parse_message_id_from_file(&path) {
+                    Ok(Some(mid)) => Some(mid),
+                    Ok(None) => {
+                        debug!("New message {} has no Message-ID header", maildir_id);
+                        None
+                    }
+                    Err(e) => {
+                        debug!("Failed to parse Message-ID for {}: {}", maildir_id, e);
+                        None
+                    }
+                };
                 changes.push(LocalChange::NewMessage {
                     maildir_id,
                     folder: folder_name.to_string(),
                     flags,
-                    path: entry.path().to_path_buf(),
+                    path,
+                    message_id,
                 });
             }
         }
@@ -94,11 +113,24 @@ pub fn scan_folder(
 
         if !known_state.contains_key(&maildir_id) {
             debug!("New message in new/: {}", maildir_id);
+            let path = entry.path().to_path_buf();
+            let message_id = match parse_message_id_from_file(&path) {
+                Ok(Some(mid)) => Some(mid),
+                Ok(None) => {
+                    debug!("New message {} has no Message-ID header", maildir_id);
+                    None
+                }
+                Err(e) => {
+                    debug!("Failed to parse Message-ID for {}: {}", maildir_id, e);
+                    None
+                }
+            };
             changes.push(LocalChange::NewMessage {
                 maildir_id,
                 folder: folder_name.to_string(),
                 flags: String::new(),
-                path: entry.path().to_path_buf(),
+                path,
+                message_id,
             });
         }
     }

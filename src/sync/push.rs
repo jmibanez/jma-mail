@@ -29,6 +29,7 @@ pub async fn push(
                 folder,
                 flags,
                 path,
+                message_id: _,
             } => {
                 push_new_message(client, conn, &maildir_id, &folder, &flags, &path, mailboxes)
                     .await?;

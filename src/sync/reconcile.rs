@@ -108,6 +108,7 @@ pub fn reconcile(
                 folder,
                 flags: _,
                 path,
+                message_id: _,
             } => {
                 // Find mailbox ID for this folder
                 if let Some((mailbox_id, _)) = mailboxes.iter().find(|(_, f)| f == folder) {
