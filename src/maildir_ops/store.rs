@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use maildir::Maildir;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tracing::debug;
 
 /// Ensure a maildir folder exists with cur/new/tmp subdirectories.
@@ -45,9 +45,4 @@ pub fn move_message(from: &Maildir, to: &Maildir, id: &str) -> Result<()> {
         .with_context(|| format!("Failed to move message {}", id))?;
     debug!("Moved message {} to {:?}", id, to.path());
     Ok(())
-}
-
-/// Get the full path for a maildir folder under the root.
-pub fn maildir_folder_path(root: &Path, folder_name: &str) -> PathBuf {
-    root.join(folder_name)
 }
