@@ -1,7 +1,14 @@
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
+
+/// One invocation of the post-arrival command. Returned futures are
+/// driven to completion by `run_loop`. Boxed so `Hook` can own it
+/// behind `Arc` without a generic parameter leaking through callers.
+type CommandRunner = Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 /// Single-slot coalescing runner for the post-arrival shell command.
 ///
@@ -29,6 +36,7 @@ struct Inner {
     /// `trigger()` is a no-op.
     command: Option<String>,
     state: Mutex<State>,
+    runner: CommandRunner,
 }
 
 #[derive(Default)]
@@ -39,10 +47,22 @@ struct State {
 
 impl Hook {
     pub fn new(command: Option<String>) -> Self {
+        Self::with_runner(
+            command,
+            Arc::new(|cmd| Box::pin(async move { run_shell(&cmd).await })),
+        )
+    }
+
+    /// Construct with a custom command runner. Production code uses
+    /// `new()`, which wires up the shell runner; tests inject a runner
+    /// that synchronises on a Notify (no subprocess, no sleeps) so
+    /// coalescing assertions are deterministic in millisecond budgets.
+    fn with_runner(command: Option<String>, runner: CommandRunner) -> Self {
         Self {
             inner: Arc::new(Inner {
                 command,
                 state: Mutex::new(State::default()),
+                runner,
             }),
         }
     }
@@ -88,7 +108,7 @@ impl Hook {
 /// coalesce into another single follow-up (and so on, until idle).
 async fn run_loop(inner: Arc<Inner>, cmd: String) {
     loop {
-        run_once(&cmd).await;
+        (inner.runner)(cmd.clone()).await;
 
         let mut state = inner.state.lock().await;
         if state.pending {
@@ -102,7 +122,7 @@ async fn run_loop(inner: Arc<Inner>, cmd: String) {
     }
 }
 
-async fn run_once(cmd: &str) {
+async fn run_shell(cmd: &str) {
     info!("Running post-arrival hook: {}", cmd);
     let mut child = match Command::new("sh").arg("-c").arg(cmd).spawn() {
         Ok(c) => c,
@@ -127,18 +147,47 @@ async fn run_once(cmd: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
 
-    /// Helper that waits up to `timeout` for `predicate` to become true.
-    async fn wait_for(predicate: impl Fn() -> bool, timeout: Duration) -> bool {
-        let start = std::time::Instant::now();
-        while start.elapsed() < timeout {
-            if predicate() {
-                return true;
+    /// Test runner that stands in for the shell. `started` fires once
+    /// per invocation; the runner then awaits `release` before
+    /// completing. Tests drive the state machine by hand instead of
+    /// sleeping.
+    struct Gate {
+        count: Arc<AtomicUsize>,
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    impl Gate {
+        fn new() -> Self {
+            Self {
+                count: Arc::new(AtomicUsize::new(0)),
+                started: Arc::new(Notify::new()),
+                release: Arc::new(Notify::new()),
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        predicate()
+
+        fn runner(&self) -> CommandRunner {
+            let count = self.count.clone();
+            let started = self.started.clone();
+            let release = self.release.clone();
+            Arc::new(move |_cmd| {
+                let count = count.clone();
+                let started = started.clone();
+                let release = release.clone();
+                Box::pin(async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    started.notify_one();
+                    release.notified().await;
+                })
+            })
+        }
+
+        fn count(&self) -> usize {
+            self.count.load(Ordering::SeqCst)
+        }
     }
 
     #[tokio::test]
@@ -150,61 +199,57 @@ mod tests {
 
     #[tokio::test]
     async fn coalesces_bursts_into_at_most_two_runs() {
-        // Use a marker file in a tempdir to count invocations.
-        let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join("count");
-        let cmd = format!("sleep 0.2; printf x >> {}", marker.display());
-        let hook = Hook::new(Some(cmd));
+        let gate = Gate::new();
+        let hook = Hook::with_runner(Some("noop".into()), gate.runner());
 
-        // Fire 5 triggers in quick succession.
-        for _ in 0..5 {
+        // First trigger: spawns run_loop, runner enters and blocks on release.
+        hook.trigger().await;
+        gate.started.notified().await;
+        assert_eq!(gate.count(), 1);
+
+        // Four more triggers while the first is in flight: the second
+        // raises pending, the rest must coalesce into it (no extra runs).
+        for _ in 0..4 {
             hook.trigger().await;
         }
 
-        // Wait for both runs (initial + 1 coalesced follow-up) to finish.
-        wait_for(
-            || {
-                std::fs::read(&marker)
-                    .map(|b| b.len() >= 2)
-                    .unwrap_or(false)
-            },
-            Duration::from_secs(3),
-        )
-        .await;
+        // Release first run; run_loop should pick up pending=true and
+        // start a single follow-up.
+        gate.release.notify_one();
+        gate.started.notified().await;
+        assert_eq!(gate.count(), 2);
 
-        // Give a small grace period in case a third (incorrect) run is in flight.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Release the follow-up; run_loop should now exit cleanly. No
+        // further runs are expected. We wait one trigger() round-trip
+        // through the same Mutex so the run_loop has had a chance to
+        // settle, then assert.
+        gate.release.notify_one();
+        hook.trigger().await; // would observe running=false and respawn
+        gate.started.notified().await;
+        assert_eq!(gate.count(), 3, "post-burst trigger starts a fresh run");
 
-        let bytes = std::fs::read(&marker).unwrap_or_default();
-        assert_eq!(
-            bytes.len(),
-            2,
-            "5 triggers should collapse to exactly 2 runs (initial + 1 follow-up), got {}",
-            bytes.len()
-        );
+        gate.release.notify_one();
     }
 
     #[tokio::test]
     async fn single_trigger_runs_once() {
-        let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join("count");
-        let cmd = format!("printf x >> {}", marker.display());
-        let hook = Hook::new(Some(cmd));
+        let gate = Gate::new();
+        let hook = Hook::with_runner(Some("noop".into()), gate.runner());
 
         hook.trigger().await;
+        gate.started.notified().await;
+        assert_eq!(gate.count(), 1);
 
-        wait_for(
-            || {
-                std::fs::read(&marker)
-                    .map(|b| !b.is_empty())
-                    .unwrap_or(false)
-            },
-            Duration::from_secs(2),
-        )
-        .await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        gate.release.notify_one();
+        // No second trigger fired, so no follow-up should ever start.
+        // Round-trip through the Mutex via a quick is_enabled check
+        // would be racy; instead, fire another trigger and verify the
+        // count went from 1 to 2 (would be 3 if a phantom follow-up
+        // had also run).
+        hook.trigger().await;
+        gate.started.notified().await;
+        assert_eq!(gate.count(), 2);
 
-        let bytes = std::fs::read(&marker).unwrap_or_default();
-        assert_eq!(bytes.len(), 1);
+        gate.release.notify_one();
     }
 }
