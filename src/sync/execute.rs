@@ -235,7 +235,8 @@ fn move_local_messages(
             );
             continue;
         }
-        if let Some(rec) = queries::get_message_by_jmap_id(conn, &jmap_email_id)? {
+        let flags = if let Some(rec) = queries::get_message_by_jmap_id(conn, &jmap_email_id)? {
+            let preserved_flags = rec.flags.clone();
             queries::upsert_message(
                 conn,
                 &MessageRecord {
@@ -243,8 +244,11 @@ fn move_local_messages(
                     ..rec
                 },
             )?;
-        }
-        queries::upsert_local_state(conn, &maildir_id, &to_folder, "", None)?;
+            preserved_flags
+        } else {
+            String::new()
+        };
+        queries::upsert_local_state(conn, &maildir_id, &to_folder, &flags, None)?;
         info!("Moved {} from {} to {}", maildir_id, from_folder, to_folder);
     }
     Ok(())
