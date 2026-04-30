@@ -314,6 +314,101 @@ pub async fn destroy(client: &Client, email_ids: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// One unit of work for `set_email_batch`. Collapses keyword changes,
+/// mailbox moves, and destroys onto a single Email/set method call so
+/// the server sees one transaction per cycle instead of N.
+#[derive(Debug, Clone)]
+pub enum EmailSetOp {
+    /// Patch keywords on an email. Map is `keyword -> set?`.
+    Keywords {
+        email_id: String,
+        keywords: HashMap<String, bool>,
+    },
+    /// Remove from one mailbox and add to another.
+    Move {
+        email_id: String,
+        from_mailbox_id: String,
+        to_mailbox_id: String,
+    },
+    /// Destroy an email by id.
+    Destroy { email_id: String },
+}
+
+/// Outcome of `set_email_batch`. The two `failed_*` sets contain ids
+/// the server rejected per-row (notUpdated / notDestroyed); callers
+/// should suppress DB mirror for those ids.
+#[derive(Debug, Default)]
+pub struct EmailSetOutcome {
+    pub failed_updates: std::collections::HashSet<String>,
+    pub failed_destroys: std::collections::HashSet<String>,
+}
+
+/// Apply a batch of Email/set operations in a single JMAP method call.
+///
+/// JMAP allows arbitrarily many `update` and `destroy` entries in one
+/// Email/set, capped server-side by `maxObjectsInSet`. Per-id failures
+/// land in `notUpdated`/`notDestroyed` and are surfaced as warnings;
+/// they do not fail the batch.
+pub async fn set_email_batch(client: &Client, ops: &[EmailSetOp]) -> Result<EmailSetOutcome> {
+    if ops.is_empty() {
+        return Ok(EmailSetOutcome::default());
+    }
+
+    let outcome = with_retry("Email/set (batch)", || async {
+        let mut request = client.build();
+        {
+            let set = request.set_email().account_id(client.default_account_id());
+            for op in ops {
+                match op {
+                    EmailSetOp::Keywords { email_id, keywords } => {
+                        let upd = set.update(email_id);
+                        for (kw, val) in keywords {
+                            upd.keyword(kw, *val);
+                        }
+                    }
+                    EmailSetOp::Move {
+                        email_id,
+                        from_mailbox_id,
+                        to_mailbox_id,
+                    } => {
+                        set.update(email_id)
+                            .mailbox_id(from_mailbox_id, false)
+                            .mailbox_id(to_mailbox_id, true);
+                    }
+                    EmailSetOp::Destroy { email_id } => {
+                        set.destroy([email_id.as_str()]);
+                    }
+                }
+            }
+        }
+
+        let response = request
+            .send_single::<jmap_client::core::response::EmailSetResponse>()
+            .await
+            .map_err(|e| anyhow::anyhow!("Email/set batch failed: {}", e))?;
+
+        let mut outcome = EmailSetOutcome::default();
+        if let Some(not_updated) = response.not_updated_ids() {
+            for id in not_updated {
+                tracing::warn!("Email/set batch: notUpdated {}", id);
+                outcome.failed_updates.insert(id.clone());
+            }
+        }
+        if let Some(not_destroyed) = response.not_destroyed_ids() {
+            for id in not_destroyed {
+                tracing::warn!("Email/set batch: notDestroyed {}", id);
+                outcome.failed_destroys.insert(id.clone());
+            }
+        }
+
+        Ok(outcome)
+    })
+    .await?;
+
+    debug!("Applied {} Email/set operations in one call", ops.len());
+    Ok(outcome)
+}
+
 /// Normalize line endings to CRLF for RFC 5322 wire format.
 /// Maildir messages are typically stored with bare LF; JMAP servers
 /// reject those with `invalidEmail: Message contains bare newlines`.
