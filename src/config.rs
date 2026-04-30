@@ -31,9 +31,6 @@ pub struct SyncConfig {
     /// Conflict resolution strategy
     #[serde(default)]
     pub conflict_strategy: ConflictStrategy,
-    /// Max messages to fetch per sync run (0 = unlimited)
-    #[serde(default)]
-    pub max_messages: u64,
     /// If true, match `mailboxes` entries against server names case-insensitively.
     /// `INBOX` is always treated as an alias for the inbox role regardless.
     #[serde(default)]
@@ -179,8 +176,6 @@ mailboxes = ["INBOX", "Archive", "Sent", "Drafts", "Trash"]
 case_insensitive_match = false
 # Conflict resolution: server-wins or local-wins
 conflict_strategy = "server-wins"
-# Max messages per sync run (0 = unlimited)
-max_messages = 0
 # Max concurrent blob downloads during pull. Clamped to the server's
 # advertised maxConcurrentRequests (Fastmail: 10).
 download_concurrency = 8

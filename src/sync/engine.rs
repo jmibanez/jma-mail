@@ -134,14 +134,8 @@ pub async fn run(
     }
 
     // Phase 2: collect remote changes.
-    let (remote_emails, remote_destroyed, new_state, used_initial_path) = fetch_remote_state(
-        client,
-        conn,
-        &account_id,
-        &mailboxes,
-        config.sync.max_messages,
-    )
-    .await?;
+    let (remote_emails, remote_destroyed, new_state, used_initial_path) =
+        fetch_remote_state(client, conn, &account_id, &mailboxes).await?;
 
     // Phase 3: build known indices and reconcile.
     let (known_by_maildir, known_by_jmap, known_by_message_id) =
@@ -192,14 +186,13 @@ pub async fn run(
 ///
 /// On state-present: loops Email/changes until has_more_changes is
 /// false, accumulating ids; then Email/get on (created ∪ updated).
-/// On no-state (or cannotCalculateChanges): Email/query per mailbox
-/// up to max_messages, then Email/get; new_state via get_current_state.
+/// On no-state (or cannotCalculateChanges): Email/query per mailbox,
+/// then Email/get; new_state via get_current_state.
 async fn fetch_remote_state(
     client: &Client,
     conn: &Connection,
     account_id: &str,
     mailboxes: &[(String, String)],
-    max_messages: u64,
 ) -> Result<(Vec<EmailObject>, Vec<String>, String, bool)> {
     let cursor = queries::get_jmap_state(conn, account_id, "Email")?;
 
@@ -227,7 +220,7 @@ async fn fetch_remote_state(
                     if s.contains("Cannot calculate changes") {
                         info!("Server cannot calculate changes; falling back to initial pull");
                         queries::set_jmap_state(conn, account_id, "Email", "")?;
-                        return initial_remote_state(client, mailboxes, max_messages).await;
+                        return initial_remote_state(client, mailboxes).await;
                     }
                     return Err(e);
                 }
@@ -243,23 +236,17 @@ async fn fetch_remote_state(
         let emails = batched_get(client, &fetch_ids).await?;
         Ok((emails, all_destroyed, final_state, false))
     } else {
-        initial_remote_state(client, mailboxes, max_messages).await
+        initial_remote_state(client, mailboxes).await
     }
 }
 
 async fn initial_remote_state(
     client: &Client,
     mailboxes: &[(String, String)],
-    max_messages: u64,
 ) -> Result<(Vec<EmailObject>, Vec<String>, String, bool)> {
-    let max = if max_messages > 0 {
-        Some(max_messages)
-    } else {
-        None
-    };
     let mut all_ids: Vec<String> = Vec::new();
     for (mailbox_id, _) in mailboxes {
-        let ids = jmap_email::query_mailbox(client, mailbox_id, max).await?;
+        let ids = jmap_email::query_mailbox(client, mailbox_id).await?;
         for id in ids {
             if !all_ids.contains(&id) {
                 all_ids.push(id);

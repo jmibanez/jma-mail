@@ -80,7 +80,6 @@ This section configures which Maildirs `jmapsync` will sync to, and how it syncs
   * `conflict_strategy`: How to resolve conflicts:
      * `server-wins` -- The state on the server wins. Any local changes are discarded
      * `local-wins`  -- Your local Maildir state wins. The server is updated to reflect your local Maildir
-  * `max_messages`: Maximum number of messages to download per sync run. Set to `0` for no limit
   
 ### State `[state]`
 

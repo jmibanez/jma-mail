@@ -47,11 +47,7 @@ pub async fn get_by_ids(client: &Client, ids: &[&str]) -> Result<Vec<EmailObject
 }
 
 /// Query all email IDs in a mailbox, paginated.
-pub async fn query_mailbox(
-    client: &Client,
-    mailbox_id: &str,
-    max_results: Option<u64>,
-) -> Result<Vec<String>> {
+pub async fn query_mailbox(client: &Client, mailbox_id: &str) -> Result<Vec<String>> {
     let mut all_ids = Vec::new();
     let mut position: usize = 0;
     let page_size: usize = 100;
@@ -99,13 +95,6 @@ pub async fn query_mailbox(
         }
 
         position += page_size;
-
-        if let Some(max) = max_results {
-            if all_ids.len() as u64 >= max {
-                all_ids.truncate(max as usize);
-                break;
-            }
-        }
     }
 
     info!(
