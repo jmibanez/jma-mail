@@ -722,3 +722,557 @@ fn emit_local_flag_update(
         message_id: local_msg_id,
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::maildir_ops::dedupe::{LocalEntry, LocalIndex};
+    use std::path::PathBuf;
+
+    fn mailboxes() -> Vec<(String, String)> {
+        vec![
+            ("MB-INBOX".into(), "INBOX".into()),
+            ("MB-ARCH".into(), "Archive".into()),
+        ]
+    }
+
+    fn email(id: &str, mailbox_id: &str, flags: &str, message_id: Option<&str>) -> EmailObject {
+        let mut mailbox_ids = HashMap::new();
+        mailbox_ids.insert(mailbox_id.to_string(), true);
+        EmailObject {
+            id: id.into(),
+            blob_id: format!("blob-{id}"),
+            thread_id: format!("thr-{id}"),
+            mailbox_ids,
+            keywords: flags_to_keywords(flags),
+            message_id: message_id.map(|m| vec![m.to_string()]),
+            subject: None,
+        }
+    }
+
+    fn record(
+        jmap_id: &str,
+        mailbox_id: &str,
+        folder: &str,
+        maildir_id: Option<&str>,
+        flags: &str,
+        message_id: Option<&str>,
+    ) -> MessageRecord {
+        let kw = flags_to_keywords(flags);
+        MessageRecord {
+            jmap_email_id: jmap_id.into(),
+            jmap_blob_id: Some(format!("blob-{jmap_id}")),
+            jmap_thread_id: Some(format!("thr-{jmap_id}")),
+            mailbox_id: mailbox_id.into(),
+            maildir_id: maildir_id.map(String::from),
+            maildir_folder: Some(folder.into()),
+            message_id: message_id.map(String::from),
+            flags: flags.into(),
+            jmap_keywords: serde_json::to_string(&kw).unwrap(),
+        }
+    }
+
+    /// Build the three message_map indices the way the engine does.
+    fn indices(
+        records: &[MessageRecord],
+    ) -> (
+        HashMap<String, MessageRecord>,
+        HashMap<String, MessageRecord>,
+        HashMap<String, Vec<MessageRecord>>,
+    ) {
+        let mut by_maildir = HashMap::new();
+        let mut by_jmap = HashMap::new();
+        let mut by_message_id: HashMap<String, Vec<MessageRecord>> = HashMap::new();
+        for r in records {
+            if let Some(ref m) = r.maildir_id {
+                by_maildir.insert(m.clone(), r.clone());
+            }
+            if let Some(ref mid) = r.message_id {
+                by_message_id
+                    .entry(mid.clone())
+                    .or_default()
+                    .push(r.clone());
+            }
+            by_jmap.insert(r.jmap_email_id.clone(), r.clone());
+        }
+        (by_maildir, by_jmap, by_message_id)
+    }
+
+    fn empty_index() -> LocalIndex {
+        LocalIndex::default()
+    }
+
+    fn run(
+        remote_emails: &[EmailObject],
+        remote_destroyed: &[String],
+        local_changes: &[LocalChange],
+        records: &[MessageRecord],
+        local_index: &LocalIndex,
+        strategy: ConflictStrategy,
+    ) -> SyncPlan {
+        let (by_maildir, by_jmap, by_message_id) = indices(records);
+        reconcile(
+            remote_emails,
+            remote_destroyed,
+            local_changes,
+            &by_maildir,
+            &by_jmap,
+            &by_message_id,
+            local_index,
+            &mailboxes(),
+            strategy,
+            None,
+        )
+    }
+
+    /// Server has an email we've never seen and no local file matches its
+    /// Message-ID — pull path emits a download.
+    #[test]
+    fn unknown_remote_email_emits_download() {
+        let plan = run(
+            &[email("E1", "MB-INBOX", "S", Some("<a@x>"))],
+            &[],
+            &[],
+            &[],
+            &empty_index(),
+            ConflictStrategy::ServerWins,
+        );
+        assert_eq!(plan.download_count(), 1);
+        assert!(matches!(
+            plan.actions[0],
+            SyncAction::DownloadMessage { ref jmap_email_id, .. } if jmap_email_id == "E1"
+        ));
+    }
+
+    /// Remote email lives in a mailbox not in the synced set: skip silently
+    /// (no action, not even a download).
+    #[test]
+    fn remote_email_in_unsynced_mailbox_skipped() {
+        let plan = run(
+            &[email("E1", "MB-OTHER", "S", Some("<a@x>"))],
+            &[],
+            &[],
+            &[],
+            &empty_index(),
+            ConflictStrategy::ServerWins,
+        );
+        assert!(plan.is_empty());
+    }
+
+    /// Adoption via message_map: same Message-ID, same folder, has a local
+    /// maildir_id — emit AdoptLocalMessage instead of DownloadMessage. This
+    /// exercises the carry-over-from-stale-DB path.
+    #[test]
+    fn adopt_via_known_message_id_in_db() {
+        let rec = record(
+            "STALE-ID",
+            "MB-INBOX",
+            "INBOX",
+            Some("MID-1"),
+            "S",
+            Some("<a@x>"),
+        );
+        let plan = run(
+            &[email("E1", "MB-INBOX", "S", Some("<a@x>"))],
+            &[],
+            &[],
+            &[rec],
+            &empty_index(),
+            ConflictStrategy::ServerWins,
+        );
+        assert_eq!(plan.adopt_count(), 1);
+        assert_eq!(plan.download_count(), 0);
+        let SyncAction::AdoptLocalMessage {
+            jmap_email_id,
+            maildir_id,
+            ..
+        } = &plan.actions[0]
+        else {
+            panic!("expected adopt");
+        };
+        assert_eq!(jmap_email_id, "E1");
+        assert_eq!(maildir_id, "MID-1");
+    }
+
+    /// Adoption via local_index: state DB is empty, but the maildir holds a
+    /// file with the matching Message-ID in the target folder.
+    #[test]
+    fn adopt_via_local_index_when_db_is_empty() {
+        let mut idx = empty_index();
+        idx.by_message_id.insert(
+            "<a@x>".into(),
+            vec![LocalEntry {
+                folder: "INBOX".into(),
+                maildir_id: "FILE-1".into(),
+                path: PathBuf::from("/dev/null"),
+            }],
+        );
+        let plan = run(
+            &[email("E1", "MB-INBOX", "S", Some("<a@x>"))],
+            &[],
+            &[],
+            &[],
+            &idx,
+            ConflictStrategy::ServerWins,
+        );
+        assert_eq!(plan.adopt_count(), 1);
+        let SyncAction::AdoptLocalMessage {
+            maildir_id,
+            jmap_email_id,
+            ..
+        } = &plan.actions[0]
+        else {
+            panic!("expected adopt");
+        };
+        assert_eq!(maildir_id, "FILE-1");
+        assert_eq!(jmap_email_id, "E1");
+    }
+
+    /// Known JMAP id, server keywords differ from message_map: emit a
+    /// pull-side flag update, no upload.
+    #[test]
+    fn server_keyword_change_emits_update_local_flags() {
+        let rec = record("E1", "MB-INBOX", "INBOX", Some("M-1"), "", Some("<a@x>"));
+        let plan = run(
+            &[email("E1", "MB-INBOX", "S", Some("<a@x>"))],
+            &[],
+            &[],
+            &[rec],
+            &empty_index(),
+            ConflictStrategy::ServerWins,
+        );
+        assert!(matches!(
+            plan.actions[0],
+            SyncAction::UpdateLocalFlags { ref new_flags, .. } if new_flags == "S"
+        ));
+    }
+
+    /// Server reports the email has moved between mailboxes: emit MoveLocal.
+    #[test]
+    fn server_mailbox_change_emits_move_local() {
+        let rec = record("E1", "MB-INBOX", "INBOX", Some("M-1"), "S", Some("<a@x>"));
+        let plan = run(
+            &[email("E1", "MB-ARCH", "S", Some("<a@x>"))],
+            &[],
+            &[],
+            &[rec],
+            &empty_index(),
+            ConflictStrategy::ServerWins,
+        );
+        assert!(plan.actions.iter().any(|a| matches!(
+            a,
+            SyncAction::MoveLocal {
+                from_folder, to_folder, ..
+            } if from_folder == "INBOX" && to_folder == "Archive"
+        )));
+    }
+
+    /// Local-delete vs server-update with ServerWins: re-download to
+    /// restore the file; do not emit DestroyRemote.
+    #[test]
+    fn delete_vs_update_server_wins_redownloads() {
+        let rec = record("E1", "MB-INBOX", "INBOX", Some("M-1"), "", Some("<a@x>"));
+        let plan = run(
+            &[email("E1", "MB-INBOX", "S", Some("<a@x>"))],
+            &[],
+            &[LocalChange::DeletedMessage {
+                maildir_id: "M-1".into(),
+                folder: "INBOX".into(),
+            }],
+            &[rec],
+            &empty_index(),
+            ConflictStrategy::ServerWins,
+        );
+        assert_eq!(plan.download_count(), 1);
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| matches!(a, SyncAction::DestroyRemote { .. }))
+        );
+    }
+
+    /// Local-delete vs server-update with LocalWins: emit DestroyRemote;
+    /// suppress the redownload.
+    #[test]
+    fn delete_vs_update_local_wins_destroys_remote() {
+        let rec = record("E1", "MB-INBOX", "INBOX", Some("M-1"), "", Some("<a@x>"));
+        let plan = run(
+            &[email("E1", "MB-INBOX", "S", Some("<a@x>"))],
+            &[],
+            &[LocalChange::DeletedMessage {
+                maildir_id: "M-1".into(),
+                folder: "INBOX".into(),
+            }],
+            &[rec],
+            &empty_index(),
+            ConflictStrategy::LocalWins,
+        );
+        assert_eq!(plan.download_count(), 0);
+        assert!(plan.actions.iter().any(
+            |a| matches!(a, SyncAction::DestroyRemote { jmap_email_id } if jmap_email_id == "E1")
+        ));
+    }
+
+    /// Flag conflict (both sides changed keywords) with ServerWins: pull
+    /// down the server flags, drop the local push.
+    #[test]
+    fn flag_conflict_server_wins() {
+        let rec = record("E1", "MB-INBOX", "INBOX", Some("M-1"), "", Some("<a@x>"));
+        let plan = run(
+            &[email("E1", "MB-INBOX", "S", Some("<a@x>"))],
+            &[],
+            &[LocalChange::FlagsChanged {
+                maildir_id: "M-1".into(),
+                folder: "INBOX".into(),
+                old_flags: "".into(),
+                new_flags: "F".into(),
+            }],
+            &[rec],
+            &empty_index(),
+            ConflictStrategy::ServerWins,
+        );
+        assert!(matches!(
+            plan.actions[0],
+            SyncAction::UpdateLocalFlags { ref new_flags, .. } if new_flags == "S"
+        ));
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| matches!(a, SyncAction::UpdateRemoteKeywords { .. }))
+        );
+    }
+
+    /// Flag conflict with LocalWins: push local keywords, suppress the
+    /// server-side flag update.
+    #[test]
+    fn flag_conflict_local_wins() {
+        let rec = record("E1", "MB-INBOX", "INBOX", Some("M-1"), "", Some("<a@x>"));
+        let plan = run(
+            &[email("E1", "MB-INBOX", "S", Some("<a@x>"))],
+            &[],
+            &[LocalChange::FlagsChanged {
+                maildir_id: "M-1".into(),
+                folder: "INBOX".into(),
+                old_flags: "".into(),
+                new_flags: "F".into(),
+            }],
+            &[rec],
+            &empty_index(),
+            ConflictStrategy::LocalWins,
+        );
+        assert!(
+            plan.actions
+                .iter()
+                .any(|a| matches!(a, SyncAction::UpdateRemoteKeywords { .. }))
+        );
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| matches!(a, SyncAction::UpdateLocalFlags { .. }))
+        );
+    }
+
+    /// Local NewMessage with no Message-ID match anywhere: upload.
+    #[test]
+    fn local_new_with_no_match_uploads() {
+        let plan = run(
+            &[],
+            &[],
+            &[LocalChange::NewMessage {
+                maildir_id: "M-NEW".into(),
+                folder: "INBOX".into(),
+                flags: "S".into(),
+                path: PathBuf::from("/tmp/m-new"),
+                message_id: Some("<new@x>".into()),
+            }],
+            &[],
+            &empty_index(),
+            ConflictStrategy::ServerWins,
+        );
+        assert_eq!(plan.upload_count(), 1);
+    }
+
+    /// Local NewMessage whose Message-ID is already mapped to a different
+    /// folder, with no paired delete: skip upload (alreadyExists guard).
+    #[test]
+    fn local_new_dup_message_id_in_other_folder_skips_upload() {
+        let rec = record(
+            "E1",
+            "MB-ARCH",
+            "Archive",
+            Some("M-EXISTING"),
+            "",
+            Some("<a@x>"),
+        );
+        let plan = run(
+            &[],
+            &[],
+            &[LocalChange::NewMessage {
+                maildir_id: "M-DUP".into(),
+                folder: "INBOX".into(),
+                flags: "".into(),
+                path: PathBuf::from("/tmp/m-dup"),
+                message_id: Some("<a@x>".into()),
+            }],
+            &[rec],
+            &empty_index(),
+            ConflictStrategy::ServerWins,
+        );
+        assert!(plan.is_empty());
+    }
+
+    /// Local DeletedMessage for a known JMAP id: emit DestroyRemote.
+    #[test]
+    fn local_delete_emits_destroy_remote() {
+        let rec = record("E1", "MB-INBOX", "INBOX", Some("M-1"), "", Some("<a@x>"));
+        let plan = run(
+            &[],
+            &[],
+            &[LocalChange::DeletedMessage {
+                maildir_id: "M-1".into(),
+                folder: "INBOX".into(),
+            }],
+            &[rec],
+            &empty_index(),
+            ConflictStrategy::ServerWins,
+        );
+        assert!(matches!(
+            plan.actions[0],
+            SyncAction::DestroyRemote { ref jmap_email_id } if jmap_email_id == "E1"
+        ));
+    }
+
+    /// Local DeletedMessage for an id the server *also* destroyed: emit
+    /// only DeleteLocal (from the destroy pass), not DestroyRemote.
+    #[test]
+    fn local_delete_paired_with_remote_destroy_collapses() {
+        let rec = record("E1", "MB-INBOX", "INBOX", Some("M-1"), "", Some("<a@x>"));
+        let plan = run(
+            &[],
+            &["E1".into()],
+            &[LocalChange::DeletedMessage {
+                maildir_id: "M-1".into(),
+                folder: "INBOX".into(),
+            }],
+            &[rec],
+            &empty_index(),
+            ConflictStrategy::ServerWins,
+        );
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| matches!(a, SyncAction::DestroyRemote { .. }))
+        );
+        assert!(
+            plan.actions
+                .iter()
+                .any(|a| matches!(a, SyncAction::DeleteLocal { .. }))
+        );
+    }
+
+    /// Move pre-pass: paired DeletedMessage(src) + NewMessage(dst) sharing
+    /// a Message-ID becomes one MoveRemote + Adopt, not Destroy + Upload.
+    #[test]
+    fn cross_folder_local_move_emits_move_remote_and_adopt() {
+        let rec = record("E1", "MB-INBOX", "INBOX", Some("M-OLD"), "", Some("<a@x>"));
+        let plan = run(
+            &[],
+            &[],
+            &[
+                LocalChange::DeletedMessage {
+                    maildir_id: "M-OLD".into(),
+                    folder: "INBOX".into(),
+                },
+                LocalChange::NewMessage {
+                    maildir_id: "M-NEW".into(),
+                    folder: "Archive".into(),
+                    flags: "".into(),
+                    path: PathBuf::from("/tmp/m-new"),
+                    message_id: Some("<a@x>".into()),
+                },
+            ],
+            &[rec],
+            &empty_index(),
+            ConflictStrategy::ServerWins,
+        );
+        assert!(plan.actions.iter().any(|a| matches!(
+            a,
+            SyncAction::MoveRemote { jmap_email_id, to_mailbox_id, .. }
+                if jmap_email_id == "E1" && to_mailbox_id == "MB-ARCH"
+        )));
+        assert!(plan.actions.iter().any(|a| matches!(
+            a,
+            SyncAction::AdoptLocalMessage {
+                maildir_id, old_maildir_id: Some(old), ..
+            } if maildir_id == "M-NEW" && old == "M-OLD"
+        )));
+        // Neither side of the lossy Destroy + Upload shape may appear.
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| matches!(a, SyncAction::DestroyRemote { .. }))
+        );
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| matches!(a, SyncAction::UploadMessage { .. }))
+        );
+    }
+
+    /// Cross-folder move where the destination file also gained a flag:
+    /// expect MoveRemote + Adopt + UpdateRemoteKeywords.
+    #[test]
+    fn cross_folder_move_with_flag_change_pushes_keywords() {
+        let rec = record("E1", "MB-INBOX", "INBOX", Some("M-OLD"), "", Some("<a@x>"));
+        let plan = run(
+            &[],
+            &[],
+            &[
+                LocalChange::DeletedMessage {
+                    maildir_id: "M-OLD".into(),
+                    folder: "INBOX".into(),
+                },
+                LocalChange::NewMessage {
+                    maildir_id: "M-NEW".into(),
+                    folder: "Archive".into(),
+                    flags: "S".into(),
+                    path: PathBuf::from("/tmp/m-new"),
+                    message_id: Some("<a@x>".into()),
+                },
+            ],
+            &[rec],
+            &empty_index(),
+            ConflictStrategy::ServerWins,
+        );
+        assert!(
+            plan.actions
+                .iter()
+                .any(|a| matches!(a, SyncAction::UpdateRemoteKeywords { .. }))
+        );
+    }
+
+    /// Server destroy of a known id: emit DeleteLocal carrying the
+    /// resolved maildir_id and folder.
+    #[test]
+    fn remote_destroy_emits_delete_local() {
+        let rec = record("E1", "MB-INBOX", "INBOX", Some("M-1"), "", Some("<a@x>"));
+        let plan = run(
+            &[],
+            &["E1".into()],
+            &[],
+            &[rec],
+            &empty_index(),
+            ConflictStrategy::ServerWins,
+        );
+        assert!(matches!(
+            plan.actions[0],
+            SyncAction::DeleteLocal { ref maildir_id, .. } if maildir_id == "M-1"
+        ));
+    }
+}
