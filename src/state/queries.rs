@@ -39,6 +39,7 @@ pub fn set_jmap_state(
 
 // --- Message Map ---
 
+#[derive(Clone)]
 pub struct MessageRecord {
     pub jmap_email_id: String,
     pub jmap_blob_id: Option<String>,

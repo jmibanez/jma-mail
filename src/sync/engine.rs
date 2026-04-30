@@ -64,6 +64,37 @@ pub async fn resolve_mailboxes(
     Ok(synced)
 }
 
+/// Build the three message_map indices the reconcile step consumes.
+fn build_known_indices(
+    conn: &Connection,
+    mailboxes: &[(String, String)],
+) -> Result<(
+    HashMap<String, queries::MessageRecord>,
+    HashMap<String, queries::MessageRecord>,
+    HashMap<String, Vec<queries::MessageRecord>>,
+)> {
+    let mut by_maildir: HashMap<String, queries::MessageRecord> = HashMap::new();
+    let mut by_jmap: HashMap<String, queries::MessageRecord> = HashMap::new();
+    let mut by_message_id: HashMap<String, Vec<queries::MessageRecord>> = HashMap::new();
+
+    for (_, folder_name) in mailboxes {
+        let messages = queries::get_messages_by_folder(conn, folder_name)?;
+        for msg in messages {
+            if let Some(ref mid) = msg.maildir_id {
+                by_maildir.insert(mid.clone(), msg.clone());
+            }
+            if let Some(ref message_id) = msg.message_id {
+                by_message_id
+                    .entry(message_id.clone())
+                    .or_default()
+                    .push(msg.clone());
+            }
+            by_jmap.insert(msg.jmap_email_id.clone(), msg);
+        }
+    }
+    Ok((by_maildir, by_jmap, by_message_id))
+}
+
 /// Outcome of one sync iteration -- enough for the daemon loop to know
 /// whether to fire the post-arrival hook.
 #[derive(Debug, Default, Clone, Copy)]
@@ -121,41 +152,34 @@ pub async fn sync(
 
     if let Some(ref remote) = remote_changes {
         // Phase 3: Reconcile and build plan
-        let mut known_by_maildir: HashMap<String, queries::MessageRecord> = HashMap::new();
-        let mut known_by_jmap: HashMap<String, queries::MessageRecord> = HashMap::new();
+        let (known_by_maildir, known_by_jmap, known_by_message_id) =
+            build_known_indices(conn, &mailboxes)?;
 
-        for (_, folder_name) in &mailboxes {
-            let messages = queries::get_messages_by_folder(conn, folder_name)?;
-            for msg in messages {
-                if let Some(ref mid) = msg.maildir_id {
-                    known_by_maildir.insert(
-                        mid.clone(),
-                        queries::MessageRecord {
-                            jmap_email_id: msg.jmap_email_id.clone(),
-                            jmap_blob_id: msg.jmap_blob_id.clone(),
-                            jmap_thread_id: msg.jmap_thread_id.clone(),
-                            mailbox_id: msg.mailbox_id.clone(),
-                            maildir_id: msg.maildir_id.clone(),
-                            maildir_folder: msg.maildir_folder.clone(),
-                            message_id: msg.message_id.clone(),
-                            flags: msg.flags.clone(),
-                            jmap_keywords: msg.jmap_keywords.clone(),
-                        },
-                    );
-                }
-                known_by_jmap.insert(msg.jmap_email_id.clone(), msg);
+        // Fetch metadata for created+updated so reconcile can act on full
+        // EmailObjects rather than just IDs.
+        let mut fetch_ids: Vec<String> = remote.created.clone();
+        for u in &remote.updated {
+            if !fetch_ids.contains(u) {
+                fetch_ids.push(u.clone());
             }
+        }
+        let mut remote_emails: Vec<crate::jmap::types::EmailObject> = Vec::new();
+        for chunk in fetch_ids.chunks(50) {
+            let id_refs: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
+            let batch = jmap_email::get_by_ids(client, &id_refs).await?;
+            remote_emails.extend(batch);
         }
 
         let plan = reconcile::reconcile(
-            &remote.created,
-            &remote.updated,
+            &remote_emails,
             &remote.destroyed,
             &all_local_changes,
             &known_by_maildir,
             &known_by_jmap,
-            config.sync.conflict_strategy,
+            &known_by_message_id,
+            &local_index,
             &mailboxes,
+            config.sync.conflict_strategy,
             Some(remote.new_state.clone()),
         );
 

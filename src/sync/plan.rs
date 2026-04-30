@@ -50,6 +50,11 @@ pub enum SyncAction {
         mailbox_id: String,
         keywords: HashMap<String, bool>,
         message_id: Option<String>,
+        /// When the adopt rebinds an existing JMAP id from one local
+        /// maildir_id to another (cross-folder local move), the old
+        /// local_state row needs to be cleaned up so subsequent scans
+        /// don't keep emitting DeletedMessage for it.
+        old_maildir_id: Option<String>,
     },
 
     // Local -> Server
