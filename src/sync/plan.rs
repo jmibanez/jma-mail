@@ -9,23 +9,47 @@ pub enum SyncAction {
     DownloadMessage {
         jmap_email_id: String,
         jmap_blob_id: String,
+        jmap_thread_id: String,
         mailbox_id: String,
         maildir_folder: String,
         keywords: HashMap<String, bool>,
+        message_id: Option<String>,
     },
     UpdateLocalFlags {
         maildir_id: String,
         maildir_folder: String,
         new_flags: String,
+        jmap_email_id: String,
+        keywords: HashMap<String, bool>,
+        jmap_blob_id: String,
+        jmap_thread_id: String,
+        mailbox_id: String,
+        message_id: Option<String>,
     },
     DeleteLocal {
         maildir_id: String,
         maildir_folder: String,
+        jmap_email_id: String,
     },
     MoveLocal {
         maildir_id: String,
         from_folder: String,
         to_folder: String,
+        jmap_email_id: String,
+    },
+
+    /// Bind an existing local file to a known server email (no download,
+    /// no upload — pure DB write). Pre-empts the alreadyExists path on
+    /// push and the redundant download path on pull.
+    AdoptLocalMessage {
+        maildir_id: String,
+        maildir_folder: String,
+        jmap_email_id: String,
+        jmap_blob_id: String,
+        jmap_thread_id: String,
+        mailbox_id: String,
+        keywords: HashMap<String, bool>,
+        message_id: Option<String>,
     },
 
     // Local -> Server
@@ -47,6 +71,39 @@ pub enum SyncAction {
         from_mailbox_id: String,
         to_mailbox_id: String,
     },
+}
+
+impl SyncAction {
+    /// Which side of a sync this action belongs to.
+    pub fn direction(&self) -> ActionDirection {
+        match self {
+            SyncAction::DownloadMessage { .. }
+            | SyncAction::UpdateLocalFlags { .. }
+            | SyncAction::DeleteLocal { .. }
+            | SyncAction::MoveLocal { .. } => ActionDirection::Pull,
+            SyncAction::UploadMessage { .. }
+            | SyncAction::UpdateRemoteKeywords { .. }
+            | SyncAction::DestroyRemote { .. }
+            | SyncAction::MoveRemote { .. } => ActionDirection::Push,
+            SyncAction::AdoptLocalMessage { .. } => ActionDirection::Both,
+        }
+    }
+}
+
+/// Which direction(s) an action moves data in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionDirection {
+    Pull,
+    Push,
+    Both,
+}
+
+/// Top-level sync mode. Selects which side(s) of the plan execute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncDirection {
+    Both,
+    PullOnly,
+    PushOnly,
 }
 
 /// A computed plan of sync actions to execute.
@@ -107,6 +164,54 @@ impl SyncPlan {
             })
             .count()
     }
+
+    pub fn adopt_count(&self) -> usize {
+        self.actions
+            .iter()
+            .filter(|a| matches!(a, SyncAction::AdoptLocalMessage { .. }))
+            .count()
+    }
+
+    /// Split the plan into (kept, dropped) according to `direction`.
+    /// AdoptLocalMessage is always kept — it is byte-identical and pure
+    /// DB, so adopting in pull-only or push-only mode is still strictly
+    /// progress. Pull-only keeps pull-side actions; push-only keeps
+    /// push-side; Both keeps everything.
+    pub fn into_filtered(self, direction: SyncDirection) -> (SyncPlan, Vec<SyncAction>) {
+        let SyncPlan {
+            actions,
+            new_email_state,
+            new_mailbox_state,
+        } = self;
+
+        let mut kept = Vec::with_capacity(actions.len());
+        let mut dropped = Vec::new();
+
+        for action in actions {
+            let action_dir = action.direction();
+            let keep = match (direction, action_dir) {
+                (SyncDirection::Both, _) => true,
+                (_, ActionDirection::Both) => true,
+                (SyncDirection::PullOnly, ActionDirection::Pull) => true,
+                (SyncDirection::PushOnly, ActionDirection::Push) => true,
+                _ => false,
+            };
+            if keep {
+                kept.push(action);
+            } else {
+                dropped.push(action);
+            }
+        }
+
+        (
+            SyncPlan {
+                actions: kept,
+                new_email_state,
+                new_mailbox_state,
+            },
+            dropped,
+        )
+    }
 }
 
 impl fmt::Display for SyncPlan {
@@ -117,6 +222,7 @@ impl fmt::Display for SyncPlan {
         writeln!(f, "Sync plan:")?;
         writeln!(f, "  Downloads:    {}", self.download_count())?;
         writeln!(f, "  Uploads:      {}", self.upload_count())?;
+        writeln!(f, "  Adoptions:    {}", self.adopt_count())?;
         writeln!(f, "  Flag updates: {}", self.flag_update_count())?;
         writeln!(f, "  Deletes:      {}", self.delete_count())?;
         writeln!(f)?;
@@ -148,10 +254,21 @@ impl fmt::Display for SyncPlan {
                     maildir_id,
                     from_folder,
                     to_folder,
+                    ..
                 } => writeln!(
                     f,
                     "  [PULL]  Move {} from {}/ to {}/",
                     maildir_id, from_folder, to_folder
+                )?,
+                SyncAction::AdoptLocalMessage {
+                    maildir_id,
+                    maildir_folder,
+                    jmap_email_id,
+                    ..
+                } => writeln!(
+                    f,
+                    "  [BOTH]  Adopt {}/{} as {}",
+                    maildir_folder, maildir_id, jmap_email_id
                 )?,
                 SyncAction::UploadMessage {
                     maildir_id,

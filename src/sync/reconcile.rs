@@ -46,9 +46,11 @@ pub fn reconcile(
         plan.actions.push(SyncAction::DownloadMessage {
             jmap_email_id: jmap_id.clone(),
             jmap_blob_id: String::new(), // filled during execution
+            jmap_thread_id: String::new(),
             mailbox_id: String::new(),
             maildir_folder: String::new(),
             keywords: HashMap::new(),
+            message_id: None,
         });
     }
 
@@ -95,6 +97,7 @@ pub fn reconcile(
                 plan.actions.push(SyncAction::DeleteLocal {
                     maildir_id: maildir_id.clone(),
                     maildir_folder: folder.clone(),
+                    jmap_email_id: jmap_id.clone(),
                 });
             }
         }
