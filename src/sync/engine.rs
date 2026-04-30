@@ -1,7 +1,7 @@
 use anyhow::Result;
 use jmap_client::client::Client;
 use rusqlite::Connection;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::{info, warn};
 
 use crate::config::Config;
@@ -227,9 +227,10 @@ async fn fetch_remote_state(
             }
         };
 
+        let mut seen: HashSet<String> = all_created.iter().cloned().collect();
         let mut fetch_ids: Vec<String> = all_created;
         for u in all_updated {
-            if !fetch_ids.contains(&u) {
+            if seen.insert(u.clone()) {
                 fetch_ids.push(u);
             }
         }
@@ -245,10 +246,11 @@ async fn initial_remote_state(
     mailboxes: &[(String, String)],
 ) -> Result<(Vec<EmailObject>, Vec<String>, String, bool)> {
     let mut all_ids: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
     for (mailbox_id, _) in mailboxes {
         let ids = jmap_email::query_mailbox(client, mailbox_id).await?;
         for id in ids {
-            if !all_ids.contains(&id) {
+            if seen.insert(id.clone()) {
                 all_ids.push(id);
             }
         }
