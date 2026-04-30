@@ -2,13 +2,15 @@ use anyhow::Result;
 use jmap_client::client::Client;
 use rusqlite::Connection;
 use std::collections::HashMap;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::Config;
-use crate::jmap::{email as jmap_email, mailbox as jmap_mailbox};
+use crate::jmap::{email as jmap_email, mailbox as jmap_mailbox, types::EmailObject};
 use crate::maildir_ops::{dedupe, scan, store};
 use crate::state::queries;
-use crate::sync::{pull, push, reconcile};
+use crate::sync::execute;
+use crate::sync::plan::{SyncAction, SyncDirection};
+use crate::sync::reconcile;
 
 /// Resolve the list of mailboxes to sync, returning (jmap_id, folder_name) pairs.
 pub async fn resolve_mailboxes(
@@ -102,6 +104,244 @@ pub struct SyncOutcome {
     pub downloaded: usize,
 }
 
+/// Single orchestration path. `direction` selects which side(s) of the
+/// plan execute; adoption always runs.
+pub async fn run(
+    client: &Client,
+    conn: &Connection,
+    config: &Config,
+    dry_run: bool,
+    direction: SyncDirection,
+) -> Result<SyncOutcome> {
+    let account_id = client.default_account_id().to_string();
+    let mailboxes = resolve_mailboxes(client, conn, config).await?;
+    let maildir_root = config.maildir_path();
+
+    // Phase 0: dedupe + index. Always before scan so newly-introduced
+    // duplicates from a prior aborted run don't get treated as local
+    // changes to push.
+    let folder_names: Vec<String> = mailboxes.iter().map(|(_, f)| f.clone()).collect();
+    let local_index = dedupe::dedupe_and_index(&maildir_root, &folder_names)?;
+
+    // Phase 1: scan local changes.
+    let mut all_local_changes = Vec::new();
+    for (_, folder_name) in &mailboxes {
+        let maildir_path = maildir_root.join(folder_name);
+        let maildir = store::ensure_maildir(&maildir_path)?;
+        let known_state = queries::get_local_state_for_folder(conn, folder_name)?;
+        let (changes, _seen) = scan::scan_folder(&maildir, folder_name, &known_state)?;
+        all_local_changes.extend(changes);
+    }
+
+    // Phase 2: collect remote changes.
+    let (remote_emails, remote_destroyed, new_state, used_initial_path) = fetch_remote_state(
+        client,
+        conn,
+        &account_id,
+        &mailboxes,
+        config.sync.max_messages,
+    )
+    .await?;
+
+    // Phase 3: build known indices and reconcile.
+    let (known_by_maildir, known_by_jmap, known_by_message_id) =
+        build_known_indices(conn, &mailboxes)?;
+
+    let plan = reconcile::reconcile(
+        &remote_emails,
+        &remote_destroyed,
+        &all_local_changes,
+        &known_by_maildir,
+        &known_by_jmap,
+        &known_by_message_id,
+        &local_index,
+        &mailboxes,
+        config.sync.conflict_strategy,
+        Some(new_state),
+    );
+
+    if dry_run {
+        print!("{}", plan);
+        return Ok(SyncOutcome::default());
+    }
+
+    if plan.is_empty() {
+        info!("Already in sync");
+        return Ok(SyncOutcome::default());
+    }
+
+    // Phase 4: filter by direction; warn on every dropped non-adoption
+    // action so the user sees that pull-only / push-only suppressed
+    // something they may have wanted.
+    let (filtered, dropped) = plan.into_filtered(direction);
+    log_dropped(direction, &dropped);
+
+    // Phase 5: execute.
+    let outcome =
+        execute::execute(client, conn, config, filtered, &maildir_root, &account_id).await?;
+
+    if used_initial_path {
+        info!("Initial sync complete ({} downloaded)", outcome.downloaded);
+    } else {
+        info!("Sync complete ({} downloaded)", outcome.downloaded);
+    }
+    Ok(outcome)
+}
+
+/// Returns `(emails, destroyed, new_state, used_initial_path)`.
+///
+/// On state-present: loops Email/changes until has_more_changes is
+/// false, accumulating ids; then Email/get on (created ∪ updated).
+/// On no-state (or cannotCalculateChanges): Email/query per mailbox
+/// up to max_messages, then Email/get; new_state via get_current_state.
+async fn fetch_remote_state(
+    client: &Client,
+    conn: &Connection,
+    account_id: &str,
+    mailboxes: &[(String, String)],
+    max_messages: u64,
+) -> Result<(Vec<EmailObject>, Vec<String>, String, bool)> {
+    let cursor = queries::get_jmap_state(conn, account_id, "Email")?;
+
+    if let Some(state) = cursor {
+        let mut current = state;
+        let mut all_created: Vec<String> = Vec::new();
+        let mut all_updated: Vec<String> = Vec::new();
+        let mut all_destroyed: Vec<String> = Vec::new();
+
+        let final_state = loop {
+            let res = jmap_email::get_changes(client, &current).await;
+            match res {
+                Ok(changes) => {
+                    all_created.extend(changes.created.clone());
+                    all_updated.extend(changes.updated.clone());
+                    all_destroyed.extend(changes.destroyed.clone());
+                    let next = changes.new_state.clone();
+                    if !changes.has_more_changes {
+                        break next;
+                    }
+                    current = next;
+                }
+                Err(e) => {
+                    let s = e.to_string();
+                    if s.contains("Cannot calculate changes") {
+                        info!("Server cannot calculate changes; falling back to initial pull");
+                        queries::set_jmap_state(conn, account_id, "Email", "")?;
+                        return initial_remote_state(client, mailboxes, max_messages).await;
+                    }
+                    return Err(e);
+                }
+            }
+        };
+
+        let mut fetch_ids: Vec<String> = all_created;
+        for u in all_updated {
+            if !fetch_ids.contains(&u) {
+                fetch_ids.push(u);
+            }
+        }
+        let emails = batched_get(client, &fetch_ids).await?;
+        Ok((emails, all_destroyed, final_state, false))
+    } else {
+        initial_remote_state(client, mailboxes, max_messages).await
+    }
+}
+
+async fn initial_remote_state(
+    client: &Client,
+    mailboxes: &[(String, String)],
+    max_messages: u64,
+) -> Result<(Vec<EmailObject>, Vec<String>, String, bool)> {
+    let max = if max_messages > 0 {
+        Some(max_messages)
+    } else {
+        None
+    };
+    let mut all_ids: Vec<String> = Vec::new();
+    for (mailbox_id, _) in mailboxes {
+        let ids = jmap_email::query_mailbox(client, mailbox_id, max).await?;
+        for id in ids {
+            if !all_ids.contains(&id) {
+                all_ids.push(id);
+            }
+        }
+    }
+    let emails = batched_get(client, &all_ids).await?;
+    let state = jmap_email::get_current_state(client).await?;
+    Ok((emails, Vec::new(), state, true))
+}
+
+async fn batched_get(client: &Client, ids: &[String]) -> Result<Vec<EmailObject>> {
+    let mut out: Vec<EmailObject> = Vec::new();
+    for chunk in ids.chunks(50) {
+        let id_refs: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
+        let batch = jmap_email::get_by_ids(client, &id_refs).await?;
+        out.extend(batch);
+    }
+    Ok(out)
+}
+
+fn log_dropped(direction: SyncDirection, dropped: &[SyncAction]) {
+    for a in dropped {
+        match a {
+            SyncAction::DownloadMessage {
+                jmap_email_id,
+                maildir_folder,
+                ..
+            } => warn!(
+                "{:?}: dropped DownloadMessage {} -> {}",
+                direction, jmap_email_id, maildir_folder
+            ),
+            SyncAction::UpdateLocalFlags {
+                jmap_email_id,
+                maildir_id,
+                new_flags,
+                ..
+            } => warn!(
+                "{:?}: dropped UpdateLocalFlags on {} ({}) -> '{}'",
+                direction, maildir_id, jmap_email_id, new_flags
+            ),
+            SyncAction::DeleteLocal {
+                jmap_email_id,
+                maildir_id,
+                ..
+            } => warn!(
+                "{:?}: dropped DeleteLocal {} ({})",
+                direction, maildir_id, jmap_email_id
+            ),
+            SyncAction::MoveLocal {
+                jmap_email_id,
+                from_folder,
+                to_folder,
+                ..
+            } => warn!(
+                "{:?}: dropped MoveLocal {} {} -> {}",
+                direction, jmap_email_id, from_folder, to_folder
+            ),
+            SyncAction::UploadMessage {
+                maildir_id,
+                maildir_folder,
+                ..
+            } => warn!(
+                "{:?}: dropped UploadMessage {} from {}",
+                direction, maildir_id, maildir_folder
+            ),
+            SyncAction::UpdateRemoteKeywords { jmap_email_id, .. } => warn!(
+                "{:?}: dropped UpdateRemoteKeywords on {}",
+                direction, jmap_email_id
+            ),
+            SyncAction::DestroyRemote { jmap_email_id } => {
+                warn!("{:?}: dropped DestroyRemote {}", direction, jmap_email_id)
+            }
+            SyncAction::MoveRemote { jmap_email_id, .. } => {
+                warn!("{:?}: dropped MoveRemote {}", direction, jmap_email_id)
+            }
+            // Adoption is always kept; it never appears here.
+            SyncAction::AdoptLocalMessage { .. } => {}
+        }
+    }
+}
+
 /// Run a full bidirectional sync.
 pub async fn sync(
     client: &Client,
@@ -109,184 +349,16 @@ pub async fn sync(
     config: &Config,
     dry_run: bool,
 ) -> Result<SyncOutcome> {
-    let account_id = client.default_account_id().to_string();
-    let mailboxes = resolve_mailboxes(client, conn, config).await?;
-    let maildir_root = config.maildir_path();
-
-    // Phase 0: dedupe local maildir by Message-ID and build an index for the
-    // pull phase. Running this before scan/pull guarantees that any duplicate
-    // jmapsync wrote in a previous run is removed before it can be picked up
-    // as a "new local message" and pushed back to the server.
-    let folder_names: Vec<String> = mailboxes.iter().map(|(_, f)| f.clone()).collect();
-    let local_index = dedupe::dedupe_and_index(&maildir_root, &folder_names)?;
-
-    // Phase 1: Get remote changes
-    let email_state = queries::get_jmap_state(conn, &account_id, "Email")?;
-    let remote_changes = if let Some(ref state) = email_state {
-        match jmap_email::get_changes(client, state).await {
-            Ok(changes) => Some(changes),
-            Err(e) => {
-                let err_str = e.to_string();
-                if err_str.contains("Cannot calculate changes") {
-                    info!("Server cannot calculate changes; clearing state for full re-sync");
-                    queries::set_jmap_state(conn, &account_id, "Email", "")?;
-                    None
-                } else {
-                    return Err(e);
-                }
-            }
-        }
-    } else {
-        None
-    };
-
-    // Phase 2: Scan local changes
-    let mut all_local_changes = Vec::new();
-    for (_, folder_name) in &mailboxes {
-        let maildir_path = maildir_root.join(folder_name);
-        let maildir = store::ensure_maildir(&maildir_path)?;
-        let known_state = queries::get_local_state_for_folder(conn, folder_name)?;
-        let (changes, _seen) = scan::scan_folder(&maildir, folder_name, &known_state)?;
-        all_local_changes.extend(changes);
-    }
-
-    if let Some(ref remote) = remote_changes {
-        // Phase 3: Reconcile and build plan
-        let (known_by_maildir, known_by_jmap, known_by_message_id) =
-            build_known_indices(conn, &mailboxes)?;
-
-        // Fetch metadata for created+updated so reconcile can act on full
-        // EmailObjects rather than just IDs.
-        let mut fetch_ids: Vec<String> = remote.created.clone();
-        for u in &remote.updated {
-            if !fetch_ids.contains(u) {
-                fetch_ids.push(u.clone());
-            }
-        }
-        let mut remote_emails: Vec<crate::jmap::types::EmailObject> = Vec::new();
-        for chunk in fetch_ids.chunks(50) {
-            let id_refs: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
-            let batch = jmap_email::get_by_ids(client, &id_refs).await?;
-            remote_emails.extend(batch);
-        }
-
-        let plan = reconcile::reconcile(
-            &remote_emails,
-            &remote.destroyed,
-            &all_local_changes,
-            &known_by_maildir,
-            &known_by_jmap,
-            &known_by_message_id,
-            &local_index,
-            &mailboxes,
-            config.sync.conflict_strategy,
-            Some(remote.new_state.clone()),
-        );
-
-        if dry_run {
-            print!("{}", plan);
-            return Ok(SyncOutcome::default());
-        }
-
-        if plan.is_empty() && all_local_changes.is_empty() {
-            info!("Already in sync");
-            return Ok(SyncOutcome::default());
-        }
-
-        // Execute: pull phase
-        let outcome = pull::pull(
-            client,
-            conn,
-            &account_id,
-            &mailboxes,
-            &maildir_root,
-            config.sync.max_messages,
-            &local_index,
-            config.sync.download_concurrency,
-        )
-        .await?;
-
-        // Execute: push phase
-        push::push(client, conn, all_local_changes, &mailboxes).await?;
-
-        info!("Sync complete");
-        Ok(SyncOutcome {
-            downloaded: outcome.downloaded,
-        })
-    } else {
-        // No previous state or cannotCalculateChanges -- do full pull then push
-        if dry_run {
-            println!("Full sync required (no previous state). Use without --dry-run to execute.");
-            return Ok(SyncOutcome::default());
-        }
-
-        let outcome = pull::pull(
-            client,
-            conn,
-            &account_id,
-            &mailboxes,
-            &maildir_root,
-            config.sync.max_messages,
-            &local_index,
-            config.sync.download_concurrency,
-        )
-        .await?;
-
-        push::push(client, conn, all_local_changes, &mailboxes).await?;
-
-        info!("Sync complete");
-        Ok(SyncOutcome {
-            downloaded: outcome.downloaded,
-        })
-    }
+    run(client, conn, config, dry_run, SyncDirection::Both).await
 }
 
-/// Run pull only (server -> local).
+/// Run pull only (server -> local). Adoption still runs.
 pub async fn pull_only(client: &Client, conn: &Connection, config: &Config) -> Result<SyncOutcome> {
-    let account_id = client.default_account_id().to_string();
-    let mailboxes = resolve_mailboxes(client, conn, config).await?;
-    let maildir_root = config.maildir_path();
-
-    let folder_names: Vec<String> = mailboxes.iter().map(|(_, f)| f.clone()).collect();
-    let local_index = dedupe::dedupe_and_index(&maildir_root, &folder_names)?;
-
-    let outcome = pull::pull(
-        client,
-        conn,
-        &account_id,
-        &mailboxes,
-        &maildir_root,
-        config.sync.max_messages,
-        &local_index,
-        config.sync.download_concurrency,
-    )
-    .await?;
-
-    info!("Pull complete");
-    Ok(SyncOutcome {
-        downloaded: outcome.downloaded,
-    })
+    run(client, conn, config, false, SyncDirection::PullOnly).await
 }
 
-/// Run push only (local -> server).
+/// Run push only (local -> server). Adoption still runs.
 pub async fn push_only(client: &Client, conn: &Connection, config: &Config) -> Result<()> {
-    let mailboxes = resolve_mailboxes(client, conn, config).await?;
-    let maildir_root = config.maildir_path();
-
-    let folder_names: Vec<String> = mailboxes.iter().map(|(_, f)| f.clone()).collect();
-    dedupe::dedupe_and_index(&maildir_root, &folder_names)?;
-
-    let mut all_local_changes = Vec::new();
-    for (_, folder_name) in &mailboxes {
-        let maildir_path = maildir_root.join(folder_name);
-        let maildir = store::ensure_maildir(&maildir_path)?;
-        let known_state = queries::get_local_state_for_folder(conn, folder_name)?;
-        let (changes, _seen) = scan::scan_folder(&maildir, folder_name, &known_state)?;
-        all_local_changes.extend(changes);
-    }
-
-    push::push(client, conn, all_local_changes, &mailboxes).await?;
-
-    info!("Push complete");
+    run(client, conn, config, false, SyncDirection::PushOnly).await?;
     Ok(())
 }
