@@ -4,6 +4,8 @@
 
 `jmapsync` supports syncing a Maildir mailbox that was downloaded via `mbsync` or `offlineimap` -- point it to the directory containing your Maildir mailboxes and it should pick up where `mbsync` or `offlineimap` left off.
 
+This project is in a very early state, though I'm using it for my own mail. **Use it at your own risk**.
+
 
 ## Quick Start
 
@@ -50,6 +52,11 @@ So what's stored in `state.db`?
   * And `local_state`, which is a snapshot of the local state (flags, size, mtime) so any local filesystem changes are quickly detected
 
 None of `state.db`'s contents are required to do a `pull`.
+
+### Breaking Changes
+
+If there are any changes that break state tracking, as mentioned above you can simply delete the state DB and re-run `jmapsync`.
+
 
 ## Configuration
 
