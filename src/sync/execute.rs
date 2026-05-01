@@ -454,15 +454,13 @@ async fn apply_remote_set(
     for action in &moves {
         if let SyncAction::MoveRemote {
             id,
-            from_mailbox_id,
-            to_mailbox_id,
+            target_mailbox_ids,
             ..
         } = action
         {
-            ops.push(EmailSetOp::Move {
+            ops.push(EmailSetOp::SetMailboxes {
                 email_id: id.jmap_email_id.clone(),
-                from_mailbox_id: from_mailbox_id.clone(),
-                to_mailbox_id: to_mailbox_id.clone(),
+                target_mailbox_ids: target_mailbox_ids.clone(),
             });
         }
     }

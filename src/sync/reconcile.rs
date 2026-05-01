@@ -128,7 +128,6 @@ pub fn reconcile(
 
         detected_moves.push(DetectedMove {
             jmap_email_id: rec.jmap_email_id.clone(),
-            from_mailbox_id: rec.mailbox_id.clone(),
             to_mailbox_id: dst_mailbox_id,
             old_maildir_id: old_id.clone(),
             new_maildir_id: new_id.clone(),
@@ -206,7 +205,6 @@ pub fn reconcile(
 /// the move pre-pass.
 struct DetectedMove {
     jmap_email_id: String,
-    from_mailbox_id: String,
     to_mailbox_id: String,
     old_maildir_id: String,
     new_maildir_id: String,
@@ -229,8 +227,13 @@ fn emit_detected_moves(moves: &[DetectedMove], plan: &mut SyncPlan) {
                 jmap_email_id: m.jmap_email_id.clone(),
                 message_id: Some(m.message_id.clone()),
             },
-            from_mailbox_id: m.from_mailbox_id.clone(),
-            to_mailbox_id: m.to_mailbox_id.clone(),
+            // jmapsync's DB binds each email to exactly one mailbox,
+            // so the target set after the move is just the destination.
+            // If the email also lives in unsynced JMAP mailboxes (e.g.
+            // server-side label rules), this full-replacement strips
+            // those memberships -- accepted for now; the alternative
+            // is a per-cycle Email/get to read the current set first.
+            target_mailbox_ids: vec![m.to_mailbox_id.clone()],
             from_folder: m.from_folder.clone(),
             to_folder: m.new_folder.clone(),
         });
@@ -1263,8 +1266,8 @@ mod tests {
         );
         assert!(plan.actions.iter().any(|a| matches!(
             a,
-            SyncAction::MoveRemote { id: RemoteId { jmap_email_id, .. }, to_mailbox_id, .. }
-                if jmap_email_id == "E1" && to_mailbox_id == "MB-ARCH"
+            SyncAction::MoveRemote { id: RemoteId { jmap_email_id, .. }, target_mailbox_ids, .. }
+                if jmap_email_id == "E1" && target_mailbox_ids == &vec!["MB-ARCH".to_string()]
         )));
         assert!(plan.actions.iter().any(|a| matches!(
             a,
@@ -1355,8 +1358,8 @@ mod tests {
         assert!(
             plan.actions.iter().any(|a| matches!(
                 a,
-                SyncAction::MoveRemote { id: RemoteId { jmap_email_id, .. }, to_mailbox_id, .. }
-                    if jmap_email_id == "E1" && to_mailbox_id == "MB-ARCH"
+                SyncAction::MoveRemote { id: RemoteId { jmap_email_id, .. }, target_mailbox_ids, .. }
+                    if jmap_email_id == "E1" && target_mailbox_ids == &vec!["MB-ARCH".to_string()]
             )),
             "expected MoveRemote, got {:?}",
             plan.actions
@@ -1425,8 +1428,8 @@ mod tests {
         // The move detection still has to produce its MoveRemote+Adopt.
         assert!(plan.actions.iter().any(|a| matches!(
             a,
-            SyncAction::MoveRemote { id: RemoteId { jmap_email_id, .. }, to_mailbox_id, .. }
-                if jmap_email_id == "E1" && to_mailbox_id == "MB-ARCH"
+            SyncAction::MoveRemote { id: RemoteId { jmap_email_id, .. }, target_mailbox_ids, .. }
+                if jmap_email_id == "E1" && target_mailbox_ids == &vec!["MB-ARCH".to_string()]
         )));
         // And critically: no spurious re-download into the source.
         assert!(

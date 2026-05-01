@@ -134,11 +134,19 @@ pub enum SyncAction {
     },
     MoveRemote {
         id: RemoteId,
-        from_mailbox_id: String,
-        to_mailbox_id: String,
-        /// Folder names of `from_mailbox_id` / `to_mailbox_id`, plumbed
-        /// through purely so logs can name folders instead of opaque
-        /// JMAP mailbox ids.
+        /// Full target set of mailbox ids the email should belong to
+        /// after the move. We send this as a full-replacement
+        /// `mailboxIds` in Email/set rather than a per-key patch
+        /// because jmap-client 0.4.1 cannot serialize a `null` value
+        /// for `mailboxIds/{id}` (its patch map is typed `bool`), and
+        /// servers like Fastmail correctly reject `false` for a
+        /// `Id[Boolean]` set-membership map. Computed at planning
+        /// time; for jmapsync's single-mailbox-per-email DB model
+        /// this is just `[to_mailbox_id]`.
+        target_mailbox_ids: Vec<String>,
+        /// Folder names of the source / destination mailboxes,
+        /// plumbed through purely so logs can name folders instead
+        /// of opaque JMAP mailbox ids.
         from_folder: String,
         to_folder: String,
     },

@@ -187,11 +187,13 @@ pub enum EmailSetOp {
         email_id: String,
         keywords: HashMap<String, bool>,
     },
-    /// Remove from one mailbox and add to another.
-    Move {
+    /// Replace the email's full mailbox-id set. The caller computes
+    /// the target set; `set_email_batch` issues a full-replacement
+    /// `mailboxIds` update. Used both for cross-mailbox moves and
+    /// (in principle) any other membership change.
+    SetMailboxes {
         email_id: String,
-        from_mailbox_id: String,
-        to_mailbox_id: String,
+        target_mailbox_ids: Vec<String>,
     },
     /// Destroy an email by id.
     Destroy { email_id: String },
@@ -212,6 +214,17 @@ pub struct EmailSetOutcome {
 /// Email/set, capped server-side by `maxObjectsInSet`. Per-id failures
 /// land in `notUpdated`/`notDestroyed` and are surfaced as warnings;
 /// they do not fail the batch.
+///
+/// Moves are emitted as a *full replacement* of `mailboxIds` (the
+/// caller-supplied `target_mailbox_ids`) rather than a per-key patch.
+/// Per RFC 8621 §4.1.1, `mailboxIds` is `Id[Boolean]` whose values are
+/// always `true`; removing a key requires a `null` patch value (RFC
+/// 8620 §5.3). jmap-client 0.4.1 cannot serialize `null` for a
+/// mailboxIds patch (its patch map is typed `bool`), and Fastmail
+/// correctly rejects `mailboxIds/{id}: false`. Full replacement
+/// sidesteps the issue at the cost of stripping any out-of-band
+/// mailbox memberships not in the target set — acceptable for
+/// jmapsync's single-mailbox-per-email model.
 pub async fn set_email_batch(client: &Client, ops: &[EmailSetOp]) -> Result<EmailSetOutcome> {
     if ops.is_empty() {
         return Ok(EmailSetOutcome::default());
@@ -229,14 +242,11 @@ pub async fn set_email_batch(client: &Client, ops: &[EmailSetOp]) -> Result<Emai
                             upd.keyword(kw, *val);
                         }
                     }
-                    EmailSetOp::Move {
+                    EmailSetOp::SetMailboxes {
                         email_id,
-                        from_mailbox_id,
-                        to_mailbox_id,
+                        target_mailbox_ids,
                     } => {
-                        set.update(email_id)
-                            .mailbox_id(from_mailbox_id, false)
-                            .mailbox_id(to_mailbox_id, true);
+                        set.update(email_id).mailbox_ids(target_mailbox_ids.clone());
                     }
                     EmailSetOp::Destroy { email_id } => {
                         set.destroy([email_id.as_str()]);
