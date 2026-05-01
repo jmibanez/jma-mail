@@ -13,7 +13,7 @@ use crate::jmap::retry::is_transient_error;
 use crate::maildir_ops::{flags::keywords_to_flags, store};
 use crate::state::queries::{self, MessageRecord};
 use crate::sync::engine::SyncOutcome;
-use crate::sync::plan::{BoundId, SyncAction, SyncPlan};
+use crate::sync::plan::{BoundId, RemoteId, SyncAction, SyncPlan};
 
 /// Resolve effective per-cycle concurrency by clamping the configured
 /// value to the server's advertised maxConcurrentRequests.
@@ -162,6 +162,7 @@ fn commit_adopt(conn: &Connection, action: SyncAction) -> Result<()> {
     else {
         return Ok(());
     };
+    let bound_for_log = id.clone();
     let BoundId {
         maildir_id,
         jmap_email_id,
@@ -197,7 +198,9 @@ fn commit_adopt(conn: &Connection, action: SyncAction) -> Result<()> {
     queries::upsert_local_state(conn, &maildir_id, &maildir_folder, &flags, None)?;
     debug!(
         "Adopted {}/{} as {}",
-        maildir_folder, maildir_id, jmap_email_id
+        maildir_folder,
+        maildir_id,
+        bound_for_log.as_remote()
     );
     Ok(())
 }
@@ -399,7 +402,11 @@ async fn upload_messages(
                     },
                 )?;
                 queries::upsert_local_state(conn, &id.maildir_id, &maildir_folder, &flags, None)?;
-                info!("Uploaded local message {} -> JMAP {}", id, jmap_email_id);
+                let target = RemoteId {
+                    jmap_email_id: jmap_email_id.clone(),
+                    message_id: id.message_id.clone(),
+                };
+                info!("Uploaded local message {} -> {}", id.maildir_id, target);
             }
             Err(e) => {
                 let s = e.to_string();

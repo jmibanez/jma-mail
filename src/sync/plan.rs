@@ -318,7 +318,13 @@ impl fmt::Display for SyncPlan {
                 )?,
                 SyncAction::AdoptLocalMessage {
                     id, maildir_folder, ..
-                } => writeln!(f, "  [BOTH]  Adopt {}/{}", maildir_folder, id)?,
+                } => writeln!(
+                    f,
+                    "  [BOTH]  Adopt {}/{} as {}",
+                    maildir_folder,
+                    id.maildir_id,
+                    id.as_remote()
+                )?,
                 SyncAction::UploadMessage {
                     id, maildir_folder, ..
                 } => writeln!(f, "  [PUSH] Upload {} from {}/", id, maildir_folder)?,
