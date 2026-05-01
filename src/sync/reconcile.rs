@@ -1269,6 +1269,77 @@ mod tests {
         );
     }
 
+    /// Maildir-id-preserving cross-folder move: the MUA renamed the
+    /// file across folders without changing the unique part of the
+    /// filename (the maildir spec recommends this). scan_folder now
+    /// emits paired DeletedMessage(src) + NewMessage(dst) with the
+    /// SAME maildir_id, and the move pre-pass must still pair them by
+    /// Message-ID and produce the lossless MoveRemote + Adopt shape.
+    /// The Adopt's old_maildir_id and new maildir_id are identical,
+    /// which is the signal to execute that the DB row only needs its
+    /// folder updated.
+    #[test]
+    fn cross_folder_move_with_preserved_maildir_id_pairs_correctly() {
+        let rec = record("E1", "MB-INBOX", "INBOX", Some("M1"), "FS", Some("<a@x>"));
+        let plan = run(
+            &[],
+            &[],
+            &[
+                LocalChange::DeletedMessage {
+                    maildir_id: "M1".into(),
+                    folder: "INBOX".into(),
+                },
+                LocalChange::NewMessage {
+                    // Same id as the deleted side -- id-preserving move.
+                    maildir_id: "M1".into(),
+                    folder: "Archive".into(),
+                    flags: "FS".into(),
+                    path: PathBuf::from("/tmp/m1"),
+                    message_id: Some("<a@x>".into()),
+                },
+            ],
+            &[rec],
+            &empty_index(),
+            ConflictStrategy::ServerWins,
+        );
+        assert!(
+            plan.actions.iter().any(|a| matches!(
+                a,
+                SyncAction::MoveRemote { jmap_email_id, to_mailbox_id, .. }
+                    if jmap_email_id == "E1" && to_mailbox_id == "MB-ARCH"
+            )),
+            "expected MoveRemote, got {:?}",
+            plan.actions
+        );
+        assert!(
+            plan.actions.iter().any(|a| matches!(
+                a,
+                SyncAction::AdoptLocalMessage {
+                    maildir_id,
+                    maildir_folder,
+                    old_maildir_id: Some(old),
+                    ..
+                } if maildir_id == "M1" && old == "M1" && maildir_folder == "Archive"
+            )),
+            "expected AdoptLocalMessage with old==new maildir_id, got {:?}",
+            plan.actions
+        );
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| matches!(a, SyncAction::DestroyRemote { .. })),
+            "id-preserving move must not degrade into DestroyRemote"
+        );
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| matches!(a, SyncAction::UploadMessage { .. })),
+            "id-preserving move must not degrade into UploadMessage"
+        );
+    }
+
     /// A cross-folder local move while the server *also* returns the
     /// email in remote_emails (unrelated update from another client, or
     /// an initial pull where every email is enumerated). The move
