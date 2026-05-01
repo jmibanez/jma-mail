@@ -70,3 +70,13 @@ pub fn open(path: &Path) -> Result<Connection> {
     info!("State database opened at {}", path.display());
     Ok(conn)
 }
+
+/// Open an in-memory connection with the schema applied. For unit
+/// tests that need a real `rusqlite::Connection` without touching disk.
+#[cfg(test)]
+pub fn open_in_memory() -> Result<Connection> {
+    let conn = Connection::open_in_memory().context("Failed to open in-memory state DB")?;
+    conn.execute_batch(SCHEMA)
+        .context("Failed to initialize in-memory schema")?;
+    Ok(conn)
+}

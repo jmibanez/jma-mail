@@ -57,7 +57,8 @@ pub async fn execute(
         new_mailbox_state: _,
     } = plan;
 
-    let mut adopts = Vec::new();
+    let mut unconditional_adopts = Vec::new();
+    let mut move_pair_adopts = Vec::new();
     let mut downloads = Vec::new();
     let mut local_flags = Vec::new();
     let mut local_moves = Vec::new();
@@ -69,7 +70,18 @@ pub async fn execute(
 
     for action in actions {
         match action {
-            SyncAction::AdoptLocalMessage { .. } => adopts.push(action),
+            // A move-pair adopt mirrors the DB half of a local cross-folder
+            // move and is paired with a MoveRemote in the same plan. Defer
+            // it until after the MoveRemote has actually landed on the
+            // server -- otherwise a per-id MoveRemote failure leaves the
+            // DB advanced to the destination while the server still has
+            // the email at the source, and the next reconcile cycle's
+            // divergence check emits a backwards MoveLocal.
+            SyncAction::AdoptLocalMessage {
+                old_maildir_id: Some(_),
+                ..
+            } => move_pair_adopts.push(action),
+            SyncAction::AdoptLocalMessage { .. } => unconditional_adopts.push(action),
             SyncAction::DownloadMessage { .. } => downloads.push(action),
             SyncAction::UpdateLocalFlags { .. } => local_flags.push(action),
             SyncAction::MoveLocal { .. } => local_moves.push(action),
@@ -81,13 +93,15 @@ pub async fn execute(
         }
     }
 
-    adopt_messages(conn, adopts)?;
+    adopt_messages(conn, unconditional_adopts)?;
     let downloaded = run_downloads(client, conn, downloads, maildir_root, &mut concurrency).await?;
     update_local_flags(conn, local_flags, maildir_root)?;
     move_local_messages(conn, local_moves, maildir_root)?;
     delete_local_messages(conn, local_deletes, maildir_root)?;
     upload_messages(client, conn, uploads).await?;
-    apply_remote_set(client, conn, remote_keywords, remote_moves, remote_destroys).await?;
+    let outcome =
+        apply_remote_set(client, conn, remote_keywords, remote_moves, remote_destroys).await?;
+    apply_move_pair_adopts(conn, move_pair_adopts, &outcome.failed_updates)?;
 
     if let Some(state) = new_email_state {
         queries::set_jmap_state(conn, account_id, "Email", &state)?;
@@ -100,53 +114,89 @@ pub async fn execute(
 /// Bind already-on-server messages to existing local files (DB only).
 fn adopt_messages(conn: &Connection, actions: Vec<SyncAction>) -> Result<()> {
     for action in actions {
-        let SyncAction::AdoptLocalMessage {
-            maildir_id,
-            maildir_folder,
-            jmap_email_id,
-            jmap_blob_id,
-            jmap_thread_id,
-            mailbox_id,
-            keywords,
-            message_id,
-            old_maildir_id,
-        } = action
-        else {
-            continue;
-        };
-        if let Some(old) = old_maildir_id.as_ref() {
-            queries::delete_local_state(conn, old)?;
-        }
-        let flags = keywords_to_flags(&keywords);
-        let keywords_json = serde_json::to_string(&keywords)?;
-        queries::upsert_message(
-            conn,
-            &MessageRecord {
-                jmap_email_id: jmap_email_id.clone(),
-                jmap_blob_id: if jmap_blob_id.is_empty() {
-                    None
-                } else {
-                    Some(jmap_blob_id)
-                },
-                jmap_thread_id: if jmap_thread_id.is_empty() {
-                    None
-                } else {
-                    Some(jmap_thread_id)
-                },
-                mailbox_id,
-                maildir_id: Some(maildir_id.clone()),
-                maildir_folder: Some(maildir_folder.clone()),
-                message_id,
-                flags: flags.clone(),
-                jmap_keywords: keywords_json,
-            },
-        )?;
-        queries::upsert_local_state(conn, &maildir_id, &maildir_folder, &flags, None)?;
-        debug!(
-            "Adopted {}/{} as {}",
-            maildir_folder, maildir_id, jmap_email_id
-        );
+        commit_adopt(conn, action)?;
     }
+    Ok(())
+}
+
+/// Apply the move-pair adopts deferred from `execute()` until after
+/// `apply_remote_set`. Skip any whose paired MoveRemote landed in
+/// `failed_updates`: the server still has the email at the source,
+/// so committing the DB to the destination would diverge the two
+/// sides and produce a backwards MoveLocal next cycle.
+fn apply_move_pair_adopts(
+    conn: &Connection,
+    actions: Vec<SyncAction>,
+    failed_updates: &HashSet<String>,
+) -> Result<()> {
+    for action in actions {
+        let jmap_email_id = match &action {
+            SyncAction::AdoptLocalMessage { jmap_email_id, .. } => jmap_email_id.clone(),
+            _ => continue,
+        };
+        if failed_updates.contains(&jmap_email_id) {
+            warn!(
+                "Skipping move-pair adopt for {}: paired MoveRemote rejected by server. \
+                 DB retains source folder; the move will be re-detected and re-attempted next cycle.",
+                jmap_email_id
+            );
+            continue;
+        }
+        commit_adopt(conn, action)?;
+    }
+    Ok(())
+}
+
+/// DB writes for a single AdoptLocalMessage. Shared between the
+/// up-front adopt phase and the post-remote-set move-pair phase so
+/// both go through the same row-shape and ordering.
+fn commit_adopt(conn: &Connection, action: SyncAction) -> Result<()> {
+    let SyncAction::AdoptLocalMessage {
+        maildir_id,
+        maildir_folder,
+        jmap_email_id,
+        jmap_blob_id,
+        jmap_thread_id,
+        mailbox_id,
+        keywords,
+        message_id,
+        old_maildir_id,
+    } = action
+    else {
+        return Ok(());
+    };
+    if let Some(old) = old_maildir_id.as_ref() {
+        queries::delete_local_state(conn, old)?;
+    }
+    let flags = keywords_to_flags(&keywords);
+    let keywords_json = serde_json::to_string(&keywords)?;
+    queries::upsert_message(
+        conn,
+        &MessageRecord {
+            jmap_email_id: jmap_email_id.clone(),
+            jmap_blob_id: if jmap_blob_id.is_empty() {
+                None
+            } else {
+                Some(jmap_blob_id)
+            },
+            jmap_thread_id: if jmap_thread_id.is_empty() {
+                None
+            } else {
+                Some(jmap_thread_id)
+            },
+            mailbox_id,
+            maildir_id: Some(maildir_id.clone()),
+            maildir_folder: Some(maildir_folder.clone()),
+            message_id,
+            flags: flags.clone(),
+            jmap_keywords: keywords_json,
+        },
+    )?;
+    queries::upsert_local_state(conn, &maildir_id, &maildir_folder, &flags, None)?;
+    debug!(
+        "Adopted {}/{} as {}",
+        maildir_folder, maildir_id, jmap_email_id
+    );
     Ok(())
 }
 
@@ -367,7 +417,7 @@ async fn apply_remote_set(
     keywords: Vec<SyncAction>,
     moves: Vec<SyncAction>,
     destroys: Vec<SyncAction>,
-) -> Result<()> {
+) -> Result<jmap_email::EmailSetOutcome> {
     let mut ops: Vec<EmailSetOp> = Vec::new();
     for action in &keywords {
         if let SyncAction::UpdateRemoteKeywords {
@@ -404,7 +454,7 @@ async fn apply_remote_set(
     }
 
     if ops.is_empty() {
-        return Ok(());
+        return Ok(jmap_email::EmailSetOutcome::default());
     }
 
     let outcome = jmap_email::set_email_batch(client, &ops).await?;
@@ -441,16 +491,26 @@ async fn apply_remote_set(
         info!("Updated remote keywords for {}", jmap_email_id);
     }
 
-    // Mirror moves: nothing to write locally beyond what scan already
-    // recorded; just log.
+    // Mirror moves: log success on the happy path, and warn with full
+    // from/to context on failure so the user can correlate the per-id
+    // notUpdated entry from the JMAP layer with the intended operation.
+    // The paired AdoptLocalMessage is held back in `apply_move_pair_adopts`,
+    // which logs the DB consequence separately.
     for action in moves {
-        if let SyncAction::MoveRemote {
+        let SyncAction::MoveRemote {
             jmap_email_id,
             from_mailbox_id,
             to_mailbox_id,
         } = action
-            && !outcome.failed_updates.contains(&jmap_email_id)
-        {
+        else {
+            continue;
+        };
+        if outcome.failed_updates.contains(&jmap_email_id) {
+            warn!(
+                "MoveRemote {} from {} to {} rejected by server",
+                jmap_email_id, from_mailbox_id, to_mailbox_id
+            );
+        } else {
             info!(
                 "Moved remote {} from {} to {}",
                 jmap_email_id, from_mailbox_id, to_mailbox_id
@@ -478,7 +538,7 @@ async fn apply_remote_set(
         info!("Destroyed remote {}", jmap_email_id);
     }
 
-    Ok(())
+    Ok(outcome)
 }
 
 /// Run all DownloadMessage actions concurrently with the rate-limit
@@ -611,4 +671,119 @@ async fn run_downloads(
     }
 
     Ok(downloaded)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::db;
+    use std::collections::HashMap;
+
+    fn seed_inbox_record(conn: &Connection) {
+        queries::upsert_message(
+            conn,
+            &MessageRecord {
+                jmap_email_id: "E1".into(),
+                jmap_blob_id: Some("B1".into()),
+                jmap_thread_id: Some("T1".into()),
+                mailbox_id: "MB-INBOX".into(),
+                maildir_id: Some("M-OLD".into()),
+                maildir_folder: Some("INBOX".into()),
+                message_id: Some("a@x".into()),
+                flags: "S".into(),
+                jmap_keywords: r#"{"$seen":true}"#.into(),
+            },
+        )
+        .unwrap();
+        queries::upsert_local_state(conn, "M-OLD", "INBOX", "S", None).unwrap();
+    }
+
+    fn move_pair_adopt() -> SyncAction {
+        let mut keywords = HashMap::new();
+        keywords.insert("$seen".to_string(), true);
+        SyncAction::AdoptLocalMessage {
+            maildir_id: "M-NEW".into(),
+            maildir_folder: "Spam".into(),
+            jmap_email_id: "E1".into(),
+            jmap_blob_id: "B1".into(),
+            jmap_thread_id: "T1".into(),
+            mailbox_id: "MB-SPAM".into(),
+            keywords,
+            message_id: Some("a@x".into()),
+            old_maildir_id: Some("M-OLD".into()),
+        }
+    }
+
+    /// When a paired MoveRemote lands in `failed_updates`, the move-pair
+    /// adopt must NOT commit. Otherwise the local DB advances to the
+    /// destination folder while the server still has the email at the
+    /// source, and the next reconcile cycle's mailbox-divergence check
+    /// at handle_known_remote emits a backwards MoveLocal to "fix" the
+    /// phantom drift -- silently undoing the user's local move.
+    #[test]
+    fn move_pair_adopt_skipped_when_move_remote_fails() {
+        let conn = db::open_in_memory().unwrap();
+        seed_inbox_record(&conn);
+
+        let mut failed: HashSet<String> = HashSet::new();
+        failed.insert("E1".to_string());
+
+        apply_move_pair_adopts(&conn, vec![move_pair_adopt()], &failed).unwrap();
+
+        let rec = queries::get_message_by_jmap_id(&conn, "E1")
+            .unwrap()
+            .expect("E1 must still exist in message_map");
+        assert_eq!(
+            rec.maildir_folder.as_deref(),
+            Some("INBOX"),
+            "DB folder must remain INBOX -- server still has it there"
+        );
+        assert_eq!(
+            rec.maildir_id.as_deref(),
+            Some("M-OLD"),
+            "DB maildir_id must remain M-OLD -- the rebind to M-NEW is contingent on MoveRemote success"
+        );
+
+        // local_state for M-OLD must also remain so the next scan
+        // pairs DeletedMessage(INBOX, M-OLD) + NewMessage(Spam, M-NEW)
+        // correctly and the move pre-pass can re-emit the lossless
+        // pair on the retry.
+        let inbox_state = queries::get_local_state_for_folder(&conn, "INBOX").unwrap();
+        assert!(
+            inbox_state.contains_key("M-OLD"),
+            "local_state(INBOX, M-OLD) must remain on a failed adopt"
+        );
+        let spam_state = queries::get_local_state_for_folder(&conn, "Spam").unwrap();
+        assert!(
+            !spam_state.contains_key("M-NEW"),
+            "local_state(Spam, M-NEW) must not exist when adopt was skipped"
+        );
+    }
+
+    /// Happy path counterpart: with no MoveRemote failure, the move-pair
+    /// adopt commits and the DB rebinds to the destination folder /
+    /// maildir_id, dropping the old local_state row.
+    #[test]
+    fn move_pair_adopt_committed_when_move_remote_succeeds() {
+        let conn = db::open_in_memory().unwrap();
+        seed_inbox_record(&conn);
+
+        let failed: HashSet<String> = HashSet::new();
+
+        apply_move_pair_adopts(&conn, vec![move_pair_adopt()], &failed).unwrap();
+
+        let rec = queries::get_message_by_jmap_id(&conn, "E1")
+            .unwrap()
+            .expect("E1 must still exist in message_map");
+        assert_eq!(rec.maildir_folder.as_deref(), Some("Spam"));
+        assert_eq!(rec.maildir_id.as_deref(), Some("M-NEW"));
+
+        let inbox_state = queries::get_local_state_for_folder(&conn, "INBOX").unwrap();
+        assert!(
+            !inbox_state.contains_key("M-OLD"),
+            "old local_state row must be cleaned up after a successful adopt"
+        );
+        let spam_state = queries::get_local_state_for_folder(&conn, "Spam").unwrap();
+        assert!(spam_state.contains_key("M-NEW"));
+    }
 }
