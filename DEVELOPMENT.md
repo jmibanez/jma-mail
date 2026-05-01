@@ -87,6 +87,7 @@ The sync pipeline moves a small set of internal types between phases. Each one l
 
 **Plan types** (`src/sync/plan.rs`). The bridge between `reconcile` and `execute`. Detailed in [`plan.rs`](#plan-rs--the-action-vocabulary) and [`reconcile.rs`](#reconcile-rs--building-the-plan); summarised here for the cast list:
 
+- `LocalId` / `RemoteId` / `BoundId` -- typed message-identity wrappers. Each pairs an opaque id with its optional RFC 5322 `Message-ID` and has a `Display` impl that formats `id (<msg-id>)` when known, falling back to the bare id. `LocalId` carries a `maildir_id`; `RemoteId` carries a `jmap_email_id`; `BoundId` carries both (a message bound on both sides) and exposes `as_local()` / `as_remote()` views. Every `SyncAction` variant takes the identity it actually needs (download takes `RemoteId`, adopt/local-flags/local-move/local-delete take `BoundId`, upload takes `LocalId`, remote-keyword/destroy/move take `RemoteId`), so log lines just `{}` the field instead of formatting the id-pair by hand. The one exception is `AdoptLocalMessage::old_maildir_id`, which stays a bare `Option<String>` because it's a DB-cleanup hint, never logged as identity.
 - `SyncAction` (enum) -- the action vocabulary. Each variant carries every field its handler needs, so execute never re-queries.
 - `SyncPlan` -- `{ actions: Vec<SyncAction>, new_email_state, new_mailbox_state }`. The plan plus the JMAP cursor to commit on success.
 - `SyncDirection` -- `Both | PullOnly | PushOnly`. Top-level mode set by the CLI subcommand.
@@ -119,6 +120,7 @@ The `jmap-client` crate is convenient but a few server behaviors need explicit h
 - **`Email/changes` since `"0"` is not a bootstrap.** Fastmail (and the spec) allows the server to refuse with `cannotCalculateChanges`. Use `jmap::email::get_current_state` (`Email/get` with empty ids) to read the current state after an initial pull instead.
 - **Error matching is on the human-readable string.** `jmap-client` formats errors via `Display` -- substring-match on `"Cannot calculate changes"`, not the JSON name `cannotCalculateChanges`. The recovery path on this error is: write empty string to `jmap_state`, which `queries::get_jmap_state` filters back to `None`, which routes to the initial-pull branch on the next cycle.
 - **Maildir stores bare LF; `Email/import` rejects bare newlines.** `jmap::email::import_email` calls `normalize_crlf` before handing bytes to `email_import`. Don't normalize at maildir read time -- keep on-disk format native so other MUAs work.
+- **`mailbox_id(id, bool)` patches can't remove memberships.** `jmap-client` 0.4.1 types its `mailboxIds` patch map as `bool`, so the only values it can emit are `true` and `false`. Per RFC 8621 §4.1.1 `mailboxIds` is `Id[Boolean]` whose values are always `true`, and per RFC 8620 §5.3 a key is removed by patching its value to `null` -- which the typed-`bool` map cannot serialize. Strict servers (Fastmail) reject the `false`-valued patch as `notUpdated`. For moves, use the full-replacement `mailboxIds(...)` setter instead, which sends the entire target set in one go.
 
 ## Sync internals
 
