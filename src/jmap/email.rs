@@ -6,6 +6,7 @@ use tracing::{debug, info};
 
 use crate::jmap::retry::with_retry;
 use crate::jmap::types::{ChangesResponse, EmailObject};
+use crate::sync::plan::LocalId;
 
 /// Properties we request for Email/get calls.
 fn email_properties() -> Vec<email::Property> {
@@ -288,12 +289,13 @@ fn normalize_crlf(input: &[u8]) -> Vec<u8> {
 }
 
 /// Import a raw email message (RFC 5322) into a mailbox using convenience helper.
-/// `folder_name` is used only for log readability.
+/// `local` and `folder_name` are used only for log readability.
 pub async fn import_email(
     client: &Client,
     raw_message: &[u8],
     mailbox_id: &str,
     folder_name: &str,
+    local: &LocalId,
     keywords: &HashMap<String, bool>,
 ) -> Result<String> {
     let keyword_list: Vec<String> = keywords
@@ -326,8 +328,8 @@ pub async fn import_email(
     let email_id = email.id().unwrap_or_default().to_string();
 
     info!(
-        "Imported email into {} ({}): {}",
-        folder_name, mailbox_id, email_id
+        "Imported email from {} into {} ({}) -> JMAP {}",
+        local, folder_name, mailbox_id, email_id
     );
     Ok(email_id)
 }

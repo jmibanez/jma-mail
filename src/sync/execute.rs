@@ -13,7 +13,7 @@ use crate::jmap::retry::is_transient_error;
 use crate::maildir_ops::{flags::keywords_to_flags, store};
 use crate::state::queries::{self, MessageRecord};
 use crate::sync::engine::SyncOutcome;
-use crate::sync::plan::{SyncAction, SyncPlan};
+use crate::sync::plan::{BoundId, SyncAction, SyncPlan};
 
 /// Resolve effective per-cycle concurrency by clamping the configured
 /// value to the server's advertised maxConcurrentRequests.
@@ -130,15 +130,14 @@ fn apply_move_pair_adopts(
     failed_updates: &HashSet<String>,
 ) -> Result<()> {
     for action in actions {
-        let jmap_email_id = match &action {
-            SyncAction::AdoptLocalMessage { jmap_email_id, .. } => jmap_email_id.clone(),
-            _ => continue,
+        let SyncAction::AdoptLocalMessage { ref id, .. } = action else {
+            continue;
         };
-        if failed_updates.contains(&jmap_email_id) {
+        if failed_updates.contains(&id.jmap_email_id) {
             warn!(
                 "Skipping move-pair adopt for {}: paired MoveRemote rejected by server. \
                  DB retains source folder; the move will be re-detected and re-attempted next cycle.",
-                jmap_email_id
+                id
             );
             continue;
         }
@@ -152,19 +151,22 @@ fn apply_move_pair_adopts(
 /// both go through the same row-shape and ordering.
 fn commit_adopt(conn: &Connection, action: SyncAction) -> Result<()> {
     let SyncAction::AdoptLocalMessage {
-        maildir_id,
+        id,
         maildir_folder,
-        jmap_email_id,
         jmap_blob_id,
         jmap_thread_id,
         mailbox_id,
         keywords,
-        message_id,
         old_maildir_id,
     } = action
     else {
         return Ok(());
     };
+    let BoundId {
+        maildir_id,
+        jmap_email_id,
+        message_id,
+    } = id;
     if let Some(old) = old_maildir_id.as_ref() {
         queries::delete_local_state(conn, old)?;
     }
@@ -207,19 +209,23 @@ fn update_local_flags(
 ) -> Result<()> {
     for action in actions {
         let SyncAction::UpdateLocalFlags {
-            maildir_id,
+            id,
             maildir_folder,
             new_flags,
-            jmap_email_id,
             keywords,
             jmap_blob_id,
             jmap_thread_id,
             mailbox_id,
-            message_id,
         } = action
         else {
             continue;
         };
+        let bound_for_log = id.clone();
+        let BoundId {
+            maildir_id,
+            jmap_email_id,
+            message_id,
+        } = id;
         let maildir_path = maildir_root.join(&maildir_folder);
         let maildir = store::ensure_maildir(&maildir_path)?;
         if let Err(e) = store::set_flags(&maildir, &maildir_id, &new_flags) {
@@ -233,7 +239,7 @@ fn update_local_flags(
         queries::upsert_message(
             conn,
             &MessageRecord {
-                jmap_email_id: jmap_email_id.clone(),
+                jmap_email_id,
                 jmap_blob_id: if jmap_blob_id.is_empty() {
                     None
                 } else {
@@ -253,10 +259,7 @@ fn update_local_flags(
             },
         )?;
         queries::upsert_local_state(conn, &maildir_id, &maildir_folder, &new_flags, None)?;
-        info!(
-            "Updated local flags for {} ({}): '{}'",
-            jmap_email_id, maildir_id, new_flags
-        );
+        info!("Updated local flags for {}: '{}'", bound_for_log, new_flags);
     }
     Ok(())
 }
@@ -268,20 +271,25 @@ fn move_local_messages(
 ) -> Result<()> {
     for action in actions {
         let SyncAction::MoveLocal {
-            maildir_id,
+            id,
             from_folder,
             to_folder,
-            jmap_email_id,
         } = action
         else {
             continue;
         };
+        let bound_for_log = id.clone();
+        let BoundId {
+            maildir_id,
+            jmap_email_id,
+            ..
+        } = id;
         let from = store::ensure_maildir(&maildir_root.join(&from_folder))?;
         let to = store::ensure_maildir(&maildir_root.join(&to_folder))?;
         if let Err(e) = store::move_message(&from, &to, &maildir_id) {
             warn!(
                 "Failed to move {} from {} to {}: {}",
-                maildir_id, from_folder, to_folder, e
+                bound_for_log, from_folder, to_folder, e
             );
             continue;
         }
@@ -299,7 +307,10 @@ fn move_local_messages(
             String::new()
         };
         queries::upsert_local_state(conn, &maildir_id, &to_folder, &flags, None)?;
-        info!("Moved {} from {} to {}", maildir_id, from_folder, to_folder);
+        info!(
+            "Moved {} from {} to {}",
+            bound_for_log, from_folder, to_folder
+        );
     }
     Ok(())
 }
@@ -310,14 +321,15 @@ fn delete_local_messages(
     maildir_root: &Path,
 ) -> Result<()> {
     for action in actions {
-        let SyncAction::DeleteLocal {
-            maildir_id,
-            maildir_folder,
-            jmap_email_id,
-        } = action
-        else {
+        let SyncAction::DeleteLocal { id, maildir_folder } = action else {
             continue;
         };
+        let bound_for_log = id.clone();
+        let BoundId {
+            maildir_id,
+            jmap_email_id,
+            ..
+        } = id;
         let maildir = store::ensure_maildir(&maildir_root.join(&maildir_folder))?;
         if let Err(e) = store::delete_message(&maildir, &maildir_id) {
             debug!(
@@ -327,7 +339,7 @@ fn delete_local_messages(
         }
         queries::delete_local_state(conn, &maildir_id)?;
         queries::delete_message_by_jmap_id(conn, &jmap_email_id)?;
-        info!("Deleted local copy of destroyed {}", jmap_email_id);
+        info!("Deleted local copy of destroyed {}", bound_for_log);
     }
     Ok(())
 }
@@ -339,7 +351,7 @@ async fn upload_messages(
 ) -> Result<()> {
     for action in actions {
         let SyncAction::UploadMessage {
-            maildir_id,
+            id,
             maildir_folder,
             file_path,
             mailbox_id,
@@ -365,6 +377,7 @@ async fn upload_messages(
             &raw_message,
             &mailbox_id,
             &maildir_folder,
+            &id,
             &keywords,
         )
         .await;
@@ -378,18 +391,15 @@ async fn upload_messages(
                         jmap_blob_id: None,
                         jmap_thread_id: None,
                         mailbox_id: mailbox_id.clone(),
-                        maildir_id: Some(maildir_id.clone()),
+                        maildir_id: Some(id.maildir_id.clone()),
                         maildir_folder: Some(maildir_folder.clone()),
-                        message_id: None,
+                        message_id: id.message_id.clone(),
                         flags: flags.clone(),
                         jmap_keywords: keywords_json,
                     },
                 )?;
-                queries::upsert_local_state(conn, &maildir_id, &maildir_folder, &flags, None)?;
-                info!(
-                    "Uploaded local message {} -> JMAP {}",
-                    maildir_id, jmap_email_id
-                );
+                queries::upsert_local_state(conn, &id.maildir_id, &maildir_folder, &flags, None)?;
+                info!("Uploaded local message {} -> JMAP {}", id, jmap_email_id);
             }
             Err(e) => {
                 let s = e.to_string();
@@ -400,7 +410,7 @@ async fn upload_messages(
                     // fail the cycle.
                     warn!(
                         "Upload of {} from {} hit alreadyExists; skipping (consider checking the message's Message-ID header)",
-                        maildir_id, maildir_folder
+                        id, maildir_folder
                     );
                 } else {
                     return Err(e);
@@ -427,36 +437,32 @@ async fn apply_remote_set(
 ) -> Result<jmap_email::EmailSetOutcome> {
     let mut ops: Vec<EmailSetOp> = Vec::new();
     for action in &keywords {
-        if let SyncAction::UpdateRemoteKeywords {
-            jmap_email_id,
-            keywords,
-        } = action
-        {
+        if let SyncAction::UpdateRemoteKeywords { id, keywords } = action {
             ops.push(EmailSetOp::Keywords {
-                email_id: jmap_email_id.clone(),
+                email_id: id.jmap_email_id.clone(),
                 keywords: keywords.clone(),
             });
         }
     }
     for action in &moves {
         if let SyncAction::MoveRemote {
-            jmap_email_id,
+            id,
             from_mailbox_id,
             to_mailbox_id,
             ..
         } = action
         {
             ops.push(EmailSetOp::Move {
-                email_id: jmap_email_id.clone(),
+                email_id: id.jmap_email_id.clone(),
                 from_mailbox_id: from_mailbox_id.clone(),
                 to_mailbox_id: to_mailbox_id.clone(),
             });
         }
     }
     for action in &destroys {
-        if let SyncAction::DestroyRemote { jmap_email_id } = action {
+        if let SyncAction::DestroyRemote { id } = action {
             ops.push(EmailSetOp::Destroy {
-                email_id: jmap_email_id.clone(),
+                email_id: id.jmap_email_id.clone(),
             });
         }
     }
@@ -469,17 +475,13 @@ async fn apply_remote_set(
 
     // Mirror keyword updates into the local DB.
     for action in keywords {
-        let SyncAction::UpdateRemoteKeywords {
-            jmap_email_id,
-            keywords,
-        } = action
-        else {
+        let SyncAction::UpdateRemoteKeywords { id, keywords } = action else {
             continue;
         };
-        if outcome.failed_updates.contains(&jmap_email_id) {
+        if outcome.failed_updates.contains(&id.jmap_email_id) {
             continue;
         }
-        if let Some(rec) = queries::get_message_by_jmap_id(conn, &jmap_email_id)? {
+        if let Some(rec) = queries::get_message_by_jmap_id(conn, &id.jmap_email_id)? {
             let keywords_json = serde_json::to_string(&keywords)?;
             let flags = keywords_to_flags(&keywords);
             let maildir_id = rec.maildir_id.clone();
@@ -496,7 +498,7 @@ async fn apply_remote_set(
                 queries::upsert_local_state(conn, &mid, &folder, &flags, None)?;
             }
         }
-        info!("Updated remote keywords for {}", jmap_email_id);
+        info!("Updated remote keywords for {}", id);
     }
 
     // Mirror moves: log success on the happy path, and warn with full
@@ -506,7 +508,7 @@ async fn apply_remote_set(
     // which logs the DB consequence separately.
     for action in moves {
         let SyncAction::MoveRemote {
-            jmap_email_id,
+            id,
             from_folder,
             to_folder,
             ..
@@ -514,16 +516,13 @@ async fn apply_remote_set(
         else {
             continue;
         };
-        if outcome.failed_updates.contains(&jmap_email_id) {
+        if outcome.failed_updates.contains(&id.jmap_email_id) {
             warn!(
                 "MoveRemote {} from {} to {} rejected by server",
-                jmap_email_id, from_folder, to_folder
+                id, from_folder, to_folder
             );
         } else {
-            info!(
-                "Moved remote {} from {} to {}",
-                jmap_email_id, from_folder, to_folder
-            );
+            info!("Moved remote {} from {} to {}", id, from_folder, to_folder);
         }
     }
 
@@ -532,19 +531,19 @@ async fn apply_remote_set(
     // matching local_state row -- otherwise scan would keep
     // emitting DeletedMessage for the orphan every cycle.
     for action in destroys {
-        let SyncAction::DestroyRemote { jmap_email_id } = action else {
+        let SyncAction::DestroyRemote { id } = action else {
             continue;
         };
-        if outcome.failed_destroys.contains(&jmap_email_id) {
+        if outcome.failed_destroys.contains(&id.jmap_email_id) {
             continue;
         }
-        if let Some(rec) = queries::get_message_by_jmap_id(conn, &jmap_email_id)?
+        if let Some(rec) = queries::get_message_by_jmap_id(conn, &id.jmap_email_id)?
             && let Some(mid) = rec.maildir_id.as_deref()
         {
             queries::delete_local_state(conn, mid)?;
         }
-        queries::delete_message_by_jmap_id(conn, &jmap_email_id)?;
-        info!("Destroyed remote {}", jmap_email_id);
+        queries::delete_message_by_jmap_id(conn, &id.jmap_email_id)?;
+        info!("Destroyed remote {}", id);
     }
 
     Ok(outcome)
@@ -589,8 +588,8 @@ async fn run_downloads(
                 Err(e) => {
                     if is_transient_error(&e) {
                         rate_limited = true;
-                        if let SyncAction::DownloadMessage { jmap_email_id, .. } = &pending[i] {
-                            debug!("Rate-limited downloading email {}: {}", jmap_email_id, e);
+                        if let SyncAction::DownloadMessage { id, .. } = &pending[i] {
+                            debug!("Rate-limited downloading email {}: {}", id, e);
                         }
                     } else if hard_error.is_none() {
                         hard_error = Some(e);
@@ -604,34 +603,30 @@ async fn run_downloads(
 
         for (i, blob) in &succeeded {
             if let SyncAction::DownloadMessage {
-                jmap_email_id,
+                id,
                 jmap_blob_id,
                 jmap_thread_id,
                 mailbox_id,
                 maildir_folder,
                 keywords,
-                message_id,
             } = &pending[*i]
             {
                 let flags = keywords_to_flags(keywords);
                 let maildir_path = maildir_root.join(maildir_folder);
                 let maildir = store::ensure_maildir(&maildir_path)?;
                 let mid = store::store_message(&maildir, blob, &flags)?;
-                info!(
-                    "Downloaded new email {} -> {}/{}",
-                    jmap_email_id, maildir_folder, mid
-                );
+                info!("Downloaded new email {} -> {}/{}", id, maildir_folder, mid);
                 let keywords_json = serde_json::to_string(keywords)?;
                 queries::upsert_message(
                     conn,
                     &MessageRecord {
-                        jmap_email_id: jmap_email_id.clone(),
+                        jmap_email_id: id.jmap_email_id.clone(),
                         jmap_blob_id: Some(jmap_blob_id.clone()),
                         jmap_thread_id: Some(jmap_thread_id.clone()),
                         mailbox_id: mailbox_id.clone(),
                         maildir_id: Some(mid.clone()),
                         maildir_folder: Some(maildir_folder.clone()),
-                        message_id: message_id.clone(),
+                        message_id: id.message_id.clone(),
                         flags: flags.clone(),
                         jmap_keywords: keywords_json,
                     },
@@ -711,14 +706,16 @@ mod tests {
         let mut keywords = HashMap::new();
         keywords.insert("$seen".to_string(), true);
         SyncAction::AdoptLocalMessage {
-            maildir_id: "M-NEW".into(),
+            id: BoundId {
+                maildir_id: "M-NEW".into(),
+                jmap_email_id: "E1".into(),
+                message_id: Some("a@x".into()),
+            },
             maildir_folder: "Spam".into(),
-            jmap_email_id: "E1".into(),
             jmap_blob_id: "B1".into(),
             jmap_thread_id: "T1".into(),
             mailbox_id: "MB-SPAM".into(),
             keywords,
-            message_id: Some("a@x".into()),
             old_maildir_id: Some("M-OLD".into()),
         }
     }

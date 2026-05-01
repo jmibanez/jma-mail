@@ -2,77 +2,138 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 
+/// A message known by its local maildir handle. The optional Message-ID
+/// rides along so logs can name the message in human-readable form.
+#[derive(Debug, Clone)]
+pub struct LocalId {
+    pub maildir_id: String,
+    pub message_id: Option<String>,
+}
+
+/// A message known by its opaque JMAP server id.
+#[derive(Debug, Clone)]
+pub struct RemoteId {
+    pub jmap_email_id: String,
+    pub message_id: Option<String>,
+}
+
+/// A message bound on both sides — same RFC 5322 message known
+/// locally as `maildir_id` and remotely as `jmap_email_id`.
+#[derive(Debug, Clone)]
+pub struct BoundId {
+    pub maildir_id: String,
+    pub jmap_email_id: String,
+    pub message_id: Option<String>,
+}
+
+impl fmt::Display for LocalId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.message_id {
+            Some(m) => write!(f, "{} ({})", self.maildir_id, m),
+            None => write!(f, "{}", self.maildir_id),
+        }
+    }
+}
+
+impl fmt::Display for RemoteId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.message_id {
+            Some(m) => write!(f, "{} ({})", self.jmap_email_id, m),
+            None => write!(f, "{}", self.jmap_email_id),
+        }
+    }
+}
+
+impl fmt::Display for BoundId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.message_id {
+            Some(m) => write!(f, "{}/{} ({})", self.maildir_id, self.jmap_email_id, m),
+            None => write!(f, "{}/{}", self.maildir_id, self.jmap_email_id),
+        }
+    }
+}
+
+impl BoundId {
+    pub fn as_local(&self) -> LocalId {
+        LocalId {
+            maildir_id: self.maildir_id.clone(),
+            message_id: self.message_id.clone(),
+        }
+    }
+    pub fn as_remote(&self) -> RemoteId {
+        RemoteId {
+            jmap_email_id: self.jmap_email_id.clone(),
+            message_id: self.message_id.clone(),
+        }
+    }
+}
+
 /// A single action to perform during sync.
 #[derive(Debug)]
 pub enum SyncAction {
     // Server -> Local
     DownloadMessage {
-        jmap_email_id: String,
+        id: RemoteId,
         jmap_blob_id: String,
         jmap_thread_id: String,
         mailbox_id: String,
         maildir_folder: String,
         keywords: HashMap<String, bool>,
-        message_id: Option<String>,
     },
     UpdateLocalFlags {
-        maildir_id: String,
+        id: BoundId,
         maildir_folder: String,
         new_flags: String,
-        jmap_email_id: String,
         keywords: HashMap<String, bool>,
         jmap_blob_id: String,
         jmap_thread_id: String,
         mailbox_id: String,
-        message_id: Option<String>,
     },
     DeleteLocal {
-        maildir_id: String,
+        id: BoundId,
         maildir_folder: String,
-        jmap_email_id: String,
     },
     MoveLocal {
-        maildir_id: String,
+        id: BoundId,
         from_folder: String,
         to_folder: String,
-        jmap_email_id: String,
     },
 
     /// Bind an existing local file to a known server email (no download,
     /// no upload — pure DB write). Pre-empts the alreadyExists path on
     /// push and the redundant download path on pull.
     AdoptLocalMessage {
-        maildir_id: String,
+        id: BoundId,
         maildir_folder: String,
-        jmap_email_id: String,
         jmap_blob_id: String,
         jmap_thread_id: String,
         mailbox_id: String,
         keywords: HashMap<String, bool>,
-        message_id: Option<String>,
         /// When the adopt rebinds an existing JMAP id from one local
         /// maildir_id to another (cross-folder local move), the old
         /// local_state row needs to be cleaned up so subsequent scans
-        /// don't keep emitting DeletedMessage for it.
+        /// don't keep emitting DeletedMessage for it. Bare String
+        /// (not LocalId) — purely a DB-cleanup hint, never logged as
+        /// identity.
         old_maildir_id: Option<String>,
     },
 
     // Local -> Server
     UploadMessage {
-        maildir_id: String,
+        id: LocalId,
         maildir_folder: String,
         file_path: PathBuf,
         mailbox_id: String,
     },
     UpdateRemoteKeywords {
-        jmap_email_id: String,
+        id: RemoteId,
         keywords: HashMap<String, bool>,
     },
     DestroyRemote {
-        jmap_email_id: String,
+        id: RemoteId,
     },
     MoveRemote {
-        jmap_email_id: String,
+        id: RemoteId,
         from_mailbox_id: String,
         to_mailbox_id: String,
         /// Folder names of `from_mailbox_id` / `to_mailbox_id`, plumbed
@@ -240,66 +301,40 @@ impl fmt::Display for SyncPlan {
         for action in &self.actions {
             match action {
                 SyncAction::DownloadMessage {
-                    jmap_email_id,
-                    maildir_folder,
-                    ..
-                } => writeln!(
-                    f,
-                    "  [PULL]  Download {} -> {}/",
-                    jmap_email_id, maildir_folder
-                )?,
-                SyncAction::UpdateLocalFlags {
-                    maildir_id,
-                    new_flags,
-                    ..
-                } => writeln!(
-                    f,
-                    "  [PULL]  Update flags on {}: '{}'",
-                    maildir_id, new_flags
-                )?,
-                SyncAction::DeleteLocal { maildir_id, .. } => {
-                    writeln!(f, "  [PULL]  Delete local {}", maildir_id)?
+                    id, maildir_folder, ..
+                } => writeln!(f, "  [PULL]  Download {} -> {}/", id, maildir_folder)?,
+                SyncAction::UpdateLocalFlags { id, new_flags, .. } => {
+                    writeln!(f, "  [PULL]  Update flags on {}: '{}'", id, new_flags)?
                 }
+                SyncAction::DeleteLocal { id, .. } => writeln!(f, "  [PULL]  Delete local {}", id)?,
                 SyncAction::MoveLocal {
-                    maildir_id,
+                    id,
                     from_folder,
                     to_folder,
-                    ..
                 } => writeln!(
                     f,
                     "  [PULL]  Move {} from {}/ to {}/",
-                    maildir_id, from_folder, to_folder
+                    id, from_folder, to_folder
                 )?,
                 SyncAction::AdoptLocalMessage {
-                    maildir_id,
-                    maildir_folder,
-                    jmap_email_id,
-                    ..
-                } => writeln!(
-                    f,
-                    "  [BOTH]  Adopt {}/{} as {}",
-                    maildir_folder, maildir_id, jmap_email_id
-                )?,
+                    id, maildir_folder, ..
+                } => writeln!(f, "  [BOTH]  Adopt {}/{}", maildir_folder, id)?,
                 SyncAction::UploadMessage {
-                    maildir_id,
-                    maildir_folder,
-                    ..
-                } => writeln!(f, "  [PUSH] Upload {} from {}/", maildir_id, maildir_folder)?,
-                SyncAction::UpdateRemoteKeywords { jmap_email_id, .. } => {
-                    writeln!(f, "  [PUSH] Update keywords on {}", jmap_email_id)?
+                    id, maildir_folder, ..
+                } => writeln!(f, "  [PUSH] Upload {} from {}/", id, maildir_folder)?,
+                SyncAction::UpdateRemoteKeywords { id, .. } => {
+                    writeln!(f, "  [PUSH] Update keywords on {}", id)?
                 }
-                SyncAction::DestroyRemote { jmap_email_id } => {
-                    writeln!(f, "  [PUSH] Destroy {}", jmap_email_id)?
-                }
+                SyncAction::DestroyRemote { id } => writeln!(f, "  [PUSH] Destroy {}", id)?,
                 SyncAction::MoveRemote {
-                    jmap_email_id,
+                    id,
                     from_folder,
                     to_folder,
                     ..
                 } => writeln!(
                     f,
                     "  [PUSH] Move {} from {}/ to {}/",
-                    jmap_email_id, from_folder, to_folder
+                    id, from_folder, to_folder
                 )?,
             }
         }

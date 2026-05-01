@@ -281,62 +281,46 @@ fn log_dropped(direction: SyncDirection, dropped: &[SyncAction]) {
     for a in dropped {
         match a {
             SyncAction::DownloadMessage {
-                jmap_email_id,
-                maildir_folder,
-                ..
+                id, maildir_folder, ..
             } => warn!(
                 "{:?}: dropped DownloadMessage {} -> {}",
-                direction, jmap_email_id, maildir_folder
+                direction, id, maildir_folder
             ),
-            SyncAction::UpdateLocalFlags {
-                jmap_email_id,
-                maildir_id,
-                new_flags,
-                ..
-            } => warn!(
-                "{:?}: dropped UpdateLocalFlags on {} ({}) -> '{}'",
-                direction, maildir_id, jmap_email_id, new_flags
+            SyncAction::UpdateLocalFlags { id, new_flags, .. } => warn!(
+                "{:?}: dropped UpdateLocalFlags on {} -> '{}'",
+                direction, id, new_flags
             ),
-            SyncAction::DeleteLocal {
-                jmap_email_id,
-                maildir_id,
-                ..
-            } => warn!(
-                "{:?}: dropped DeleteLocal {} ({})",
-                direction, maildir_id, jmap_email_id
-            ),
+            SyncAction::DeleteLocal { id, .. } => {
+                warn!("{:?}: dropped DeleteLocal {}", direction, id)
+            }
             SyncAction::MoveLocal {
-                jmap_email_id,
+                id,
                 from_folder,
                 to_folder,
-                ..
             } => warn!(
                 "{:?}: dropped MoveLocal {} {} -> {}",
-                direction, jmap_email_id, from_folder, to_folder
+                direction, id, from_folder, to_folder
             ),
             SyncAction::UploadMessage {
-                maildir_id,
-                maildir_folder,
-                ..
+                id, maildir_folder, ..
             } => warn!(
                 "{:?}: dropped UploadMessage {} from {}",
-                direction, maildir_id, maildir_folder
+                direction, id, maildir_folder
             ),
-            SyncAction::UpdateRemoteKeywords { jmap_email_id, .. } => warn!(
-                "{:?}: dropped UpdateRemoteKeywords on {}",
-                direction, jmap_email_id
-            ),
-            SyncAction::DestroyRemote { jmap_email_id } => {
-                warn!("{:?}: dropped DestroyRemote {}", direction, jmap_email_id)
+            SyncAction::UpdateRemoteKeywords { id, .. } => {
+                warn!("{:?}: dropped UpdateRemoteKeywords on {}", direction, id)
+            }
+            SyncAction::DestroyRemote { id } => {
+                warn!("{:?}: dropped DestroyRemote {}", direction, id)
             }
             SyncAction::MoveRemote {
-                jmap_email_id,
+                id,
                 from_folder,
                 to_folder,
                 ..
             } => warn!(
                 "{:?}: dropped MoveRemote {} ({} -> {})",
-                direction, jmap_email_id, from_folder, to_folder
+                direction, id, from_folder, to_folder
             ),
             // Adoption is always kept; it never appears here.
             SyncAction::AdoptLocalMessage { .. } => {}
