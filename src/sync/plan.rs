@@ -75,6 +75,11 @@ pub enum SyncAction {
         jmap_email_id: String,
         from_mailbox_id: String,
         to_mailbox_id: String,
+        /// Folder names of `from_mailbox_id` / `to_mailbox_id`, plumbed
+        /// through purely so logs can name folders instead of opaque
+        /// JMAP mailbox ids.
+        from_folder: String,
+        to_folder: String,
     },
 }
 
@@ -288,12 +293,13 @@ impl fmt::Display for SyncPlan {
                 }
                 SyncAction::MoveRemote {
                     jmap_email_id,
-                    from_mailbox_id,
-                    to_mailbox_id,
+                    from_folder,
+                    to_folder,
+                    ..
                 } => writeln!(
                     f,
-                    "  [PUSH] Move {} from {} to {}",
-                    jmap_email_id, from_mailbox_id, to_mailbox_id
+                    "  [PUSH] Move {} from {}/ to {}/",
+                    jmap_email_id, from_folder, to_folder
                 )?,
             }
         }

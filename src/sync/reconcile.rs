@@ -132,6 +132,7 @@ pub fn reconcile(
             to_mailbox_id: dst_mailbox_id,
             old_maildir_id: old_id.clone(),
             new_maildir_id: new_id.clone(),
+            from_folder: src_folder.clone(),
             new_folder: dst_folder.clone(),
             new_flags: new_flags.clone(),
             jmap_blob_id: rec.jmap_blob_id.clone().unwrap_or_default(),
@@ -209,6 +210,7 @@ struct DetectedMove {
     to_mailbox_id: String,
     old_maildir_id: String,
     new_maildir_id: String,
+    from_folder: String,
     new_folder: String,
     new_flags: String,
     jmap_blob_id: String,
@@ -226,6 +228,8 @@ fn emit_detected_moves(moves: &[DetectedMove], plan: &mut SyncPlan) {
             jmap_email_id: m.jmap_email_id.clone(),
             from_mailbox_id: m.from_mailbox_id.clone(),
             to_mailbox_id: m.to_mailbox_id.clone(),
+            from_folder: m.from_folder.clone(),
+            to_folder: m.new_folder.clone(),
         });
         let keywords = flags_to_keywords(&m.new_flags);
         plan.actions.push(SyncAction::AdoptLocalMessage {

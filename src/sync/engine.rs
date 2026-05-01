@@ -254,8 +254,8 @@ async fn initial_remote_state(
 ) -> Result<(Vec<EmailObject>, Vec<String>, String, bool)> {
     let mut all_ids: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    for (mailbox_id, _) in mailboxes {
-        let ids = jmap_email::query_mailbox(client, mailbox_id).await?;
+    for (mailbox_id, folder_name) in mailboxes {
+        let ids = jmap_email::query_mailbox(client, mailbox_id, folder_name).await?;
         for id in ids {
             if seen.insert(id.clone()) {
                 all_ids.push(id);
@@ -329,9 +329,15 @@ fn log_dropped(direction: SyncDirection, dropped: &[SyncAction]) {
             SyncAction::DestroyRemote { jmap_email_id } => {
                 warn!("{:?}: dropped DestroyRemote {}", direction, jmap_email_id)
             }
-            SyncAction::MoveRemote { jmap_email_id, .. } => {
-                warn!("{:?}: dropped MoveRemote {}", direction, jmap_email_id)
-            }
+            SyncAction::MoveRemote {
+                jmap_email_id,
+                from_folder,
+                to_folder,
+                ..
+            } => warn!(
+                "{:?}: dropped MoveRemote {} ({} -> {})",
+                direction, jmap_email_id, from_folder, to_folder
+            ),
             // Adoption is always kept; it never appears here.
             SyncAction::AdoptLocalMessage { .. } => {}
         }

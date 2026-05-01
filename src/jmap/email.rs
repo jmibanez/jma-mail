@@ -46,8 +46,14 @@ pub async fn get_by_ids(client: &Client, ids: &[&str]) -> Result<Vec<EmailObject
     .await
 }
 
-/// Query all email IDs in a mailbox, paginated.
-pub async fn query_mailbox(client: &Client, mailbox_id: &str) -> Result<Vec<String>> {
+/// Query all email IDs in a mailbox, paginated. `folder_name` is used
+/// only for log readability — the JMAP request identifies the mailbox
+/// by `mailbox_id`.
+pub async fn query_mailbox(
+    client: &Client,
+    mailbox_id: &str,
+    folder_name: &str,
+) -> Result<Vec<String>> {
     let mut all_ids = Vec::new();
     let mut position: usize = 0;
     let page_size: usize = 100;
@@ -84,7 +90,8 @@ pub async fn query_mailbox(client: &Client, mailbox_id: &str) -> Result<Vec<Stri
         all_ids.extend(ids);
 
         debug!(
-            "Queried page at position {}: got {} emails (total so far: {})",
+            "Queried {} page at position {}: got {} emails (total so far: {})",
+            folder_name,
             position,
             count,
             all_ids.len()
@@ -98,8 +105,9 @@ pub async fn query_mailbox(client: &Client, mailbox_id: &str) -> Result<Vec<Stri
     }
 
     info!(
-        "Queried {} email IDs from mailbox {}",
+        "Queried {} email IDs from {} ({})",
         all_ids.len(),
+        folder_name,
         mailbox_id
     );
     Ok(all_ids)
@@ -280,10 +288,12 @@ fn normalize_crlf(input: &[u8]) -> Vec<u8> {
 }
 
 /// Import a raw email message (RFC 5322) into a mailbox using convenience helper.
+/// `folder_name` is used only for log readability.
 pub async fn import_email(
     client: &Client,
     raw_message: &[u8],
     mailbox_id: &str,
+    folder_name: &str,
     keywords: &HashMap<String, bool>,
 ) -> Result<String> {
     let keyword_list: Vec<String> = keywords
@@ -315,7 +325,10 @@ pub async fn import_email(
 
     let email_id = email.id().unwrap_or_default().to_string();
 
-    info!("Imported email into mailbox {}: {}", mailbox_id, email_id);
+    info!(
+        "Imported email into {} ({}): {}",
+        folder_name, mailbox_id, email_id
+    );
     Ok(email_id)
 }
 

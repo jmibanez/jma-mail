@@ -360,7 +360,14 @@ async fn upload_messages(
         let flags = crate::maildir_ops::flags::extract_flags(filename).to_string();
         let keywords = crate::maildir_ops::flags::flags_to_keywords(&flags);
 
-        let result = jmap_email::import_email(client, &raw_message, &mailbox_id, &keywords).await;
+        let result = jmap_email::import_email(
+            client,
+            &raw_message,
+            &mailbox_id,
+            &maildir_folder,
+            &keywords,
+        )
+        .await;
         match result {
             Ok(jmap_email_id) => {
                 let keywords_json = serde_json::to_string(&keywords)?;
@@ -436,6 +443,7 @@ async fn apply_remote_set(
             jmap_email_id,
             from_mailbox_id,
             to_mailbox_id,
+            ..
         } = action
         {
             ops.push(EmailSetOp::Move {
@@ -499,8 +507,9 @@ async fn apply_remote_set(
     for action in moves {
         let SyncAction::MoveRemote {
             jmap_email_id,
-            from_mailbox_id,
-            to_mailbox_id,
+            from_folder,
+            to_folder,
+            ..
         } = action
         else {
             continue;
@@ -508,12 +517,12 @@ async fn apply_remote_set(
         if outcome.failed_updates.contains(&jmap_email_id) {
             warn!(
                 "MoveRemote {} from {} to {} rejected by server",
-                jmap_email_id, from_mailbox_id, to_mailbox_id
+                jmap_email_id, from_folder, to_folder
             );
         } else {
             info!(
                 "Moved remote {} from {} to {}",
-                jmap_email_id, from_mailbox_id, to_mailbox_id
+                jmap_email_id, from_folder, to_folder
             );
         }
     }
