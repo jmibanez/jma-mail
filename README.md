@@ -64,10 +64,15 @@ Configuration for `jmapsync` lives in `~/.config/jmapsync/config.toml`. The key 
 
 ### Authentication and Account `[account]`
 
-`jmapsync` currently only supports Bearer tokens, AKA API tokens. On Fastmail, go to **Settings -> Privacy & Security (under Account) -> Manage API tokens** to generate a token. Under the `[account]` settings group, fill in the `token` key  with your API token, then point `session_url` to your provider's JMAP session endpoint.
+`jmapsync` currently only supports Bearer tokens, AKA API tokens. On Fastmail, go to **Settings -> Privacy & Security (under Account) -> Manage API tokens** to generate a token, then provide it to `jmapsync` in one of three ways (checked in this order):
 
-  * `token`: The API token that jmapsync should use. Note this is optional: you can also use the environment variable `JMAPSYNC_TOKEN` if you don't mant to keep your API key in the clear inside a config file.
-  * `session_url`: The JMAP session URL for your provider; `jmapsync` defaults to the Fastmail session URL
+  1. The `JMAPSYNC_TOKEN` environment variable. Best for CI and scripted use.
+  2. The OS-native secret store, via `jmapsync auth set-token`. The token goes into macOS Keychain, Linux Secret Service (D-Bus), or Windows Credential Manager — never on disk in the clear. Recommended for interactive use. Pipe a token in (`pbpaste | jmapsync auth set-token`) or let it prompt. `jmapsync auth clear-token` removes it.
+  3. The `token` key in the `[account]` section of the config file. Plaintext fallback for headless servers (no Keychain, no D-Bus session bus) and CI environments where the env var isn't a fit.
+
+Other `[account]` keys:
+
+  * `session_url`: The JMAP session URL for your provider; `jmapsync` defaults to the Fastmail session URL.
 
 ### Sync `[sync]`
 

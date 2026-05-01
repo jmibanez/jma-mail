@@ -55,6 +55,31 @@ futures-util = "0.3"
 notify = "8"
 notify-debouncer-mini = "0.7"
 
+# OS-native secret storage for the bearer token. The keyring ecosystem
+# split in v4: `keyring-core` is the cross-platform API (Entry, Error,
+# default-store registry); platform backends are separate crates and
+# pulled in via target-cfg, so each OS only compiles its own backend.
+# A backend must be registered via `keyring_core::set_default_store`
+# before any Entry is created — see `src/auth.rs::init_store`.
+keyring-core = "1"
+
+# Hidden TTY prompt for `auth set-token`
+rpassword = "7"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "1", features = ["keychain"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# `crypto-rust` avoids an OpenSSL dep; `vendored` builds D-Bus
+# from source to ease cross-distro use.
+dbus-secret-service-keyring-store = { version = "1", features = [
+    "crypto-rust",
+    "vendored",
+] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-native-keyring-store = "1"
+
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }

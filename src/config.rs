@@ -14,7 +14,10 @@ pub struct Config {
 
 #[derive(Debug, Deserialize)]
 pub struct AccountConfig {
-    /// API token. Falls back to JMAPSYNC_TOKEN env var if not set.
+    /// API token. Lowest-priority fallback after JMAPSYNC_TOKEN and
+    /// the OS keychain (`jmapsync auth set-token`). Kept supported
+    /// indefinitely for headless servers and CI where the keychain
+    /// isn't available.
     pub token: Option<String>,
     /// JMAP session URL. Defaults to Fastmail.
     #[serde(default = "default_session_url")]
@@ -113,14 +116,31 @@ impl Default for WatchConfig {
 }
 
 impl AccountConfig {
-    /// Get the token from config or JMAPSYNC_TOKEN env var.
+    /// Resolve the bearer token. Order of precedence:
+    ///
+    /// 1. `JMAPSYNC_TOKEN` env var — explicit override; wins so CI
+    ///    and scripted use can inject a token without touching
+    ///    config or keychain.
+    /// 2. OS keychain (`jmapsync auth set-token`) — preferred
+    ///    interactive path; the token never lives on disk in the
+    ///    clear.
+    /// 3. `token` field in the config file — back-compat fallback
+    ///    for headless servers and CI where the keychain isn't
+    ///    available. Stays supported indefinitely.
     pub fn token(&self) -> Result<String> {
-        if let Some(ref token) = self.token {
-            Ok(token.clone())
-        } else {
-            std::env::var("JMAPSYNC_TOKEN")
-                .context("No token in config and JMAPSYNC_TOKEN env var not set")
+        if let Ok(t) = std::env::var("JMAPSYNC_TOKEN") {
+            return Ok(t);
         }
+        if let Some(t) = crate::auth::get_bearer_token() {
+            return Ok(t);
+        }
+        if let Some(t) = self.token.as_deref().filter(|s| !s.is_empty()) {
+            return Ok(t.to_string());
+        }
+        Err(anyhow::anyhow!(
+            "no API token: run `jmapsync auth set-token` to store one in your OS keychain, \
+             set the JMAPSYNC_TOKEN env var, or set `token` in the config file"
+        ))
     }
 }
 
@@ -158,8 +178,16 @@ pub fn expand_tilde(path: &Path) -> PathBuf {
 /// Generate a default config file template.
 pub fn default_config_template() -> &'static str {
     r#"[account]
-# API token (app-specific password). Can also use JMAPSYNC_TOKEN env var.
-# Generate at: https://www.fastmail.com/settings/security/tokens
+# API token (app-specific password). Generate at:
+#   https://www.fastmail.com/settings/security/tokens
+#
+# Three ways to provide it, in priority order:
+#   1. JMAPSYNC_TOKEN env var (best for CI / scripted use).
+#   2. OS keychain — run `jmapsync auth set-token` to store the
+#      token in macOS Keychain / Linux Secret Service / Windows
+#      Credential Manager. Recommended for interactive use.
+#   3. The `token` field below — fallback for headless servers
+#      and CI where the keychain isn't available.
 token = ""
 # JMAP session URL (default is Fastmail)
 session_url = "https://api.fastmail.com/jmap/session"

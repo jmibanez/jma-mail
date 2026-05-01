@@ -49,4 +49,18 @@ pub enum Command {
     Status,
     /// List remote mailboxes and their local mapping
     Mailboxes,
+    /// Manage the bearer token stored in the OS keychain
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+pub enum AuthAction {
+    /// Read a bearer token from stdin (hidden prompt on a TTY,
+    /// raw read otherwise) and store it in the OS keychain
+    SetToken,
+    /// Remove the bearer token from the OS keychain
+    ClearToken,
 }

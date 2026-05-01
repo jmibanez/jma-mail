@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use jmapsync::cli::{Cli, Command};
+use jmapsync::cli::{AuthAction, Cli, Command};
 use jmapsync::config::{self, Config};
 use jmapsync::daemon;
 use jmapsync::jmap::session;
@@ -37,7 +37,34 @@ async fn main() -> Result<()> {
         Command::Push => cmd_push(&cli).await,
         Command::Watch => cmd_watch(&cli).await,
         Command::Status => cmd_status(&cli).await,
+        Command::Auth { action } => cmd_auth(action),
     }
+}
+
+fn cmd_auth(action: AuthAction) -> Result<()> {
+    use std::io::{BufRead, IsTerminal};
+    match action {
+        AuthAction::SetToken => {
+            let token = if std::io::stdin().is_terminal() {
+                rpassword::prompt_password("Bearer token: ")
+                    .context("Failed to read token from prompt")?
+            } else {
+                let mut s = String::new();
+                std::io::stdin()
+                    .lock()
+                    .read_line(&mut s)
+                    .context("Failed to read token from stdin")?;
+                s.trim_end_matches(['\n', '\r']).to_string()
+            };
+            jmapsync::auth::set_bearer_token(&token)?;
+            println!("Bearer token saved to keychain.");
+        }
+        AuthAction::ClearToken => {
+            jmapsync::auth::clear_bearer_token()?;
+            println!("Bearer token cleared from keychain.");
+        }
+    }
+    Ok(())
 }
 
 async fn cmd_init(cli: &Cli) -> Result<()> {
