@@ -2,7 +2,7 @@ use anyhow::Result;
 use jmap_client::client::Client;
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::jmap::{email as jmap_email, mailbox as jmap_mailbox, types::EmailObject};
@@ -164,11 +164,18 @@ pub async fn run(
         return Ok(SyncOutcome::default());
     }
 
+    debug!("Plan to execute {}", plan);
+
     // Phase 4: filter by direction; warn on every dropped non-adoption
     // action so the user sees that pull-only / push-only suppressed
     // something they may have wanted.
     let (filtered, dropped) = plan.into_filtered(direction);
     log_dropped(direction, &dropped);
+
+    debug!(
+        "Executing {:?} direction-filtered plan {}",
+        direction, filtered
+    );
 
     // Phase 5: execute.
     let outcome =
