@@ -60,7 +60,7 @@ pub fn reconcile(
         })
         .collect();
 
-    let local_deletes: HashSet<String> = local_changes
+    let mut local_deletes: HashSet<String> = local_changes
         .iter()
         .filter_map(|lc| match lc {
             LocalChange::DeletedMessage { maildir_id, .. } => known_by_maildir
@@ -141,6 +141,18 @@ pub fn reconcile(
         });
         consumed_news.insert(new_id.clone());
         consumed_deletes.insert(rec.jmap_email_id.clone());
+    }
+
+    // A delete that's been paired into a cross-folder move is not a
+    // delete from the server's perspective -- it is the source half of
+    // a MoveRemote we are about to emit. Leaving it in `local_deletes`
+    // would let handle_known_remote interpret a coincident server-side
+    // update on the same id as a delete-vs-update conflict, and under
+    // ServerWins it would re-download into the source folder, undoing
+    // the user's move. Strip the paired ids so only genuine local
+    // deletes can trigger the conflict path.
+    for jid in &consumed_deletes {
+        local_deletes.remove(jid);
     }
 
     let ctx = ReconcileCtx {
@@ -1254,6 +1266,54 @@ mod tests {
             plan.actions
                 .iter()
                 .any(|a| matches!(a, SyncAction::UpdateRemoteKeywords { .. }))
+        );
+    }
+
+    /// A cross-folder local move while the server *also* returns the
+    /// email in remote_emails (unrelated update from another client, or
+    /// an initial pull where every email is enumerated). The move
+    /// pre-pass pairs the delete and the new -- so the delete-vs-update
+    /// conflict path in handle_known_remote must not also fire on the
+    /// same id. Otherwise ServerWins re-downloads into the source
+    /// folder and effectively undoes the user's move.
+    #[test]
+    fn cross_folder_move_with_concurrent_remote_update_does_not_redownload() {
+        let rec = record("E1", "MB-INBOX", "INBOX", Some("M-OLD"), "", Some("<a@x>"));
+        let plan = run(
+            // Server's view still has the email in INBOX (the local
+            // move hasn't been pushed yet).
+            &[email("E1", "MB-INBOX", "S", Some("<a@x>"))],
+            &[],
+            &[
+                LocalChange::DeletedMessage {
+                    maildir_id: "M-OLD".into(),
+                    folder: "INBOX".into(),
+                },
+                LocalChange::NewMessage {
+                    maildir_id: "M-NEW".into(),
+                    folder: "Archive".into(),
+                    flags: "".into(),
+                    path: PathBuf::from("/tmp/m-new"),
+                    message_id: Some("<a@x>".into()),
+                },
+            ],
+            &[rec],
+            &empty_index(),
+            ConflictStrategy::ServerWins,
+        );
+        // The move detection still has to produce its MoveRemote+Adopt.
+        assert!(plan.actions.iter().any(|a| matches!(
+            a,
+            SyncAction::MoveRemote { jmap_email_id, to_mailbox_id, .. }
+                if jmap_email_id == "E1" && to_mailbox_id == "MB-ARCH"
+        )));
+        // And critically: no spurious re-download into the source.
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| matches!(a, SyncAction::DownloadMessage { .. })),
+            "delete-vs-update conflict must not fire for a delete already paired into a move"
         );
     }
 
