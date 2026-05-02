@@ -235,13 +235,13 @@ pub fn upsert_local_state(
 pub fn get_local_state_for_folder(
     conn: &Connection,
     folder: &str,
-) -> Result<HashMap<String, (String, String)>> {
+) -> Result<HashMap<MaildirId, (String, String)>> {
     let mut stmt = conn.prepare(
         "SELECT maildir_id, maildir_folder, flags FROM local_state WHERE maildir_folder = ?1",
     )?;
     let rows = stmt.query_map(params![folder], |row| {
         Ok((
-            row.get::<_, String>(0)?,
+            row.get::<_, MaildirId>(0)?,
             (row.get::<_, String>(1)?, row.get::<_, String>(2)?),
         ))
     })?;

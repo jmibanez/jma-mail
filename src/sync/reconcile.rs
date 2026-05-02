@@ -90,7 +90,7 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
         .iter()
         .filter_map(|lc| match lc {
             LocalChange::FlagsChanged { maildir_id, .. } => known_by_maildir
-                .get(maildir_id.as_str())
+                .get(maildir_id)
                 .map(|m| (m.jmap_email_id.clone(), lc)),
             _ => None,
         })
@@ -100,7 +100,7 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
         .iter()
         .filter_map(|lc| match lc {
             LocalChange::DeletedMessage { maildir_id, .. } => known_by_maildir
-                .get(maildir_id.as_str())
+                .get(maildir_id)
                 .map(|m| m.jmap_email_id.clone()),
             _ => None,
         })
@@ -136,7 +136,7 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
         else {
             continue;
         };
-        let Some(rec) = known_by_maildir.get(old_id.as_str()) else {
+        let Some(rec) = known_by_maildir.get(old_id) else {
             continue;
         };
         let Some(mid) = rec.message_id.as_ref().map(AsRef::as_ref) else {
@@ -165,8 +165,8 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
         detected_moves.push(DetectedMove {
             jmap_email_id: rec.jmap_email_id.clone(),
             to_mailbox_id: dst_mailbox_id.into(),
-            old_maildir_id: old_id.clone().into(),
-            new_maildir_id: new_id.clone().into(),
+            old_maildir_id: old_id.clone(),
+            new_maildir_id: new_id.clone(),
             from_folder: src_folder.clone(),
             new_folder: dst_folder.clone(),
             new_flags: new_flags.clone(),
@@ -175,7 +175,7 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
             message_id: mid.into(),
             prior_flags: rec.flags.clone(),
         });
-        consumed_news.insert(new_id.clone().into());
+        consumed_news.insert(new_id.clone());
         consumed_deletes.insert(rec.jmap_email_id.clone());
     }
 
@@ -573,12 +573,12 @@ fn process_local_changes(
                 path,
                 message_id,
             } => {
-                if consumed_news.contains(maildir_id.as_str()) {
+                if consumed_news.contains(maildir_id) {
                     continue;
                 }
                 handle_local_new(
                     ctx,
-                    maildir_id,
+                    maildir_id.as_ref(),
                     folder,
                     path,
                     message_id.as_ref(),
@@ -590,14 +590,14 @@ fn process_local_changes(
                 maildir_id,
                 new_flags,
                 ..
-            } => handle_local_flags(ctx, maildir_id, new_flags, plan),
+            } => handle_local_flags(ctx, maildir_id.as_ref(), new_flags, plan),
             LocalChange::DeletedMessage { maildir_id, .. } => {
-                if let Some(rec) = ctx.known_by_maildir.get(maildir_id.as_str())
+                if let Some(rec) = ctx.known_by_maildir.get(maildir_id)
                     && consumed_deletes.contains(rec.jmap_email_id.as_ref())
                 {
                     continue;
                 }
-                handle_local_delete(ctx, maildir_id, deletes_overruled_by_server, plan)
+                handle_local_delete(ctx, maildir_id.as_ref(), deletes_overruled_by_server, plan)
             }
         }
     }

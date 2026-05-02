@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use tracing::debug;
 
-use crate::ids::MessageId;
+use crate::ids::{MaildirId, MessageId};
 use crate::maildir_ops::flags::{extract_flags, extract_id};
 use crate::maildir_ops::headers::parse_message_id_from_file;
 
@@ -13,7 +13,7 @@ use crate::maildir_ops::headers::parse_message_id_from_file;
 pub enum LocalChange {
     /// A new message file appeared that we don't have in the DB.
     NewMessage {
-        maildir_id: String,
+        maildir_id: MaildirId,
         folder: String,
         flags: String,
         path: PathBuf,
@@ -24,10 +24,13 @@ pub enum LocalChange {
         message_id: Option<MessageId>,
     },
     /// A message file we had recorded is now missing.
-    DeletedMessage { maildir_id: String, folder: String },
+    DeletedMessage {
+        maildir_id: MaildirId,
+        folder: String,
+    },
     /// The flags on a message file changed.
     FlagsChanged {
-        maildir_id: String,
+        maildir_id: MaildirId,
         folder: String,
         old_flags: String,
         new_flags: String,
@@ -40,8 +43,8 @@ pub enum LocalChange {
 pub fn scan_folder(
     maildir: &Maildir,
     folder_name: &str,
-    known_state: &HashMap<String, (String, String)>,
-) -> Result<(Vec<LocalChange>, Vec<String>)> {
+    known_state: &HashMap<MaildirId, (String, String)>,
+) -> Result<(Vec<LocalChange>, Vec<MaildirId>)> {
     let mut changes = Vec::new();
     let mut seen_ids = Vec::new();
 
@@ -54,7 +57,7 @@ pub fn scan_folder(
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
-        let maildir_id = extract_id(&filename).to_string();
+        let maildir_id: MaildirId = extract_id(&filename).into();
         let flags = extract_flags(&filename).to_string();
 
         seen_ids.push(maildir_id.clone());
@@ -139,7 +142,7 @@ pub fn scan_folder(
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
-        let maildir_id = extract_id(&filename).to_string();
+        let maildir_id: MaildirId = extract_id(&filename).into();
 
         seen_ids.push(maildir_id.clone());
 
@@ -233,7 +236,7 @@ mod tests {
         // DB still believes the file lives in INBOX with the same flags
         // (the MUA didn't change them, only the folder).
         let mut known = HashMap::new();
-        known.insert(unique.to_string(), ("INBOX".to_string(), "FS".to_string()));
+        known.insert(unique.into(), ("INBOX".to_string(), "FS".to_string()));
 
         let (changes, _seen) = scan_folder(&spam, "Spam", &known).unwrap();
 
@@ -250,7 +253,7 @@ mod tests {
                 message_id,
                 ..
             } => {
-                assert_eq!(maildir_id, unique);
+                assert_eq!(maildir_id.as_ref(), unique);
                 assert_eq!(folder, "Spam");
                 assert_eq!(message_id.as_ref().map(AsRef::as_ref), Some("a@x"));
             }
@@ -272,14 +275,14 @@ mod tests {
 
         let unique = "1700000000.M1.host";
         let mut known = HashMap::new();
-        known.insert(unique.to_string(), ("INBOX".to_string(), "FS".to_string()));
+        known.insert(unique.into(), ("INBOX".to_string(), "FS".to_string()));
 
         let (changes, _seen) = scan_folder(&inbox, "INBOX", &known).unwrap();
 
         assert_eq!(changes.len(), 1);
         match &changes[0] {
             LocalChange::DeletedMessage { maildir_id, folder } => {
-                assert_eq!(maildir_id, unique);
+                assert_eq!(maildir_id.as_ref(), unique);
                 assert_eq!(folder, "INBOX");
             }
             other => panic!("expected DeletedMessage on source scan, got {:?}", other),
@@ -301,7 +304,7 @@ mod tests {
         write_message(&inbox_path, "cur", &filename, body);
 
         let mut known = HashMap::new();
-        known.insert(unique.to_string(), ("INBOX".to_string(), "F".to_string()));
+        known.insert(unique.into(), ("INBOX".to_string(), "F".to_string()));
 
         let (changes, _seen) = scan_folder(&inbox, "INBOX", &known).unwrap();
 
@@ -313,7 +316,7 @@ mod tests {
                 new_flags,
                 ..
             } => {
-                assert_eq!(maildir_id, unique);
+                assert_eq!(maildir_id.as_ref(), unique);
                 assert_eq!(old_flags, "F");
                 assert_eq!(new_flags, "FS");
             }
@@ -347,7 +350,7 @@ mod tests {
 
         // DB still believes the file is in INBOX with its old id.
         let mut known = HashMap::new();
-        known.insert(old_id.to_string(), ("INBOX".to_string(), "FS".to_string()));
+        known.insert(old_id.into(), ("INBOX".to_string(), "FS".to_string()));
 
         let (inbox_changes, _) = scan_folder(&inbox, "INBOX", &known).unwrap();
         let (spam_changes, _) = scan_folder(&spam, "Spam", &known).unwrap();
@@ -359,7 +362,7 @@ mod tests {
         );
         match &inbox_changes[0] {
             LocalChange::DeletedMessage { maildir_id, folder } => {
-                assert_eq!(maildir_id, old_id);
+                assert_eq!(maildir_id.as_ref(), old_id);
                 assert_eq!(folder, "INBOX");
             }
             other => panic!("expected DeletedMessage, got {:?}", other),
@@ -373,7 +376,7 @@ mod tests {
                 message_id,
                 ..
             } => {
-                assert_eq!(maildir_id, new_id);
+                assert_eq!(maildir_id.as_ref(), new_id);
                 assert_eq!(folder, "Spam");
                 assert_eq!(message_id.as_ref().map(AsRef::as_ref), Some("a@x"));
             }
@@ -396,7 +399,7 @@ mod tests {
         write_message(&spam_path, "new", unique, body);
 
         let mut known = HashMap::new();
-        known.insert(unique.to_string(), ("INBOX".to_string(), "".to_string()));
+        known.insert(unique.into(), ("INBOX".to_string(), "".to_string()));
 
         let (changes, _seen) = scan_folder(&spam, "Spam", &known).unwrap();
 
@@ -408,7 +411,7 @@ mod tests {
                 message_id,
                 ..
             } => {
-                assert_eq!(maildir_id, unique);
+                assert_eq!(maildir_id.as_ref(), unique);
                 assert_eq!(folder, "Spam");
                 assert_eq!(message_id.as_ref().map(AsRef::as_ref), Some("a@x"));
             }

@@ -22,7 +22,7 @@ struct GroupKey {
 struct Candidate {
     path: PathBuf,
     mtime: SystemTime,
-    maildir_id: String,
+    maildir_id: MaildirId,
 }
 
 /// One entry in the local message-ID index.
@@ -67,7 +67,7 @@ pub fn dedupe_and_index(maildir_root: &Path, folders: &[String]) -> Result<Local
                     continue;
                 }
                 let filename = entry.file_name().to_string_lossy().to_string();
-                let maildir_id = extract_id(&filename).to_string();
+                let maildir_id: MaildirId = extract_id(&filename).into();
 
                 let msgid = match parse_message_id_from_file(&path) {
                     Ok(Some(id)) => id,
@@ -115,7 +115,7 @@ pub fn dedupe_and_index(maildir_root: &Path, folders: &[String]) -> Result<Local
             .or_default()
             .push(LocalEntry {
                 folder: folder.clone(),
-                maildir_id: keep.maildir_id.clone().into(),
+                maildir_id: keep.maildir_id.clone(),
                 path: keep.path.clone(),
             });
 
@@ -123,7 +123,7 @@ pub fn dedupe_and_index(maildir_root: &Path, folders: &[String]) -> Result<Local
             // Same Message-ID, same folder — delete this newer copy via the
             // maildir API so any maildir-level bookkeeping is honored.
             let md = store::ensure_maildir(&maildir_root.join(&folder))?;
-            if let Err(e) = store::delete_message(&md, &dup.maildir_id) {
+            if let Err(e) = store::delete_message(&md, dup.maildir_id.as_ref()) {
                 warn!(
                     "Failed to delete duplicate {} in {}: {}",
                     dup.maildir_id, folder, e
