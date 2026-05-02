@@ -337,14 +337,18 @@ fn process_remote_emails(
             .and_then(|ids| ids.first())
             .cloned();
 
+        let matched = RemoteMatch {
+            email,
+            target_mailbox_id,
+            target_folder,
+        };
+
         // Path 1: already bound by JMAP id -- flag/move updates only.
         if let Some(existing) = ctx.known_by_jmap.get(email.id.as_ref()) {
             handle_known_remote(
                 ctx,
-                email,
+                &matched,
                 existing,
-                target_mailbox_id,
-                target_folder,
                 local_msg_id.as_ref(),
                 deletes_overruled_by_server,
                 plan,
@@ -356,15 +360,7 @@ fn process_remote_emails(
         // (either via DB carry-over from a half-completed prior run, or via
         // the dedupe-pass index after a state DB wipe). Adopt it.
         if let Some(ref mid) = local_msg_id
-            && try_adopt_remote(
-                ctx,
-                email,
-                mid.as_ref(),
-                target_mailbox_id,
-                target_folder,
-                adopted_maildir_ids,
-                plan,
-            )
+            && try_adopt_remote(ctx, &matched, mid.as_ref(), adopted_maildir_ids, plan)
         {
             continue;
         }
@@ -384,16 +380,31 @@ fn process_remote_emails(
     }
 }
 
+/// One iteration's worth of "this remote email maps to that local target":
+/// the email itself plus the chosen mailbox/folder pair. Computed once in
+/// `process_remote_emails` and threaded through both the JMAP-bound and
+/// adopt paths.
+#[derive(Clone, Copy)]
+struct RemoteMatch<'a> {
+    email: &'a EmailObject,
+    target_mailbox_id: &'a str,
+    target_folder: &'a str,
+}
+
 fn handle_known_remote(
     ctx: &ReconcileCtx<'_>,
-    email: &EmailObject,
+    matched: &RemoteMatch<'_>,
     existing: &MessageRecord,
-    target_mailbox_id: &str,
-    target_folder: &str,
     local_msg_id: Option<&MessageId>,
     deletes_overruled_by_server: &mut HashSet<String>,
     plan: &mut SyncPlan,
 ) {
+    let RemoteMatch {
+        email,
+        target_mailbox_id,
+        target_folder,
+    } = *matched;
+
     // Conflict: local deleted the file while the server updated
     // it. Resolve before any flag/move emission, since the local
     // copy is gone either way.
@@ -483,13 +494,17 @@ fn handle_known_remote(
 
 fn try_adopt_remote(
     ctx: &ReconcileCtx<'_>,
-    email: &EmailObject,
+    matched: &RemoteMatch<'_>,
     mid: &str,
-    target_mailbox_id: &str,
-    target_folder: &str,
     adopted_maildir_ids: &mut HashSet<MaildirId>,
     plan: &mut SyncPlan,
 ) -> bool {
+    let RemoteMatch {
+        email,
+        target_mailbox_id,
+        target_folder,
+    } = *matched;
+
     let push_adopt =
         |plan: &mut SyncPlan, adopted: &mut HashSet<MaildirId>, maildir_id: MaildirId| {
             adopted.insert(maildir_id.clone());
