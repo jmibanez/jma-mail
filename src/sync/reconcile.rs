@@ -29,7 +29,7 @@ pub struct MessageRecordIndex {
 /// share a single source of truth for the cycle's data.
 struct ReconcileCtx<'a> {
     remote_emails: &'a [EmailObject],
-    mailboxes: &'a [(String, String)],
+    mailboxes: &'a [(JmapMailboxId, String)],
     strategy: ConflictStrategy,
     known_by_maildir: &'a HashMap<MaildirId, MessageRecord>,
     known_by_jmap: &'a HashMap<JmapEmailId, MessageRecord>,
@@ -60,7 +60,7 @@ pub struct ReconcileInput<'a> {
     pub local_changes: &'a [LocalChange],
     pub known: &'a MessageRecordIndex,
     pub local_index: &'a LocalIndex,
-    pub mailboxes: &'a [(String, String)],
+    pub mailboxes: &'a [(JmapMailboxId, String)],
     pub strategy: ConflictStrategy,
     pub new_email_state: Option<String>,
 }
@@ -164,7 +164,7 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
 
         detected_moves.push(DetectedMove {
             jmap_email_id: rec.jmap_email_id.clone(),
-            to_mailbox_id: dst_mailbox_id.into(),
+            to_mailbox_id: dst_mailbox_id,
             old_maildir_id: old_id.clone(),
             new_maildir_id: new_id.clone(),
             from_folder: src_folder.clone(),
@@ -314,7 +314,7 @@ fn process_remote_emails(
         let mailbox_match = ctx
             .mailboxes
             .iter()
-            .find(|(mid, _)| email.mailbox_ids.contains_key(mid.as_str()));
+            .find(|(mid, _)| email.mailbox_ids.contains_key(mid));
         let Some((target_mailbox_id, target_folder)) = mailbox_match else {
             debug!(
                 "Remote email {} not in any synced mailbox, skipping",
@@ -365,7 +365,7 @@ fn process_remote_emails(
             },
             jmap_blob_id: email.blob_id.clone(),
             jmap_thread_id: email.thread_id.clone(),
-            mailbox_id: target_mailbox_id.clone().into(),
+            mailbox_id: target_mailbox_id.clone(),
             maildir_folder: target_folder.clone(),
             keywords: email.keywords.clone(),
         });
@@ -379,7 +379,7 @@ fn process_remote_emails(
 #[derive(Clone, Copy)]
 struct RemoteMatch<'a> {
     email: &'a EmailObject,
-    target_mailbox_id: &'a str,
+    target_mailbox_id: &'a JmapMailboxId,
     target_folder: &'a str,
 }
 
@@ -415,7 +415,7 @@ fn handle_known_remote(
                     },
                     jmap_blob_id: email.blob_id.clone(),
                     jmap_thread_id: email.thread_id.clone(),
-                    mailbox_id: target_mailbox_id.into(),
+                    mailbox_id: target_mailbox_id.clone(),
                     maildir_folder: target_folder.to_string(),
                     keywords: email.keywords.clone(),
                 });
@@ -508,7 +508,7 @@ fn try_adopt_remote(
                 maildir_folder: target_folder.to_string(),
                 jmap_blob_id: Some(email.blob_id.clone()),
                 jmap_thread_id: Some(email.thread_id.clone()),
-                mailbox_id: target_mailbox_id.into(),
+                mailbox_id: target_mailbox_id.clone(),
                 keywords: email.keywords.clone(),
                 old_maildir_id: None,
             });
@@ -649,7 +649,7 @@ fn handle_local_new(
             maildir_folder: folder.to_string(),
             jmap_blob_id: rec.jmap_blob_id.clone(),
             jmap_thread_id: rec.jmap_thread_id.clone(),
-            mailbox_id: mailbox_id.into(),
+            mailbox_id,
             keywords,
             old_maildir_id: None,
         });
@@ -686,7 +686,7 @@ fn handle_local_new(
         },
         maildir_folder: folder.to_string(),
         file_path: path.to_path_buf(),
-        mailbox_id: mailbox_id.into(),
+        mailbox_id,
     });
 }
 
@@ -804,7 +804,7 @@ fn emit_local_flag_update(
     plan: &mut SyncPlan,
     existing: &MessageRecord,
     email: &EmailObject,
-    target_mailbox_id: &str,
+    target_mailbox_id: &JmapMailboxId,
 ) {
     let (Some(maildir_id), Some(folder)) = (&existing.maildir_id, &existing.maildir_folder) else {
         return;
@@ -827,7 +827,7 @@ fn emit_local_flag_update(
         keywords: email.keywords.clone(),
         jmap_blob_id: email.blob_id.clone(),
         jmap_thread_id: email.thread_id.clone(),
-        mailbox_id: target_mailbox_id.into(),
+        mailbox_id: target_mailbox_id.clone(),
     });
 }
 
@@ -837,7 +837,7 @@ mod tests {
     use crate::maildir_ops::dedupe::{LocalEntry, LocalIndex};
     use std::path::PathBuf;
 
-    fn mailboxes() -> Vec<(String, String)> {
+    fn mailboxes() -> Vec<(JmapMailboxId, String)> {
         vec![
             ("MB-INBOX".into(), "INBOX".into()),
             ("MB-ARCH".into(), "Archive".into()),

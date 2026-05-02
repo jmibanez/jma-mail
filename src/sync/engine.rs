@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
-use crate::ids::{JmapAccountId, JmapEmailId};
+use crate::ids::{JmapAccountId, JmapEmailId, JmapMailboxId};
 use crate::jmap::{email as jmap_email, mailbox as jmap_mailbox, types::EmailObject};
 use crate::maildir_ops::{dedupe, scan, store};
 use crate::state::queries;
@@ -18,7 +18,7 @@ pub async fn resolve_mailboxes(
     client: &Client,
     conn: &Connection,
     config: &Config,
-) -> Result<Vec<(String, String)>> {
+) -> Result<Vec<(JmapMailboxId, String)>> {
     let remote_mailboxes = jmap_mailbox::get_all(client).await?;
 
     let mut synced = Vec::new();
@@ -60,7 +60,7 @@ pub async fn resolve_mailboxes(
         let maildir_path = config.maildir_path().join(&folder_name);
         store::ensure_maildir(&maildir_path)?;
 
-        synced.push((String::from(&mb.id), folder_name));
+        synced.push((mb.id.clone(), folder_name));
     }
 
     info!("Syncing {} mailboxes", synced.len());
@@ -70,7 +70,7 @@ pub async fn resolve_mailboxes(
 /// Build the three message_map projections the reconcile step consumes.
 fn build_known_indices(
     conn: &Connection,
-    mailboxes: &[(String, String)],
+    mailboxes: &[(JmapMailboxId, String)],
 ) -> Result<MessageRecordIndex> {
     let mut idx = MessageRecordIndex::default();
 
@@ -191,7 +191,7 @@ async fn fetch_remote_state(
     client: &Client,
     conn: &Connection,
     account_id: &JmapAccountId,
-    mailboxes: &[(String, String)],
+    mailboxes: &[(JmapMailboxId, String)],
 ) -> Result<(Vec<EmailObject>, Vec<JmapEmailId>, String, bool)> {
     let cursor = queries::get_jmap_state(conn, account_id.as_ref(), "Email")?;
 
@@ -242,12 +242,12 @@ async fn fetch_remote_state(
 
 async fn initial_remote_state(
     client: &Client,
-    mailboxes: &[(String, String)],
+    mailboxes: &[(JmapMailboxId, String)],
 ) -> Result<(Vec<EmailObject>, Vec<JmapEmailId>, String, bool)> {
     let mut all_ids: Vec<JmapEmailId> = Vec::new();
     let mut seen: HashSet<JmapEmailId> = HashSet::new();
     for (mailbox_id, folder_name) in mailboxes {
-        let ids = jmap_email::query_mailbox(client, mailbox_id, folder_name).await?;
+        let ids = jmap_email::query_mailbox(client, mailbox_id.as_ref(), folder_name).await?;
         for id in ids {
             if seen.insert(id.clone()) {
                 all_ids.push(id);
