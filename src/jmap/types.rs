@@ -9,7 +9,7 @@ pub struct EmailObject {
     pub id: JmapEmailId,
     pub blob_id: JmapBlobId,
     pub thread_id: JmapThreadId,
-    pub mailbox_ids: HashMap<String, bool>,
+    pub mailbox_ids: HashMap<JmapMailboxId, bool>,
     pub keywords: HashMap<String, bool>,
     pub message_id: Option<Vec<MessageId>>,
     pub subject: Option<String>,

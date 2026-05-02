@@ -4,7 +4,7 @@ use jmap_client::email;
 use std::collections::HashMap;
 use tracing::{debug, info};
 
-use crate::ids::{JmapBlobId, JmapEmailId, JmapThreadId, MessageId};
+use crate::ids::{JmapBlobId, JmapEmailId, JmapMailboxId, JmapThreadId, MessageId};
 use crate::jmap::retry::with_retry;
 use crate::jmap::types::{ChangesResponse, EmailObject};
 use crate::sync::plan::LocalId;
@@ -372,10 +372,10 @@ fn parse_email_object(email: &jmap_client::email::Email<jmap_client::Get>) -> Em
         .message_id()
         .map(|ids| ids.iter().map(|s| MessageId::from(s.as_str())).collect());
 
-    let mailbox_ids: HashMap<String, bool> = email
+    let mailbox_ids: HashMap<JmapMailboxId, bool> = email
         .mailbox_ids()
         .iter()
-        .map(|id| (id.to_string(), true))
+        .map(|id| (id.to_string().into(), true))
         .collect();
 
     let keywords: HashMap<String, bool> = email

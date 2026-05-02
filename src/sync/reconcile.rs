@@ -303,7 +303,7 @@ fn process_remote_emails(
         let mailbox_match = ctx
             .mailboxes
             .iter()
-            .find(|(mid, _)| email.mailbox_ids.contains_key(mid));
+            .find(|(mid, _)| email.mailbox_ids.contains_key(mid.as_str()));
         let Some((target_mailbox_id, target_folder)) = mailbox_match else {
             debug!(
                 "Remote email {} not in any synced mailbox, skipping",
@@ -832,7 +832,7 @@ mod tests {
 
     fn email(id: &str, mailbox_id: &str, flags: &str, message_id: Option<&str>) -> EmailObject {
         let mut mailbox_ids = HashMap::new();
-        mailbox_ids.insert(mailbox_id.to_string(), true);
+        mailbox_ids.insert(mailbox_id.into(), true);
         EmailObject {
             id: id.into(),
             blob_id: format!("blob-{id}").into(),
