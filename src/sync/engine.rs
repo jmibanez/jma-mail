@@ -10,7 +10,7 @@ use crate::maildir_ops::{dedupe, scan, store};
 use crate::state::queries;
 use crate::sync::execute;
 use crate::sync::plan::{SyncAction, SyncDirection};
-use crate::sync::reconcile::{self, MessageRecordIndex};
+use crate::sync::reconcile::{self, MessageRecordIndex, ReconcileInput};
 
 /// Resolve the list of mailboxes to sync, returning (jmap_id, folder_name) pairs.
 pub async fn resolve_mailboxes(
@@ -134,16 +134,16 @@ pub async fn run(
     // Phase 3: build known indices and reconcile.
     let known = build_known_indices(conn, &mailboxes)?;
 
-    let plan = reconcile::reconcile(
-        &remote_emails,
-        &remote_destroyed,
-        &all_local_changes,
-        &known,
-        &local_index,
-        &mailboxes,
-        config.sync.conflict_strategy,
-        Some(new_state),
-    );
+    let plan = reconcile::reconcile(ReconcileInput {
+        remote_emails: &remote_emails,
+        remote_destroyed: &remote_destroyed,
+        local_changes: &all_local_changes,
+        known: &known,
+        local_index: &local_index,
+        mailboxes: &mailboxes,
+        strategy: config.sync.conflict_strategy,
+        new_email_state: Some(new_state),
+    });
 
     if dry_run {
         print!("{}", plan);

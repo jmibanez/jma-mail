@@ -40,7 +40,9 @@ struct ReconcileCtx<'a> {
     destroyed_set: HashSet<&'a str>,
 }
 
-/// Reconcile remote changes and local changes into a sync plan.
+/// One reconcile cycle's inputs, gathered into a single struct so the
+/// caller -- and the function signature -- doesn't have to thread eight
+/// positional parameters.
 ///
 /// `remote_emails`: Email/get result for the union of created+updated
 /// (initial pull passes the full enumerated set here).
@@ -48,16 +50,33 @@ struct ReconcileCtx<'a> {
 /// `local_changes`: scan output (NewMessage now carries Message-ID).
 /// `known`: bundled indices of message_map for fast lookup.
 /// `local_index`: dedupe-pass index of on-disk Message-IDs.
-pub fn reconcile(
-    remote_emails: &[EmailObject],
-    remote_destroyed: &[String],
-    local_changes: &[LocalChange],
-    known: &MessageRecordIndex,
-    local_index: &LocalIndex,
-    mailboxes: &[(String, String)],
-    strategy: ConflictStrategy,
-    new_email_state: Option<String>,
-) -> SyncPlan {
+/// `mailboxes`: synced (jmap_mailbox_id, folder_name) pairs.
+/// `strategy`: how to break local-vs-remote ties.
+/// `new_email_state`: cursor to stamp into the resulting plan; `None`
+/// for tests that don't care about state advancement.
+pub struct ReconcileInput<'a> {
+    pub remote_emails: &'a [EmailObject],
+    pub remote_destroyed: &'a [String],
+    pub local_changes: &'a [LocalChange],
+    pub known: &'a MessageRecordIndex,
+    pub local_index: &'a LocalIndex,
+    pub mailboxes: &'a [(String, String)],
+    pub strategy: ConflictStrategy,
+    pub new_email_state: Option<String>,
+}
+
+/// Reconcile remote changes and local changes into a sync plan.
+pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
+    let ReconcileInput {
+        remote_emails,
+        remote_destroyed,
+        local_changes,
+        known,
+        local_index,
+        mailboxes,
+        strategy,
+        new_email_state,
+    } = input;
     let known_by_maildir = &known.by_maildir;
     let known_by_jmap = &known.by_jmap;
     let known_by_message_id = &known.by_message_id;
@@ -897,16 +916,17 @@ mod tests {
         strategy: ConflictStrategy,
     ) -> SyncPlan {
         let known = indices(records);
-        reconcile(
+        let mailboxes = mailboxes();
+        reconcile(ReconcileInput {
             remote_emails,
             remote_destroyed,
             local_changes,
-            &known,
+            known: &known,
             local_index,
-            &mailboxes(),
+            mailboxes: &mailboxes,
             strategy,
-            None,
-        )
+            new_email_state: None,
+        })
     }
 
     /// Server has an email we've never seen and no local file matches its
