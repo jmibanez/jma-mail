@@ -90,7 +90,7 @@ pub fn upsert_message(conn: &Connection, msg: &MessageRecord) -> Result<()> {
 /// Look up a message by JMAP email ID.
 pub fn get_message_by_jmap_id(
     conn: &Connection,
-    jmap_email_id: &str,
+    jmap_email_id: &JmapEmailId,
 ) -> Result<Option<MessageRecord>> {
     let mut stmt = conn.prepare(
         "SELECT jmap_email_id, jmap_blob_id, jmap_thread_id, mailbox_id,
@@ -116,7 +116,7 @@ pub fn get_message_by_jmap_id(
 }
 
 /// Delete a message mapping by JMAP email ID.
-pub fn delete_message_by_jmap_id(conn: &Connection, jmap_email_id: &str) -> Result<()> {
+pub fn delete_message_by_jmap_id(conn: &Connection, jmap_email_id: &JmapEmailId) -> Result<()> {
     conn.execute(
         "DELETE FROM message_map WHERE jmap_email_id = ?1",
         params![jmap_email_id],
@@ -213,7 +213,7 @@ pub fn get_all_mailboxes(conn: &Connection) -> Result<Vec<MailboxRecord>> {
 /// Record the local filesystem state of a message.
 pub fn upsert_local_state(
     conn: &Connection,
-    maildir_id: &str,
+    maildir_id: &MaildirId,
     maildir_folder: &str,
     flags: &str,
     mtime: Option<i64>,
@@ -254,7 +254,7 @@ pub fn get_local_state_for_folder(
 }
 
 /// Delete a local state record.
-pub fn delete_local_state(conn: &Connection, maildir_id: &str) -> Result<()> {
+pub fn delete_local_state(conn: &Connection, maildir_id: &MaildirId) -> Result<()> {
     conn.execute(
         "DELETE FROM local_state WHERE maildir_id = ?1",
         params![maildir_id],

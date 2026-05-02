@@ -8,6 +8,7 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
+use crate::ids::MaildirId;
 use crate::jmap::email::{self as jmap_email, EmailSetOp};
 use crate::jmap::retry::is_transient_error;
 use crate::maildir_ops::{flags::keywords_to_flags, store};
@@ -169,7 +170,7 @@ fn commit_adopt(conn: &Connection, action: SyncAction) -> Result<()> {
         message_id,
     } = id;
     if let Some(old) = old_maildir_id.as_ref() {
-        queries::delete_local_state(conn, old)?;
+        queries::delete_local_state(conn, &MaildirId::from(old.as_str()))?;
     }
     let flags = keywords_to_flags(&keywords);
     let keywords_json = serde_json::to_string(&keywords)?;
@@ -195,7 +196,7 @@ fn commit_adopt(conn: &Connection, action: SyncAction) -> Result<()> {
             jmap_keywords: keywords_json,
         },
     )?;
-    queries::upsert_local_state(conn, maildir_id.as_ref(), &maildir_folder, &flags, None)?;
+    queries::upsert_local_state(conn, &maildir_id, &maildir_folder, &flags, None)?;
     debug!(
         "Adopted {}/{} as {}",
         maildir_folder,
@@ -261,7 +262,7 @@ fn update_local_flags(
                 jmap_keywords: keywords_json,
             },
         )?;
-        queries::upsert_local_state(conn, maildir_id.as_ref(), &maildir_folder, &new_flags, None)?;
+        queries::upsert_local_state(conn, &maildir_id, &maildir_folder, &new_flags, None)?;
         info!("Updated local flags for {}: '{}'", bound_for_log, new_flags);
     }
     Ok(())
@@ -296,21 +297,20 @@ fn move_local_messages(
             );
             continue;
         }
-        let flags =
-            if let Some(rec) = queries::get_message_by_jmap_id(conn, jmap_email_id.as_ref())? {
-                let preserved_flags = rec.flags.clone();
-                queries::upsert_message(
-                    conn,
-                    &MessageRecord {
-                        maildir_folder: Some(to_folder.clone()),
-                        ..rec
-                    },
-                )?;
-                preserved_flags
-            } else {
-                String::new()
-            };
-        queries::upsert_local_state(conn, maildir_id.as_ref(), &to_folder, &flags, None)?;
+        let flags = if let Some(rec) = queries::get_message_by_jmap_id(conn, &jmap_email_id)? {
+            let preserved_flags = rec.flags.clone();
+            queries::upsert_message(
+                conn,
+                &MessageRecord {
+                    maildir_folder: Some(to_folder.clone()),
+                    ..rec
+                },
+            )?;
+            preserved_flags
+        } else {
+            String::new()
+        };
+        queries::upsert_local_state(conn, &maildir_id, &to_folder, &flags, None)?;
         info!(
             "Moved {} from {} to {}",
             bound_for_log, from_folder, to_folder
@@ -341,8 +341,8 @@ fn delete_local_messages(
                 maildir_id, e
             );
         }
-        queries::delete_local_state(conn, maildir_id.as_ref())?;
-        queries::delete_message_by_jmap_id(conn, jmap_email_id.as_ref())?;
+        queries::delete_local_state(conn, &maildir_id)?;
+        queries::delete_message_by_jmap_id(conn, &jmap_email_id)?;
         info!("Deleted local copy of destroyed {}", bound_for_log);
     }
     Ok(())
@@ -402,13 +402,7 @@ async fn upload_messages(
                         jmap_keywords: keywords_json,
                     },
                 )?;
-                queries::upsert_local_state(
-                    conn,
-                    id.maildir_id.as_ref(),
-                    &maildir_folder,
-                    &flags,
-                    None,
-                )?;
+                queries::upsert_local_state(conn, &id.maildir_id, &maildir_folder, &flags, None)?;
                 let target = RemoteId {
                     jmap_email_id: jmap_email_id.clone().into(),
                     message_id: id.message_id.clone(),
@@ -493,7 +487,7 @@ async fn apply_remote_set(
         if outcome.failed_updates.contains(id.jmap_email_id.as_ref()) {
             continue;
         }
-        if let Some(rec) = queries::get_message_by_jmap_id(conn, id.jmap_email_id.as_ref())? {
+        if let Some(rec) = queries::get_message_by_jmap_id(conn, &id.jmap_email_id)? {
             let keywords_json = serde_json::to_string(&keywords)?;
             let flags = keywords_to_flags(&keywords);
             let maildir_id = rec.maildir_id.clone();
@@ -507,7 +501,7 @@ async fn apply_remote_set(
                 },
             )?;
             if let (Some(mid), Some(folder)) = (maildir_id, maildir_folder) {
-                queries::upsert_local_state(conn, mid.as_ref(), &folder, &flags, None)?;
+                queries::upsert_local_state(conn, &mid, &folder, &flags, None)?;
             }
         }
         info!("Updated remote keywords for {}", id);
@@ -549,12 +543,12 @@ async fn apply_remote_set(
         if outcome.failed_destroys.contains(id.jmap_email_id.as_ref()) {
             continue;
         }
-        if let Some(rec) = queries::get_message_by_jmap_id(conn, id.jmap_email_id.as_ref())?
+        if let Some(rec) = queries::get_message_by_jmap_id(conn, &id.jmap_email_id)?
             && let Some(mid) = rec.maildir_id.as_ref()
         {
-            queries::delete_local_state(conn, mid.as_ref())?;
+            queries::delete_local_state(conn, mid)?;
         }
-        queries::delete_message_by_jmap_id(conn, id.jmap_email_id.as_ref())?;
+        queries::delete_message_by_jmap_id(conn, &id.jmap_email_id)?;
         info!("Destroyed remote {}", id);
     }
 
@@ -626,7 +620,7 @@ async fn run_downloads(
                 let flags = keywords_to_flags(keywords);
                 let maildir_path = maildir_root.join(maildir_folder);
                 let maildir = store::ensure_maildir(&maildir_path)?;
-                let mid = store::store_message(&maildir, blob, &flags)?;
+                let mid: MaildirId = store::store_message(&maildir, blob, &flags)?.into();
                 info!("Downloaded new email {} -> {}/{}", id, maildir_folder, mid);
                 let keywords_json = serde_json::to_string(keywords)?;
                 queries::upsert_message(
@@ -692,6 +686,7 @@ async fn run_downloads(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ids::JmapEmailId;
     use crate::state::db;
     use std::collections::HashMap;
 
@@ -711,7 +706,7 @@ mod tests {
             },
         )
         .unwrap();
-        queries::upsert_local_state(conn, "M-OLD", "INBOX", "S", None).unwrap();
+        queries::upsert_local_state(conn, &MaildirId::from("M-OLD"), "INBOX", "S", None).unwrap();
     }
 
     fn move_pair_adopt() -> SyncAction {
@@ -748,7 +743,7 @@ mod tests {
 
         apply_move_pair_adopts(&conn, vec![move_pair_adopt()], &failed).unwrap();
 
-        let rec = queries::get_message_by_jmap_id(&conn, "E1")
+        let rec = queries::get_message_by_jmap_id(&conn, &JmapEmailId::from("E1"))
             .unwrap()
             .expect("E1 must still exist in message_map");
         assert_eq!(
@@ -790,7 +785,7 @@ mod tests {
 
         apply_move_pair_adopts(&conn, vec![move_pair_adopt()], &failed).unwrap();
 
-        let rec = queries::get_message_by_jmap_id(&conn, "E1")
+        let rec = queries::get_message_by_jmap_id(&conn, &JmapEmailId::from("E1"))
             .unwrap()
             .expect("E1 must still exist in message_map");
         assert_eq!(rec.maildir_folder.as_deref(), Some("Spam"));
