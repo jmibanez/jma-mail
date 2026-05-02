@@ -8,7 +8,7 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
-use crate::ids::{JmapAccountId, MaildirId};
+use crate::ids::{JmapAccountId, JmapEmailId, MaildirId};
 use crate::jmap::email::{self as jmap_email, EmailSetOp};
 use crate::jmap::retry::is_transient_error;
 use crate::maildir_ops::{flags::keywords_to_flags, store};
@@ -128,13 +128,13 @@ fn adopt_messages(conn: &Connection, actions: Vec<SyncAction>) -> Result<()> {
 fn apply_move_pair_adopts(
     conn: &Connection,
     actions: Vec<SyncAction>,
-    failed_updates: &HashSet<String>,
+    failed_updates: &HashSet<JmapEmailId>,
 ) -> Result<()> {
     for action in actions {
         let SyncAction::AdoptLocalMessage { ref id, .. } = action else {
             continue;
         };
-        if failed_updates.contains(id.jmap_email_id.as_ref()) {
+        if failed_updates.contains(&id.jmap_email_id) {
             warn!(
                 "Skipping move-pair adopt for {}: paired MoveRemote rejected by server. \
                  DB retains source folder; the move will be re-detected and re-attempted next cycle.",
@@ -375,7 +375,7 @@ async fn upload_messages(
                 queries::upsert_message(
                     conn,
                     &MessageRecord {
-                        jmap_email_id: jmap_email_id.clone().into(),
+                        jmap_email_id: jmap_email_id.clone(),
                         jmap_blob_id: None,
                         jmap_thread_id: None,
                         mailbox_id: mailbox_id.clone(),
@@ -388,7 +388,7 @@ async fn upload_messages(
                 )?;
                 queries::upsert_local_state(conn, &id.maildir_id, &maildir_folder, &flags, None)?;
                 let target = RemoteId {
-                    jmap_email_id: jmap_email_id.clone().into(),
+                    jmap_email_id,
                     message_id: id.message_id.clone(),
                 };
                 info!("Uploaded local message {} -> {}", id.maildir_id, target);
@@ -431,7 +431,7 @@ async fn apply_remote_set(
     for action in &keywords {
         if let SyncAction::UpdateRemoteKeywords { id, keywords } = action {
             ops.push(EmailSetOp::Keywords {
-                email_id: String::from(&id.jmap_email_id),
+                email_id: id.jmap_email_id.clone(),
                 keywords: keywords.clone(),
             });
         }
@@ -444,15 +444,15 @@ async fn apply_remote_set(
         } = action
         {
             ops.push(EmailSetOp::SetMailboxes {
-                email_id: String::from(&id.jmap_email_id),
-                target_mailbox_ids: target_mailbox_ids.iter().map(String::from).collect(),
+                email_id: id.jmap_email_id.clone(),
+                target_mailbox_ids: target_mailbox_ids.clone(),
             });
         }
     }
     for action in &destroys {
         if let SyncAction::DestroyRemote { id } = action {
             ops.push(EmailSetOp::Destroy {
-                email_id: String::from(&id.jmap_email_id),
+                email_id: id.jmap_email_id.clone(),
             });
         }
     }
@@ -468,7 +468,7 @@ async fn apply_remote_set(
         let SyncAction::UpdateRemoteKeywords { id, keywords } = action else {
             continue;
         };
-        if outcome.failed_updates.contains(id.jmap_email_id.as_ref()) {
+        if outcome.failed_updates.contains(&id.jmap_email_id) {
             continue;
         }
         if let Some(rec) = queries::get_message_by_jmap_id(conn, &id.jmap_email_id)? {
@@ -506,7 +506,7 @@ async fn apply_remote_set(
         else {
             continue;
         };
-        if outcome.failed_updates.contains(id.jmap_email_id.as_ref()) {
+        if outcome.failed_updates.contains(&id.jmap_email_id) {
             warn!(
                 "MoveRemote {} from {} to {} rejected by server",
                 id, from_folder, to_folder
@@ -524,7 +524,7 @@ async fn apply_remote_set(
         let SyncAction::DestroyRemote { id } = action else {
             continue;
         };
-        if outcome.failed_destroys.contains(id.jmap_email_id.as_ref()) {
+        if outcome.failed_destroys.contains(&id.jmap_email_id) {
             continue;
         }
         if let Some(rec) = queries::get_message_by_jmap_id(conn, &id.jmap_email_id)?
@@ -562,7 +562,7 @@ async fn run_downloads(
                 _ => unreachable!("non-download in downloads bucket"),
             };
             async move {
-                let res = jmap_email::download_blob(client, blob_id.as_ref()).await;
+                let res = jmap_email::download_blob(client, &blob_id).await;
                 (i, res)
             }
         });
@@ -722,8 +722,8 @@ mod tests {
         let conn = db::open_in_memory().unwrap();
         seed_inbox_record(&conn);
 
-        let mut failed: HashSet<String> = HashSet::new();
-        failed.insert("E1".to_string());
+        let mut failed: HashSet<JmapEmailId> = HashSet::new();
+        failed.insert(JmapEmailId::from("E1"));
 
         apply_move_pair_adopts(&conn, vec![move_pair_adopt()], &failed).unwrap();
 
@@ -765,7 +765,7 @@ mod tests {
         let conn = db::open_in_memory().unwrap();
         seed_inbox_record(&conn);
 
-        let failed: HashSet<String> = HashSet::new();
+        let failed: HashSet<JmapEmailId> = HashSet::new();
 
         apply_move_pair_adopts(&conn, vec![move_pair_adopt()], &failed).unwrap();
 

@@ -56,7 +56,7 @@ struct ReconcileCtx<'a> {
 /// for tests that don't care about state advancement.
 pub struct ReconcileInput<'a> {
     pub remote_emails: &'a [EmailObject],
-    pub remote_destroyed: &'a [String],
+    pub remote_destroyed: &'a [JmapEmailId],
     pub local_changes: &'a [LocalChange],
     pub known: &'a MessageRecordIndex,
     pub local_index: &'a LocalIndex,
@@ -106,7 +106,7 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
         })
         .collect();
 
-    let destroyed_set: HashSet<&str> = remote_destroyed.iter().map(|s| s.as_str()).collect();
+    let destroyed_set: HashSet<&str> = remote_destroyed.iter().map(JmapEmailId::as_ref).collect();
 
     // Cross-folder local move detection: scan emits a paired
     // DeletedMessage(src) + NewMessage(dst) for a user-driven move.
@@ -534,18 +534,18 @@ fn try_adopt_remote(
 }
 
 fn process_remote_destroys(
-    remote_destroyed: &[String],
+    remote_destroyed: &[JmapEmailId],
     known_by_jmap: &HashMap<JmapEmailId, MessageRecord>,
     plan: &mut SyncPlan,
 ) {
     for jmap_id in remote_destroyed {
-        if let Some(msg) = known_by_jmap.get(jmap_id.as_str())
+        if let Some(msg) = known_by_jmap.get(jmap_id)
             && let (Some(maildir_id), Some(folder)) = (&msg.maildir_id, &msg.maildir_folder)
         {
             plan.actions.push(SyncAction::DeleteLocal {
                 id: BoundId {
                     maildir_id: maildir_id.clone(),
-                    jmap_email_id: jmap_id.clone().into(),
+                    jmap_email_id: jmap_id.clone(),
                     message_id: msg.message_id.clone(),
                 },
                 maildir_folder: folder.clone(),
@@ -904,7 +904,7 @@ mod tests {
 
     fn run(
         remote_emails: &[EmailObject],
-        remote_destroyed: &[String],
+        remote_destroyed: &[JmapEmailId],
         local_changes: &[LocalChange],
         records: &[MessageRecord],
         local_index: &LocalIndex,

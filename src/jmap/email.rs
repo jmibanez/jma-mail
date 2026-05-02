@@ -22,11 +22,11 @@ fn email_properties() -> Vec<email::Property> {
 }
 
 /// Fetch emails by IDs using the request builder.
-pub async fn get_by_ids(client: &Client, ids: &[&str]) -> Result<Vec<EmailObject>> {
+pub async fn get_by_ids(client: &Client, ids: &[JmapEmailId]) -> Result<Vec<EmailObject>> {
     with_retry("Email/get", || async {
         let mut request = client.build();
         let get_request = request.get_email().account_id(client.default_account_id());
-        get_request.ids(ids.iter().map(|s| s.to_string()));
+        get_request.ids(ids.iter().map(String::from));
         get_request.properties(email_properties());
 
         let response = request
@@ -55,13 +55,13 @@ pub async fn query_mailbox(
     client: &Client,
     mailbox_id: &str,
     folder_name: &str,
-) -> Result<Vec<String>> {
+) -> Result<Vec<JmapEmailId>> {
     let mut all_ids = Vec::new();
     let mut position: usize = 0;
     let page_size: usize = 100;
 
     loop {
-        let ids: Vec<String> = with_retry("Email/query", || async {
+        let ids: Vec<JmapEmailId> = with_retry("Email/query", || async {
             let mut request = client.build();
             let query = request
                 .query_email()
@@ -85,7 +85,11 @@ pub async fn query_mailbox(
                 .unwrap_query_email()
                 .map_err(|e| anyhow::anyhow!("Failed to parse email query response: {}", e))?;
 
-            Ok(result.ids().iter().map(|id| id.to_string()).collect())
+            Ok(result
+                .ids()
+                .iter()
+                .map(|id| JmapEmailId::from(id.as_str()))
+                .collect())
         })
         .await?;
         let count = ids.len();
@@ -193,7 +197,7 @@ pub async fn get_changes(client: &Client, since_state: &str) -> Result<ChangesRe
 pub enum EmailSetOp {
     /// Patch keywords on an email. Map is `keyword -> set?`.
     Keywords {
-        email_id: String,
+        email_id: JmapEmailId,
         keywords: HashMap<String, bool>,
     },
     /// Replace the email's full mailbox-id set. The caller computes
@@ -201,11 +205,11 @@ pub enum EmailSetOp {
     /// `mailboxIds` update. Used both for cross-mailbox moves and
     /// (in principle) any other membership change.
     SetMailboxes {
-        email_id: String,
-        target_mailbox_ids: Vec<String>,
+        email_id: JmapEmailId,
+        target_mailbox_ids: Vec<JmapMailboxId>,
     },
     /// Destroy an email by id.
-    Destroy { email_id: String },
+    Destroy { email_id: JmapEmailId },
 }
 
 /// Outcome of `set_email_batch`. The two `failed_*` sets contain ids
@@ -213,8 +217,8 @@ pub enum EmailSetOp {
 /// should suppress DB mirror for those ids.
 #[derive(Debug, Default)]
 pub struct EmailSetOutcome {
-    pub failed_updates: std::collections::HashSet<String>,
-    pub failed_destroys: std::collections::HashSet<String>,
+    pub failed_updates: std::collections::HashSet<JmapEmailId>,
+    pub failed_destroys: std::collections::HashSet<JmapEmailId>,
 }
 
 /// Apply a batch of Email/set operations in a single JMAP method call.
@@ -246,7 +250,7 @@ pub async fn set_email_batch(client: &Client, ops: &[EmailSetOp]) -> Result<Emai
             for op in ops {
                 match op {
                     EmailSetOp::Keywords { email_id, keywords } => {
-                        let upd = set.update(email_id);
+                        let upd = set.update(email_id.as_ref());
                         for (kw, val) in keywords {
                             upd.keyword(kw, *val);
                         }
@@ -255,10 +259,11 @@ pub async fn set_email_batch(client: &Client, ops: &[EmailSetOp]) -> Result<Emai
                         email_id,
                         target_mailbox_ids,
                     } => {
-                        set.update(email_id).mailbox_ids(target_mailbox_ids.clone());
+                        set.update(email_id.as_ref())
+                            .mailbox_ids(target_mailbox_ids.iter());
                     }
                     EmailSetOp::Destroy { email_id } => {
-                        set.destroy([email_id.as_str()]);
+                        set.destroy([email_id.as_ref()]);
                     }
                 }
             }
@@ -273,13 +278,13 @@ pub async fn set_email_batch(client: &Client, ops: &[EmailSetOp]) -> Result<Emai
         if let Some(not_updated) = response.not_updated_ids() {
             for id in not_updated {
                 tracing::warn!("Email/set batch: notUpdated {}", id);
-                outcome.failed_updates.insert(id.clone());
+                outcome.failed_updates.insert(id.as_str().into());
             }
         }
         if let Some(not_destroyed) = response.not_destroyed_ids() {
             for id in not_destroyed {
                 tracing::warn!("Email/set batch: notDestroyed {}", id);
-                outcome.failed_destroys.insert(id.clone());
+                outcome.failed_destroys.insert(id.as_str().into());
             }
         }
 
@@ -316,7 +321,7 @@ pub async fn import_email(
     folder_name: &str,
     local: &LocalId,
     keywords: &HashMap<String, bool>,
-) -> Result<String> {
+) -> Result<JmapEmailId> {
     let keyword_list: Vec<String> = keywords
         .iter()
         .filter(|(_, v)| **v)
@@ -344,7 +349,7 @@ pub async fn import_email(
     })
     .await?;
 
-    let email_id = email.id().unwrap_or_default().to_string();
+    let email_id = JmapEmailId::from(email.id().unwrap_or_default());
 
     info!(
         "Imported email from {} into {} ({}) -> JMAP {}",
@@ -354,9 +359,9 @@ pub async fn import_email(
 }
 
 /// Download the raw blob of an email.
-pub async fn download_blob(client: &Client, blob_id: &str) -> Result<Vec<u8>> {
+pub async fn download_blob(client: &Client, blob_id: &JmapBlobId) -> Result<Vec<u8>> {
     let data = client
-        .download(blob_id)
+        .download(blob_id.as_ref())
         .await
         .map_err(|e| anyhow::anyhow!("Failed to download blob {}: {}", blob_id, e))?;
 

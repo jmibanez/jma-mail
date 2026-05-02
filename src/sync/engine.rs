@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
-use crate::ids::JmapAccountId;
+use crate::ids::{JmapAccountId, JmapEmailId};
 use crate::jmap::{email as jmap_email, mailbox as jmap_mailbox, types::EmailObject};
 use crate::maildir_ops::{dedupe, scan, store};
 use crate::state::queries;
@@ -192,22 +192,22 @@ async fn fetch_remote_state(
     conn: &Connection,
     account_id: &JmapAccountId,
     mailboxes: &[(String, String)],
-) -> Result<(Vec<EmailObject>, Vec<String>, String, bool)> {
+) -> Result<(Vec<EmailObject>, Vec<JmapEmailId>, String, bool)> {
     let cursor = queries::get_jmap_state(conn, account_id.as_ref(), "Email")?;
 
     if let Some(state) = cursor {
         let mut current = state;
-        let mut all_created: Vec<String> = Vec::new();
-        let mut all_updated: Vec<String> = Vec::new();
-        let mut all_destroyed: Vec<String> = Vec::new();
+        let mut all_created: Vec<JmapEmailId> = Vec::new();
+        let mut all_updated: Vec<JmapEmailId> = Vec::new();
+        let mut all_destroyed: Vec<JmapEmailId> = Vec::new();
 
         let final_state = loop {
             let res = jmap_email::get_changes(client, &current).await;
             match res {
                 Ok(changes) => {
-                    all_created.extend(changes.created.iter().map(String::from));
-                    all_updated.extend(changes.updated.iter().map(String::from));
-                    all_destroyed.extend(changes.destroyed.iter().map(String::from));
+                    all_created.extend(changes.created);
+                    all_updated.extend(changes.updated);
+                    all_destroyed.extend(changes.destroyed);
                     let next = changes.new_state.clone();
                     if !changes.has_more_changes {
                         break next;
@@ -226,8 +226,8 @@ async fn fetch_remote_state(
             }
         };
 
-        let mut seen: HashSet<String> = all_created.iter().cloned().collect();
-        let mut fetch_ids: Vec<String> = all_created;
+        let mut seen: HashSet<JmapEmailId> = all_created.iter().cloned().collect();
+        let mut fetch_ids: Vec<JmapEmailId> = all_created;
         for u in all_updated {
             if seen.insert(u.clone()) {
                 fetch_ids.push(u);
@@ -243,9 +243,9 @@ async fn fetch_remote_state(
 async fn initial_remote_state(
     client: &Client,
     mailboxes: &[(String, String)],
-) -> Result<(Vec<EmailObject>, Vec<String>, String, bool)> {
-    let mut all_ids: Vec<String> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
+) -> Result<(Vec<EmailObject>, Vec<JmapEmailId>, String, bool)> {
+    let mut all_ids: Vec<JmapEmailId> = Vec::new();
+    let mut seen: HashSet<JmapEmailId> = HashSet::new();
     for (mailbox_id, folder_name) in mailboxes {
         let ids = jmap_email::query_mailbox(client, mailbox_id, folder_name).await?;
         for id in ids {
@@ -259,11 +259,10 @@ async fn initial_remote_state(
     Ok((emails, Vec::new(), state, true))
 }
 
-async fn batched_get(client: &Client, ids: &[String]) -> Result<Vec<EmailObject>> {
+async fn batched_get(client: &Client, ids: &[JmapEmailId]) -> Result<Vec<EmailObject>> {
     let mut out: Vec<EmailObject> = Vec::new();
     for chunk in ids.chunks(50) {
-        let id_refs: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
-        let batch = jmap_email::get_by_ids(client, &id_refs).await?;
+        let batch = jmap_email::get_by_ids(client, chunk).await?;
         out.extend(batch);
     }
     Ok(out)
