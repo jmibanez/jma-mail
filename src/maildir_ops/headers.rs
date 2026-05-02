@@ -88,10 +88,10 @@ fn header_name_matches(line: &[u8], name: &[u8]) -> bool {
 
 fn extract_msgid_value(value: &[u8]) -> Option<String> {
     let s = std::str::from_utf8(value).ok()?.trim();
-    if let (Some(lt), Some(gt)) = (s.find('<'), s.rfind('>')) {
-        if gt > lt {
-            return Some(s[lt + 1..gt].to_string());
-        }
+    if let (Some(lt), Some(gt)) = (s.find('<'), s.rfind('>'))
+        && gt > lt
+    {
+        return Some(s[lt + 1..gt].to_string());
     }
     if s.is_empty() {
         None

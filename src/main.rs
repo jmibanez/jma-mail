@@ -144,7 +144,7 @@ async fn cmd_mailboxes(cli: &Cli) -> Result<()> {
 
     let mailboxes = jmapsync::jmap::mailbox::get_all(&client).await?;
 
-    println!("{:<40} {:>8} {:>8}  {}", "Name", "Total", "Unread", "Role");
+    println!("{:<40} {:>8} {:>8}  Role", "Name", "Total", "Unread");
     println!("{}", "-".repeat(70));
     for mb in &mailboxes {
         let synced = if jmapsync::jmap::mailbox::is_mailbox_synced(

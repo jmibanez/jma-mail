@@ -7,7 +7,6 @@ use std::collections::HashMap;
 ///
 /// JMAP keywords:
 ///   $draft, $flagged, $answered, $seen, $deleted (and others)
-
 const FLAG_MAPPINGS: &[(&str, char)] = &[
     ("$draft", 'D'),
     ("$flagged", 'F'),

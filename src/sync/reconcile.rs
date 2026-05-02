@@ -46,8 +46,10 @@ pub fn reconcile(
     strategy: ConflictStrategy,
     new_email_state: Option<String>,
 ) -> SyncPlan {
-    let mut plan = SyncPlan::new();
-    plan.new_email_state = new_email_state;
+    let mut plan = SyncPlan {
+        new_email_state,
+        ..SyncPlan::default()
+    };
 
     // Quickly look up "did the local side change flags on this JMAP id?"
     let local_flag_changes: HashMap<String, &LocalChange> = local_changes

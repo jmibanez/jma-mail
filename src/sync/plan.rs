@@ -186,7 +186,7 @@ pub enum SyncDirection {
 }
 
 /// A computed plan of sync actions to execute.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct SyncPlan {
     pub actions: Vec<SyncAction>,
     pub new_email_state: Option<String>,
@@ -194,14 +194,6 @@ pub struct SyncPlan {
 }
 
 impl SyncPlan {
-    pub fn new() -> Self {
-        Self {
-            actions: Vec::new(),
-            new_email_state: None,
-            new_mailbox_state: None,
-        }
-    }
-
     pub fn is_empty(&self) -> bool {
         self.actions.is_empty()
     }
