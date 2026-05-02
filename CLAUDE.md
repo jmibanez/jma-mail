@@ -40,3 +40,14 @@ logical change per commit. See `git log` for examples.
 
 **Always run `cargo fmt` before committing** so the diff stays
 formatting-noise-free.
+
+## Referring to commits
+
+When mentioning a commit in conversation, summaries, or commit
+bodies, identify it by its **commit ID** (short SHA is fine). Don't
+refer to commits by their ordinal position in a session plan
+("Commit 3"), by a task number that produced them ("the commit from
+task #15"), or by any other handle that only resolves inside the
+ephemeral context of one session. Those references are dead weight to
+anyone — including future-you — reading the history without that
+session's plan in hand.
