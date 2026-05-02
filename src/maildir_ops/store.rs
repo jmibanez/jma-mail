@@ -3,6 +3,8 @@ use maildir::Maildir;
 use std::path::Path;
 use tracing::debug;
 
+use crate::ids::MaildirId;
+
 /// Ensure a maildir folder exists with cur/new/tmp subdirectories.
 pub fn ensure_maildir(path: &Path) -> Result<Maildir> {
     let md = Maildir::from(path.to_path_buf());
@@ -13,12 +15,12 @@ pub fn ensure_maildir(path: &Path) -> Result<Maildir> {
 
 /// Store a raw email message into a maildir's cur/ with the given flags.
 /// Returns the maildir unique ID assigned to the message.
-pub fn store_message(maildir: &Maildir, data: &[u8], flags: &str) -> Result<String> {
+pub fn store_message(maildir: &Maildir, data: &[u8], flags: &str) -> Result<MaildirId> {
     let id = maildir
         .store_cur_with_flags(data, flags)
         .context("Failed to store message in maildir")?;
     debug!("Stored message {} with flags '{}'", id, flags);
-    Ok(id)
+    Ok(MaildirId::from(id))
 }
 
 /// Delete a message from a maildir by its unique ID.

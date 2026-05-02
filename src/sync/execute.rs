@@ -604,7 +604,7 @@ async fn run_downloads(
                 let flags = keywords_to_flags(keywords);
                 let maildir_path = maildir_root.join(maildir_folder);
                 let maildir = store::ensure_maildir(&maildir_path)?;
-                let mid: MaildirId = store::store_message(&maildir, blob, &flags)?.into();
+                let mid = store::store_message(&maildir, blob, &flags)?;
                 info!("Downloaded new email {} -> {}/{}", id, maildir_folder, mid);
                 let keywords_json = serde_json::to_string(keywords)?;
                 queries::upsert_message(
