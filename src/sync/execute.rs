@@ -133,7 +133,7 @@ fn apply_move_pair_adopts(
         let SyncAction::AdoptLocalMessage { ref id, .. } = action else {
             continue;
         };
-        if failed_updates.contains(&id.jmap_email_id) {
+        if failed_updates.contains(id.jmap_email_id.as_ref()) {
             warn!(
                 "Skipping move-pair adopt for {}: paired MoveRemote rejected by server. \
                  DB retains source folder; the move will be re-detected and re-attempted next cycle.",
@@ -176,7 +176,7 @@ fn commit_adopt(conn: &Connection, action: SyncAction) -> Result<()> {
     queries::upsert_message(
         conn,
         &MessageRecord {
-            jmap_email_id: jmap_email_id.clone().into(),
+            jmap_email_id: jmap_email_id.clone(),
             jmap_blob_id: if jmap_blob_id.is_empty() {
                 None
             } else {
@@ -188,14 +188,14 @@ fn commit_adopt(conn: &Connection, action: SyncAction) -> Result<()> {
                 Some(jmap_thread_id.into())
             },
             mailbox_id: mailbox_id.into(),
-            maildir_id: Some(maildir_id.clone().into()),
+            maildir_id: Some(maildir_id.clone()),
             maildir_folder: Some(maildir_folder.clone()),
-            message_id: message_id.map(Into::into),
+            message_id,
             flags: flags.clone(),
             jmap_keywords: keywords_json,
         },
     )?;
-    queries::upsert_local_state(conn, &maildir_id, &maildir_folder, &flags, None)?;
+    queries::upsert_local_state(conn, maildir_id.as_ref(), &maildir_folder, &flags, None)?;
     debug!(
         "Adopted {}/{} as {}",
         maildir_folder,
@@ -231,7 +231,7 @@ fn update_local_flags(
         } = id;
         let maildir_path = maildir_root.join(&maildir_folder);
         let maildir = store::ensure_maildir(&maildir_path)?;
-        if let Err(e) = store::set_flags(&maildir, &maildir_id, &new_flags) {
+        if let Err(e) = store::set_flags(&maildir, maildir_id.as_ref(), &new_flags) {
             warn!(
                 "Failed to set flags for {} in {}: {}",
                 maildir_id, maildir_folder, e
@@ -242,7 +242,7 @@ fn update_local_flags(
         queries::upsert_message(
             conn,
             &MessageRecord {
-                jmap_email_id: jmap_email_id.into(),
+                jmap_email_id,
                 jmap_blob_id: if jmap_blob_id.is_empty() {
                     None
                 } else {
@@ -254,14 +254,14 @@ fn update_local_flags(
                     Some(jmap_thread_id.into())
                 },
                 mailbox_id: mailbox_id.into(),
-                maildir_id: Some(maildir_id.clone().into()),
+                maildir_id: Some(maildir_id.clone()),
                 maildir_folder: Some(maildir_folder.clone()),
-                message_id: message_id.map(Into::into),
+                message_id,
                 flags: new_flags.clone(),
                 jmap_keywords: keywords_json,
             },
         )?;
-        queries::upsert_local_state(conn, &maildir_id, &maildir_folder, &new_flags, None)?;
+        queries::upsert_local_state(conn, maildir_id.as_ref(), &maildir_folder, &new_flags, None)?;
         info!("Updated local flags for {}: '{}'", bound_for_log, new_flags);
     }
     Ok(())
@@ -289,27 +289,28 @@ fn move_local_messages(
         } = id;
         let from = store::ensure_maildir(&maildir_root.join(&from_folder))?;
         let to = store::ensure_maildir(&maildir_root.join(&to_folder))?;
-        if let Err(e) = store::move_message(&from, &to, &maildir_id) {
+        if let Err(e) = store::move_message(&from, &to, maildir_id.as_ref()) {
             warn!(
                 "Failed to move {} from {} to {}: {}",
                 bound_for_log, from_folder, to_folder, e
             );
             continue;
         }
-        let flags = if let Some(rec) = queries::get_message_by_jmap_id(conn, &jmap_email_id)? {
-            let preserved_flags = rec.flags.clone();
-            queries::upsert_message(
-                conn,
-                &MessageRecord {
-                    maildir_folder: Some(to_folder.clone()),
-                    ..rec
-                },
-            )?;
-            preserved_flags
-        } else {
-            String::new()
-        };
-        queries::upsert_local_state(conn, &maildir_id, &to_folder, &flags, None)?;
+        let flags =
+            if let Some(rec) = queries::get_message_by_jmap_id(conn, jmap_email_id.as_ref())? {
+                let preserved_flags = rec.flags.clone();
+                queries::upsert_message(
+                    conn,
+                    &MessageRecord {
+                        maildir_folder: Some(to_folder.clone()),
+                        ..rec
+                    },
+                )?;
+                preserved_flags
+            } else {
+                String::new()
+            };
+        queries::upsert_local_state(conn, maildir_id.as_ref(), &to_folder, &flags, None)?;
         info!(
             "Moved {} from {} to {}",
             bound_for_log, from_folder, to_folder
@@ -334,14 +335,14 @@ fn delete_local_messages(
             ..
         } = id;
         let maildir = store::ensure_maildir(&maildir_root.join(&maildir_folder))?;
-        if let Err(e) = store::delete_message(&maildir, &maildir_id) {
+        if let Err(e) = store::delete_message(&maildir, maildir_id.as_ref()) {
             debug!(
                 "Failed to delete local {} (may already be gone): {}",
                 maildir_id, e
             );
         }
-        queries::delete_local_state(conn, &maildir_id)?;
-        queries::delete_message_by_jmap_id(conn, &jmap_email_id)?;
+        queries::delete_local_state(conn, maildir_id.as_ref())?;
+        queries::delete_message_by_jmap_id(conn, jmap_email_id.as_ref())?;
         info!("Deleted local copy of destroyed {}", bound_for_log);
     }
     Ok(())
@@ -394,16 +395,22 @@ async fn upload_messages(
                         jmap_blob_id: None,
                         jmap_thread_id: None,
                         mailbox_id: mailbox_id.clone().into(),
-                        maildir_id: Some(id.maildir_id.clone().into()),
+                        maildir_id: Some(id.maildir_id.clone()),
                         maildir_folder: Some(maildir_folder.clone()),
-                        message_id: id.message_id.clone().map(Into::into),
+                        message_id: id.message_id.clone(),
                         flags: flags.clone(),
                         jmap_keywords: keywords_json,
                     },
                 )?;
-                queries::upsert_local_state(conn, &id.maildir_id, &maildir_folder, &flags, None)?;
+                queries::upsert_local_state(
+                    conn,
+                    id.maildir_id.as_ref(),
+                    &maildir_folder,
+                    &flags,
+                    None,
+                )?;
                 let target = RemoteId {
-                    jmap_email_id: jmap_email_id.clone(),
+                    jmap_email_id: jmap_email_id.clone().into(),
                     message_id: id.message_id.clone(),
                 };
                 info!("Uploaded local message {} -> {}", id.maildir_id, target);
@@ -446,7 +453,7 @@ async fn apply_remote_set(
     for action in &keywords {
         if let SyncAction::UpdateRemoteKeywords { id, keywords } = action {
             ops.push(EmailSetOp::Keywords {
-                email_id: id.jmap_email_id.clone(),
+                email_id: String::from(&id.jmap_email_id),
                 keywords: keywords.clone(),
             });
         }
@@ -459,7 +466,7 @@ async fn apply_remote_set(
         } = action
         {
             ops.push(EmailSetOp::SetMailboxes {
-                email_id: id.jmap_email_id.clone(),
+                email_id: String::from(&id.jmap_email_id),
                 target_mailbox_ids: target_mailbox_ids.clone(),
             });
         }
@@ -467,7 +474,7 @@ async fn apply_remote_set(
     for action in &destroys {
         if let SyncAction::DestroyRemote { id } = action {
             ops.push(EmailSetOp::Destroy {
-                email_id: id.jmap_email_id.clone(),
+                email_id: String::from(&id.jmap_email_id),
             });
         }
     }
@@ -483,10 +490,10 @@ async fn apply_remote_set(
         let SyncAction::UpdateRemoteKeywords { id, keywords } = action else {
             continue;
         };
-        if outcome.failed_updates.contains(&id.jmap_email_id) {
+        if outcome.failed_updates.contains(id.jmap_email_id.as_ref()) {
             continue;
         }
-        if let Some(rec) = queries::get_message_by_jmap_id(conn, &id.jmap_email_id)? {
+        if let Some(rec) = queries::get_message_by_jmap_id(conn, id.jmap_email_id.as_ref())? {
             let keywords_json = serde_json::to_string(&keywords)?;
             let flags = keywords_to_flags(&keywords);
             let maildir_id = rec.maildir_id.clone();
@@ -521,7 +528,7 @@ async fn apply_remote_set(
         else {
             continue;
         };
-        if outcome.failed_updates.contains(&id.jmap_email_id) {
+        if outcome.failed_updates.contains(id.jmap_email_id.as_ref()) {
             warn!(
                 "MoveRemote {} from {} to {} rejected by server",
                 id, from_folder, to_folder
@@ -539,15 +546,15 @@ async fn apply_remote_set(
         let SyncAction::DestroyRemote { id } = action else {
             continue;
         };
-        if outcome.failed_destroys.contains(&id.jmap_email_id) {
+        if outcome.failed_destroys.contains(id.jmap_email_id.as_ref()) {
             continue;
         }
-        if let Some(rec) = queries::get_message_by_jmap_id(conn, &id.jmap_email_id)?
+        if let Some(rec) = queries::get_message_by_jmap_id(conn, id.jmap_email_id.as_ref())?
             && let Some(mid) = rec.maildir_id.as_ref()
         {
             queries::delete_local_state(conn, mid.as_ref())?;
         }
-        queries::delete_message_by_jmap_id(conn, &id.jmap_email_id)?;
+        queries::delete_message_by_jmap_id(conn, id.jmap_email_id.as_ref())?;
         info!("Destroyed remote {}", id);
     }
 
@@ -625,13 +632,13 @@ async fn run_downloads(
                 queries::upsert_message(
                     conn,
                     &MessageRecord {
-                        jmap_email_id: id.jmap_email_id.clone().into(),
+                        jmap_email_id: id.jmap_email_id.clone(),
                         jmap_blob_id: Some(jmap_blob_id.clone().into()),
                         jmap_thread_id: Some(jmap_thread_id.clone().into()),
                         mailbox_id: mailbox_id.clone().into(),
                         maildir_id: Some(mid.clone().into()),
                         maildir_folder: Some(maildir_folder.clone()),
-                        message_id: id.message_id.clone().map(Into::into),
+                        message_id: id.message_id.clone(),
                         flags: flags.clone(),
                         jmap_keywords: keywords_json,
                     },

@@ -180,7 +180,7 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
                 .as_ref()
                 .map(String::from)
                 .unwrap_or_default(),
-            message_id: mid.to_string(),
+            message_id: mid.into(),
             prior_flags: rec.flags.clone(),
         });
         consumed_news.insert(new_id.clone());
@@ -215,7 +215,7 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
     // Track local maildir_ids that have been claimed by an adoption emitted
     // from the remote side, so processing of LocalChange::NewMessage doesn't
     // also emit an upload for the same file.
-    let mut adopted_maildir_ids: HashSet<String> = HashSet::new();
+    let mut adopted_maildir_ids: HashSet<MaildirId> = HashSet::new();
 
     // JMAP ids whose local DestroyRemote should be suppressed because the
     // server-side update won the local-delete-vs-remote-update conflict.
@@ -257,7 +257,7 @@ struct DetectedMove {
     new_flags: String,
     jmap_blob_id: String,
     jmap_thread_id: String,
-    message_id: String,
+    message_id: MessageId,
     /// Flags as recorded in message_map at the start of the cycle;
     /// compared against new_flags to decide whether the move should
     /// also push keyword changes.
@@ -268,7 +268,7 @@ fn emit_detected_moves(moves: &[DetectedMove], plan: &mut SyncPlan) {
     for m in moves {
         plan.actions.push(SyncAction::MoveRemote {
             id: RemoteId {
-                jmap_email_id: m.jmap_email_id.clone(),
+                jmap_email_id: m.jmap_email_id.clone().into(),
                 message_id: Some(m.message_id.clone()),
             },
             // jmapsync's DB binds each email to exactly one mailbox,
@@ -284,8 +284,8 @@ fn emit_detected_moves(moves: &[DetectedMove], plan: &mut SyncPlan) {
         let keywords = flags_to_keywords(&m.new_flags);
         plan.actions.push(SyncAction::AdoptLocalMessage {
             id: BoundId {
-                maildir_id: m.new_maildir_id.clone(),
-                jmap_email_id: m.jmap_email_id.clone(),
+                maildir_id: m.new_maildir_id.clone().into(),
+                jmap_email_id: m.jmap_email_id.clone().into(),
                 message_id: Some(m.message_id.clone()),
             },
             maildir_folder: m.new_folder.clone(),
@@ -298,7 +298,7 @@ fn emit_detected_moves(moves: &[DetectedMove], plan: &mut SyncPlan) {
         if m.prior_flags != m.new_flags {
             plan.actions.push(SyncAction::UpdateRemoteKeywords {
                 id: RemoteId {
-                    jmap_email_id: m.jmap_email_id.clone(),
+                    jmap_email_id: m.jmap_email_id.clone().into(),
                     message_id: Some(m.message_id.clone()),
                 },
                 keywords,
@@ -309,7 +309,7 @@ fn emit_detected_moves(moves: &[DetectedMove], plan: &mut SyncPlan) {
 
 fn process_remote_emails(
     ctx: &ReconcileCtx<'_>,
-    adopted_maildir_ids: &mut HashSet<String>,
+    adopted_maildir_ids: &mut HashSet<MaildirId>,
     deletes_overruled_by_server: &mut HashSet<String>,
     plan: &mut SyncPlan,
 ) {
@@ -345,7 +345,7 @@ fn process_remote_emails(
                 existing,
                 target_mailbox_id,
                 target_folder,
-                local_msg_id.as_ref().map(AsRef::as_ref),
+                local_msg_id.as_ref(),
                 deletes_overruled_by_server,
                 plan,
             );
@@ -372,8 +372,8 @@ fn process_remote_emails(
         // Path 3: nothing local -- download.
         plan.actions.push(SyncAction::DownloadMessage {
             id: RemoteId {
-                jmap_email_id: String::from(&email.id),
-                message_id: local_msg_id.map(Into::into),
+                jmap_email_id: email.id.clone(),
+                message_id: local_msg_id,
             },
             jmap_blob_id: String::from(&email.blob_id),
             jmap_thread_id: String::from(&email.thread_id),
@@ -390,7 +390,7 @@ fn handle_known_remote(
     existing: &MessageRecord,
     target_mailbox_id: &str,
     target_folder: &str,
-    local_msg_id: Option<&str>,
+    local_msg_id: Option<&MessageId>,
     deletes_overruled_by_server: &mut HashSet<String>,
     plan: &mut SyncPlan,
 ) {
@@ -408,8 +408,8 @@ fn handle_known_remote(
                 // cycle's idempotent DeletedMessage path.
                 plan.actions.push(SyncAction::DownloadMessage {
                     id: RemoteId {
-                        jmap_email_id: email_id_str.to_string(),
-                        message_id: local_msg_id.map(|s| s.to_string()),
+                        jmap_email_id: email_id_str.into(),
+                        message_id: local_msg_id.cloned(),
                     },
                     jmap_blob_id: String::from(&email.blob_id),
                     jmap_thread_id: String::from(&email.thread_id),
@@ -448,8 +448,8 @@ fn handle_known_remote(
                 {
                     plan.actions.push(SyncAction::UpdateRemoteKeywords {
                         id: RemoteId {
-                            jmap_email_id: email_id_str.to_string(),
-                            message_id: existing.message_id.as_ref().map(String::from),
+                            jmap_email_id: email_id_str.into(),
+                            message_id: existing.message_id.clone(),
                         },
                         keywords: flags_to_keywords(new_flags),
                     });
@@ -471,9 +471,9 @@ fn handle_known_remote(
     {
         plan.actions.push(SyncAction::MoveLocal {
             id: BoundId {
-                maildir_id: String::from(local_maildir_id),
-                jmap_email_id: email_id_str.to_string(),
-                message_id: existing.message_id.as_ref().map(String::from),
+                maildir_id: local_maildir_id.clone(),
+                jmap_email_id: email_id_str.into(),
+                message_id: existing.message_id.clone(),
             },
             from_folder: local_folder.clone(),
             to_folder: target_folder.to_string(),
@@ -487,43 +487,40 @@ fn try_adopt_remote(
     mid: &str,
     target_mailbox_id: &str,
     target_folder: &str,
-    adopted_maildir_ids: &mut HashSet<String>,
+    adopted_maildir_ids: &mut HashSet<MaildirId>,
     plan: &mut SyncPlan,
 ) -> bool {
-    let push_adopt = |plan: &mut SyncPlan, adopted: &mut HashSet<String>, maildir_id: String| {
-        adopted.insert(maildir_id.clone());
-        plan.actions.push(SyncAction::AdoptLocalMessage {
-            id: BoundId {
-                maildir_id,
-                jmap_email_id: String::from(&email.id),
-                message_id: Some(mid.to_string()),
-            },
-            maildir_folder: target_folder.to_string(),
-            jmap_blob_id: String::from(&email.blob_id),
-            jmap_thread_id: String::from(&email.thread_id),
-            mailbox_id: target_mailbox_id.to_string(),
-            keywords: email.keywords.clone(),
-            old_maildir_id: None,
-        });
-    };
+    let push_adopt =
+        |plan: &mut SyncPlan, adopted: &mut HashSet<MaildirId>, maildir_id: MaildirId| {
+            adopted.insert(maildir_id.clone());
+            plan.actions.push(SyncAction::AdoptLocalMessage {
+                id: BoundId {
+                    maildir_id,
+                    jmap_email_id: email.id.clone(),
+                    message_id: Some(mid.into()),
+                },
+                maildir_folder: target_folder.to_string(),
+                jmap_blob_id: String::from(&email.blob_id),
+                jmap_thread_id: String::from(&email.thread_id),
+                mailbox_id: target_mailbox_id.to_string(),
+                keywords: email.keywords.clone(),
+                old_maildir_id: None,
+            });
+        };
 
     if let Some(recs) = ctx.known_by_message_id.get(mid)
         && let Some(rec) = recs
             .iter()
             .find(|r| r.maildir_folder.as_deref() == Some(target_folder) && r.maildir_id.is_some())
     {
-        push_adopt(
-            plan,
-            adopted_maildir_ids,
-            String::from(rec.maildir_id.as_ref().unwrap()),
-        );
+        push_adopt(plan, adopted_maildir_ids, rec.maildir_id.clone().unwrap());
         return true;
     }
 
     if let Some(entries) = ctx.local_index.by_message_id.get(mid)
         && let Some(entry) = entries.iter().find(|e| e.folder == target_folder)
     {
-        push_adopt(plan, adopted_maildir_ids, entry.maildir_id.clone().into());
+        push_adopt(plan, adopted_maildir_ids, entry.maildir_id.clone());
         return true;
     }
 
@@ -541,9 +538,9 @@ fn process_remote_destroys(
         {
             plan.actions.push(SyncAction::DeleteLocal {
                 id: BoundId {
-                    maildir_id: String::from(maildir_id),
-                    jmap_email_id: jmap_id.clone(),
-                    message_id: msg.message_id.as_ref().map(String::from),
+                    maildir_id: maildir_id.clone(),
+                    jmap_email_id: jmap_id.clone().into(),
+                    message_id: msg.message_id.clone(),
                 },
                 maildir_folder: folder.clone(),
             });
@@ -554,7 +551,7 @@ fn process_remote_destroys(
 fn process_local_changes(
     local_changes: &[LocalChange],
     ctx: &ReconcileCtx<'_>,
-    adopted_maildir_ids: &HashSet<String>,
+    adopted_maildir_ids: &HashSet<MaildirId>,
     deletes_overruled_by_server: &HashSet<String>,
     consumed_news: &HashSet<String>,
     consumed_deletes: &HashSet<String>,
@@ -577,7 +574,7 @@ fn process_local_changes(
                     maildir_id,
                     folder,
                     path,
-                    message_id.as_ref().map(AsRef::as_ref),
+                    message_id.as_ref(),
                     adopted_maildir_ids,
                     plan,
                 )
@@ -604,8 +601,8 @@ fn handle_local_new(
     maildir_id: &str,
     folder: &str,
     path: &std::path::Path,
-    message_id: Option<&str>,
-    adopted_maildir_ids: &HashSet<String>,
+    message_id: Option<&MessageId>,
+    adopted_maildir_ids: &HashSet<MaildirId>,
     plan: &mut SyncPlan,
 ) {
     if adopted_maildir_ids.contains(maildir_id) {
@@ -639,9 +636,9 @@ fn handle_local_new(
             serde_json::from_str::<HashMap<String, bool>>(&rec.jmap_keywords).unwrap_or_default();
         plan.actions.push(SyncAction::AdoptLocalMessage {
             id: BoundId {
-                maildir_id: maildir_id.to_string(),
-                jmap_email_id: String::from(&rec.jmap_email_id),
-                message_id: Some(mid.to_string()),
+                maildir_id: maildir_id.into(),
+                jmap_email_id: rec.jmap_email_id.clone(),
+                message_id: Some(mid.clone()),
             },
             maildir_folder: folder.to_string(),
             jmap_blob_id: rec
@@ -686,8 +683,8 @@ fn handle_local_new(
 
     plan.actions.push(SyncAction::UploadMessage {
         id: LocalId {
-            maildir_id: maildir_id.to_string(),
-            message_id: message_id.map(String::from),
+            maildir_id: maildir_id.into(),
+            message_id: message_id.cloned(),
         },
         maildir_folder: folder.to_string(),
         file_path: path.to_path_buf(),
@@ -717,8 +714,8 @@ fn handle_local_flags(
     }
     plan.actions.push(SyncAction::UpdateRemoteKeywords {
         id: RemoteId {
-            jmap_email_id: String::from(&msg.jmap_email_id),
-            message_id: msg.message_id.as_ref().map(String::from),
+            jmap_email_id: msg.jmap_email_id.clone(),
+            message_id: msg.message_id.clone(),
         },
         keywords: flags_to_keywords(new_flags),
     });
@@ -741,8 +738,8 @@ fn handle_local_delete(
     }
     plan.actions.push(SyncAction::DestroyRemote {
         id: RemoteId {
-            jmap_email_id: String::from(&msg.jmap_email_id),
-            message_id: msg.message_id.as_ref().map(String::from),
+            jmap_email_id: msg.jmap_email_id.clone(),
+            message_id: msg.message_id.clone(),
         },
     });
 }
@@ -823,9 +820,9 @@ fn emit_local_flag_update(
         .or_else(|| existing.message_id.clone());
     plan.actions.push(SyncAction::UpdateLocalFlags {
         id: BoundId {
-            maildir_id: String::from(maildir_id),
-            jmap_email_id: String::from(&email.id),
-            message_id: local_msg_id.map(Into::into),
+            maildir_id: maildir_id.clone(),
+            jmap_email_id: email.id.clone(),
+            message_id: local_msg_id,
         },
         maildir_folder: folder.clone(),
         new_flags,
@@ -944,7 +941,7 @@ mod tests {
         assert_eq!(plan.download_count(), 1);
         assert!(matches!(
             plan.actions[0],
-            SyncAction::DownloadMessage { id: RemoteId { ref jmap_email_id, .. }, .. } if jmap_email_id == "E1"
+            SyncAction::DownloadMessage { id: RemoteId { ref jmap_email_id, .. }, .. } if jmap_email_id.as_ref() == "E1"
         ));
     }
 
@@ -998,8 +995,8 @@ mod tests {
         else {
             panic!("expected adopt");
         };
-        assert_eq!(jmap_email_id, "E1");
-        assert_eq!(maildir_id, "MID-1");
+        assert_eq!(jmap_email_id.as_ref(), "E1");
+        assert_eq!(maildir_id.as_ref(), "MID-1");
     }
 
     /// Adoption via local_index: state DB is empty, but the maildir holds a
@@ -1036,8 +1033,8 @@ mod tests {
         else {
             panic!("expected adopt");
         };
-        assert_eq!(maildir_id, "FILE-1");
-        assert_eq!(jmap_email_id, "E1");
+        assert_eq!(maildir_id.as_ref(), "FILE-1");
+        assert_eq!(jmap_email_id.as_ref(), "E1");
     }
 
     /// Known JMAP id, server keywords differ from message_map: emit a
@@ -1123,7 +1120,7 @@ mod tests {
         assert_eq!(plan.download_count(), 0);
         assert!(plan.actions.iter().any(|a| matches!(
             a,
-            SyncAction::DestroyRemote { id: RemoteId { jmap_email_id, .. } } if jmap_email_id == "E1"
+            SyncAction::DestroyRemote { id: RemoteId { jmap_email_id, .. } } if jmap_email_id.as_ref() == "E1"
         )));
     }
 
@@ -1254,7 +1251,7 @@ mod tests {
         );
         assert!(matches!(
             plan.actions[0],
-            SyncAction::DestroyRemote { id: RemoteId { ref jmap_email_id, .. } } if jmap_email_id == "E1"
+            SyncAction::DestroyRemote { id: RemoteId { ref jmap_email_id, .. } } if jmap_email_id.as_ref() == "E1"
         ));
     }
 
@@ -1315,13 +1312,13 @@ mod tests {
         assert!(plan.actions.iter().any(|a| matches!(
             a,
             SyncAction::MoveRemote { id: RemoteId { jmap_email_id, .. }, target_mailbox_ids, .. }
-                if jmap_email_id == "E1" && target_mailbox_ids == &vec!["MB-ARCH".to_string()]
+                if jmap_email_id.as_ref() == "E1" && target_mailbox_ids == &vec!["MB-ARCH".to_string()]
         )));
         assert!(plan.actions.iter().any(|a| matches!(
             a,
             SyncAction::AdoptLocalMessage {
                 id: BoundId { maildir_id, .. }, old_maildir_id: Some(old), ..
-            } if maildir_id == "M-NEW" && old == "M-OLD"
+            } if maildir_id.as_ref() == "M-NEW" && old == "M-OLD"
         )));
         // Neither side of the lossy Destroy + Upload shape may appear.
         assert!(
@@ -1407,7 +1404,7 @@ mod tests {
             plan.actions.iter().any(|a| matches!(
                 a,
                 SyncAction::MoveRemote { id: RemoteId { jmap_email_id, .. }, target_mailbox_ids, .. }
-                    if jmap_email_id == "E1" && target_mailbox_ids == &vec!["MB-ARCH".to_string()]
+                    if jmap_email_id.as_ref() == "E1" && target_mailbox_ids == &vec!["MB-ARCH".to_string()]
             )),
             "expected MoveRemote, got {:?}",
             plan.actions
@@ -1420,7 +1417,7 @@ mod tests {
                     maildir_folder,
                     old_maildir_id: Some(old),
                     ..
-                } if maildir_id == "M1" && old == "M1" && maildir_folder == "Archive"
+                } if maildir_id.as_ref() == "M1" && old == "M1" && maildir_folder == "Archive"
             )),
             "expected AdoptLocalMessage with old==new maildir_id, got {:?}",
             plan.actions
@@ -1477,7 +1474,7 @@ mod tests {
         assert!(plan.actions.iter().any(|a| matches!(
             a,
             SyncAction::MoveRemote { id: RemoteId { jmap_email_id, .. }, target_mailbox_ids, .. }
-                if jmap_email_id == "E1" && target_mailbox_ids == &vec!["MB-ARCH".to_string()]
+                if jmap_email_id.as_ref() == "E1" && target_mailbox_ids == &vec!["MB-ARCH".to_string()]
         )));
         // And critically: no spurious re-download into the source.
         assert!(
@@ -1504,7 +1501,7 @@ mod tests {
         );
         assert!(matches!(
             plan.actions[0],
-            SyncAction::DeleteLocal { id: BoundId { ref maildir_id, .. }, .. } if maildir_id == "M-1"
+            SyncAction::DeleteLocal { id: BoundId { ref maildir_id, .. }, .. } if maildir_id.as_ref() == "M-1"
         ));
     }
 }

@@ -2,28 +2,30 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 
+use crate::ids::{JmapEmailId, MaildirId, MessageId};
+
 /// A message known by its local maildir handle. The optional Message-ID
 /// rides along so logs can name the message in human-readable form.
 #[derive(Debug, Clone)]
 pub struct LocalId {
-    pub maildir_id: String,
-    pub message_id: Option<String>,
+    pub maildir_id: MaildirId,
+    pub message_id: Option<MessageId>,
 }
 
 /// A message known by its opaque JMAP server id.
 #[derive(Debug, Clone)]
 pub struct RemoteId {
-    pub jmap_email_id: String,
-    pub message_id: Option<String>,
+    pub jmap_email_id: JmapEmailId,
+    pub message_id: Option<MessageId>,
 }
 
 /// A message bound on both sides — same RFC 5322 message known
 /// locally as `maildir_id` and remotely as `jmap_email_id`.
 #[derive(Debug, Clone)]
 pub struct BoundId {
-    pub maildir_id: String,
-    pub jmap_email_id: String,
-    pub message_id: Option<String>,
+    pub maildir_id: MaildirId,
+    pub jmap_email_id: JmapEmailId,
+    pub message_id: Option<MessageId>,
 }
 
 impl fmt::Display for LocalId {
