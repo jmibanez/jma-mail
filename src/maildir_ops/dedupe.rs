@@ -1,12 +1,29 @@
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 use tracing::{debug, info, warn};
 
 use crate::ids::{MaildirId, MessageId};
 use crate::maildir_ops::flags::extract_id;
 use crate::maildir_ops::headers::parse_message_id_from_file;
 use crate::maildir_ops::store;
+
+/// Per-folder Message-ID — the dedupe scope. Two files share a group
+/// iff they're in the same folder and parse to the same Message-ID.
+#[derive(PartialEq, Eq, Hash)]
+struct GroupKey {
+    folder: String,
+    msgid: MessageId,
+}
+
+/// One file that might be the kept copy for a `GroupKey`. Built up
+/// during the maildir walk; the oldest mtime per group wins.
+struct Candidate {
+    path: PathBuf,
+    mtime: SystemTime,
+    maildir_id: String,
+}
 
 /// One entry in the local message-ID index.
 #[derive(Debug, Clone)]
@@ -34,9 +51,7 @@ pub struct LocalIndex {
 /// — a user copying a message into another mailbox is a distinct instance.
 /// The kept file (oldest mtime) per folder becomes an entry in the index.
 pub fn dedupe_and_index(maildir_root: &Path, folders: &[String]) -> Result<LocalIndex> {
-    // Group by (folder, msgid) so dedupe is per-folder.
-    let mut groups: HashMap<(String, String), Vec<(PathBuf, std::time::SystemTime, String)>> =
-        HashMap::new();
+    let mut groups: HashMap<GroupKey, Vec<Candidate>> = HashMap::new();
 
     for folder in folders {
         let folder_path = maildir_root.join(folder);
@@ -66,12 +81,19 @@ pub fn dedupe_and_index(maildir_root: &Path, folders: &[String]) -> Result<Local
                 let mtime = entry
                     .metadata()
                     .and_then(|m| m.modified())
-                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
 
                 groups
-                    .entry((folder.clone(), msgid))
+                    .entry(GroupKey {
+                        folder: folder.clone(),
+                        msgid: msgid.into(),
+                    })
                     .or_default()
-                    .push((path, mtime, maildir_id));
+                    .push(Candidate {
+                        path,
+                        mtime,
+                        maildir_id,
+                    });
             }
         }
     }
@@ -79,36 +101,39 @@ pub fn dedupe_and_index(maildir_root: &Path, folders: &[String]) -> Result<Local
     let mut index = LocalIndex::default();
     let mut deleted = 0usize;
 
-    for ((folder, msgid), mut entries) in groups {
+    for (GroupKey { folder, msgid }, mut candidates) in groups {
         // Oldest mtime first.
-        entries.sort_by_key(|e| e.1);
-        let mut iter = entries.into_iter();
-        let Some((keep_path, _, keep_id)) = iter.next() else {
+        candidates.sort_by_key(|c| c.mtime);
+        let mut iter = candidates.into_iter();
+        let Some(keep) = iter.next() else {
             continue;
         };
 
         index
             .by_message_id
-            .entry(msgid.clone().into())
+            .entry(msgid.clone())
             .or_default()
             .push(LocalEntry {
                 folder: folder.clone(),
-                maildir_id: keep_id.clone().into(),
-                path: keep_path.clone(),
+                maildir_id: keep.maildir_id.clone().into(),
+                path: keep.path.clone(),
             });
 
-        for (_, _, dup_id) in iter {
+        for dup in iter {
             // Same Message-ID, same folder — delete this newer copy via the
             // maildir API so any maildir-level bookkeeping is honored.
             let md = store::ensure_maildir(&maildir_root.join(&folder))?;
-            if let Err(e) = store::delete_message(&md, &dup_id) {
-                warn!("Failed to delete duplicate {} in {}: {}", dup_id, folder, e);
+            if let Err(e) = store::delete_message(&md, &dup.maildir_id) {
+                warn!(
+                    "Failed to delete duplicate {} in {}: {}",
+                    dup.maildir_id, folder, e
+                );
                 continue;
             }
 
             info!(
                 "Removed in-folder duplicate of Message-ID <{}>: {}/{} (kept {}/{})",
-                msgid, folder, dup_id, folder, keep_id
+                msgid, folder, dup.maildir_id, folder, keep.maildir_id
             );
             deleted += 1;
         }
