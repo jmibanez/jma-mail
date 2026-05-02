@@ -1,10 +1,65 @@
 use anyhow::{Context, Result};
 use jmap_client::client::Client;
 use jmap_client::mailbox;
+use std::path::{Component, Path};
 use tracing::{debug, info};
 
 use crate::ids::JmapMailboxId;
 use crate::jmap::types::MailboxObject;
+
+/// Cap on accepted mailbox-name byte length. 255 matches the most
+/// common filesystem `NAME_MAX`; anything longer would also fail at
+/// `mkdir` time, so reject early with a clearer error.
+const MAX_MAILBOX_NAME_LEN: usize = 255;
+
+/// Validate a mailbox name received from the JMAP server before it is
+/// joined onto the local maildir root. A malicious or compromised
+/// server can otherwise return `..`, `/etc/passwd`, or similar and
+/// `Path::join` will happily escape the maildir tree (relative `..`
+/// segments) or replace the base entirely (absolute paths).
+///
+/// Rejects: empty strings, NUL bytes, `/` or `\` separators, `.` or
+/// `..` components, absolute paths, and names longer than
+/// `MAX_MAILBOX_NAME_LEN`. JMAP nests mailboxes via `parent_id`, never
+/// via separators inside `name`, so a single normal component is
+/// always the right shape here.
+fn validate_mailbox_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        anyhow::bail!("mailbox name is empty");
+    }
+    if name.len() > MAX_MAILBOX_NAME_LEN {
+        anyhow::bail!(
+            "mailbox name longer than {} bytes ({} bytes): {:?}",
+            MAX_MAILBOX_NAME_LEN,
+            name.len(),
+            name
+        );
+    }
+    if name.contains('\0') {
+        anyhow::bail!("mailbox name contains NUL byte: {:?}", name);
+    }
+    if name.contains('/') || name.contains('\\') {
+        anyhow::bail!("mailbox name contains path separator: {:?}", name);
+    }
+
+    // Defense in depth: parse with `Path::components()` and require
+    // exactly one Normal component. Catches anything `contains()`
+    // missed and explicitly rejects `.` / `..` / absolute paths.
+    let mut comps = Path::new(name).components();
+    let first = comps.next();
+    if comps.next().is_some() {
+        anyhow::bail!("mailbox name parses as multi-component path: {:?}", name);
+    }
+    match first {
+        Some(Component::Normal(_)) => Ok(()),
+        Some(Component::CurDir) => anyhow::bail!("mailbox name is '.': {:?}", name),
+        Some(Component::ParentDir) => anyhow::bail!("mailbox name is '..': {:?}", name),
+        Some(Component::RootDir) | Some(Component::Prefix(_)) => {
+            anyhow::bail!("mailbox name is an absolute path: {:?}", name)
+        }
+        None => anyhow::bail!("mailbox name has no path component: {:?}", name),
+    }
+}
 
 /// Decide whether `mb` matches any entry in the user's configured mailbox
 /// list. An empty list means "sync everything".
@@ -71,9 +126,10 @@ pub async fn get_all(client: &Client) -> Result<Vec<MailboxObject>> {
     let mailboxes: Vec<MailboxObject> = get_response
         .list()
         .iter()
-        .map(|mb| {
+        .map(|mb| -> Result<MailboxObject> {
             let id = JmapMailboxId::from(mb.id().unwrap_or_default());
             let name = mb.name().unwrap_or("(unnamed)").to_string();
+            validate_mailbox_name(&name).with_context(|| format!("rejecting mailbox id={}", id))?;
             let parent_id = mb.parent_id().map(JmapMailboxId::from);
             let role = mb.role();
             let role_str = match role {
@@ -89,7 +145,7 @@ pub async fn get_all(client: &Client) -> Result<Vec<MailboxObject>> {
                 name, id, role_str, total_emails, unread_emails
             );
 
-            MailboxObject {
+            Ok(MailboxObject {
                 id,
                 name,
                 parent_id,
@@ -97,9 +153,9 @@ pub async fn get_all(client: &Client) -> Result<Vec<MailboxObject>> {
                 sort_order,
                 total_emails,
                 unread_emails,
-            }
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
     info!("Fetched {} mailboxes (state: {})", mailboxes.len(), state);
 
@@ -198,5 +254,69 @@ mod tests {
             &mb("Spam", Some("junk")),
             true
         ));
+    }
+
+    #[test]
+    fn validate_mailbox_name_accepts_normal_names() {
+        for name in [
+            "Inbox",
+            "Sent",
+            "Drafts",
+            "Spam",
+            "All Mail",
+            "Archive 2024",
+            "Folder.With.Dots",
+            "list-personal",
+            "Indbakke",
+            "受信箱",
+            "(unnamed)",
+        ] {
+            validate_mailbox_name(name)
+                .unwrap_or_else(|e| panic!("expected {:?} to validate, got {}", name, e));
+        }
+    }
+
+    #[test]
+    fn validate_mailbox_name_rejects_empty() {
+        assert!(validate_mailbox_name("").is_err());
+    }
+
+    #[test]
+    fn validate_mailbox_name_rejects_dot_components() {
+        assert!(validate_mailbox_name(".").is_err());
+        assert!(validate_mailbox_name("..").is_err());
+    }
+
+    #[test]
+    fn validate_mailbox_name_rejects_separators() {
+        for bad in [
+            "../etc",
+            "../../tmp/x",
+            "foo/bar",
+            "foo\\bar",
+            "/etc/passwd",
+            "/tmp/x",
+            "\\\\server\\share",
+        ] {
+            assert!(
+                validate_mailbox_name(bad).is_err(),
+                "expected {:?} to be rejected",
+                bad
+            );
+        }
+    }
+
+    #[test]
+    fn validate_mailbox_name_rejects_nul_byte() {
+        assert!(validate_mailbox_name("foo\0bar").is_err());
+        assert!(validate_mailbox_name("\0").is_err());
+    }
+
+    #[test]
+    fn validate_mailbox_name_rejects_overlong() {
+        let long = "a".repeat(MAX_MAILBOX_NAME_LEN + 1);
+        assert!(validate_mailbox_name(&long).is_err());
+        let at_limit = "a".repeat(MAX_MAILBOX_NAME_LEN);
+        assert!(validate_mailbox_name(&at_limit).is_ok());
     }
 }
