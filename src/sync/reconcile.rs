@@ -3,12 +3,26 @@ use std::collections::{HashMap, HashSet};
 use tracing::{debug, warn};
 
 use crate::config::ConflictStrategy;
+use crate::ids::{JmapEmailId, MaildirId, MessageId};
 use crate::jmap::types::EmailObject;
 use crate::maildir_ops::dedupe::LocalIndex;
 use crate::maildir_ops::flags::{flags_to_keywords, keywords_to_flags};
 use crate::maildir_ops::scan::LocalChange;
 use crate::state::queries::MessageRecord;
 use crate::sync::plan::{BoundId, LocalId, RemoteId, SyncAction, SyncPlan};
+
+/// Look up a `MessageRecord` (or records) by whichever ID kind you
+/// happen to hold: a maildir basename, a JMAP email id, or an RFC
+/// 5322 Message-ID. The Message-ID side is one-to-many because the
+/// same Message-ID can legitimately appear in more than one folder.
+/// Built once per cycle from `message_map` and consulted everywhere
+/// reconcile needs to ask "do I already know about this?".
+#[derive(Default)]
+pub struct MessageRecordIndex {
+    pub by_maildir: HashMap<MaildirId, MessageRecord>,
+    pub by_jmap: HashMap<JmapEmailId, MessageRecord>,
+    pub by_message_id: HashMap<MessageId, Vec<MessageRecord>>,
+}
 
 /// Bundle of immutable inputs and derived indices that every reconcile
 /// helper needs. Passed by `&` so helpers stay short on parameters and
@@ -17,9 +31,9 @@ struct ReconcileCtx<'a> {
     remote_emails: &'a [EmailObject],
     mailboxes: &'a [(String, String)],
     strategy: ConflictStrategy,
-    known_by_maildir: &'a HashMap<String, MessageRecord>,
-    known_by_jmap: &'a HashMap<String, MessageRecord>,
-    known_by_message_id: &'a HashMap<String, Vec<MessageRecord>>,
+    known_by_maildir: &'a HashMap<MaildirId, MessageRecord>,
+    known_by_jmap: &'a HashMap<JmapEmailId, MessageRecord>,
+    known_by_message_id: &'a HashMap<MessageId, Vec<MessageRecord>>,
     local_index: &'a LocalIndex,
     local_flag_changes: HashMap<String, &'a LocalChange>,
     local_deletes: HashSet<String>,
@@ -32,20 +46,21 @@ struct ReconcileCtx<'a> {
 /// (initial pull passes the full enumerated set here).
 /// `remote_destroyed`: JMAP email IDs the server says are gone.
 /// `local_changes`: scan output (NewMessage now carries Message-ID).
-/// `known_by_*`: indices of message_map for fast lookup.
+/// `known`: bundled indices of message_map for fast lookup.
 /// `local_index`: dedupe-pass index of on-disk Message-IDs.
 pub fn reconcile(
     remote_emails: &[EmailObject],
     remote_destroyed: &[String],
     local_changes: &[LocalChange],
-    known_by_maildir: &HashMap<String, MessageRecord>,
-    known_by_jmap: &HashMap<String, MessageRecord>,
-    known_by_message_id: &HashMap<String, Vec<MessageRecord>>,
+    known: &MessageRecordIndex,
     local_index: &LocalIndex,
     mailboxes: &[(String, String)],
     strategy: ConflictStrategy,
     new_email_state: Option<String>,
 ) -> SyncPlan {
+    let known_by_maildir = &known.by_maildir;
+    let known_by_jmap = &known.by_jmap;
+    let known_by_message_id = &known.by_message_id;
     let mut plan = SyncPlan {
         new_email_state,
         ..SyncPlan::default()
@@ -56,7 +71,7 @@ pub fn reconcile(
         .iter()
         .filter_map(|lc| match lc {
             LocalChange::FlagsChanged { maildir_id, .. } => known_by_maildir
-                .get(maildir_id)
+                .get(maildir_id.as_str())
                 .map(|m| (String::from(&m.jmap_email_id), lc)),
             _ => None,
         })
@@ -66,7 +81,7 @@ pub fn reconcile(
         .iter()
         .filter_map(|lc| match lc {
             LocalChange::DeletedMessage { maildir_id, .. } => known_by_maildir
-                .get(maildir_id)
+                .get(maildir_id.as_str())
                 .map(|m| String::from(&m.jmap_email_id)),
             _ => None,
         })
@@ -102,7 +117,7 @@ pub fn reconcile(
         else {
             continue;
         };
-        let Some(rec) = known_by_maildir.get(old_id) else {
+        let Some(rec) = known_by_maildir.get(old_id.as_str()) else {
             continue;
         };
         let Some(mid) = rec.message_id.as_ref().map(AsRef::as_ref) else {
@@ -498,11 +513,11 @@ fn try_adopt_remote(
 
 fn process_remote_destroys(
     remote_destroyed: &[String],
-    known_by_jmap: &HashMap<String, MessageRecord>,
+    known_by_jmap: &HashMap<JmapEmailId, MessageRecord>,
     plan: &mut SyncPlan,
 ) {
     for jmap_id in remote_destroyed {
-        if let Some(msg) = known_by_jmap.get(jmap_id)
+        if let Some(msg) = known_by_jmap.get(jmap_id.as_str())
             && let (Some(maildir_id), Some(folder)) = (&msg.maildir_id, &msg.maildir_folder)
         {
             plan.actions.push(SyncAction::DeleteLocal {
@@ -554,7 +569,7 @@ fn process_local_changes(
                 ..
             } => handle_local_flags(ctx, maildir_id, new_flags, plan),
             LocalChange::DeletedMessage { maildir_id, .. } => {
-                if let Some(rec) = ctx.known_by_maildir.get(maildir_id)
+                if let Some(rec) = ctx.known_by_maildir.get(maildir_id.as_str())
                     && consumed_deletes.contains(rec.jmap_email_id.as_ref())
                 {
                     continue;
@@ -851,30 +866,22 @@ mod tests {
         }
     }
 
-    /// Build the three message_map indices the way the engine does.
-    fn indices(
-        records: &[MessageRecord],
-    ) -> (
-        HashMap<String, MessageRecord>,
-        HashMap<String, MessageRecord>,
-        HashMap<String, Vec<MessageRecord>>,
-    ) {
-        let mut by_maildir: HashMap<String, MessageRecord> = HashMap::new();
-        let mut by_jmap: HashMap<String, MessageRecord> = HashMap::new();
-        let mut by_message_id: HashMap<String, Vec<MessageRecord>> = HashMap::new();
+    /// Build the message_map indices the way the engine does.
+    fn indices(records: &[MessageRecord]) -> MessageRecordIndex {
+        let mut idx = MessageRecordIndex::default();
         for r in records {
             if let Some(ref m) = r.maildir_id {
-                by_maildir.insert(String::from(m), r.clone());
+                idx.by_maildir.insert(m.clone(), r.clone());
             }
             if let Some(ref mid) = r.message_id {
-                by_message_id
-                    .entry(String::from(mid))
+                idx.by_message_id
+                    .entry(mid.clone())
                     .or_default()
                     .push(r.clone());
             }
-            by_jmap.insert(String::from(&r.jmap_email_id), r.clone());
+            idx.by_jmap.insert(r.jmap_email_id.clone(), r.clone());
         }
-        (by_maildir, by_jmap, by_message_id)
+        idx
     }
 
     fn empty_index() -> LocalIndex {
@@ -889,14 +896,12 @@ mod tests {
         local_index: &LocalIndex,
         strategy: ConflictStrategy,
     ) -> SyncPlan {
-        let (by_maildir, by_jmap, by_message_id) = indices(records);
+        let known = indices(records);
         reconcile(
             remote_emails,
             remote_destroyed,
             local_changes,
-            &by_maildir,
-            &by_jmap,
-            &by_message_id,
+            &known,
             local_index,
             &mailboxes(),
             strategy,

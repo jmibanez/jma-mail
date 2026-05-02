@@ -1,7 +1,7 @@
 use anyhow::Result;
 use jmap_client::client::Client;
 use rusqlite::Connection;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
@@ -10,7 +10,7 @@ use crate::maildir_ops::{dedupe, scan, store};
 use crate::state::queries;
 use crate::sync::execute;
 use crate::sync::plan::{SyncAction, SyncDirection};
-use crate::sync::reconcile;
+use crate::sync::reconcile::{self, MessageRecordIndex};
 
 /// Resolve the list of mailboxes to sync, returning (jmap_id, folder_name) pairs.
 pub async fn resolve_mailboxes(
@@ -66,35 +66,29 @@ pub async fn resolve_mailboxes(
     Ok(synced)
 }
 
-/// Build the three message_map indices the reconcile step consumes.
+/// Build the three message_map projections the reconcile step consumes.
 fn build_known_indices(
     conn: &Connection,
     mailboxes: &[(String, String)],
-) -> Result<(
-    HashMap<String, queries::MessageRecord>,
-    HashMap<String, queries::MessageRecord>,
-    HashMap<String, Vec<queries::MessageRecord>>,
-)> {
-    let mut by_maildir: HashMap<String, queries::MessageRecord> = HashMap::new();
-    let mut by_jmap: HashMap<String, queries::MessageRecord> = HashMap::new();
-    let mut by_message_id: HashMap<String, Vec<queries::MessageRecord>> = HashMap::new();
+) -> Result<MessageRecordIndex> {
+    let mut idx = MessageRecordIndex::default();
 
     for (_, folder_name) in mailboxes {
         let messages = queries::get_messages_by_folder(conn, folder_name)?;
         for msg in messages {
             if let Some(ref mid) = msg.maildir_id {
-                by_maildir.insert(String::from(mid), msg.clone());
+                idx.by_maildir.insert(mid.clone(), msg.clone());
             }
             if let Some(ref message_id) = msg.message_id {
-                by_message_id
-                    .entry(String::from(message_id))
+                idx.by_message_id
+                    .entry(message_id.clone())
                     .or_default()
                     .push(msg.clone());
             }
-            by_jmap.insert(String::from(&msg.jmap_email_id), msg);
+            idx.by_jmap.insert(msg.jmap_email_id.clone(), msg);
         }
     }
-    Ok((by_maildir, by_jmap, by_message_id))
+    Ok(idx)
 }
 
 /// Outcome of one sync iteration -- enough for the daemon loop to know
@@ -138,16 +132,13 @@ pub async fn run(
         fetch_remote_state(client, conn, &account_id, &mailboxes).await?;
 
     // Phase 3: build known indices and reconcile.
-    let (known_by_maildir, known_by_jmap, known_by_message_id) =
-        build_known_indices(conn, &mailboxes)?;
+    let known = build_known_indices(conn, &mailboxes)?;
 
     let plan = reconcile::reconcile(
         &remote_emails,
         &remote_destroyed,
         &all_local_changes,
-        &known_by_maildir,
-        &known_by_jmap,
-        &known_by_message_id,
+        &known,
         &local_index,
         &mailboxes,
         config.sync.conflict_strategy,
