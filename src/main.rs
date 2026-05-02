@@ -172,8 +172,9 @@ async fn cmd_mailboxes(cli: &Cli) -> Result<()> {
 
 async fn cmd_sync(cli: &Cli) -> Result<()> {
     let config = load_config(cli)?;
-    let client = session::connect(&config.account).await?;
     let db_path = config.db_path();
+    state::db::acquire_lock(&db_path)?;
+    let client = session::connect(&config.account).await?;
     let conn = state::db::open(&db_path)?;
 
     engine::sync(&client, &conn, &config, cli.dry_run).await?;
@@ -183,8 +184,9 @@ async fn cmd_sync(cli: &Cli) -> Result<()> {
 
 async fn cmd_pull(cli: &Cli) -> Result<()> {
     let config = load_config(cli)?;
-    let client = session::connect(&config.account).await?;
     let db_path = config.db_path();
+    state::db::acquire_lock(&db_path)?;
+    let client = session::connect(&config.account).await?;
     let conn = state::db::open(&db_path)?;
 
     engine::pull_only(&client, &conn, &config).await?;
@@ -194,8 +196,9 @@ async fn cmd_pull(cli: &Cli) -> Result<()> {
 
 async fn cmd_push(cli: &Cli) -> Result<()> {
     let config = load_config(cli)?;
-    let client = session::connect(&config.account).await?;
     let db_path = config.db_path();
+    state::db::acquire_lock(&db_path)?;
+    let client = session::connect(&config.account).await?;
     let conn = state::db::open(&db_path)?;
 
     engine::push_only(&client, &conn, &config).await?;
@@ -205,8 +208,9 @@ async fn cmd_push(cli: &Cli) -> Result<()> {
 
 async fn cmd_watch(cli: &Cli) -> Result<()> {
     let config = load_config(cli)?;
-    let client = session::connect(&config.account).await?;
     let db_path = config.db_path();
+    state::db::acquire_lock(&db_path)?;
+    let client = session::connect(&config.account).await?;
     let conn = state::db::open(&db_path)?;
 
     daemon::runner::run(&client, &conn, &config).await?;

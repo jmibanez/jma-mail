@@ -27,6 +27,10 @@ clap = { version = "4", features = ["derive"] }
 # State DB
 rusqlite = { version = "0.31", features = ["bundled"] }
 
+# Cross-platform advisory file lock (flock / LockFileEx) for the
+# per-state-DB instance lock; see `state::db::acquire_lock`.
+fd-lock = "4"
+
 # Maildir
 maildir = "0.6"
 

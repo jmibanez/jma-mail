@@ -57,6 +57,14 @@ None of `state.db`'s contents are required to do a `pull`.
 
 If there are any changes that break state tracking, as mentioned above you can simply delete the state DB and re-run `jmapsync`.
 
+### Concurrency: One Mutator at a Time
+
+Mutating commands (`sync`, `pull`, `push`, `watch`) take an exclusive OS-level advisory lock on `<db_path>.lock` (e.g. `~/.local/share/jmapsync/state.db.lock`) before doing any work. If another instance already holds the lock, the second invocation fails fast with a message naming the holder's PID. This prevents two instances from racing on the SQLite state DB or double-uploading local-only messages to the server.
+
+Read-only commands (`status`, `mailboxes`) and commands that don't touch the state DB (`init`, `auth`) do **not** take the lock and can run alongside a `watch` daemon.
+
+The lock is held by the kernel, not by the contents of the file, so it's released automatically when the holding process exits — including on crash or `kill -9`. The `.lock` file itself may stick around on disk; that's fine, the next invocation will reuse it. You should never need to delete it by hand, but it's safe to do so when no jmapsync process is running.
+
 
 ## Configuration
 
