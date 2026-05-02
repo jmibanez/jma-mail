@@ -504,7 +504,7 @@ fn try_adopt_remote(
     if let Some(entries) = ctx.local_index.by_message_id.get(mid)
         && let Some(entry) = entries.iter().find(|e| e.folder == target_folder)
     {
-        push_adopt(plan, adopted_maildir_ids, entry.maildir_id.clone());
+        push_adopt(plan, adopted_maildir_ids, entry.maildir_id.clone().into());
         return true;
     }
 

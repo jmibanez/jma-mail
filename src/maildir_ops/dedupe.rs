@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
+use crate::ids::{MaildirId, MessageId};
 use crate::maildir_ops::flags::extract_id;
 use crate::maildir_ops::headers::parse_message_id_from_file;
 use crate::maildir_ops::store;
@@ -11,7 +12,7 @@ use crate::maildir_ops::store;
 #[derive(Debug, Clone)]
 pub struct LocalEntry {
     pub folder: String,
-    pub maildir_id: String,
+    pub maildir_id: MaildirId,
     pub path: PathBuf,
 }
 
@@ -22,7 +23,7 @@ pub struct LocalEntry {
 /// already have on disk even when the state DB has been wiped.
 #[derive(Debug, Default)]
 pub struct LocalIndex {
-    pub by_message_id: HashMap<String, Vec<LocalEntry>>,
+    pub by_message_id: HashMap<MessageId, Vec<LocalEntry>>,
 }
 
 /// Walk every synced maildir folder, parse Message-IDs out of each file, and
@@ -88,11 +89,11 @@ pub fn dedupe_and_index(maildir_root: &Path, folders: &[String]) -> Result<Local
 
         index
             .by_message_id
-            .entry(msgid.clone())
+            .entry(msgid.clone().into())
             .or_default()
             .push(LocalEntry {
                 folder: folder.clone(),
-                maildir_id: keep_id.clone(),
+                maildir_id: keep_id.clone().into(),
                 path: keep_path.clone(),
             });
 
