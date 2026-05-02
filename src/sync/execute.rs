@@ -8,7 +8,7 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
-use crate::ids::{JmapAccountId, JmapEmailId, MaildirId};
+use crate::ids::{JmapAccountId, JmapEmailId};
 use crate::jmap::email::{self as jmap_email, EmailSetOp};
 use crate::jmap::retry::is_transient_error;
 use crate::maildir_ops::{flags::keywords_to_flags, store};
@@ -670,7 +670,7 @@ async fn run_downloads(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::JmapEmailId;
+    use crate::ids::{JmapEmailId, MaildirId};
     use crate::state::db;
     use std::collections::HashMap;
 
