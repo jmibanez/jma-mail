@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 
-use crate::ids::{JmapEmailId, MaildirId, MessageId};
+use crate::ids::{JmapBlobId, JmapEmailId, JmapMailboxId, JmapThreadId, MaildirId, MessageId};
 
 /// A message known by its local maildir handle. The optional Message-ID
 /// rides along so logs can name the message in human-readable form.
@@ -76,9 +76,9 @@ pub enum SyncAction {
     // Server -> Local
     DownloadMessage {
         id: RemoteId,
-        jmap_blob_id: String,
-        jmap_thread_id: String,
-        mailbox_id: String,
+        jmap_blob_id: JmapBlobId,
+        jmap_thread_id: JmapThreadId,
+        mailbox_id: JmapMailboxId,
         maildir_folder: String,
         keywords: HashMap<String, bool>,
     },
@@ -87,9 +87,9 @@ pub enum SyncAction {
         maildir_folder: String,
         new_flags: String,
         keywords: HashMap<String, bool>,
-        jmap_blob_id: String,
-        jmap_thread_id: String,
-        mailbox_id: String,
+        jmap_blob_id: JmapBlobId,
+        jmap_thread_id: JmapThreadId,
+        mailbox_id: JmapMailboxId,
     },
     DeleteLocal {
         id: BoundId,
@@ -107,17 +107,17 @@ pub enum SyncAction {
     AdoptLocalMessage {
         id: BoundId,
         maildir_folder: String,
-        jmap_blob_id: String,
-        jmap_thread_id: String,
-        mailbox_id: String,
+        jmap_blob_id: Option<JmapBlobId>,
+        jmap_thread_id: Option<JmapThreadId>,
+        mailbox_id: JmapMailboxId,
         keywords: HashMap<String, bool>,
         /// When the adopt rebinds an existing JMAP id from one local
         /// maildir_id to another (cross-folder local move), the old
         /// local_state row needs to be cleaned up so subsequent scans
-        /// don't keep emitting DeletedMessage for it. Bare String
-        /// (not LocalId) — purely a DB-cleanup hint, never logged as
-        /// identity.
-        old_maildir_id: Option<String>,
+        /// don't keep emitting DeletedMessage for it. Just a bare
+        /// `MaildirId` (not a `LocalId` bundle) — this is purely a
+        /// DB-cleanup hint, never logged as identity.
+        old_maildir_id: Option<MaildirId>,
     },
 
     // Local -> Server
@@ -125,7 +125,7 @@ pub enum SyncAction {
         id: LocalId,
         maildir_folder: String,
         file_path: PathBuf,
-        mailbox_id: String,
+        mailbox_id: JmapMailboxId,
     },
     UpdateRemoteKeywords {
         id: RemoteId,
@@ -145,7 +145,7 @@ pub enum SyncAction {
         /// `Id[Boolean]` set-membership map. Computed at planning
         /// time; for jmapsync's single-mailbox-per-email DB model
         /// this is just `[to_mailbox_id]`.
-        target_mailbox_ids: Vec<String>,
+        target_mailbox_ids: Vec<JmapMailboxId>,
         /// Folder names of the source / destination mailboxes,
         /// plumbed through purely so logs can name folders instead
         /// of opaque JMAP mailbox ids.

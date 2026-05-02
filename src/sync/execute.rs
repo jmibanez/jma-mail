@@ -170,7 +170,7 @@ fn commit_adopt(conn: &Connection, action: SyncAction) -> Result<()> {
         message_id,
     } = id;
     if let Some(old) = old_maildir_id.as_ref() {
-        queries::delete_local_state(conn, &MaildirId::from(old.as_str()))?;
+        queries::delete_local_state(conn, old)?;
     }
     let flags = keywords_to_flags(&keywords);
     let keywords_json = serde_json::to_string(&keywords)?;
@@ -178,17 +178,9 @@ fn commit_adopt(conn: &Connection, action: SyncAction) -> Result<()> {
         conn,
         &MessageRecord {
             jmap_email_id: jmap_email_id.clone(),
-            jmap_blob_id: if jmap_blob_id.is_empty() {
-                None
-            } else {
-                Some(jmap_blob_id.into())
-            },
-            jmap_thread_id: if jmap_thread_id.is_empty() {
-                None
-            } else {
-                Some(jmap_thread_id.into())
-            },
-            mailbox_id: mailbox_id.into(),
+            jmap_blob_id,
+            jmap_thread_id,
+            mailbox_id,
             maildir_id: Some(maildir_id.clone()),
             maildir_folder: Some(maildir_folder.clone()),
             message_id,
@@ -244,17 +236,9 @@ fn update_local_flags(
             conn,
             &MessageRecord {
                 jmap_email_id,
-                jmap_blob_id: if jmap_blob_id.is_empty() {
-                    None
-                } else {
-                    Some(jmap_blob_id.into())
-                },
-                jmap_thread_id: if jmap_thread_id.is_empty() {
-                    None
-                } else {
-                    Some(jmap_thread_id.into())
-                },
-                mailbox_id: mailbox_id.into(),
+                jmap_blob_id: Some(jmap_blob_id),
+                jmap_thread_id: Some(jmap_thread_id),
+                mailbox_id,
                 maildir_id: Some(maildir_id.clone()),
                 maildir_folder: Some(maildir_folder.clone()),
                 message_id,
@@ -379,7 +363,7 @@ async fn upload_messages(
         let result = jmap_email::import_email(
             client,
             &raw_message,
-            &mailbox_id,
+            mailbox_id.as_ref(),
             &maildir_folder,
             &id,
             &keywords,
@@ -394,7 +378,7 @@ async fn upload_messages(
                         jmap_email_id: jmap_email_id.clone().into(),
                         jmap_blob_id: None,
                         jmap_thread_id: None,
-                        mailbox_id: mailbox_id.clone().into(),
+                        mailbox_id: mailbox_id.clone(),
                         maildir_id: Some(id.maildir_id.clone()),
                         maildir_folder: Some(maildir_folder.clone()),
                         message_id: id.message_id.clone(),
@@ -461,7 +445,7 @@ async fn apply_remote_set(
         {
             ops.push(EmailSetOp::SetMailboxes {
                 email_id: String::from(&id.jmap_email_id),
-                target_mailbox_ids: target_mailbox_ids.clone(),
+                target_mailbox_ids: target_mailbox_ids.iter().map(String::from).collect(),
             });
         }
     }
@@ -578,7 +562,7 @@ async fn run_downloads(
                 _ => unreachable!("non-download in downloads bucket"),
             };
             async move {
-                let res = jmap_email::download_blob(client, &blob_id).await;
+                let res = jmap_email::download_blob(client, blob_id.as_ref()).await;
                 (i, res)
             }
         });
@@ -627,10 +611,10 @@ async fn run_downloads(
                     conn,
                     &MessageRecord {
                         jmap_email_id: id.jmap_email_id.clone(),
-                        jmap_blob_id: Some(jmap_blob_id.clone().into()),
-                        jmap_thread_id: Some(jmap_thread_id.clone().into()),
-                        mailbox_id: mailbox_id.clone().into(),
-                        maildir_id: Some(mid.clone().into()),
+                        jmap_blob_id: Some(jmap_blob_id.clone()),
+                        jmap_thread_id: Some(jmap_thread_id.clone()),
+                        mailbox_id: mailbox_id.clone(),
+                        maildir_id: Some(mid.clone()),
                         maildir_folder: Some(maildir_folder.clone()),
                         message_id: id.message_id.clone(),
                         flags: flags.clone(),
@@ -719,8 +703,8 @@ mod tests {
                 message_id: Some("a@x".into()),
             },
             maildir_folder: "Spam".into(),
-            jmap_blob_id: "B1".into(),
-            jmap_thread_id: "T1".into(),
+            jmap_blob_id: Some("B1".into()),
+            jmap_thread_id: Some("T1".into()),
             mailbox_id: "MB-SPAM".into(),
             keywords,
             old_maildir_id: Some("M-OLD".into()),
