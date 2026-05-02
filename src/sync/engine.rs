@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
+use crate::ids::JmapAccountId;
 use crate::jmap::{email as jmap_email, mailbox as jmap_mailbox, types::EmailObject};
 use crate::maildir_ops::{dedupe, scan, store};
 use crate::state::queries;
@@ -107,7 +108,7 @@ pub async fn run(
     dry_run: bool,
     direction: SyncDirection,
 ) -> Result<SyncOutcome> {
-    let account_id = client.default_account_id().to_string();
+    let account_id: JmapAccountId = client.default_account_id().into();
     let mailboxes = resolve_mailboxes(client, conn, config).await?;
     let maildir_root = config.maildir_path();
 
@@ -189,10 +190,10 @@ pub async fn run(
 async fn fetch_remote_state(
     client: &Client,
     conn: &Connection,
-    account_id: &str,
+    account_id: &JmapAccountId,
     mailboxes: &[(String, String)],
 ) -> Result<(Vec<EmailObject>, Vec<String>, String, bool)> {
-    let cursor = queries::get_jmap_state(conn, account_id, "Email")?;
+    let cursor = queries::get_jmap_state(conn, account_id.as_ref(), "Email")?;
 
     if let Some(state) = cursor {
         let mut current = state;
@@ -217,7 +218,7 @@ async fn fetch_remote_state(
                     let s = e.to_string();
                     if s.contains("Cannot calculate changes") {
                         info!("Server cannot calculate changes; falling back to initial pull");
-                        queries::set_jmap_state(conn, account_id, "Email", "")?;
+                        queries::set_jmap_state(conn, account_id.as_ref(), "Email", "")?;
                         return initial_remote_state(client, mailboxes).await;
                     }
                     return Err(e);

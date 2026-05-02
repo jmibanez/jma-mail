@@ -8,7 +8,7 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
-use crate::ids::MaildirId;
+use crate::ids::{JmapAccountId, MaildirId};
 use crate::jmap::email::{self as jmap_email, EmailSetOp};
 use crate::jmap::retry::is_transient_error;
 use crate::maildir_ops::{flags::keywords_to_flags, store};
@@ -42,7 +42,7 @@ pub async fn execute(
     config: &Config,
     plan: SyncPlan,
     maildir_root: &Path,
-    account_id: &str,
+    account_id: &JmapAccountId,
 ) -> Result<SyncOutcome> {
     let mut concurrency = effective_concurrency(client, config.sync.download_concurrency);
     if concurrency != config.sync.download_concurrency {
@@ -105,7 +105,7 @@ pub async fn execute(
     apply_move_pair_adopts(conn, move_pair_adopts, &outcome.failed_updates)?;
 
     if let Some(state) = new_email_state {
-        queries::set_jmap_state(conn, account_id, "Email", &state)?;
+        queries::set_jmap_state(conn, account_id.as_ref(), "Email", &state)?;
         debug!("Persisted new Email state: {}", state);
     }
 

@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use super::runner::SyncTrigger;
+use crate::ids::JmapAccountId;
 
 const RECONNECT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(60);
@@ -34,7 +35,7 @@ const TRACKED_TYPES: &[&str] = &["Email", "Mailbox"];
 pub async fn listen(
     event_source_url: &str,
     auth_token: &str,
-    account_id: &str,
+    account_id: &JmapAccountId,
     ping_interval: u64,
     initial_states: HashMap<String, String>,
     tx: mpsc::Sender<SyncTrigger>,
@@ -78,7 +79,7 @@ pub async fn listen(
 async fn connect_and_listen(
     event_source_url: &str,
     auth_token: &str,
-    account_id: &str,
+    account_id: &JmapAccountId,
     ping_interval: u64,
     last_states: &mut HashMap<String, String>,
     backoff: &mut Duration,
@@ -111,7 +112,11 @@ async fn connect_and_listen(
                     continue;
                 }
 
-                let should_trigger = match decide_trigger(&msg.data, account_id, last_states) {
+                let should_trigger = match decide_trigger(
+                    &msg.data,
+                    account_id.as_ref(),
+                    last_states,
+                ) {
                     Ok(decision) => decision,
                     Err(e) => {
                         // Don't drop events because of a payload quirk;

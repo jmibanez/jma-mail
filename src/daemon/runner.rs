@@ -6,6 +6,7 @@ use tokio::sync::mpsc;
 use tracing::{error, info};
 
 use crate::config::Config;
+use crate::ids::JmapAccountId;
 use crate::jmap::session;
 use crate::state::queries;
 use crate::sync::engine;
@@ -42,14 +43,14 @@ pub async fn run(client: &Client, conn: &Connection, config: &Config) -> Result<
     let session_info = session::session_info(client)?;
     let token = config.account.token()?;
     let maildir_root = config.maildir_path();
-    let account_id = client.default_account_id().to_string();
+    let account_id: JmapAccountId = client.default_account_id().into();
     let ping_interval = config.watch.ping_interval;
 
     // Seed the SSE dedup cache from current DB state so the first event
     // after the initial sync isn't a guaranteed redundant trigger.
     let mut initial_states: HashMap<String, String> = HashMap::new();
     for entity_type in ["Email", "Mailbox"] {
-        if let Some(state) = queries::get_jmap_state(conn, &account_id, entity_type)? {
+        if let Some(state) = queries::get_jmap_state(conn, account_id.as_ref(), entity_type)? {
             initial_states.insert(entity_type.to_string(), state);
         }
     }
