@@ -261,15 +261,13 @@ impl SyncPlan {
         let mut dropped = Vec::new();
 
         for action in actions {
-            let action_dir = action.direction();
-            let keep = match (direction, action_dir) {
-                (SyncDirection::Both, _) => true,
-                (_, ActionDirection::Both) => true,
-                (SyncDirection::PullOnly, ActionDirection::Pull) => true,
-                (SyncDirection::PushOnly, ActionDirection::Push) => true,
-                _ => false,
-            };
-            if keep {
+            if matches!(
+                (direction, action.direction()),
+                (SyncDirection::Both, _)
+                    | (_, ActionDirection::Both)
+                    | (SyncDirection::PullOnly, ActionDirection::Pull)
+                    | (SyncDirection::PushOnly, ActionDirection::Push)
+            ) {
                 kept.push(action);
             } else {
                 dropped.push(action);
