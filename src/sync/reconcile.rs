@@ -35,8 +35,8 @@ struct ReconcileCtx<'a> {
     known_by_jmap: &'a HashMap<JmapEmailId, MessageRecord>,
     known_by_message_id: &'a HashMap<MessageId, Vec<MessageRecord>>,
     local_index: &'a LocalIndex,
-    local_flag_changes: HashMap<String, &'a LocalChange>,
-    local_deletes: HashSet<String>,
+    local_flag_changes: HashMap<JmapEmailId, &'a LocalChange>,
+    local_deletes: HashSet<JmapEmailId>,
     destroyed_set: HashSet<&'a str>,
 }
 
@@ -86,22 +86,22 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
     };
 
     // Quickly look up "did the local side change flags on this JMAP id?"
-    let local_flag_changes: HashMap<String, &LocalChange> = local_changes
+    let local_flag_changes: HashMap<JmapEmailId, &LocalChange> = local_changes
         .iter()
         .filter_map(|lc| match lc {
             LocalChange::FlagsChanged { maildir_id, .. } => known_by_maildir
                 .get(maildir_id.as_str())
-                .map(|m| (String::from(&m.jmap_email_id), lc)),
+                .map(|m| (m.jmap_email_id.clone(), lc)),
             _ => None,
         })
         .collect();
 
-    let mut local_deletes: HashSet<String> = local_changes
+    let mut local_deletes: HashSet<JmapEmailId> = local_changes
         .iter()
         .filter_map(|lc| match lc {
             LocalChange::DeletedMessage { maildir_id, .. } => known_by_maildir
                 .get(maildir_id.as_str())
-                .map(|m| String::from(&m.jmap_email_id)),
+                .map(|m| m.jmap_email_id.clone()),
             _ => None,
         })
         .collect();
@@ -125,8 +125,8 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
         .collect();
 
     let mut detected_moves: Vec<DetectedMove> = Vec::new();
-    let mut consumed_news: HashSet<String> = HashSet::new();
-    let mut consumed_deletes: HashSet<String> = HashSet::new();
+    let mut consumed_news: HashSet<MaildirId> = HashSet::new();
+    let mut consumed_deletes: HashSet<JmapEmailId> = HashSet::new();
 
     for change in local_changes {
         let LocalChange::DeletedMessage {
@@ -175,8 +175,8 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
             message_id: mid.into(),
             prior_flags: rec.flags.clone(),
         });
-        consumed_news.insert(new_id.clone());
-        consumed_deletes.insert(String::from(&rec.jmap_email_id));
+        consumed_news.insert(new_id.clone().into());
+        consumed_deletes.insert(rec.jmap_email_id.clone());
     }
 
     // A delete that's been paired into a cross-folder move is not a
@@ -211,7 +211,7 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
 
     // JMAP ids whose local DestroyRemote should be suppressed because the
     // server-side update won the local-delete-vs-remote-update conflict.
-    let mut deletes_overruled_by_server: HashSet<String> = HashSet::new();
+    let mut deletes_overruled_by_server: HashSet<JmapEmailId> = HashSet::new();
 
     process_remote_emails(
         &ctx,
@@ -302,7 +302,7 @@ fn emit_detected_moves(moves: &[DetectedMove], plan: &mut SyncPlan) {
 fn process_remote_emails(
     ctx: &ReconcileCtx<'_>,
     adopted_maildir_ids: &mut HashSet<MaildirId>,
-    deletes_overruled_by_server: &mut HashSet<String>,
+    deletes_overruled_by_server: &mut HashSet<JmapEmailId>,
     plan: &mut SyncPlan,
 ) {
     for email in ctx.remote_emails {
@@ -388,7 +388,7 @@ fn handle_known_remote(
     matched: &RemoteMatch<'_>,
     existing: &MessageRecord,
     local_msg_id: Option<&MessageId>,
-    deletes_overruled_by_server: &mut HashSet<String>,
+    deletes_overruled_by_server: &mut HashSet<JmapEmailId>,
     plan: &mut SyncPlan,
 ) {
     let RemoteMatch {
@@ -404,7 +404,7 @@ fn handle_known_remote(
     if ctx.local_deletes.contains(email_id_str) {
         match resolve_delete_conflict(email_id_str, ctx.strategy) {
             DeleteWinner::Server => {
-                deletes_overruled_by_server.insert(email_id_str.to_string());
+                deletes_overruled_by_server.insert(email.id.clone());
                 // Re-download to restore the deleted local file.
                 // The orphaned local_state row from the prior
                 // maildir_id will be cleaned by the next scan
@@ -559,9 +559,9 @@ fn process_local_changes(
     local_changes: &[LocalChange],
     ctx: &ReconcileCtx<'_>,
     adopted_maildir_ids: &HashSet<MaildirId>,
-    deletes_overruled_by_server: &HashSet<String>,
-    consumed_news: &HashSet<String>,
-    consumed_deletes: &HashSet<String>,
+    deletes_overruled_by_server: &HashSet<JmapEmailId>,
+    consumed_news: &HashSet<MaildirId>,
+    consumed_deletes: &HashSet<JmapEmailId>,
     plan: &mut SyncPlan,
 ) {
     for change in local_changes {
@@ -573,7 +573,7 @@ fn process_local_changes(
                 path,
                 message_id,
             } => {
-                if consumed_news.contains(maildir_id) {
+                if consumed_news.contains(maildir_id.as_str()) {
                     continue;
                 }
                 handle_local_new(
@@ -723,7 +723,7 @@ fn handle_local_flags(
 fn handle_local_delete(
     ctx: &ReconcileCtx<'_>,
     maildir_id: &str,
-    deletes_overruled_by_server: &HashSet<String>,
+    deletes_overruled_by_server: &HashSet<JmapEmailId>,
     plan: &mut SyncPlan,
 ) {
     let Some(msg) = ctx.known_by_maildir.get(maildir_id) else {
