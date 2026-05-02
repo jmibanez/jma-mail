@@ -113,13 +113,13 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
     // Pair them by Message-ID so we can emit a single MoveRemote +
     // rebind, avoiding the lossy DestroyRemote + UploadMessage shape
     // (which would lose the JMAP id, thread, and keyword history).
-    let news_by_message_id: HashMap<&str, &LocalChange> = local_changes
+    let news_by_message_id: HashMap<&MessageId, &LocalChange> = local_changes
         .iter()
         .filter_map(|c| match c {
             LocalChange::NewMessage {
                 message_id: Some(mid),
                 ..
-            } => Some((mid.as_ref(), c)),
+            } => Some((mid, c)),
             _ => None,
         })
         .collect();
@@ -139,7 +139,7 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
         let Some(rec) = known_by_maildir.get(old_id) else {
             continue;
         };
-        let Some(mid) = rec.message_id.as_ref().map(AsRef::as_ref) else {
+        let Some(mid) = rec.message_id.as_ref() else {
             continue;
         };
         let Some(LocalChange::NewMessage {
@@ -172,7 +172,7 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
             new_flags: new_flags.clone(),
             jmap_blob_id: rec.jmap_blob_id.clone(),
             jmap_thread_id: rec.jmap_thread_id.clone(),
-            message_id: mid.into(),
+            message_id: mid.clone(),
             prior_flags: rec.flags.clone(),
         });
         consumed_news.insert(new_id.clone());
@@ -352,7 +352,7 @@ fn process_remote_emails(
         // (either via DB carry-over from a half-completed prior run, or via
         // the dedupe-pass index after a state DB wipe). Adopt it.
         if let Some(ref mid) = local_msg_id
-            && try_adopt_remote(ctx, &matched, mid.as_ref(), adopted_maildir_ids, plan)
+            && try_adopt_remote(ctx, &matched, mid, adopted_maildir_ids, plan)
         {
             continue;
         }
@@ -400,9 +400,8 @@ fn handle_known_remote(
     // Conflict: local deleted the file while the server updated
     // it. Resolve before any flag/move emission, since the local
     // copy is gone either way.
-    let email_id_str: &str = email.id.as_ref();
-    if ctx.local_deletes.contains(email_id_str) {
-        match resolve_delete_conflict(email_id_str, ctx.strategy) {
+    if ctx.local_deletes.contains(&email.id) {
+        match resolve_delete_conflict(&email.id, ctx.strategy) {
             DeleteWinner::Server => {
                 deletes_overruled_by_server.insert(email.id.clone());
                 // Re-download to restore the deleted local file.
@@ -411,7 +410,7 @@ fn handle_known_remote(
                 // cycle's idempotent DeletedMessage path.
                 plan.actions.push(SyncAction::DownloadMessage {
                     id: RemoteId {
-                        jmap_email_id: email_id_str.into(),
+                        jmap_email_id: email.id.clone(),
                         message_id: local_msg_id.cloned(),
                     },
                     jmap_blob_id: email.blob_id.clone(),
@@ -430,15 +429,15 @@ fn handle_known_remote(
     }
 
     let new_flags = keywords_to_flags(&email.keywords);
-    let local_changed = ctx.local_flag_changes.contains_key(email_id_str);
+    let local_changed = ctx.local_flag_changes.contains_key(&email.id);
     let server_flag_change = existing.flags != new_flags;
 
     if server_flag_change && local_changed {
         let resolved = resolve_flag_conflict(
-            email_id_str,
+            &email.id,
             existing,
             email,
-            ctx.local_flag_changes.get(email_id_str).copied(),
+            ctx.local_flag_changes.get(&email.id).copied(),
             ctx.strategy,
         );
         match resolved {
@@ -447,11 +446,11 @@ fn handle_known_remote(
             }
             FlagWinner::Local => {
                 if let Some(LocalChange::FlagsChanged { new_flags, .. }) =
-                    ctx.local_flag_changes.get(email_id_str).copied()
+                    ctx.local_flag_changes.get(&email.id).copied()
                 {
                     plan.actions.push(SyncAction::UpdateRemoteKeywords {
                         id: RemoteId {
-                            jmap_email_id: email_id_str.into(),
+                            jmap_email_id: email.id.clone(),
                             message_id: existing.message_id.clone(),
                         },
                         keywords: flags_to_keywords(new_flags),
@@ -475,7 +474,7 @@ fn handle_known_remote(
         plan.actions.push(SyncAction::MoveLocal {
             id: BoundId {
                 maildir_id: local_maildir_id.clone(),
-                jmap_email_id: email_id_str.into(),
+                jmap_email_id: email.id.clone(),
                 message_id: existing.message_id.clone(),
             },
             from_folder: local_folder.clone(),
@@ -487,7 +486,7 @@ fn handle_known_remote(
 fn try_adopt_remote(
     ctx: &ReconcileCtx<'_>,
     matched: &RemoteMatch<'_>,
-    mid: &str,
+    mid: &MessageId,
     adopted_maildir_ids: &mut HashSet<MaildirId>,
     plan: &mut SyncPlan,
 ) -> bool {
@@ -504,7 +503,7 @@ fn try_adopt_remote(
                 id: BoundId {
                     maildir_id,
                     jmap_email_id: email.id.clone(),
-                    message_id: Some(mid.into()),
+                    message_id: Some(mid.clone()),
                 },
                 maildir_folder: target_folder.to_string(),
                 jmap_blob_id: Some(email.blob_id.clone()),
@@ -578,7 +577,7 @@ fn process_local_changes(
                 }
                 handle_local_new(
                     ctx,
-                    maildir_id.as_ref(),
+                    maildir_id,
                     folder,
                     path,
                     message_id.as_ref(),
@@ -590,14 +589,14 @@ fn process_local_changes(
                 maildir_id,
                 new_flags,
                 ..
-            } => handle_local_flags(ctx, maildir_id.as_ref(), new_flags, plan),
+            } => handle_local_flags(ctx, maildir_id, new_flags, plan),
             LocalChange::DeletedMessage { maildir_id, .. } => {
                 if let Some(rec) = ctx.known_by_maildir.get(maildir_id)
-                    && consumed_deletes.contains(rec.jmap_email_id.as_ref())
+                    && consumed_deletes.contains(&rec.jmap_email_id)
                 {
                     continue;
                 }
-                handle_local_delete(ctx, maildir_id.as_ref(), deletes_overruled_by_server, plan)
+                handle_local_delete(ctx, maildir_id, deletes_overruled_by_server, plan)
             }
         }
     }
@@ -605,7 +604,7 @@ fn process_local_changes(
 
 fn handle_local_new(
     ctx: &ReconcileCtx<'_>,
-    maildir_id: &str,
+    maildir_id: &MaildirId,
     folder: &str,
     path: &std::path::Path,
     message_id: Option<&MessageId>,
@@ -643,7 +642,7 @@ fn handle_local_new(
             serde_json::from_str::<HashMap<String, bool>>(&rec.jmap_keywords).unwrap_or_default();
         plan.actions.push(SyncAction::AdoptLocalMessage {
             id: BoundId {
-                maildir_id: maildir_id.into(),
+                maildir_id: maildir_id.clone(),
                 jmap_email_id: rec.jmap_email_id.clone(),
                 message_id: Some(mid.clone()),
             },
@@ -682,7 +681,7 @@ fn handle_local_new(
 
     plan.actions.push(SyncAction::UploadMessage {
         id: LocalId {
-            maildir_id: maildir_id.into(),
+            maildir_id: maildir_id.clone(),
             message_id: message_id.cloned(),
         },
         maildir_folder: folder.to_string(),
@@ -693,7 +692,7 @@ fn handle_local_new(
 
 fn handle_local_flags(
     ctx: &ReconcileCtx<'_>,
-    maildir_id: &str,
+    maildir_id: &MaildirId,
     new_flags: &str,
     plan: &mut SyncPlan,
 ) {
@@ -722,7 +721,7 @@ fn handle_local_flags(
 
 fn handle_local_delete(
     ctx: &ReconcileCtx<'_>,
-    maildir_id: &str,
+    maildir_id: &MaildirId,
     deletes_overruled_by_server: &HashSet<JmapEmailId>,
     plan: &mut SyncPlan,
 ) {
@@ -732,7 +731,7 @@ fn handle_local_delete(
     if ctx.destroyed_set.contains(msg.jmap_email_id.as_ref()) {
         return;
     }
-    if deletes_overruled_by_server.contains(msg.jmap_email_id.as_ref()) {
+    if deletes_overruled_by_server.contains(&msg.jmap_email_id) {
         return;
     }
     plan.actions.push(SyncAction::DestroyRemote {
@@ -751,7 +750,7 @@ enum DeleteWinner {
     Local,
 }
 
-fn resolve_delete_conflict(jmap_id: &str, strategy: ConflictStrategy) -> DeleteWinner {
+fn resolve_delete_conflict(jmap_id: &JmapEmailId, strategy: ConflictStrategy) -> DeleteWinner {
     match strategy {
         ConflictStrategy::ServerWins => {
             warn!(
@@ -777,7 +776,7 @@ enum FlagWinner {
 }
 
 fn resolve_flag_conflict(
-    jmap_id: &str,
+    jmap_id: &JmapEmailId,
     _local_record: &MessageRecord,
     _server_email: &EmailObject,
     _local_change: Option<&LocalChange>,
