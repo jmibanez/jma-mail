@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use tracing::debug;
 
+use crate::ids::MessageId;
 use crate::maildir_ops::flags::{extract_flags, extract_id};
 use crate::maildir_ops::headers::parse_message_id_from_file;
 
@@ -20,7 +21,7 @@ pub enum LocalChange {
         /// the header was missing or unreadable; reconcile treats that as
         /// "not safe to dedupe against the server" and falls through to a
         /// plain upload.
-        message_id: Option<String>,
+        message_id: Option<MessageId>,
     },
     /// A message file we had recorded is now missing.
     DeletedMessage { maildir_id: String, folder: String },
@@ -251,7 +252,7 @@ mod tests {
             } => {
                 assert_eq!(maildir_id, unique);
                 assert_eq!(folder, "Spam");
-                assert_eq!(message_id.as_deref(), Some("a@x"));
+                assert_eq!(message_id.as_ref().map(AsRef::as_ref), Some("a@x"));
             }
             other => panic!("expected NewMessage on destination scan, got {:?}", other),
         }
@@ -374,7 +375,7 @@ mod tests {
             } => {
                 assert_eq!(maildir_id, new_id);
                 assert_eq!(folder, "Spam");
-                assert_eq!(message_id.as_deref(), Some("a@x"));
+                assert_eq!(message_id.as_ref().map(AsRef::as_ref), Some("a@x"));
             }
             other => panic!("expected NewMessage, got {:?}", other),
         }
@@ -409,7 +410,7 @@ mod tests {
             } => {
                 assert_eq!(maildir_id, unique);
                 assert_eq!(folder, "Spam");
-                assert_eq!(message_id.as_deref(), Some("a@x"));
+                assert_eq!(message_id.as_ref().map(AsRef::as_ref), Some("a@x"));
             }
             other => panic!("expected NewMessage on new/ scan, got {:?}", other),
         }

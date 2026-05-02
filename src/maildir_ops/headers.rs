@@ -1,10 +1,12 @@
 use anyhow::Result;
 use std::path::Path;
 
+use crate::ids::MessageId;
+
 /// Read a message file and extract its `Message-ID` header value.
-/// The returned string is the value with surrounding `<...>` stripped, or
-/// the raw value if no angle brackets are present.
-pub fn parse_message_id_from_file(path: &Path) -> Result<Option<String>> {
+/// The returned id has surrounding `<...>` stripped, or is the raw
+/// value if no angle brackets are present.
+pub fn parse_message_id_from_file(path: &Path) -> Result<Option<MessageId>> {
     // Read only enough bytes to comfortably cover header section.
     // 64 KiB is plenty for any reasonable message header block.
     let raw = read_header_bytes(path, 64 * 1024)?;
@@ -23,7 +25,7 @@ fn read_header_bytes(path: &Path, max: usize) -> Result<Vec<u8>> {
 /// Parse a Message-ID header value out of a byte slice that begins with the
 /// message's headers. Returns the angle-bracket-stripped value, or `None` if
 /// the header is missing.
-pub fn parse_message_id(raw: &[u8]) -> Option<String> {
+pub fn parse_message_id(raw: &[u8]) -> Option<MessageId> {
     let header_end = find_header_end(raw).unwrap_or(raw.len());
     let headers = &raw[..header_end];
 
@@ -86,17 +88,17 @@ fn header_name_matches(line: &[u8], name: &[u8]) -> bool {
     k < line.len() && line[k] == b':'
 }
 
-fn extract_msgid_value(value: &[u8]) -> Option<String> {
+fn extract_msgid_value(value: &[u8]) -> Option<MessageId> {
     let s = std::str::from_utf8(value).ok()?.trim();
     if let (Some(lt), Some(gt)) = (s.find('<'), s.rfind('>'))
         && gt > lt
     {
-        return Some(s[lt + 1..gt].to_string());
+        return Some(MessageId::from(&s[lt + 1..gt]));
     }
     if s.is_empty() {
         None
     } else {
-        Some(s.to_string())
+        Some(MessageId::from(s))
     }
 }
 
@@ -125,19 +127,22 @@ mod tests {
     #[test]
     fn parses_simple_message_id() {
         let raw = b"Subject: hi\r\nMessage-ID: <abc@example.com>\r\n\r\nbody";
-        assert_eq!(parse_message_id(raw), Some("abc@example.com".to_string()));
+        assert_eq!(
+            parse_message_id(raw),
+            Some(MessageId::from("abc@example.com"))
+        );
     }
 
     #[test]
     fn parses_lf_only() {
         let raw = b"Subject: hi\nMessage-Id: <id-2@host>\n\nbody";
-        assert_eq!(parse_message_id(raw), Some("id-2@host".to_string()));
+        assert_eq!(parse_message_id(raw), Some(MessageId::from("id-2@host")));
     }
 
     #[test]
     fn parses_folded_value() {
         let raw = b"Message-ID:\r\n <wrapped@x>\r\nSubject: hi\r\n\r\nbody";
-        assert_eq!(parse_message_id(raw), Some("wrapped@x".to_string()));
+        assert_eq!(parse_message_id(raw), Some(MessageId::from("wrapped@x")));
     }
 
     #[test]

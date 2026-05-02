@@ -86,7 +86,7 @@ pub fn dedupe_and_index(maildir_root: &Path, folders: &[String]) -> Result<Local
                 groups
                     .entry(GroupKey {
                         folder: folder.clone(),
-                        msgid: msgid.into(),
+                        msgid,
                     })
                     .or_default()
                     .push(Candidate {

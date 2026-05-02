@@ -119,7 +119,7 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
             LocalChange::NewMessage {
                 message_id: Some(mid),
                 ..
-            } => Some((mid.as_str(), c)),
+            } => Some((mid.as_ref(), c)),
             _ => None,
         })
         .collect();
@@ -577,7 +577,7 @@ fn process_local_changes(
                     maildir_id,
                     folder,
                     path,
-                    message_id.as_deref(),
+                    message_id.as_ref().map(AsRef::as_ref),
                     adopted_maildir_ids,
                     plan,
                 )
