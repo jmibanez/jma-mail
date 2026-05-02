@@ -176,21 +176,21 @@ fn commit_adopt(conn: &Connection, action: SyncAction) -> Result<()> {
     queries::upsert_message(
         conn,
         &MessageRecord {
-            jmap_email_id: jmap_email_id.clone(),
+            jmap_email_id: jmap_email_id.clone().into(),
             jmap_blob_id: if jmap_blob_id.is_empty() {
                 None
             } else {
-                Some(jmap_blob_id)
+                Some(jmap_blob_id.into())
             },
             jmap_thread_id: if jmap_thread_id.is_empty() {
                 None
             } else {
-                Some(jmap_thread_id)
+                Some(jmap_thread_id.into())
             },
-            mailbox_id,
-            maildir_id: Some(maildir_id.clone()),
+            mailbox_id: mailbox_id.into(),
+            maildir_id: Some(maildir_id.clone().into()),
             maildir_folder: Some(maildir_folder.clone()),
-            message_id,
+            message_id: message_id.map(Into::into),
             flags: flags.clone(),
             jmap_keywords: keywords_json,
         },
@@ -242,21 +242,21 @@ fn update_local_flags(
         queries::upsert_message(
             conn,
             &MessageRecord {
-                jmap_email_id,
+                jmap_email_id: jmap_email_id.into(),
                 jmap_blob_id: if jmap_blob_id.is_empty() {
                     None
                 } else {
-                    Some(jmap_blob_id)
+                    Some(jmap_blob_id.into())
                 },
                 jmap_thread_id: if jmap_thread_id.is_empty() {
                     None
                 } else {
-                    Some(jmap_thread_id)
+                    Some(jmap_thread_id.into())
                 },
-                mailbox_id,
-                maildir_id: Some(maildir_id.clone()),
+                mailbox_id: mailbox_id.into(),
+                maildir_id: Some(maildir_id.clone().into()),
                 maildir_folder: Some(maildir_folder.clone()),
-                message_id,
+                message_id: message_id.map(Into::into),
                 flags: new_flags.clone(),
                 jmap_keywords: keywords_json,
             },
@@ -390,13 +390,13 @@ async fn upload_messages(
                 queries::upsert_message(
                     conn,
                     &MessageRecord {
-                        jmap_email_id: jmap_email_id.clone(),
+                        jmap_email_id: jmap_email_id.clone().into(),
                         jmap_blob_id: None,
                         jmap_thread_id: None,
-                        mailbox_id: mailbox_id.clone(),
-                        maildir_id: Some(id.maildir_id.clone()),
+                        mailbox_id: mailbox_id.clone().into(),
+                        maildir_id: Some(id.maildir_id.clone().into()),
                         maildir_folder: Some(maildir_folder.clone()),
-                        message_id: id.message_id.clone(),
+                        message_id: id.message_id.clone().map(Into::into),
                         flags: flags.clone(),
                         jmap_keywords: keywords_json,
                     },
@@ -500,7 +500,7 @@ async fn apply_remote_set(
                 },
             )?;
             if let (Some(mid), Some(folder)) = (maildir_id, maildir_folder) {
-                queries::upsert_local_state(conn, &mid, &folder, &flags, None)?;
+                queries::upsert_local_state(conn, mid.as_ref(), &folder, &flags, None)?;
             }
         }
         info!("Updated remote keywords for {}", id);
@@ -543,9 +543,9 @@ async fn apply_remote_set(
             continue;
         }
         if let Some(rec) = queries::get_message_by_jmap_id(conn, &id.jmap_email_id)?
-            && let Some(mid) = rec.maildir_id.as_deref()
+            && let Some(mid) = rec.maildir_id.as_ref()
         {
-            queries::delete_local_state(conn, mid)?;
+            queries::delete_local_state(conn, mid.as_ref())?;
         }
         queries::delete_message_by_jmap_id(conn, &id.jmap_email_id)?;
         info!("Destroyed remote {}", id);
@@ -625,13 +625,13 @@ async fn run_downloads(
                 queries::upsert_message(
                     conn,
                     &MessageRecord {
-                        jmap_email_id: id.jmap_email_id.clone(),
-                        jmap_blob_id: Some(jmap_blob_id.clone()),
-                        jmap_thread_id: Some(jmap_thread_id.clone()),
-                        mailbox_id: mailbox_id.clone(),
-                        maildir_id: Some(mid.clone()),
+                        jmap_email_id: id.jmap_email_id.clone().into(),
+                        jmap_blob_id: Some(jmap_blob_id.clone().into()),
+                        jmap_thread_id: Some(jmap_thread_id.clone().into()),
+                        mailbox_id: mailbox_id.clone().into(),
+                        maildir_id: Some(mid.clone().into()),
                         maildir_folder: Some(maildir_folder.clone()),
-                        message_id: id.message_id.clone(),
+                        message_id: id.message_id.clone().map(Into::into),
                         flags: flags.clone(),
                         jmap_keywords: keywords_json,
                     },
@@ -750,7 +750,7 @@ mod tests {
             "DB folder must remain INBOX -- server still has it there"
         );
         assert_eq!(
-            rec.maildir_id.as_deref(),
+            rec.maildir_id.as_ref().map(AsRef::as_ref),
             Some("M-OLD"),
             "DB maildir_id must remain M-OLD -- the rebind to M-NEW is contingent on MoveRemote success"
         );
@@ -787,7 +787,7 @@ mod tests {
             .unwrap()
             .expect("E1 must still exist in message_map");
         assert_eq!(rec.maildir_folder.as_deref(), Some("Spam"));
-        assert_eq!(rec.maildir_id.as_deref(), Some("M-NEW"));
+        assert_eq!(rec.maildir_id.as_ref().map(AsRef::as_ref), Some("M-NEW"));
 
         let inbox_state = queries::get_local_state_for_folder(&conn, "INBOX").unwrap();
         assert!(

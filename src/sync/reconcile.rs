@@ -57,7 +57,7 @@ pub fn reconcile(
         .filter_map(|lc| match lc {
             LocalChange::FlagsChanged { maildir_id, .. } => known_by_maildir
                 .get(maildir_id)
-                .map(|m| (m.jmap_email_id.clone(), lc)),
+                .map(|m| (String::from(&m.jmap_email_id), lc)),
             _ => None,
         })
         .collect();
@@ -67,7 +67,7 @@ pub fn reconcile(
         .filter_map(|lc| match lc {
             LocalChange::DeletedMessage { maildir_id, .. } => known_by_maildir
                 .get(maildir_id)
-                .map(|m| m.jmap_email_id.clone()),
+                .map(|m| String::from(&m.jmap_email_id)),
             _ => None,
         })
         .collect();
@@ -105,7 +105,7 @@ pub fn reconcile(
         let Some(rec) = known_by_maildir.get(old_id) else {
             continue;
         };
-        let Some(mid) = rec.message_id.as_deref() else {
+        let Some(mid) = rec.message_id.as_ref().map(AsRef::as_ref) else {
             continue;
         };
         let Some(LocalChange::NewMessage {
@@ -129,20 +129,28 @@ pub fn reconcile(
         };
 
         detected_moves.push(DetectedMove {
-            jmap_email_id: rec.jmap_email_id.clone(),
+            jmap_email_id: String::from(&rec.jmap_email_id),
             to_mailbox_id: dst_mailbox_id,
             old_maildir_id: old_id.clone(),
             new_maildir_id: new_id.clone(),
             from_folder: src_folder.clone(),
             new_folder: dst_folder.clone(),
             new_flags: new_flags.clone(),
-            jmap_blob_id: rec.jmap_blob_id.clone().unwrap_or_default(),
-            jmap_thread_id: rec.jmap_thread_id.clone().unwrap_or_default(),
+            jmap_blob_id: rec
+                .jmap_blob_id
+                .as_ref()
+                .map(String::from)
+                .unwrap_or_default(),
+            jmap_thread_id: rec
+                .jmap_thread_id
+                .as_ref()
+                .map(String::from)
+                .unwrap_or_default(),
             message_id: mid.to_string(),
             prior_flags: rec.flags.clone(),
         });
         consumed_news.insert(new_id.clone());
-        consumed_deletes.insert(rec.jmap_email_id.clone());
+        consumed_deletes.insert(String::from(&rec.jmap_email_id));
     }
 
     // A delete that's been paired into a cross-folder move is not a
@@ -272,7 +280,7 @@ fn process_remote_emails(
     plan: &mut SyncPlan,
 ) {
     for email in ctx.remote_emails {
-        if ctx.destroyed_set.contains(email.id.as_str()) {
+        if ctx.destroyed_set.contains(email.id.as_ref()) {
             // Will be handled by the destroyed pass.
             continue;
         }
@@ -296,14 +304,14 @@ fn process_remote_emails(
             .cloned();
 
         // Path 1: already bound by JMAP id -- flag/move updates only.
-        if let Some(existing) = ctx.known_by_jmap.get(&email.id) {
+        if let Some(existing) = ctx.known_by_jmap.get(email.id.as_ref()) {
             handle_known_remote(
                 ctx,
                 email,
                 existing,
                 target_mailbox_id,
                 target_folder,
-                local_msg_id.as_deref(),
+                local_msg_id.as_ref().map(AsRef::as_ref),
                 deletes_overruled_by_server,
                 plan,
             );
@@ -317,7 +325,7 @@ fn process_remote_emails(
             && try_adopt_remote(
                 ctx,
                 email,
-                mid,
+                mid.as_ref(),
                 target_mailbox_id,
                 target_folder,
                 adopted_maildir_ids,
@@ -330,11 +338,11 @@ fn process_remote_emails(
         // Path 3: nothing local -- download.
         plan.actions.push(SyncAction::DownloadMessage {
             id: RemoteId {
-                jmap_email_id: email.id.clone(),
-                message_id: local_msg_id,
+                jmap_email_id: String::from(&email.id),
+                message_id: local_msg_id.map(Into::into),
             },
-            jmap_blob_id: email.blob_id.clone(),
-            jmap_thread_id: email.thread_id.clone(),
+            jmap_blob_id: String::from(&email.blob_id),
+            jmap_thread_id: String::from(&email.thread_id),
             mailbox_id: target_mailbox_id.clone(),
             maildir_folder: target_folder.clone(),
             keywords: email.keywords.clone(),
@@ -355,21 +363,22 @@ fn handle_known_remote(
     // Conflict: local deleted the file while the server updated
     // it. Resolve before any flag/move emission, since the local
     // copy is gone either way.
-    if ctx.local_deletes.contains(&email.id) {
-        match resolve_delete_conflict(&email.id, ctx.strategy) {
+    let email_id_str: &str = email.id.as_ref();
+    if ctx.local_deletes.contains(email_id_str) {
+        match resolve_delete_conflict(email_id_str, ctx.strategy) {
             DeleteWinner::Server => {
-                deletes_overruled_by_server.insert(email.id.clone());
+                deletes_overruled_by_server.insert(email_id_str.to_string());
                 // Re-download to restore the deleted local file.
                 // The orphaned local_state row from the prior
                 // maildir_id will be cleaned by the next scan
                 // cycle's idempotent DeletedMessage path.
                 plan.actions.push(SyncAction::DownloadMessage {
                     id: RemoteId {
-                        jmap_email_id: email.id.clone(),
+                        jmap_email_id: email_id_str.to_string(),
                         message_id: local_msg_id.map(|s| s.to_string()),
                     },
-                    jmap_blob_id: email.blob_id.clone(),
-                    jmap_thread_id: email.thread_id.clone(),
+                    jmap_blob_id: String::from(&email.blob_id),
+                    jmap_thread_id: String::from(&email.thread_id),
                     mailbox_id: target_mailbox_id.to_string(),
                     maildir_folder: target_folder.to_string(),
                     keywords: email.keywords.clone(),
@@ -384,15 +393,15 @@ fn handle_known_remote(
     }
 
     let new_flags = keywords_to_flags(&email.keywords);
-    let local_changed = ctx.local_flag_changes.contains_key(&email.id);
+    let local_changed = ctx.local_flag_changes.contains_key(email_id_str);
     let server_flag_change = existing.flags != new_flags;
 
     if server_flag_change && local_changed {
         let resolved = resolve_flag_conflict(
-            &email.id,
+            email_id_str,
             existing,
             email,
-            ctx.local_flag_changes.get(&email.id).copied(),
+            ctx.local_flag_changes.get(email_id_str).copied(),
             ctx.strategy,
         );
         match resolved {
@@ -401,12 +410,12 @@ fn handle_known_remote(
             }
             FlagWinner::Local => {
                 if let Some(LocalChange::FlagsChanged { new_flags, .. }) =
-                    ctx.local_flag_changes.get(&email.id).copied()
+                    ctx.local_flag_changes.get(email_id_str).copied()
                 {
                     plan.actions.push(SyncAction::UpdateRemoteKeywords {
                         id: RemoteId {
-                            jmap_email_id: email.id.clone(),
-                            message_id: existing.message_id.clone(),
+                            jmap_email_id: email_id_str.to_string(),
+                            message_id: existing.message_id.as_ref().map(String::from),
                         },
                         keywords: flags_to_keywords(new_flags),
                     });
@@ -428,9 +437,9 @@ fn handle_known_remote(
     {
         plan.actions.push(SyncAction::MoveLocal {
             id: BoundId {
-                maildir_id: local_maildir_id.clone(),
-                jmap_email_id: email.id.clone(),
-                message_id: existing.message_id.clone(),
+                maildir_id: String::from(local_maildir_id),
+                jmap_email_id: email_id_str.to_string(),
+                message_id: existing.message_id.as_ref().map(String::from),
             },
             from_folder: local_folder.clone(),
             to_folder: target_folder.to_string(),
@@ -452,12 +461,12 @@ fn try_adopt_remote(
         plan.actions.push(SyncAction::AdoptLocalMessage {
             id: BoundId {
                 maildir_id,
-                jmap_email_id: email.id.clone(),
+                jmap_email_id: String::from(&email.id),
                 message_id: Some(mid.to_string()),
             },
             maildir_folder: target_folder.to_string(),
-            jmap_blob_id: email.blob_id.clone(),
-            jmap_thread_id: email.thread_id.clone(),
+            jmap_blob_id: String::from(&email.blob_id),
+            jmap_thread_id: String::from(&email.thread_id),
             mailbox_id: target_mailbox_id.to_string(),
             keywords: email.keywords.clone(),
             old_maildir_id: None,
@@ -469,7 +478,11 @@ fn try_adopt_remote(
             .iter()
             .find(|r| r.maildir_folder.as_deref() == Some(target_folder) && r.maildir_id.is_some())
     {
-        push_adopt(plan, adopted_maildir_ids, rec.maildir_id.clone().unwrap());
+        push_adopt(
+            plan,
+            adopted_maildir_ids,
+            String::from(rec.maildir_id.as_ref().unwrap()),
+        );
         return true;
     }
 
@@ -494,9 +507,9 @@ fn process_remote_destroys(
         {
             plan.actions.push(SyncAction::DeleteLocal {
                 id: BoundId {
-                    maildir_id: maildir_id.clone(),
+                    maildir_id: String::from(maildir_id),
                     jmap_email_id: jmap_id.clone(),
-                    message_id: msg.message_id.clone(),
+                    message_id: msg.message_id.as_ref().map(String::from),
                 },
                 maildir_folder: folder.clone(),
             });
@@ -542,7 +555,7 @@ fn process_local_changes(
             } => handle_local_flags(ctx, maildir_id, new_flags, plan),
             LocalChange::DeletedMessage { maildir_id, .. } => {
                 if let Some(rec) = ctx.known_by_maildir.get(maildir_id)
-                    && consumed_deletes.contains(&rec.jmap_email_id)
+                    && consumed_deletes.contains(rec.jmap_email_id.as_ref())
                 {
                     continue;
                 }
@@ -593,12 +606,20 @@ fn handle_local_new(
         plan.actions.push(SyncAction::AdoptLocalMessage {
             id: BoundId {
                 maildir_id: maildir_id.to_string(),
-                jmap_email_id: rec.jmap_email_id.clone(),
+                jmap_email_id: String::from(&rec.jmap_email_id),
                 message_id: Some(mid.to_string()),
             },
             maildir_folder: folder.to_string(),
-            jmap_blob_id: rec.jmap_blob_id.clone().unwrap_or_default(),
-            jmap_thread_id: rec.jmap_thread_id.clone().unwrap_or_default(),
+            jmap_blob_id: rec
+                .jmap_blob_id
+                .as_ref()
+                .map(String::from)
+                .unwrap_or_default(),
+            jmap_thread_id: rec
+                .jmap_thread_id
+                .as_ref()
+                .map(String::from)
+                .unwrap_or_default(),
             mailbox_id,
             keywords,
             old_maildir_id: None,
@@ -662,8 +683,8 @@ fn handle_local_flags(
     }
     plan.actions.push(SyncAction::UpdateRemoteKeywords {
         id: RemoteId {
-            jmap_email_id: msg.jmap_email_id.clone(),
-            message_id: msg.message_id.clone(),
+            jmap_email_id: String::from(&msg.jmap_email_id),
+            message_id: msg.message_id.as_ref().map(String::from),
         },
         keywords: flags_to_keywords(new_flags),
     });
@@ -678,16 +699,16 @@ fn handle_local_delete(
     let Some(msg) = ctx.known_by_maildir.get(maildir_id) else {
         return;
     };
-    if ctx.destroyed_set.contains(msg.jmap_email_id.as_str()) {
+    if ctx.destroyed_set.contains(msg.jmap_email_id.as_ref()) {
         return;
     }
-    if deletes_overruled_by_server.contains(&msg.jmap_email_id) {
+    if deletes_overruled_by_server.contains(msg.jmap_email_id.as_ref()) {
         return;
     }
     plan.actions.push(SyncAction::DestroyRemote {
         id: RemoteId {
-            jmap_email_id: msg.jmap_email_id.clone(),
-            message_id: msg.message_id.clone(),
+            jmap_email_id: String::from(&msg.jmap_email_id),
+            message_id: msg.message_id.as_ref().map(String::from),
         },
     });
 }
@@ -768,15 +789,15 @@ fn emit_local_flag_update(
         .or_else(|| existing.message_id.clone());
     plan.actions.push(SyncAction::UpdateLocalFlags {
         id: BoundId {
-            maildir_id: maildir_id.clone(),
-            jmap_email_id: email.id.clone(),
-            message_id: local_msg_id,
+            maildir_id: String::from(maildir_id),
+            jmap_email_id: String::from(&email.id),
+            message_id: local_msg_id.map(Into::into),
         },
         maildir_folder: folder.clone(),
         new_flags,
         keywords: email.keywords.clone(),
-        jmap_blob_id: email.blob_id.clone(),
-        jmap_thread_id: email.thread_id.clone(),
+        jmap_blob_id: String::from(&email.blob_id),
+        jmap_thread_id: String::from(&email.thread_id),
         mailbox_id: target_mailbox_id.to_string(),
     });
 }
@@ -799,11 +820,11 @@ mod tests {
         mailbox_ids.insert(mailbox_id.to_string(), true);
         EmailObject {
             id: id.into(),
-            blob_id: format!("blob-{id}"),
-            thread_id: format!("thr-{id}"),
+            blob_id: format!("blob-{id}").into(),
+            thread_id: format!("thr-{id}").into(),
             mailbox_ids,
             keywords: flags_to_keywords(flags),
-            message_id: message_id.map(|m| vec![m.to_string()]),
+            message_id: message_id.map(|m| vec![m.into()]),
             subject: None,
         }
     }
@@ -819,12 +840,12 @@ mod tests {
         let kw = flags_to_keywords(flags);
         MessageRecord {
             jmap_email_id: jmap_id.into(),
-            jmap_blob_id: Some(format!("blob-{jmap_id}")),
-            jmap_thread_id: Some(format!("thr-{jmap_id}")),
+            jmap_blob_id: Some(format!("blob-{jmap_id}").into()),
+            jmap_thread_id: Some(format!("thr-{jmap_id}").into()),
             mailbox_id: mailbox_id.into(),
-            maildir_id: maildir_id.map(String::from),
+            maildir_id: maildir_id.map(Into::into),
             maildir_folder: Some(folder.into()),
-            message_id: message_id.map(String::from),
+            message_id: message_id.map(Into::into),
             flags: flags.into(),
             jmap_keywords: serde_json::to_string(&kw).unwrap(),
         }
@@ -838,20 +859,20 @@ mod tests {
         HashMap<String, MessageRecord>,
         HashMap<String, Vec<MessageRecord>>,
     ) {
-        let mut by_maildir = HashMap::new();
-        let mut by_jmap = HashMap::new();
+        let mut by_maildir: HashMap<String, MessageRecord> = HashMap::new();
+        let mut by_jmap: HashMap<String, MessageRecord> = HashMap::new();
         let mut by_message_id: HashMap<String, Vec<MessageRecord>> = HashMap::new();
         for r in records {
             if let Some(ref m) = r.maildir_id {
-                by_maildir.insert(m.clone(), r.clone());
+                by_maildir.insert(String::from(m), r.clone());
             }
             if let Some(ref mid) = r.message_id {
                 by_message_id
-                    .entry(mid.clone())
+                    .entry(String::from(mid))
                     .or_default()
                     .push(r.clone());
             }
-            by_jmap.insert(r.jmap_email_id.clone(), r.clone());
+            by_jmap.insert(String::from(&r.jmap_email_id), r.clone());
         }
         (by_maildir, by_jmap, by_message_id)
     }

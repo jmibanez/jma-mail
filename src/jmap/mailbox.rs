@@ -3,6 +3,7 @@ use jmap_client::client::Client;
 use jmap_client::mailbox;
 use tracing::{debug, info};
 
+use crate::ids::JmapMailboxId;
 use crate::jmap::types::MailboxObject;
 
 /// Decide whether `mb` matches any entry in the user's configured mailbox
@@ -71,9 +72,9 @@ pub async fn get_all(client: &Client) -> Result<Vec<MailboxObject>> {
         .list()
         .iter()
         .map(|mb| {
-            let id = mb.id().unwrap_or_default().to_string();
+            let id = JmapMailboxId::from(mb.id().unwrap_or_default());
             let name = mb.name().unwrap_or("(unnamed)").to_string();
-            let parent_id = mb.parent_id().map(|p| p.to_string());
+            let parent_id = mb.parent_id().map(JmapMailboxId::from);
             let role = mb.role();
             let role_str = match role {
                 jmap_client::mailbox::Role::None => None,
@@ -111,7 +112,7 @@ mod tests {
 
     fn mb(name: &str, role: Option<&str>) -> MailboxObject {
         MailboxObject {
-            id: "mb1".to_string(),
+            id: JmapMailboxId::from("mb1"),
             name: name.to_string(),
             parent_id: None,
             role: role.map(str::to_string),

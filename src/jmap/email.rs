@@ -4,6 +4,7 @@ use jmap_client::email;
 use std::collections::HashMap;
 use tracing::{debug, info};
 
+use crate::ids::{JmapBlobId, JmapEmailId, JmapThreadId, MessageId};
 use crate::jmap::retry::with_retry;
 use crate::jmap::types::{ChangesResponse, EmailObject};
 use crate::sync::plan::LocalId;
@@ -155,12 +156,20 @@ pub async fn get_changes(client: &Client, since_state: &str) -> Result<ChangesRe
     let result = ChangesResponse {
         old_state: changes.old_state().to_string(),
         new_state: changes.new_state().to_string(),
-        created: changes.created().iter().map(|id| id.to_string()).collect(),
-        updated: changes.updated().iter().map(|id| id.to_string()).collect(),
+        created: changes
+            .created()
+            .iter()
+            .map(|id| JmapEmailId::from(id.as_str()))
+            .collect(),
+        updated: changes
+            .updated()
+            .iter()
+            .map(|id| JmapEmailId::from(id.as_str()))
+            .collect(),
         destroyed: changes
             .destroyed()
             .iter()
-            .map(|id| id.to_string())
+            .map(|id| JmapEmailId::from(id.as_str()))
             .collect(),
         has_more_changes: changes.has_more_changes(),
     };
@@ -356,12 +365,12 @@ pub async fn download_blob(client: &Client, blob_id: &str) -> Result<Vec<u8>> {
 }
 
 fn parse_email_object(email: &jmap_client::email::Email<jmap_client::Get>) -> EmailObject {
-    let id = email.id().unwrap_or_default().to_string();
-    let blob_id = email.blob_id().unwrap_or_default().to_string();
-    let thread_id = email.thread_id().unwrap_or_default().to_string();
+    let id = JmapEmailId::from(email.id().unwrap_or_default());
+    let blob_id = JmapBlobId::from(email.blob_id().unwrap_or_default());
+    let thread_id = JmapThreadId::from(email.thread_id().unwrap_or_default());
     let message_id = email
         .message_id()
-        .map(|ids| ids.iter().map(|s| s.to_string()).collect());
+        .map(|ids| ids.iter().map(|s| MessageId::from(s.as_str())).collect());
 
     let mailbox_ids: HashMap<String, bool> = email
         .mailbox_ids()

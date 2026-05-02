@@ -59,7 +59,7 @@ pub async fn resolve_mailboxes(
         let maildir_path = config.maildir_path().join(&folder_name);
         store::ensure_maildir(&maildir_path)?;
 
-        synced.push((mb.id.clone(), folder_name));
+        synced.push((String::from(&mb.id), folder_name));
     }
 
     info!("Syncing {} mailboxes", synced.len());
@@ -83,15 +83,15 @@ fn build_known_indices(
         let messages = queries::get_messages_by_folder(conn, folder_name)?;
         for msg in messages {
             if let Some(ref mid) = msg.maildir_id {
-                by_maildir.insert(mid.clone(), msg.clone());
+                by_maildir.insert(String::from(mid), msg.clone());
             }
             if let Some(ref message_id) = msg.message_id {
                 by_message_id
-                    .entry(message_id.clone())
+                    .entry(String::from(message_id))
                     .or_default()
                     .push(msg.clone());
             }
-            by_jmap.insert(msg.jmap_email_id.clone(), msg);
+            by_jmap.insert(String::from(&msg.jmap_email_id), msg);
         }
     }
     Ok((by_maildir, by_jmap, by_message_id))
@@ -213,9 +213,9 @@ async fn fetch_remote_state(
             let res = jmap_email::get_changes(client, &current).await;
             match res {
                 Ok(changes) => {
-                    all_created.extend(changes.created.clone());
-                    all_updated.extend(changes.updated.clone());
-                    all_destroyed.extend(changes.destroyed.clone());
+                    all_created.extend(changes.created.iter().map(String::from));
+                    all_updated.extend(changes.updated.iter().map(String::from));
+                    all_destroyed.extend(changes.destroyed.iter().map(String::from));
                     let next = changes.new_state.clone();
                     if !changes.has_more_changes {
                         break next;

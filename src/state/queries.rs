@@ -2,6 +2,8 @@ use anyhow::Result;
 use rusqlite::{Connection, params};
 use std::collections::HashMap;
 
+use crate::ids::{JmapBlobId, JmapEmailId, JmapMailboxId, JmapThreadId, MaildirId, MessageId};
+
 // --- JMAP State ---
 
 /// Get the JMAP state string for an entity type.
@@ -41,13 +43,13 @@ pub fn set_jmap_state(
 
 #[derive(Clone)]
 pub struct MessageRecord {
-    pub jmap_email_id: String,
-    pub jmap_blob_id: Option<String>,
-    pub jmap_thread_id: Option<String>,
-    pub mailbox_id: String,
-    pub maildir_id: Option<String>,
+    pub jmap_email_id: JmapEmailId,
+    pub jmap_blob_id: Option<JmapBlobId>,
+    pub jmap_thread_id: Option<JmapThreadId>,
+    pub mailbox_id: JmapMailboxId,
+    pub maildir_id: Option<MaildirId>,
     pub maildir_folder: Option<String>,
-    pub message_id: Option<String>,
+    pub message_id: Option<MessageId>,
     pub flags: String,
     pub jmap_keywords: String,
 }
@@ -152,10 +154,10 @@ pub fn get_messages_by_folder(conn: &Connection, folder: &str) -> Result<Vec<Mes
 // --- Mailbox Map ---
 
 pub struct MailboxRecord {
-    pub jmap_mailbox_id: String,
+    pub jmap_mailbox_id: JmapMailboxId,
     pub name: String,
     pub role: Option<String>,
-    pub parent_id: Option<String>,
+    pub parent_id: Option<JmapMailboxId>,
     pub maildir_folder: String,
     pub sort_order: i32,
 }

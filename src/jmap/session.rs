@@ -3,6 +3,7 @@ use jmap_client::client::{Client, Credentials};
 use tracing::info;
 
 use crate::config::AccountConfig;
+use crate::ids::JmapAccountId;
 use crate::jmap::retry::with_retry;
 use crate::jmap::types::SessionInfo;
 
@@ -38,15 +39,14 @@ pub fn session_info(client: &Client) -> Result<SessionInfo> {
     let account_id = session
         .accounts()
         .next()
-        .context("No accounts found in JMAP session")?
-        .clone();
+        .context("No accounts found in JMAP session")?;
 
     Ok(SessionInfo {
         api_url: session.api_url().to_string(),
         download_url: session.download_url().to_string(),
         upload_url: session.upload_url().to_string(),
         event_source_url: session.event_source_url().to_string(),
-        account_id,
+        account_id: JmapAccountId::from(account_id.as_str()),
         username: session.username().to_string(),
     })
 }
