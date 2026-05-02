@@ -67,7 +67,7 @@ pub fn dedupe_and_index(maildir_root: &Path, folders: &[String]) -> Result<Local
                     continue;
                 }
                 let filename = entry.file_name().to_string_lossy().to_string();
-                let maildir_id: MaildirId = extract_id(&filename).into();
+                let maildir_id = extract_id(&filename);
 
                 let msgid = match parse_message_id_from_file(&path) {
                     Ok(Some(id)) => id,

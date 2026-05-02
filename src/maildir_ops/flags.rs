@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use crate::ids::MaildirId;
+
 /// JMAP keyword to Maildir flag mapping.
 ///
 /// Maildir flags (in the :2, suffix) are single uppercase chars, sorted:
@@ -48,11 +50,11 @@ pub fn extract_flags(filename: &str) -> &str {
 }
 
 /// Extract the unique ID portion from a maildir filename (before the :2, suffix).
-pub fn extract_id(filename: &str) -> &str {
+pub fn extract_id(filename: &str) -> MaildirId {
     if let Some(pos) = filename.find(":2,") {
-        &filename[..pos]
+        MaildirId::from(&filename[..pos])
     } else {
-        filename
+        MaildirId::from(filename)
     }
 }
 
@@ -102,7 +104,13 @@ mod tests {
 
     #[test]
     fn test_extract_id() {
-        assert_eq!(extract_id("1234567890.abc:2,FS"), "1234567890.abc");
-        assert_eq!(extract_id("1234567890.abc"), "1234567890.abc");
+        assert_eq!(
+            extract_id("1234567890.abc:2,FS"),
+            MaildirId::from("1234567890.abc")
+        );
+        assert_eq!(
+            extract_id("1234567890.abc"),
+            MaildirId::from("1234567890.abc")
+        );
     }
 }

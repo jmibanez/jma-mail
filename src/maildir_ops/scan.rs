@@ -57,7 +57,7 @@ pub fn scan_folder(
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
-        let maildir_id: MaildirId = extract_id(&filename).into();
+        let maildir_id = extract_id(&filename);
         let flags = extract_flags(&filename).to_string();
 
         seen_ids.push(maildir_id.clone());
@@ -142,7 +142,7 @@ pub fn scan_folder(
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
-        let maildir_id: MaildirId = extract_id(&filename).into();
+        let maildir_id = extract_id(&filename);
 
         seen_ids.push(maildir_id.clone());
 
