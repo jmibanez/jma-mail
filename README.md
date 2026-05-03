@@ -29,7 +29,7 @@ $ jmapsync watch
 Currently, this project doesn't yet have releases. You need to install this manually via Cargo:
 
 ```shell
-cargo install --path .
+cargo install --git https://github.com/jmibanez/jmapsync
 ```
 
 ## A note on mailboxes
