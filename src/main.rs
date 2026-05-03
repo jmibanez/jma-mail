@@ -37,11 +37,11 @@ async fn main() -> Result<()> {
         Command::Push => cmd_push(&cli).await,
         Command::Watch => cmd_watch(&cli).await,
         Command::Status => cmd_status(&cli).await,
-        Command::Auth { action } => cmd_auth(action),
+        Command::Auth { action } => cmd_auth(&cli, action).await,
     }
 }
 
-fn cmd_auth(action: AuthAction) -> Result<()> {
+async fn cmd_auth(cli: &Cli, action: AuthAction) -> Result<()> {
     use std::io::{BufRead, IsTerminal};
     match action {
         AuthAction::SetToken => {
@@ -62,6 +62,39 @@ fn cmd_auth(action: AuthAction) -> Result<()> {
         AuthAction::ClearToken => {
             jmapsync::auth::clear_bearer_token()?;
             println!("Bearer token cleared from keychain.");
+        }
+        AuthAction::Rediscover => {
+            let config = load_config(cli)?;
+            if config.account.session_url.is_some() {
+                println!(
+                    "Note: [account].session_url is set explicitly in the config, \
+                     so sync bypasses the discovery cache. Rediscovering anyway -- \
+                     this will take effect once you remove the override."
+                );
+            }
+            let domain = config.account.email_domain()?;
+            let db_path = config.db_path();
+            // No acquire_lock: this only touches the discovery cache,
+            // which SQLite serializes internally. It's safe to run
+            // alongside an in-progress sync/watch.
+            let conn = state::db::open(&db_path)?;
+
+            let prev = jmapsync::state::queries::get_cached_session_url(&conn, domain)?;
+            jmapsync::state::queries::clear_cached_session_url(&conn, domain)?;
+
+            let new_url = jmapsync::jmap::discovery::discover(domain).await?;
+            jmapsync::state::queries::set_cached_session_url(&conn, domain, &new_url)?;
+
+            match prev.as_deref() {
+                Some(p) if p == new_url => {
+                    println!("Discovered (unchanged): {new_url}");
+                }
+                Some(p) => {
+                    println!("Discovered: {new_url}");
+                    println!("(previously cached: {p})");
+                }
+                None => println!("Discovered: {new_url}"),
+            }
         }
     }
     Ok(())

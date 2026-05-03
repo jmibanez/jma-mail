@@ -49,7 +49,7 @@ pub enum Command {
     Status,
     /// List remote mailboxes and their local mapping
     Mailboxes,
-    /// Manage the bearer token stored in the OS keychain
+    /// Manage account credentials and the JMAP discovery cache
     Auth {
         #[command(subcommand)]
         action: AuthAction,
@@ -63,4 +63,9 @@ pub enum AuthAction {
     SetToken,
     /// Remove the bearer token from the OS keychain
     ClearToken,
+    /// Clear the cached JMAP session URL for this account's email
+    /// domain and run autodiscovery (DNS SRV, /.well-known/jmap)
+    /// again, printing the result. Use this when your provider
+    /// changes their session endpoint.
+    Rediscover,
 }

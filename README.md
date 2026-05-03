@@ -81,7 +81,7 @@ Configuration for `jmapsync` lives in `~/.config/jmapsync/config.toml`. The key 
 Other `[account]` keys:
 
   * `email`: The email address for this account. Required. The domain part is used to discover the JMAP session URL via DNS SRV (`_jmap._tcp.<domain>`) and `/.well-known/jmap`, per RFC 8620 section 2.2.
-  * `session_url`: Optional explicit JMAP session URL. When unset (the default), the URL is autodiscovered from the `email` domain via DNS SRV and `/.well-known/jmap`, and the result is cached in the state DB. Set this only to override autodiscovery -- e.g. when your provider doesn't publish the discovery records, or to pin a specific endpoint during testing.
+  * `session_url`: Optional explicit JMAP session URL. When unset (the default), the URL is autodiscovered from the `email` domain via DNS SRV and `/.well-known/jmap`, and the result is cached in the state DB. Set this only to override autodiscovery -- e.g. when your provider doesn't publish the discovery records, or to pin a specific endpoint during testing. To force a re-discovery (for example, when your provider changes their session endpoint), run `jmapsync auth rediscover`.
 
 ### Sync `[sync]`
 
