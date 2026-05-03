@@ -515,11 +515,15 @@ fn try_adopt_remote(
         };
 
     if let Some(recs) = ctx.known_by_message_id.get(mid)
-        && let Some(rec) = recs
-            .iter()
-            .find(|r| r.maildir_folder.as_deref() == Some(target_folder) && r.maildir_id.is_some())
+        && let Some(maildir_id) = recs.iter().find_map(|r| {
+            if r.maildir_folder.as_deref() == Some(target_folder) {
+                r.maildir_id.clone()
+            } else {
+                None
+            }
+        })
     {
-        push_adopt(plan, adopted_maildir_ids, rec.maildir_id.clone().unwrap());
+        push_adopt(plan, adopted_maildir_ids, maildir_id);
         return true;
     }
 
