@@ -152,15 +152,25 @@ The state DB is **disposable**. Nuking `state.db` and re-running must converge o
 
 Don't add a code path that writes to a maildir outside `execute::execute` (or `dedupe`'s deletion of duplicates). Every other writer would skip the Message-ID check.
 
-### Schema migration: dropping the DB
+### Schema versioning: nuke-and-resync as the migration story
 
-The `message_id` column on `message_map` is `NOT NULL`, and `MessageRecord.message_id` / `LocalId.message_id` / `RemoteId.message_id` / `BoundId.message_id` are non-`Option`. There is no in-place migration from older schemas that allowed `NULL` here -- if you're upgrading from a pre-tightening jmapsync, **delete `state.db` and re-sync**. Disposability is the migration story: the dedupe pass plus the Message-ID-anchored adopt path will rebind every existing local file without re-downloading.
+There is no in-place migration system. Whenever the SQLite schema or the invariants the code expects of existing rows change in a way the previous binary's writes would violate (e.g. tightening a column from `NULL`-able to `NOT NULL`, adding a uniqueness constraint, changing what a string-encoded field represents), bump `state::db::SCHEMA_VERSION`. The version is stored as SQLite's `PRAGMA user_version`.
+
+On open, the binary compares the on-disk version against `SCHEMA_VERSION`:
+
+- **Match** -- proceed.
+- **Mismatch** under a mutating command (`sync`, `pull`, `push`, `watch`) -- `open_or_recreate` `warn!`s and unlinks `state.db` plus its `-wal` and `-shm` siblings, then recreates an empty schema. The mutating command holds the advisory lock at this point, so no concurrent jmapsync can race with the unlink. The disposability invariant is what makes this safe: the maildir + JMAP server are the source of truth, and the dedupe pass plus Message-ID-anchored adoption rebind every existing local file without re-downloading bytes.
+- **Mismatch** under a read-only command (`status`, `mailboxes`, `auth rediscover`) -- `open` refuses with an actionable error pointing the user at `jmapsync sync`. Read-only paths don't hold the lock and so can't safely nuke; deferring to the next mutating run keeps the locking invariant intact.
+
+Both directions of mismatch (older binary, newer DB; or newer binary, older DB) take the same auto-nuke path. Disposability cuts both ways. A pre-versioning DB (`user_version = 0` with populated tables) is treated as stale.
+
+When you bump `SCHEMA_VERSION`, you don't need to write migration code -- but you DO need to mention the field/invariant change in the commit message, and ideally add a regression test that constructs an old-schema DB on disk and checks `open_or_recreate` rebuilds correctly.
 
 ## State DB concurrency model
 
 Three layers, each protecting against a different mutation source:
 
-1. **Inter-jmapsync coordination** -- `state::db::acquire_lock` takes a `flock`-backed advisory lock on `<state.db>.lock`. Two jmapsync invocations (`sync`, `pull`, `push`, `watch`) against the same DB can't both run; the second fails with the first's PID in the error message. Read-only commands (`status`, `mailboxes`) and DB-less commands (`init`, `auth`) skip this.
+1. **Inter-jmapsync coordination** -- `state::db::acquire_lock` takes a `flock`-backed advisory lock on `<state.db>.lock`. Two jmapsync invocations (`sync`, `pull`, `push`, `watch`) against the same DB can't both run; the second fails with the first's PID in the error message. Read-only commands (`status`, `mailboxes`) and DB-less commands (`init`, `auth`) skip this. The lock is held *before* `open_or_recreate` runs, so the schema-version recovery path (which unlinks `state.db`) is also serialized.
 
 2. **Intra-cycle write atomicity** -- `src/sync/execute.rs` wraps each mutation phase in a SQLite transaction via `Connection::unchecked_transaction()`. Pure-DB phases (`adopt_messages`, `apply_move_pair_adopts`, the post-network section of `apply_remote_set`) take one transaction per phase, so a panic mid-loop rolls the whole phase back. FS-mutating phases (`update_local_flags`, `move_local_messages`, `delete_local_messages`, `upload_messages`, `run_downloads`) take one transaction per iteration around the paired DB writes that follow each successful FS op, so a row's `message_map` and `local_state` never disagree even if the second DB write fails. Side benefit: SQLite's WAL writer-lock serializes any other writer on the file from the first write through commit; the eventual multi-account refactor (one engine per account against a shared DB) inherits this serialization for free.
 
