@@ -1,11 +1,11 @@
 use anyhow::Result;
+use maildir::Maildir;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tracing::{debug, error, info, warn};
 
 use crate::ids::{MaildirId, MessageId};
-use crate::maildir_ops::flags::extract_id;
 use crate::maildir_ops::headers::parse_message_id_from_file;
 use crate::maildir_ops::store;
 
@@ -54,52 +54,48 @@ pub fn dedupe_and_index(maildir_root: &Path, folders: &[String]) -> Result<Local
     let mut groups: HashMap<GroupKey, Vec<Candidate>> = HashMap::new();
 
     for folder in folders {
-        let folder_path = maildir_root.join(folder);
-        for sub in &["cur", "new"] {
-            let dir = folder_path.join(sub);
-            if !dir.exists() {
-                continue;
-            }
-            for entry in std::fs::read_dir(&dir)? {
-                let entry = entry?;
-                let path = entry.path();
-                if !path.is_file() {
+        // Delegate "what counts as a maildir file" to the crate:
+        // list_cur/list_new filter dot-prefixed entries (.DS_Store,
+        // .nfsXXXX) and enforce the `<unique>:2,<flags>` convention.
+        // Maildir::from(PathBuf) is a pure constructor, and the
+        // iterators yield nothing when the subdir is missing, so
+        // dedupe stays non-mutating and the "skip missing folder"
+        // behavior is preserved.
+        let md = Maildir::from(maildir_root.join(folder));
+        for entry in md.list_cur().chain(md.list_new()) {
+            let entry = entry?;
+            let maildir_id = MaildirId::from(entry.id());
+            let path = entry.path().clone();
+
+            let msgid = match parse_message_id_from_file(&path)? {
+                Some(id) => id,
+                None => {
+                    error!(
+                        "Skipping {} ({}): no Message-ID header. \
+                         jmapsync requires Message-ID to anchor idempotency; \
+                         fix the file or remove it.",
+                        maildir_id,
+                        path.display()
+                    );
                     continue;
                 }
-                let filename = entry.file_name().to_string_lossy().to_string();
-                let maildir_id = extract_id(&filename);
+            };
 
-                let msgid = match parse_message_id_from_file(&path)? {
-                    Some(id) => id,
-                    None => {
-                        error!(
-                            "Skipping {} ({}): no Message-ID header. \
-                             jmapsync requires Message-ID to anchor idempotency; \
-                             fix the file or remove it.",
-                            maildir_id,
-                            path.display()
-                        );
-                        continue;
-                    }
-                };
+            let mtime = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
 
-                let mtime = entry
-                    .metadata()
-                    .and_then(|m| m.modified())
-                    .unwrap_or(SystemTime::UNIX_EPOCH);
-
-                groups
-                    .entry(GroupKey {
-                        folder: folder.clone(),
-                        msgid,
-                    })
-                    .or_default()
-                    .push(Candidate {
-                        path,
-                        mtime,
-                        maildir_id,
-                    });
-            }
+            groups
+                .entry(GroupKey {
+                    folder: folder.clone(),
+                    msgid,
+                })
+                .or_default()
+                .push(Candidate {
+                    path,
+                    mtime,
+                    maildir_id,
+                });
         }
     }
 
@@ -151,4 +147,53 @@ pub fn dedupe_and_index(maildir_root: &Path, folders: &[String]) -> Result<Local
     }
 
     Ok(index)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::maildir_ops::store::ensure_maildir;
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// Finder writes .DS_Store metadata into folders it browses,
+    /// including a maildir's cur/ and new/. dedupe_and_index walks
+    /// via the maildir crate's list_cur/list_new iterators
+    /// specifically because they filter dot-prefixed entries — guard
+    /// that delegation so a future "let's avoid the crate dependency
+    /// here" refactor can't silently regress and trip the
+    /// require-Message-ID error path on every sync.
+    #[test]
+    fn dedupe_skips_dot_prefixed_files() {
+        let tmp = TempDir::new().unwrap();
+        let inbox_path = tmp.path().join("INBOX");
+        let _inbox = ensure_maildir(&inbox_path).unwrap();
+
+        let unique = "1700000000.M1.host";
+        let filename = format!("{unique}:2,S");
+        let body = "Message-ID: <a@x>\r\n\r\nbody\r\n";
+        fs::write(inbox_path.join("cur").join(&filename), body).unwrap();
+
+        // Dot-prefixed files in both cur/ and new/ — .DS_Store is
+        // arbitrary binary noise that won't parse as a header block.
+        fs::write(inbox_path.join("cur").join(".DS_Store"), b"\x00\x01\x02").unwrap();
+        fs::write(inbox_path.join("new").join(".keep"), b"").unwrap();
+
+        let folders = vec!["INBOX".to_string()];
+        let index = dedupe_and_index(tmp.path(), &folders).unwrap();
+
+        assert_eq!(
+            index.by_message_id.len(),
+            1,
+            "expected one indexed Message-ID, got {:?}",
+            index.by_message_id
+        );
+        let entries = index
+            .by_message_id
+            .get(&MessageId::from("a@x"))
+            .expect("real mail file should be indexed");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].folder, "INBOX");
+        assert_eq!(entries[0].maildir_id.as_ref(), unique);
+    }
 }
