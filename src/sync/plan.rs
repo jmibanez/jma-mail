@@ -4,12 +4,16 @@ use std::path::PathBuf;
 
 use crate::ids::{JmapBlobId, JmapEmailId, JmapMailboxId, JmapThreadId, MaildirId, MessageId};
 
-/// A message known by its local maildir handle. The optional Message-ID
-/// rides along so logs can name the message in human-readable form.
+/// A message known by its local maildir handle. The Message-ID rides
+/// along so logs can name the message in human-readable form, and so
+/// downstream reconcile/execute can use it as the idempotency anchor
+/// without re-parsing the file. Required: scan refuses to construct a
+/// `LocalId` for a file with no parseable Message-ID, so by the time
+/// any code holds one, the id is guaranteed.
 #[derive(Debug, Clone)]
 pub struct LocalId {
     pub maildir_id: MaildirId,
-    pub message_id: Option<MessageId>,
+    pub message_id: MessageId,
 }
 
 /// A message known by its opaque JMAP server id.
@@ -30,10 +34,7 @@ pub struct BoundId {
 
 impl fmt::Display for LocalId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.message_id {
-            Some(m) => write!(f, "{} ({})", self.maildir_id, m),
-            None => write!(f, "{}", self.maildir_id),
-        }
+        write!(f, "{} ({})", self.maildir_id, self.message_id)
     }
 }
 
@@ -56,12 +57,6 @@ impl fmt::Display for BoundId {
 }
 
 impl BoundId {
-    pub fn as_local(&self) -> LocalId {
-        LocalId {
-            maildir_id: self.maildir_id.clone(),
-            message_id: self.message_id.clone(),
-        }
-    }
     pub fn as_remote(&self) -> RemoteId {
         RemoteId {
             jmap_email_id: self.jmap_email_id.clone(),

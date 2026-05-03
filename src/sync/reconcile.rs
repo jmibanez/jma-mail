@@ -116,10 +116,7 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
     let news_by_message_id: HashMap<&MessageId, &LocalChange> = local_changes
         .iter()
         .filter_map(|c| match c {
-            LocalChange::NewMessage {
-                message_id: Some(mid),
-                ..
-            } => Some((mid, c)),
+            LocalChange::NewMessage { message_id, .. } => Some((message_id, c)),
             _ => None,
         })
         .collect();
@@ -584,7 +581,7 @@ fn process_local_changes(
                     maildir_id,
                     folder,
                     path,
-                    message_id.as_ref(),
+                    message_id,
                     adopted_maildir_ids,
                     plan,
                 )
@@ -611,7 +608,7 @@ fn handle_local_new(
     maildir_id: &MaildirId,
     folder: &str,
     path: &std::path::Path,
-    message_id: Option<&MessageId>,
+    message_id: &MessageId,
     adopted_maildir_ids: &HashSet<MaildirId>,
     plan: &mut SyncPlan,
 ) {
@@ -636,8 +633,7 @@ fn handle_local_new(
     // If we can match the local Message-ID against a known server
     // email (DB index), adopt instead of upload. This is the
     // alreadyExists guard.
-    if let Some(mid) = message_id
-        && let Some(recs) = ctx.known_by_message_id.get(mid)
+    if let Some(recs) = ctx.known_by_message_id.get(message_id)
         && let Some(rec) = recs
             .iter()
             .find(|r| r.maildir_folder.as_deref() == Some(folder))
@@ -648,7 +644,7 @@ fn handle_local_new(
             id: BoundId {
                 maildir_id: maildir_id.clone(),
                 jmap_email_id: rec.jmap_email_id.clone(),
-                message_id: Some(mid.clone()),
+                message_id: Some(message_id.clone()),
             },
             maildir_folder: folder.to_string(),
             jmap_blob_id: rec.jmap_blob_id.clone(),
@@ -668,15 +664,14 @@ fn handle_local_new(
     // racing us. Uploading would be rejected with alreadyExists every
     // cycle and never converge, so skip the upload and warn loudly so
     // the user can decide which copy to keep.
-    if let Some(mid) = message_id
-        && let Some(recs) = ctx.known_by_message_id.get(mid)
+    if let Some(recs) = ctx.known_by_message_id.get(message_id)
         && let Some(other) = recs.iter().find(|r| r.maildir_id.is_some())
     {
         warn!(
             "Local file {}/{} duplicates Message-ID {} already mapped to JMAP {} in folder {} (no paired delete to interpret as a move). Skipping upload to avoid alreadyExists; remove one copy to converge.",
             folder,
             maildir_id,
-            mid,
+            message_id,
             other.jmap_email_id,
             other.maildir_folder.as_deref().unwrap_or("?"),
         );
@@ -686,7 +681,7 @@ fn handle_local_new(
     plan.actions.push(SyncAction::UploadMessage {
         id: LocalId {
             maildir_id: maildir_id.clone(),
-            message_id: message_id.cloned(),
+            message_id: message_id.clone(),
         },
         maildir_folder: folder.to_string(),
         file_path: path.to_path_buf(),
@@ -1198,7 +1193,7 @@ mod tests {
                 folder: "INBOX".into(),
                 flags: "S".into(),
                 path: PathBuf::from("/tmp/m-new"),
-                message_id: Some("<new@x>".into()),
+                message_id: "<new@x>".into(),
             }],
             &[],
             &empty_index(),
@@ -1227,7 +1222,7 @@ mod tests {
                 folder: "INBOX".into(),
                 flags: "".into(),
                 path: PathBuf::from("/tmp/m-dup"),
-                message_id: Some("<a@x>".into()),
+                message_id: "<a@x>".into(),
             }],
             &[rec],
             &empty_index(),
@@ -1304,7 +1299,7 @@ mod tests {
                     folder: "Archive".into(),
                     flags: "".into(),
                     path: PathBuf::from("/tmp/m-new"),
-                    message_id: Some("<a@x>".into()),
+                    message_id: "<a@x>".into(),
                 },
             ],
             &[rec],
@@ -1355,7 +1350,7 @@ mod tests {
                     folder: "Archive".into(),
                     flags: "S".into(),
                     path: PathBuf::from("/tmp/m-new"),
-                    message_id: Some("<a@x>".into()),
+                    message_id: "<a@x>".into(),
                 },
             ],
             &[rec],
@@ -1395,7 +1390,7 @@ mod tests {
                     folder: "Archive".into(),
                     flags: "FS".into(),
                     path: PathBuf::from("/tmp/m1"),
-                    message_id: Some("<a@x>".into()),
+                    message_id: "<a@x>".into(),
                 },
             ],
             &[rec],
@@ -1465,7 +1460,7 @@ mod tests {
                     folder: "Archive".into(),
                     flags: "".into(),
                     path: PathBuf::from("/tmp/m-new"),
-                    message_id: Some("<a@x>".into()),
+                    message_id: "<a@x>".into(),
                 },
             ],
             &[rec],

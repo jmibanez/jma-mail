@@ -428,7 +428,7 @@ async fn upload_messages(
                         mailbox_id: mailbox_id.clone(),
                         maildir_id: Some(id.maildir_id.clone()),
                         maildir_folder: Some(maildir_folder.clone()),
-                        message_id: id.message_id.clone(),
+                        message_id: Some(id.message_id.clone()),
                         flags: flags.clone(),
                         jmap_keywords: keywords_json,
                     },
@@ -437,19 +437,25 @@ async fn upload_messages(
                 txn.commit()?;
                 let target = RemoteId {
                     jmap_email_id,
-                    message_id: id.message_id.clone(),
+                    message_id: Some(id.message_id.clone()),
                 };
                 info!("Uploaded local message {} -> {}", id.maildir_id, target);
             }
             Err(e) => {
                 let s = e.to_string();
                 if s.contains("alreadyExists") {
-                    // Reconcile should have emitted AdoptLocalMessage
-                    // for this case; reaching here is a sign the
-                    // Message-ID was unparseable or absent. Don't
-                    // fail the cycle.
+                    // Reconcile's adopt path should have caught this -
+                    // a same-Message-ID server email already exists in
+                    // a folder we know about. Hitting this branch
+                    // means we raced another writer (another mail
+                    // client uploaded the same message between our
+                    // scan and our import), or our message_map index
+                    // is missing a row reconcile would have used.
+                    // Either way it's self-healing: the next cycle
+                    // sees the server's copy and adopts. Don't fail
+                    // the run.
                     warn!(
-                        "Upload of {} from {} hit alreadyExists; skipping (consider checking the message's Message-ID header)",
+                        "Upload of {} from {} hit alreadyExists; skipping. Reconcile will adopt the existing server copy on the next cycle.",
                         id, maildir_folder
                     );
                 } else {

@@ -1,8 +1,8 @@
 use anyhow::Result;
 use maildir::Maildir;
 use std::collections::HashMap;
-use std::path::PathBuf;
-use tracing::debug;
+use std::path::{Path, PathBuf};
+use tracing::{debug, error};
 
 use crate::ids::{MaildirId, MessageId};
 use crate::maildir_ops::flags::{extract_flags, extract_id};
@@ -12,16 +12,19 @@ use crate::maildir_ops::headers::parse_message_id_from_file;
 #[derive(Debug)]
 pub enum LocalChange {
     /// A new message file appeared that we don't have in the DB.
+    ///
+    /// `message_id` is required: scan refuses to emit `NewMessage` for a
+    /// file whose `Message-ID` header is missing or unparseable. Without
+    /// it, the disposable-state-DB invariant breaks (a wipe + re-sync
+    /// would re-upload the file as a fresh server email rather than
+    /// adopting the existing one), so the file is dropped at the scan
+    /// boundary with an `error!` and stays on disk untouched.
     NewMessage {
         maildir_id: MaildirId,
         folder: String,
         flags: String,
         path: PathBuf,
-        /// RFC 5322 Message-ID parsed from the file at scan time. None if
-        /// the header was missing or unreadable; reconcile treats that as
-        /// "not safe to dedupe against the server" and falls through to a
-        /// plain upload.
-        message_id: Option<MessageId>,
+        message_id: MessageId,
     },
     /// A message file we had recorded is now missing.
     DeletedMessage {
@@ -78,13 +81,8 @@ pub fn scan_folder(
                     maildir_id, folder_name, known_folder
                 );
                 let path = entry.path().to_path_buf();
-                let message_id = match parse_message_id_from_file(&path) {
-                    Ok(Some(mid)) => Some(mid),
-                    Ok(None) => None,
-                    Err(e) => {
-                        debug!("Failed to parse Message-ID for {}: {}", maildir_id, e);
-                        None
-                    }
+                let Some(message_id) = require_message_id(&maildir_id, &path)? else {
+                    continue;
                 };
                 changes.push(LocalChange::NewMessage {
                     maildir_id,
@@ -111,16 +109,8 @@ pub fn scan_folder(
             None => {
                 debug!("New message in cur/: {}", maildir_id);
                 let path = entry.path().to_path_buf();
-                let message_id = match parse_message_id_from_file(&path) {
-                    Ok(Some(mid)) => Some(mid),
-                    Ok(None) => {
-                        debug!("New message {} has no Message-ID header", maildir_id);
-                        None
-                    }
-                    Err(e) => {
-                        debug!("Failed to parse Message-ID for {}: {}", maildir_id, e);
-                        None
-                    }
+                let Some(message_id) = require_message_id(&maildir_id, &path)? else {
+                    continue;
                 };
                 changes.push(LocalChange::NewMessage {
                     maildir_id,
@@ -163,16 +153,8 @@ pub fn scan_folder(
                 debug!("New message in new/: {}", maildir_id);
             }
             let path = entry.path().to_path_buf();
-            let message_id = match parse_message_id_from_file(&path) {
-                Ok(Some(mid)) => Some(mid),
-                Ok(None) => {
-                    debug!("New message {} has no Message-ID header", maildir_id);
-                    None
-                }
-                Err(e) => {
-                    debug!("Failed to parse Message-ID for {}: {}", maildir_id, e);
-                    None
-                }
+            let Some(message_id) = require_message_id(&maildir_id, &path)? else {
+                continue;
             };
             changes.push(LocalChange::NewMessage {
                 maildir_id,
@@ -196,6 +178,32 @@ pub fn scan_folder(
     }
 
     Ok((changes, seen_ids))
+}
+
+/// Parse the file's `Message-ID` header, returning `Ok(Some(_))` when
+/// a usable id is present and `Ok(None)` (with an `error!` log) when
+/// the header is missing — the user produced an RFC-violating file
+/// that sync can't anchor idempotently, so the caller skips it.
+///
+/// I/O errors (file vanished mid-scan, EACCES, malformed UTF-8 in a
+/// header) propagate as `Err` and abort the scan: those are systemic
+/// problems the user can't fix on a per-file basis, and continuing
+/// past them risks misclassifying transient failures as "user data
+/// problem."
+fn require_message_id(maildir_id: &MaildirId, path: &Path) -> Result<Option<MessageId>> {
+    match parse_message_id_from_file(path)? {
+        Some(mid) => Ok(Some(mid)),
+        None => {
+            error!(
+                "Skipping {} ({}): no Message-ID header. \
+                 jmapsync requires Message-ID to anchor idempotency; \
+                 fix the file or remove it.",
+                maildir_id,
+                path.display()
+            );
+            Ok(None)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -255,7 +263,7 @@ mod tests {
             } => {
                 assert_eq!(maildir_id.as_ref(), unique);
                 assert_eq!(folder, "Spam");
-                assert_eq!(message_id.as_ref().map(AsRef::as_ref), Some("a@x"));
+                assert_eq!(message_id.as_ref(), "a@x");
             }
             other => panic!("expected NewMessage on destination scan, got {:?}", other),
         }
@@ -378,7 +386,7 @@ mod tests {
             } => {
                 assert_eq!(maildir_id.as_ref(), new_id);
                 assert_eq!(folder, "Spam");
-                assert_eq!(message_id.as_ref().map(AsRef::as_ref), Some("a@x"));
+                assert_eq!(message_id.as_ref(), "a@x");
             }
             other => panic!("expected NewMessage, got {:?}", other),
         }
@@ -413,9 +421,105 @@ mod tests {
             } => {
                 assert_eq!(maildir_id.as_ref(), unique);
                 assert_eq!(folder, "Spam");
-                assert_eq!(message_id.as_ref().map(AsRef::as_ref), Some("a@x"));
+                assert_eq!(message_id.as_ref(), "a@x");
             }
             other => panic!("expected NewMessage on new/ scan, got {:?}", other),
         }
+    }
+
+    /// A file with no Message-ID header (RFC 5322 says it SHOULD be
+    /// present, but isn't a hard MUST) must NOT be ingested: jmapsync
+    /// anchors idempotency on Message-ID, and emitting NewMessage
+    /// without one would either drop the message at reconcile or
+    /// produce a server-side duplicate after a state DB wipe. Scan
+    /// drops the file (logs error!) so it stays on disk untouched.
+    #[test]
+    fn scan_folder_skips_file_without_message_id() {
+        let tmp = TempDir::new().unwrap();
+        let inbox_path = tmp.path().join("INBOX");
+        let inbox = ensure_maildir(&inbox_path).unwrap();
+
+        // No Message-ID header — only a Subject + body.
+        let unique = "1700000000.M1.host";
+        let filename = format!("{unique}:2,");
+        let body = "Subject: no msgid\r\n\r\nbody\r\n";
+        write_message(&inbox_path, "cur", &filename, body);
+
+        let known = HashMap::new();
+        let (changes, seen) = scan_folder(&inbox, "INBOX", &known).unwrap();
+
+        assert!(
+            changes.is_empty(),
+            "expected no LocalChanges for a file without Message-ID, got {:?}",
+            changes
+        );
+        // The file is still seen on disk, so it counts as observed —
+        // we just refuse to emit a NewMessage for it.
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].as_ref(), unique);
+    }
+
+    /// Same folder, file already known to the DB, but the file's
+    /// Message-ID header is missing. This hits the
+    /// `Some((_, known_flags))` branch where `require_message_id`
+    /// isn't even called (flags match), so no `NewMessage` is emitted
+    /// — but more importantly: the maildir_id IS pushed onto
+    /// `seen_ids` before any matching, so the trailing
+    /// deletion-detection loop must NOT spuriously emit a
+    /// DeletedMessage for it. Pins the "seen_ids tracks every walked
+    /// file regardless of whether we emit a change for it" invariant.
+    #[test]
+    fn scan_folder_known_file_without_message_id_emits_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let inbox_path = tmp.path().join("INBOX");
+        let inbox = ensure_maildir(&inbox_path).unwrap();
+
+        let unique = "1700000000.M1.host";
+        let filename = format!("{unique}:2,FS");
+        let body = "Subject: no msgid\r\n\r\nbody\r\n";
+        write_message(&inbox_path, "cur", &filename, body);
+
+        // DB has the file in the same folder with the same flags.
+        let mut known = HashMap::new();
+        known.insert(unique.into(), ("INBOX".to_string(), "FS".to_string()));
+
+        let (changes, _seen) = scan_folder(&inbox, "INBOX", &known).unwrap();
+
+        assert!(
+            changes.is_empty(),
+            "no changes expected for an unchanged known file, got {:?}",
+            changes
+        );
+    }
+
+    /// Destination-side scan of a Message-ID-less cross-folder move:
+    /// the cross-folder branch must run `require_message_id` before
+    /// emitting NewMessage. With no Message-ID, the move pre-pass in
+    /// reconcile (which keys on Message-ID) couldn't pair this with
+    /// any source-side delete anyway, so we refuse at the scan
+    /// boundary and the destination produces zero changes.
+    #[test]
+    fn scan_folder_skips_cross_folder_move_without_message_id() {
+        let tmp = TempDir::new().unwrap();
+        let spam_path = tmp.path().join("Spam");
+        let spam = ensure_maildir(&spam_path).unwrap();
+
+        let unique = "1700000000.M1.host";
+        let filename = format!("{unique}:2,FS");
+        // No Message-ID header.
+        let body = "Subject: no msgid\r\n\r\nbody\r\n";
+        write_message(&spam_path, "cur", &filename, body);
+
+        // DB believes the file lives in INBOX.
+        let mut known = HashMap::new();
+        known.insert(unique.into(), ("INBOX".to_string(), "FS".to_string()));
+
+        let (changes, _seen) = scan_folder(&spam, "Spam", &known).unwrap();
+
+        assert!(
+            changes.is_empty(),
+            "expected no LocalChanges for a Message-ID-less cross-folder move, got {:?}",
+            changes
+        );
     }
 }

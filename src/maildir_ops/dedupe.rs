@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::ids::{MaildirId, MessageId};
 use crate::maildir_ops::flags::extract_id;
@@ -69,11 +69,16 @@ pub fn dedupe_and_index(maildir_root: &Path, folders: &[String]) -> Result<Local
                 let filename = entry.file_name().to_string_lossy().to_string();
                 let maildir_id = extract_id(&filename);
 
-                let msgid = match parse_message_id_from_file(&path) {
-                    Ok(Some(id)) => id,
-                    Ok(None) => continue,
-                    Err(e) => {
-                        warn!("Failed to read headers from {}: {}", path.display(), e);
+                let msgid = match parse_message_id_from_file(&path)? {
+                    Some(id) => id,
+                    None => {
+                        error!(
+                            "Skipping {} ({}): no Message-ID header. \
+                             jmapsync requires Message-ID to anchor idempotency; \
+                             fix the file or remove it.",
+                            maildir_id,
+                            path.display()
+                        );
                         continue;
                     }
                 };
