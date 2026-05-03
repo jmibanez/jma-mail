@@ -106,6 +106,10 @@ pub fn lock_path_for(db_path: &Path) -> PathBuf {
 ///
 /// Read-only commands (`status`, `mailboxes`) and commands that
 /// don't touch the state DB (`init`, `auth`) do not call this.
+///
+/// This advisory lock is layer 1 of the state DB concurrency model;
+/// see DEVELOPMENT.md "State DB concurrency model" for the full
+/// picture (per-batch transactions and the external-writer caveat).
 pub fn acquire_lock(db_path: &Path) -> Result<()> {
     let lock_path = lock_path_for(db_path);
     if let Some(parent) = lock_path.parent() {

@@ -105,6 +105,10 @@ pub async fn execute(
     apply_move_pair_adopts(conn, move_pair_adopts, &outcome.failed_updates)?;
     let failed_remote_actions = outcome.failed_updates.len() + outcome.failed_destroys.len();
 
+    // Intentionally outside the per-phase transactions: if the process
+    // dies between the last phase commit and this write, the cursor
+    // stays at the previous value and the next cycle replays
+    // Email/changes against the already-mirrored DB. Idempotent.
     if let Some(state) = new_email_state {
         queries::set_jmap_state(conn, account_id.as_ref(), "Email", &state)?;
         debug!("Persisted new Email state: {}", state);
@@ -117,10 +121,18 @@ pub async fn execute(
 }
 
 /// Bind already-on-server messages to existing local files (DB only).
+/// Pure-DB phase, so the whole loop runs in one transaction: a panic
+/// or error mid-loop rolls the entire phase back instead of leaving
+/// half the adoptions committed.
 fn adopt_messages(conn: &Connection, actions: Vec<SyncAction>) -> Result<()> {
-    for action in actions {
-        commit_adopt(conn, action)?;
+    if actions.is_empty() {
+        return Ok(());
     }
+    let txn = conn.unchecked_transaction()?;
+    for action in actions {
+        commit_adopt(&txn, action)?;
+    }
+    txn.commit()?;
     Ok(())
 }
 
@@ -134,6 +146,10 @@ fn apply_move_pair_adopts(
     actions: Vec<SyncAction>,
     failed_updates: &HashSet<JmapEmailId>,
 ) -> Result<()> {
+    if actions.is_empty() {
+        return Ok(());
+    }
+    let txn = conn.unchecked_transaction()?;
     for action in actions {
         let SyncAction::AdoptLocalMessage { ref id, .. } = action else {
             continue;
@@ -146,8 +162,9 @@ fn apply_move_pair_adopts(
             );
             continue;
         }
-        commit_adopt(conn, action)?;
+        commit_adopt(&txn, action)?;
     }
+    txn.commit()?;
     Ok(())
 }
 
@@ -236,8 +253,12 @@ fn update_local_flags(
             continue;
         }
         let keywords_json = serde_json::to_string(&keywords)?;
+        // Per-iteration transaction: pair the two DB writes so this
+        // row's message_map and local_state never disagree on flags
+        // even if the second write fails.
+        let txn = conn.unchecked_transaction()?;
         queries::upsert_message(
-            conn,
+            &txn,
             &MessageRecord {
                 jmap_email_id,
                 jmap_blob_id: Some(jmap_blob_id),
@@ -250,7 +271,8 @@ fn update_local_flags(
                 jmap_keywords: keywords_json,
             },
         )?;
-        queries::upsert_local_state(conn, &maildir_id, &maildir_folder, &new_flags, None)?;
+        queries::upsert_local_state(&txn, &maildir_id, &maildir_folder, &new_flags, None)?;
+        txn.commit()?;
         info!("Updated local flags for {}: '{}'", bound_for_log, new_flags);
     }
     Ok(())
@@ -285,10 +307,19 @@ fn move_local_messages(
             );
             continue;
         }
-        let flags = if let Some(rec) = queries::get_message_by_jmap_id(conn, &jmap_email_id)? {
+        // Per-iteration transaction: the read, the conditional upsert
+        // of message_map, and the upsert of local_state must all land
+        // together so this row's two tables never disagree on the
+        // destination folder. With DEFERRED semantics the writer lock
+        // is only taken on the first write, so an external (non-engine)
+        // writer that bypasses the flock could in principle slip a
+        // change in between the read and the write -- accepted as
+        // layer-3 divergence; the next sync cycle re-reconciles.
+        let txn = conn.unchecked_transaction()?;
+        let flags = if let Some(rec) = queries::get_message_by_jmap_id(&txn, &jmap_email_id)? {
             let preserved_flags = rec.flags.clone();
             queries::upsert_message(
-                conn,
+                &txn,
                 &MessageRecord {
                     maildir_folder: Some(to_folder.clone()),
                     ..rec
@@ -298,7 +329,8 @@ fn move_local_messages(
         } else {
             String::new()
         };
-        queries::upsert_local_state(conn, &maildir_id, &to_folder, &flags, None)?;
+        queries::upsert_local_state(&txn, &maildir_id, &to_folder, &flags, None)?;
+        txn.commit()?;
         info!(
             "Moved {} from {} to {}",
             bound_for_log, from_folder, to_folder
@@ -329,8 +361,14 @@ fn delete_local_messages(
                 maildir_id, e
             );
         }
-        queries::delete_local_state(conn, &maildir_id)?;
-        queries::delete_message_by_jmap_id(conn, &jmap_email_id)?;
+        // Per-iteration transaction: the local_state delete and the
+        // message_map delete must both land or neither, so a failure
+        // mid-pair doesn't leave an orphan row that would re-emit
+        // DeletedMessage every cycle.
+        let txn = conn.unchecked_transaction()?;
+        queries::delete_local_state(&txn, &maildir_id)?;
+        queries::delete_message_by_jmap_id(&txn, &jmap_email_id)?;
+        txn.commit()?;
         info!("Deleted local copy of destroyed {}", bound_for_log);
     }
     Ok(())
@@ -376,8 +414,13 @@ async fn upload_messages(
         match result {
             Ok(jmap_email_id) => {
                 let keywords_json = serde_json::to_string(&keywords)?;
+                // Per-iteration transaction: pair the message_map and
+                // local_state upserts so a failure between them can't
+                // leave the just-uploaded message visible in only one
+                // of the two tables.
+                let txn = conn.unchecked_transaction()?;
                 queries::upsert_message(
-                    conn,
+                    &txn,
                     &MessageRecord {
                         jmap_email_id: jmap_email_id.clone(),
                         jmap_blob_id: None,
@@ -390,7 +433,8 @@ async fn upload_messages(
                         jmap_keywords: keywords_json,
                     },
                 )?;
-                queries::upsert_local_state(conn, &id.maildir_id, &maildir_folder, &flags, None)?;
+                queries::upsert_local_state(&txn, &id.maildir_id, &maildir_folder, &flags, None)?;
+                txn.commit()?;
                 let target = RemoteId {
                     jmap_email_id,
                     message_id: id.message_id.clone(),
@@ -467,6 +511,13 @@ async fn apply_remote_set(
 
     let outcome = jmap_email::set_email_batch(client, &ops).await?;
 
+    // One transaction wraps the entire post-network mirroring section.
+    // The server's outcome is fixed; either we reflect all of it into
+    // the local DB or none of it (next cycle re-detects the missing
+    // mirrorings via Email/changes and retries). Pure-DB after this
+    // point, so the txn is short-lived.
+    let txn = conn.unchecked_transaction()?;
+
     // Mirror keyword updates into the local DB.
     for action in keywords {
         let SyncAction::UpdateRemoteKeywords { id, keywords } = action else {
@@ -480,13 +531,13 @@ async fn apply_remote_set(
             );
             continue;
         }
-        if let Some(rec) = queries::get_message_by_jmap_id(conn, &id.jmap_email_id)? {
+        if let Some(rec) = queries::get_message_by_jmap_id(&txn, &id.jmap_email_id)? {
             let keywords_json = serde_json::to_string(&keywords)?;
             let flags = keywords_to_flags(&keywords);
             let maildir_id = rec.maildir_id.clone();
             let maildir_folder = rec.maildir_folder.clone();
             queries::upsert_message(
-                conn,
+                &txn,
                 &MessageRecord {
                     flags: flags.clone(),
                     jmap_keywords: keywords_json,
@@ -494,7 +545,7 @@ async fn apply_remote_set(
                 },
             )?;
             if let (Some(mid), Some(folder)) = (maildir_id, maildir_folder) {
-                queries::upsert_local_state(conn, &mid, &folder, &flags, None)?;
+                queries::upsert_local_state(&txn, &mid, &folder, &flags, None)?;
             }
         }
         info!("Updated remote keywords for {}", id);
@@ -543,15 +594,16 @@ async fn apply_remote_set(
             );
             continue;
         }
-        if let Some(rec) = queries::get_message_by_jmap_id(conn, &id.jmap_email_id)?
+        if let Some(rec) = queries::get_message_by_jmap_id(&txn, &id.jmap_email_id)?
             && let Some(mid) = rec.maildir_id.as_ref()
         {
-            queries::delete_local_state(conn, mid)?;
+            queries::delete_local_state(&txn, mid)?;
         }
-        queries::delete_message_by_jmap_id(conn, &id.jmap_email_id)?;
+        queries::delete_message_by_jmap_id(&txn, &id.jmap_email_id)?;
         info!("Destroyed remote {}", id);
     }
 
+    txn.commit()?;
     Ok(outcome)
 }
 
@@ -623,8 +675,12 @@ async fn run_downloads(
                 let mid = store::store_message(&maildir, blob, &flags)?;
                 info!("Downloaded new email {} -> {}/{}", id, maildir_folder, mid);
                 let keywords_json = serde_json::to_string(keywords)?;
+                // Per-iteration transaction: pair the message_map and
+                // local_state upserts so the just-stored maildir file
+                // doesn't end up bound in only one of the two tables.
+                let txn = conn.unchecked_transaction()?;
                 queries::upsert_message(
-                    conn,
+                    &txn,
                     &MessageRecord {
                         jmap_email_id: id.jmap_email_id.clone(),
                         jmap_blob_id: Some(jmap_blob_id.clone()),
@@ -637,7 +693,8 @@ async fn run_downloads(
                         jmap_keywords: keywords_json,
                     },
                 )?;
-                queries::upsert_local_state(conn, &mid, maildir_folder, &flags, None)?;
+                queries::upsert_local_state(&txn, &mid, maildir_folder, &flags, None)?;
+                txn.commit()?;
                 downloaded += 1;
             }
         }

@@ -151,6 +151,16 @@ The state DB is **disposable**. Nuking `state.db` and re-running must converge o
 Don't add a code path that writes to a maildir outside `execute::execute` (or `dedupe`'s deletion of duplicates). Every
 other writer would skip the Message-ID anchor.
 
+## State DB concurrency model
+
+Three layers, each protecting against a different mutation source:
+
+1. **Inter-jmapsync coordination** -- `state::db::acquire_lock` takes a `flock`-backed advisory lock on `<state.db>.lock`. Two jmapsync invocations (`sync`, `pull`, `push`, `watch`) against the same DB can't both run; the second fails with the first's PID in the error message. Read-only commands (`status`, `mailboxes`) and DB-less commands (`init`, `auth`) skip this.
+
+2. **Intra-cycle write atomicity** -- `src/sync/execute.rs` wraps each mutation phase in a SQLite transaction via `Connection::unchecked_transaction()`. Pure-DB phases (`adopt_messages`, `apply_move_pair_adopts`, the post-network section of `apply_remote_set`) take one transaction per phase, so a panic mid-loop rolls the whole phase back. FS-mutating phases (`update_local_flags`, `move_local_messages`, `delete_local_messages`, `upload_messages`, `run_downloads`) take one transaction per iteration around the paired DB writes that follow each successful FS op, so a row's `message_map` and `local_state` never disagree even if the second DB write fails. Side benefit: SQLite's WAL writer-lock serializes any other writer on the file from the first write through commit; the eventual multi-account refactor (one engine per account against a shared DB) inherits this serialization for free.
+
+3. **External writers** -- a deliberate bypass (e.g. `sqlite3 state.db "UPDATE ..."` typed in error, or any tool that opens the DB without going through `acquire_lock`) is not prevented. Per-batch transactions block such writers from interleaving *within* a phase, but they can still interleave between phases. The recovery story is "next sync cycle re-reconciles from server state"; the design accepts this rather than holding cycle-spanning transactions across network I/O (which would balloon the WAL during long initial syncs and lose Ctrl-C-mid-cycle partial-progress recovery).
+
 ## JMAP boundary quirks
 
 The `jmap-client` crate is convenient but a few server behaviors need explicit handling:
