@@ -385,6 +385,7 @@ async fn upload_messages(
             maildir_folder,
             file_path,
             mailbox_id,
+            flags,
         } = action
         else {
             continue;
@@ -396,10 +397,6 @@ async fn upload_messages(
                 continue;
             }
         };
-        // The maildir filename carries the flags; use the on-disk
-        // suffix as the source of truth.
-        let filename = file_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        let flags = crate::maildir_ops::flags::extract_flags(filename).to_string();
         let keywords = crate::maildir_ops::flags::flags_to_keywords(&flags);
 
         let result = jmap_email::import_email(

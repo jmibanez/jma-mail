@@ -581,7 +581,7 @@ fn process_local_changes(
             LocalChange::NewMessage {
                 maildir_id,
                 folder,
-                flags: _,
+                flags,
                 path,
                 message_id,
             } => {
@@ -594,6 +594,7 @@ fn process_local_changes(
                     folder,
                     path,
                     message_id,
+                    flags,
                     adopted_maildir_ids,
                     plan,
                 )
@@ -615,12 +616,18 @@ fn process_local_changes(
     }
 }
 
+// 8 args: 5 of them are the `LocalChange::NewMessage` payload
+// (maildir_id, folder, path, message_id, flags). Bundling them into a
+// wrapper just to satisfy the heuristic adds noise without making the
+// dispatch any clearer.
+#[allow(clippy::too_many_arguments)]
 fn handle_local_new(
     ctx: &ReconcileCtx<'_>,
     maildir_id: &MaildirId,
     folder: &str,
     path: &std::path::Path,
     message_id: &MessageId,
+    flags: &str,
     adopted_maildir_ids: &HashSet<MaildirId>,
     plan: &mut SyncPlan,
 ) {
@@ -698,6 +705,7 @@ fn handle_local_new(
         maildir_folder: folder.to_string(),
         file_path: path.to_path_buf(),
         mailbox_id,
+        flags: flags.to_string(),
     });
 }
 

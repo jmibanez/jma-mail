@@ -37,16 +37,6 @@ pub fn flags_to_keywords(flags: &str) -> HashMap<String, bool> {
     keywords
 }
 
-/// Extract the flags portion from a maildir filename.
-/// Format: <unique>:2,<flags>
-pub fn extract_flags(filename: &str) -> &str {
-    if let Some(pos) = filename.find(":2,") {
-        &filename[pos + 3..]
-    } else {
-        ""
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,12 +72,5 @@ mod tests {
         assert_eq!(keywords.get("$seen"), Some(&true));
         assert_eq!(keywords.get("$flagged"), Some(&true));
         assert_eq!(keywords.get("$answered"), None);
-    }
-
-    #[test]
-    fn test_extract_flags() {
-        assert_eq!(extract_flags("1234567890.abc:2,FS"), "FS");
-        assert_eq!(extract_flags("1234567890.abc:2,"), "");
-        assert_eq!(extract_flags("1234567890.abc"), "");
     }
 }

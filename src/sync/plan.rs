@@ -125,6 +125,12 @@ pub enum SyncAction {
         maildir_folder: String,
         file_path: PathBuf,
         mailbox_id: JmapMailboxId,
+        /// Maildir flags suffix captured at scan time. Plumbed
+        /// through from `LocalChange::NewMessage` so the executor
+        /// doesn't have to re-parse the on-disk filename, and so
+        /// the keywords we upload match the ones the plan was
+        /// built against.
+        flags: String,
     },
     UpdateRemoteKeywords {
         id: RemoteId,
