@@ -150,6 +150,9 @@ impl Config {
         let contents = std::fs::read_to_string(&path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
         let config: Config = toml::from_str(&contents).context("Failed to parse config file")?;
+        if let Some(msg) = check_token_perms(&path, config.account.token.as_deref()) {
+            return Err(anyhow::anyhow!(msg));
+        }
         Ok(config)
     }
 
@@ -161,6 +164,45 @@ impl Config {
     /// Resolved state DB path with ~ expanded.
     pub fn db_path(&self) -> PathBuf {
         expand_tilde(Path::new(&self.state.db_path))
+    }
+}
+
+/// If the config file holds a non-empty in-file `token` and is readable
+/// by group or world on a Unix-like FS, return an error message naming
+/// the file. `Config::load` propagates this as `Err(...)` so every
+/// subcommand refuses to start until the user tightens permissions.
+///
+/// Returns `None` when:
+///   - `token` is `None` or empty (nothing on disk to leak),
+///   - the platform is non-Unix (mode bits don't apply; ACL story is
+///     separate and not in scope here),
+///   - the stat fails (don't escalate I/O hiccups into hard failures
+///     when the operation isn't security-critical),
+///   - permissions are already tight (`mode & 0o077 == 0`).
+pub fn check_token_perms(path: &Path, token: Option<&str>) -> Option<String> {
+    let has_token = token.is_some_and(|s| !s.is_empty());
+    if !has_token {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(path).ok()?;
+        if meta.mode() & 0o077 != 0 {
+            return Some(format!(
+                "config file {} is readable by group or others and contains a non-empty token; \
+                 refusing to use it. Run `chmod 600 {}` (or move the token to JMAPSYNC_TOKEN \
+                 / `jmapsync auth set-token`).",
+                path.display(),
+                path.display()
+            ));
+        }
+        None
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
     }
 }
 
@@ -222,4 +264,49 @@ ping_interval = 60
 # a single follow-up run. Leave unset to disable.
 # post_arrival_command = "mu index"
 "#
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn write_with_mode(path: &Path, mode: u32) {
+        std::fs::write(path, b"x").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn check_token_perms_returns_none_when_mode_is_tight() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        write_with_mode(&p, 0o600);
+        assert!(check_token_perms(&p, Some("secret")).is_none());
+    }
+
+    #[test]
+    fn check_token_perms_returns_some_when_world_or_group_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        write_with_mode(&p, 0o644);
+        let msg = check_token_perms(&p, Some("secret"))
+            .expect("loose perms with non-empty token must error");
+        assert!(msg.contains("chmod 600"), "got: {msg}");
+    }
+
+    #[test]
+    fn check_token_perms_ignores_loose_perms_when_token_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        write_with_mode(&p, 0o644);
+        assert!(check_token_perms(&p, Some("")).is_none());
+    }
+
+    #[test]
+    fn check_token_perms_ignores_loose_perms_when_token_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        write_with_mode(&p, 0o644);
+        assert!(check_token_perms(&p, None).is_none());
+    }
 }

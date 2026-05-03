@@ -76,7 +76,22 @@ async fn cmd_init(cli: &Cli) -> Result<()> {
         if let Some(parent) = config_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&config_path, config::default_config_template())?;
+        // Mode 0o600 from creation so a token added later isn't briefly
+        // exposed under the user's umask. The load-time perms check (in
+        // config::check_token_perms) catches files that already exist
+        // with looser perms.
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts
+            .open(&config_path)
+            .with_context(|| format!("Failed to create config file: {}", config_path.display()))?;
+        std::io::Write::write_all(&mut f, config::default_config_template().as_bytes())
+            .with_context(|| format!("Failed to write config file: {}", config_path.display()))?;
         println!("Created config file: {}", config_path.display());
     }
 
