@@ -20,7 +20,7 @@ pub async fn connect(account: &AccountConfig) -> Result<Client> {
             .credentials(Credentials::bearer(token.clone()))
             .connect(&account.session_url)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to connect to JMAP server: {}", e))
+            .context("Failed to connect to JMAP server")
     })
     .await?;
 

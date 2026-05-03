@@ -108,10 +108,7 @@ pub async fn get_all(client: &Client) -> Result<Vec<MailboxObject>> {
         mailbox::Property::UnreadEmails,
     ]);
 
-    let response = request
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to fetch mailboxes: {}", e))?;
+    let response = request.send().await.context("Failed to fetch mailboxes")?;
 
     let mailbox_response = response
         .unwrap_method_responses()
@@ -120,7 +117,7 @@ pub async fn get_all(client: &Client) -> Result<Vec<MailboxObject>> {
 
     let get_response = mailbox_response
         .unwrap_get_mailbox()
-        .map_err(|e| anyhow::anyhow!("Failed to parse mailbox response: {}", e))?;
+        .context("Failed to parse mailbox response")?;
 
     let state = get_response.state().to_string();
     let mailboxes: Vec<MailboxObject> = get_response

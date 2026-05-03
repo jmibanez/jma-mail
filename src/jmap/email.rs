@@ -29,10 +29,7 @@ pub async fn get_by_ids(client: &Client, ids: &[JmapEmailId]) -> Result<Vec<Emai
         get_request.ids(ids.iter().map(String::from));
         get_request.properties(email_properties());
 
-        let response = request
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to fetch emails: {}", e))?;
+        let response = request.send().await.context("Failed to fetch emails")?;
 
         let email_response = response
             .unwrap_method_responses()
@@ -41,7 +38,7 @@ pub async fn get_by_ids(client: &Client, ids: &[JmapEmailId]) -> Result<Vec<Emai
 
         let get_response = email_response
             .unwrap_get_email()
-            .map_err(|e| anyhow::anyhow!("Failed to parse email response: {}", e))?;
+            .context("Failed to parse email response")?;
 
         Ok(get_response.list().iter().map(parse_email_object).collect())
     })
@@ -71,10 +68,7 @@ pub async fn query_mailbox(
                 .position(position as i32)
                 .limit(page_size);
 
-            let response = request
-                .send()
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to query emails: {}", e))?;
+            let response = request.send().await.context("Failed to query emails")?;
 
             let query_response = response
                 .unwrap_method_responses()
@@ -83,7 +77,7 @@ pub async fn query_mailbox(
 
             let result = query_response
                 .unwrap_query_email()
-                .map_err(|e| anyhow::anyhow!("Failed to parse email query response: {}", e))?;
+                .context("Failed to parse email query response")?;
 
             Ok(result
                 .ids()
@@ -131,7 +125,7 @@ pub async fn get_current_state(client: &Client) -> Result<String> {
         let response = request
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to fetch email state: {}", e))?;
+            .context("Failed to fetch email state")?;
 
         let email_response = response
             .unwrap_method_responses()
@@ -140,7 +134,7 @@ pub async fn get_current_state(client: &Client) -> Result<String> {
 
         let get_response = email_response
             .unwrap_get_email()
-            .map_err(|e| anyhow::anyhow!("Failed to parse email state response: {}", e))?;
+            .context("Failed to parse email state response")?;
 
         Ok(get_response.state().to_string())
     })
@@ -153,7 +147,7 @@ pub async fn get_changes(client: &Client, since_state: &str) -> Result<ChangesRe
         client
             .email_changes(since_state, Some(500))
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to fetch email changes: {}", e))
+            .context("Failed to fetch email changes")
     })
     .await?;
 
@@ -272,7 +266,7 @@ pub async fn set_email_batch(client: &Client, ops: &[EmailSetOp]) -> Result<Emai
         let response = request
             .send_single::<jmap_client::core::response::EmailSetResponse>()
             .await
-            .map_err(|e| anyhow::anyhow!("Email/set batch failed: {}", e))?;
+            .context("Email/set batch failed")?;
 
         let mut outcome = EmailSetOutcome::default();
         if let Some(not_updated) = response.not_updated_ids() {
@@ -345,7 +339,7 @@ pub async fn import_email(
                 None,
             )
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to import email: {}", e))
+            .context("Failed to import email")
     })
     .await?;
 
@@ -360,10 +354,13 @@ pub async fn import_email(
 
 /// Download the raw blob of an email.
 pub async fn download_blob(client: &Client, blob_id: &JmapBlobId) -> Result<Vec<u8>> {
-    let data = client
-        .download(blob_id.as_ref())
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to download blob {}: {}", blob_id, e))?;
+    let data = with_retry("Email/blob", || async {
+        client
+            .download(blob_id.as_ref())
+            .await
+            .with_context(|| format!("Failed to download blob {}", blob_id))
+    })
+    .await?;
 
     debug!("Downloaded blob {} ({} bytes)", blob_id, data.len());
     Ok(data)
