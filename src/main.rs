@@ -155,7 +155,13 @@ fn provision_maildirs(config: &Config) -> Result<()> {
 
 async fn cmd_mailboxes(cli: &Cli) -> Result<()> {
     let config = load_config(cli)?;
-    let client = session::connect(&config.account).await?;
+    // Read-only listing, but we still open the state DB so
+    // `session::connect` can hit the JMAP discovery cache. No
+    // `acquire_lock` here -- this command shouldn't block while a
+    // sync/watch invocation holds the lock.
+    let db_path = config.db_path();
+    let conn = state::db::open(&db_path)?;
+    let client = session::connect(&config.account, &conn).await?;
 
     let mailboxes = jmapsync::jmap::mailbox::get_all(&client).await?;
 
@@ -189,8 +195,8 @@ async fn cmd_sync(cli: &Cli) -> Result<()> {
     let config = load_config(cli)?;
     let db_path = config.db_path();
     state::db::acquire_lock(&db_path)?;
-    let client = session::connect(&config.account).await?;
     let conn = state::db::open(&db_path)?;
+    let client = session::connect(&config.account, &conn).await?;
 
     engine::sync(&client, &conn, &config, cli.dry_run).await?;
 
@@ -201,8 +207,8 @@ async fn cmd_pull(cli: &Cli) -> Result<()> {
     let config = load_config(cli)?;
     let db_path = config.db_path();
     state::db::acquire_lock(&db_path)?;
-    let client = session::connect(&config.account).await?;
     let conn = state::db::open(&db_path)?;
+    let client = session::connect(&config.account, &conn).await?;
 
     engine::pull_only(&client, &conn, &config).await?;
 
@@ -213,8 +219,8 @@ async fn cmd_push(cli: &Cli) -> Result<()> {
     let config = load_config(cli)?;
     let db_path = config.db_path();
     state::db::acquire_lock(&db_path)?;
-    let client = session::connect(&config.account).await?;
     let conn = state::db::open(&db_path)?;
+    let client = session::connect(&config.account, &conn).await?;
 
     engine::push_only(&client, &conn, &config).await?;
 
@@ -225,8 +231,8 @@ async fn cmd_watch(cli: &Cli) -> Result<()> {
     let config = load_config(cli)?;
     let db_path = config.db_path();
     state::db::acquire_lock(&db_path)?;
-    let client = session::connect(&config.account).await?;
     let conn = state::db::open(&db_path)?;
+    let client = session::connect(&config.account, &conn).await?;
 
     daemon::runner::run(&client, &conn, &config).await?;
 

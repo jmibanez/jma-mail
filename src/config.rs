@@ -23,9 +23,12 @@ pub struct AccountConfig {
     /// indefinitely for headless servers and CI where the keychain
     /// isn't available.
     pub token: Option<String>,
-    /// JMAP session URL. Defaults to Fastmail.
-    #[serde(default = "default_session_url")]
-    pub session_url: String,
+    /// Explicit JMAP session URL. When set, it bypasses autodiscovery
+    /// and the discovery cache entirely. Leave unset (the default) to
+    /// have the URL discovered from the email domain via DNS SRV /
+    /// well-known and cached in the state DB.
+    #[serde(default)]
+    pub session_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -79,10 +82,6 @@ pub struct WatchConfig {
     /// (multiple events coalesce into one). Only fires in `watch` mode.
     #[serde(default)]
     pub post_arrival_command: Option<String>,
-}
-
-fn default_session_url() -> String {
-    "https://api.fastmail.com/jmap/session".to_string()
 }
 
 fn default_db_path() -> String {
@@ -145,6 +144,21 @@ impl AccountConfig {
             "no API token: run `jmapsync auth set-token` to store one in your OS keychain, \
              set the JMAPSYNC_TOKEN env var, or set `token` in the config file"
         ))
+    }
+
+    /// Domain part of `email`, used as the cache key for discovery
+    /// and the input to `_jmap._tcp.<domain>` SRV lookups.
+    pub fn email_domain(&self) -> Result<&str> {
+        self.email
+            .rsplit_once('@')
+            .map(|(_, d)| d)
+            .filter(|d| !d.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "[account].email is not a valid email address: {:?}",
+                    self.email
+                )
+            })
     }
 }
 
@@ -239,8 +253,13 @@ email = "you@example.com"
 #   3. The `token` field below — fallback for headless servers
 #      and CI where the keychain isn't available.
 token = ""
-# JMAP session URL (default is Fastmail)
-session_url = "https://api.fastmail.com/jmap/session"
+# Explicit JMAP session URL. Leave unset to have it autodiscovered
+# from the email domain (DNS SRV + /.well-known/jmap, RFC 8620
+# section 2.2). The discovered URL is cached in the state DB. Set
+# this only to override autodiscovery -- e.g. for a provider whose
+# discovery records aren't published, or to force a specific
+# endpoint during testing.
+# session_url = "https://api.fastmail.com/jmap/session"
 
 [sync]
 # Root directory for local maildir storage
@@ -272,6 +291,60 @@ ping_interval = 60
 # a single follow-up run. Leave unset to disable.
 # post_arrival_command = "mu index"
 "#
+}
+
+#[cfg(test)]
+mod email_tests {
+    use super::*;
+
+    fn account(email: &str) -> AccountConfig {
+        AccountConfig {
+            email: email.to_string(),
+            token: None,
+            session_url: None,
+        }
+    }
+
+    #[test]
+    fn email_domain_extracts_after_at() {
+        assert_eq!(
+            account("user@example.com").email_domain().unwrap(),
+            "example.com"
+        );
+    }
+
+    #[test]
+    fn email_domain_uses_rightmost_at_for_quoted_locals() {
+        // RFC 5321 allows @ inside a quoted local-part; rsplit_once
+        // takes the rightmost one which is what JMAP discovery needs.
+        assert_eq!(
+            account("\"weird@local\"@example.com")
+                .email_domain()
+                .unwrap(),
+            "example.com"
+        );
+    }
+
+    #[test]
+    fn email_domain_rejects_missing_at() {
+        assert!(account("not-an-email").email_domain().is_err());
+    }
+
+    #[test]
+    fn email_domain_rejects_empty_domain() {
+        assert!(account("user@").email_domain().is_err());
+    }
+
+    #[test]
+    fn email_domain_accepts_empty_local_part() {
+        // Pin current behavior: only the domain matters for
+        // discovery, so an empty local-part is not rejected here.
+        // Config-time email validity is the user's job.
+        assert_eq!(
+            account("@example.com").email_domain().unwrap(),
+            "example.com"
+        );
+    }
 }
 
 #[cfg(all(test, unix))]
