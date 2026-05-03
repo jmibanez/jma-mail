@@ -105,19 +105,9 @@ fn extract_msgid_value(value: &[u8]) -> Option<MessageId> {
 /// Find the byte offset where the headers end (the empty line separator).
 /// Returns the offset of the start of the body, or None if no separator found.
 fn find_header_end(raw: &[u8]) -> Option<usize> {
-    // CRLF CRLF
-    for i in 0..raw.len().saturating_sub(3) {
-        if &raw[i..i + 4] == b"\r\n\r\n" {
-            return Some(i);
-        }
-    }
-    // LF LF
-    for i in 0..raw.len().saturating_sub(1) {
-        if &raw[i..i + 2] == b"\n\n" {
-            return Some(i);
-        }
-    }
-    None
+    raw.windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .or_else(|| raw.windows(2).position(|w| w == b"\n\n"))
 }
 
 #[cfg(test)]
@@ -149,5 +139,44 @@ mod tests {
     fn missing_header_returns_none() {
         let raw = b"Subject: hi\r\n\r\nbody";
         assert_eq!(parse_message_id(raw), None);
+    }
+
+    #[test]
+    fn find_header_end_crlf() {
+        assert_eq!(find_header_end(b"a\r\n\r\nb"), Some(1));
+    }
+
+    #[test]
+    fn find_header_end_lf() {
+        assert_eq!(find_header_end(b"a\n\nb"), Some(1));
+    }
+
+    #[test]
+    fn find_header_end_prefers_crlf_over_lf() {
+        // Both separators present; CRLF CRLF must win even when LF LF
+        // appears earlier in the buffer.
+        assert_eq!(find_header_end(b"\n\nfoo\r\n\r\nbody"), Some(5));
+    }
+
+    #[test]
+    fn find_header_end_too_short_for_crlf_falls_back_to_lf() {
+        // 3 bytes can't fit \r\n\r\n; must still find \n\n.
+        assert_eq!(find_header_end(b"\n\n!"), Some(0));
+    }
+
+    #[test]
+    fn find_header_end_separator_at_end_of_buffer() {
+        // Pins the upper boundary: a separator whose last byte is also
+        // the last byte of the buffer must still be found.
+        assert_eq!(find_header_end(b"abc\r\n\r\n"), Some(3));
+        assert_eq!(find_header_end(b"abc\n\n"), Some(3));
+    }
+
+    #[test]
+    fn find_header_end_no_separator() {
+        assert_eq!(find_header_end(b""), None);
+        assert_eq!(find_header_end(b"a"), None);
+        assert_eq!(find_header_end(b"abc"), None);
+        assert_eq!(find_header_end(b"no separator here"), None);
     }
 }
