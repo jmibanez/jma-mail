@@ -262,5 +262,41 @@ pub fn delete_local_state(conn: &Connection, maildir_id: &MaildirId) -> Result<(
     Ok(())
 }
 
+// --- Discovery Cache ---
+
+/// Get the cached JMAP session URL for a domain, or None if no
+/// discovery has been persisted for it.
+pub fn get_cached_session_url(conn: &Connection, domain: &str) -> Result<Option<String>> {
+    let mut stmt = conn.prepare("SELECT session_url FROM jmap_discovery WHERE domain = ?1")?;
+    let result = stmt
+        .query_row(params![domain], |row| row.get::<_, String>(0))
+        .optional()?;
+    Ok(result)
+}
+
+/// Persist a discovered session URL for a domain, overwriting any
+/// prior entry.
+pub fn set_cached_session_url(conn: &Connection, domain: &str, session_url: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO jmap_discovery (domain, session_url, discovered_at)
+         VALUES (?1, ?2, datetime('now'))
+         ON CONFLICT(domain) DO UPDATE SET
+            session_url = excluded.session_url,
+            discovered_at = excluded.discovered_at",
+        params![domain, session_url],
+    )?;
+    Ok(())
+}
+
+/// Drop any cached session URL for a domain. Idempotent: silently
+/// does nothing when no entry exists.
+pub fn clear_cached_session_url(conn: &Connection, domain: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM jmap_discovery WHERE domain = ?1",
+        params![domain],
+    )?;
+    Ok(())
+}
+
 // Bring in the Optional extension trait
 use rusqlite::OptionalExtension;

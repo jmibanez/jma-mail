@@ -48,6 +48,12 @@ CREATE TABLE IF NOT EXISTS local_state (
     mtime          INTEGER,
     recorded_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS jmap_discovery (
+    domain         TEXT NOT NULL PRIMARY KEY,
+    session_url    TEXT NOT NULL,
+    discovered_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
 "#;
 
 /// Open (or create) the state database and run schema migrations.
