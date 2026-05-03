@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, error};
 
 use crate::ids::{MaildirId, MessageId};
-use crate::maildir_ops::flags::{extract_flags, extract_id};
 use crate::maildir_ops::headers::parse_message_id_from_file;
 
 /// A change detected in the local maildir.
@@ -54,14 +53,8 @@ pub fn scan_folder(
     // Scan cur/ directory
     for entry in maildir.list_cur() {
         let entry = entry?;
-        let filename = entry
-            .path()
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        let maildir_id = extract_id(&filename);
-        let flags = extract_flags(&filename).to_string();
+        let maildir_id = MaildirId::from(entry.id());
+        let flags = entry.flags().to_string();
 
         seen_ids.push(maildir_id.clone());
 
@@ -126,13 +119,7 @@ pub fn scan_folder(
     // Scan new/ directory (messages not yet seen)
     for entry in maildir.list_new() {
         let entry = entry?;
-        let filename = entry
-            .path()
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        let maildir_id = extract_id(&filename);
+        let maildir_id = MaildirId::from(entry.id());
 
         seen_ids.push(maildir_id.clone());
 
