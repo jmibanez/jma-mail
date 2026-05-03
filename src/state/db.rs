@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS message_map (
     mailbox_id      TEXT NOT NULL,
     maildir_id      TEXT,
     maildir_folder  TEXT,
-    message_id      TEXT,
+    message_id      TEXT NOT NULL,
     flags           TEXT NOT NULL DEFAULT '',
     jmap_keywords   TEXT NOT NULL DEFAULT '{}',
     last_synced_at  TEXT NOT NULL DEFAULT (datetime('now')),

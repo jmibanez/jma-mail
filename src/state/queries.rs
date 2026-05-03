@@ -49,7 +49,7 @@ pub struct MessageRecord {
     pub mailbox_id: JmapMailboxId,
     pub maildir_id: Option<MaildirId>,
     pub maildir_folder: Option<String>,
-    pub message_id: Option<MessageId>,
+    pub message_id: MessageId,
     pub flags: String,
     pub jmap_keywords: String,
 }

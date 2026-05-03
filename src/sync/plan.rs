@@ -16,20 +16,26 @@ pub struct LocalId {
     pub message_id: MessageId,
 }
 
-/// A message known by its opaque JMAP server id.
+/// A message known by its opaque JMAP server id. Carries the
+/// Message-ID for human-readable logging and as the cross-boundary
+/// idempotency anchor: scan and reconcile both refuse to construct a
+/// `RemoteId` for a message without one (see `maildir_ops::scan` and
+/// `sync::reconcile::process_remote_emails`), so by the time any
+/// downstream code holds one, the id is guaranteed.
 #[derive(Debug, Clone)]
 pub struct RemoteId {
     pub jmap_email_id: JmapEmailId,
-    pub message_id: Option<MessageId>,
+    pub message_id: MessageId,
 }
 
 /// A message bound on both sides — same RFC 5322 message known
-/// locally as `maildir_id` and remotely as `jmap_email_id`.
+/// locally as `maildir_id` and remotely as `jmap_email_id`. Same
+/// Message-ID guarantee as `LocalId` and `RemoteId`.
 #[derive(Debug, Clone)]
 pub struct BoundId {
     pub maildir_id: MaildirId,
     pub jmap_email_id: JmapEmailId,
-    pub message_id: Option<MessageId>,
+    pub message_id: MessageId,
 }
 
 impl fmt::Display for LocalId {
@@ -40,19 +46,17 @@ impl fmt::Display for LocalId {
 
 impl fmt::Display for RemoteId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.message_id {
-            Some(m) => write!(f, "{} ({})", self.jmap_email_id, m),
-            None => write!(f, "{}", self.jmap_email_id),
-        }
+        write!(f, "{} ({})", self.jmap_email_id, self.message_id)
     }
 }
 
 impl fmt::Display for BoundId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.message_id {
-            Some(m) => write!(f, "{}/{} ({})", self.maildir_id, self.jmap_email_id, m),
-            None => write!(f, "{}/{}", self.maildir_id, self.jmap_email_id),
-        }
+        write!(
+            f,
+            "{}/{} ({})",
+            self.maildir_id, self.jmap_email_id, self.message_id
+        )
     }
 }
 

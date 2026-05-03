@@ -80,12 +80,10 @@ fn build_known_indices(
             if let Some(ref mid) = msg.maildir_id {
                 idx.by_maildir.insert(mid.clone(), msg.clone());
             }
-            if let Some(ref message_id) = msg.message_id {
-                idx.by_message_id
-                    .entry(message_id.clone())
-                    .or_default()
-                    .push(msg.clone());
-            }
+            idx.by_message_id
+                .entry(msg.message_id.clone())
+                .or_default()
+                .push(msg.clone());
             idx.by_jmap.insert(msg.jmap_email_id.clone(), msg);
         }
     }

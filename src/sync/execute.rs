@@ -428,7 +428,7 @@ async fn upload_messages(
                         mailbox_id: mailbox_id.clone(),
                         maildir_id: Some(id.maildir_id.clone()),
                         maildir_folder: Some(maildir_folder.clone()),
-                        message_id: Some(id.message_id.clone()),
+                        message_id: id.message_id.clone(),
                         flags: flags.clone(),
                         jmap_keywords: keywords_json,
                     },
@@ -437,7 +437,7 @@ async fn upload_messages(
                 txn.commit()?;
                 let target = RemoteId {
                     jmap_email_id,
-                    message_id: Some(id.message_id.clone()),
+                    message_id: id.message_id.clone(),
                 };
                 info!("Uploaded local message {} -> {}", id.maildir_id, target);
             }
@@ -763,7 +763,7 @@ mod tests {
                 mailbox_id: "MB-INBOX".into(),
                 maildir_id: Some("M-OLD".into()),
                 maildir_folder: Some("INBOX".into()),
-                message_id: Some("a@x".into()),
+                message_id: "a@x".into(),
                 flags: "S".into(),
                 jmap_keywords: r#"{"$seen":true}"#.into(),
             },
@@ -779,7 +779,7 @@ mod tests {
             id: BoundId {
                 maildir_id: "M-NEW".into(),
                 jmap_email_id: "E1".into(),
-                message_id: Some("a@x".into()),
+                message_id: "a@x".into(),
             },
             maildir_folder: "Spam".into(),
             jmap_blob_id: Some("B1".into()),

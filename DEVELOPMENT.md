@@ -111,13 +111,13 @@ The sync pipeline moves a small set of internal types between phases. Each one l
 
 **State-side types** (`src/state/queries.rs`). One struct per row-shape; every read or write goes through these.
 
-- `MessageRecord` -- one `message_map` row. Carries everything needed to act on an email without re-querying: both server identifiers (`jmap_email_id`, `jmap_blob_id`, `jmap_thread_id`, `mailbox_id`), both local identifiers (`maildir_id`, `maildir_folder`), the cross-cutting `message_id`, and a flags pair (`flags` for the maildir suffix view, `jmap_keywords` for the JSON-serialised JMAP view). Many fields are `Option` because a row can exist in a partially-bound state during in-flight phases.
+- `MessageRecord` -- one `message_map` row. Carries everything needed to act on an email without re-querying: both server identifiers (`jmap_email_id`, `jmap_blob_id`, `jmap_thread_id`, `mailbox_id`), both local identifiers (`maildir_id`, `maildir_folder`), the cross-cutting `message_id`, and a flags pair (`flags` for the maildir suffix view, `jmap_keywords` for the JSON-serialised JMAP view). `message_id` is non-`Option` (and `NOT NULL` in the DB schema): scan and reconcile both refuse to write a row without one. The `maildir_*`, `jmap_blob_id`, and `jmap_thread_id` fields remain `Option` because a row can be JMAP-known but not yet bound to an on-disk file during in-flight phases (and the blob/thread ids aren't always carried through every code path that constructs a `MessageRecord`).
 - `MailboxRecord` -- one `mailbox_map` row. Mostly a snapshot of `MailboxObject` plus the resolved `maildir_folder` (with the `INBOX` magic alias applied).
 
 **Maildir-side types** (`src/maildir_ops/`). What `scan` and `dedupe` produce for `reconcile` to chew on.
 
 - `LocalChange` (enum) -- one of:
-  - `NewMessage { maildir_id, folder, flags, path, message_id }` -- a file appeared that wasn't in `local_state`. The `message_id` is `Option` because the header may be missing or unreadable; reconcile treats `None` as "not safe to dedupe against the server" and falls through to a plain upload.
+  - `NewMessage { maildir_id, folder, flags, path, message_id }` -- a file appeared that wasn't in `local_state`. `message_id` is non-`Option`: `scan::scan_folder` refuses to construct a `NewMessage` for a file without a parseable Message-ID header (it `error!`s and skips the file), so reconcile never has to defend against the missing-anchor case.
   - `FlagsChanged { maildir_id, folder, old_flags, new_flags }` -- the maildir filename suffix changed.
   - `DeletedMessage { maildir_id, folder }` -- a `local_state` row has no corresponding file on disk.
 - `LocalEntry` -- `{ folder, maildir_id, path }`. One on-disk file's location.
@@ -125,7 +125,7 @@ The sync pipeline moves a small set of internal types between phases. Each one l
 
 **Plan types** (`src/sync/plan.rs`). The bridge between `reconcile` and `execute`. Detailed in [`plan.rs`](#plan-rs--the-action-vocabulary) and [`reconcile.rs`](#reconcile-rs--building-the-plan); summarised here for the cast list:
 
-- `LocalId` / `RemoteId` / `BoundId` -- typed message-identity wrappers. Each pairs an opaque id with its optional RFC 5322 `Message-ID` and has a `Display` impl that formats `id (<msg-id>)` when known, falling back to the bare id. `LocalId` carries a `MaildirId`; `RemoteId` carries a `JmapEmailId`; `BoundId` carries both (a message bound on both sides) and exposes `as_local()` / `as_remote()` views. Every `SyncAction` variant takes the identity it actually needs (download takes `RemoteId`, adopt/local-flags/local-move/local-delete take `BoundId`, upload takes `LocalId`, remote-keyword/destroy/move take `RemoteId`), so log lines just `{}` the field instead of formatting the id-pair by hand. `AdoptLocalMessage::old_maildir_id` is `Option<MaildirId>` rather than a `LocalId` bundle: it's a DB-cleanup hint (the row to drop on a cross-folder rebind), not an identity worth logging.
+- `LocalId` / `RemoteId` / `BoundId` -- typed message-identity wrappers. Each pairs an opaque id with its RFC 5322 `Message-ID` (non-`Option`: scan and reconcile both refuse to construct one of these for a message without a parseable Message-ID, so by the time downstream code holds one the anchor is guaranteed). `Display` formats `id (<msg-id>)`. `LocalId` carries a `MaildirId`; `RemoteId` carries a `JmapEmailId`; `BoundId` carries both (a message bound on both sides) and exposes `as_remote()`. Every `SyncAction` variant takes the identity it actually needs (download takes `RemoteId`, adopt/local-flags/local-move/local-delete take `BoundId`, upload takes `LocalId`, remote-keyword/destroy/move take `RemoteId`), so log lines just `{}` the field instead of formatting the id-pair by hand. `AdoptLocalMessage::old_maildir_id` is `Option<MaildirId>` rather than a `LocalId` bundle: it's a DB-cleanup hint (the row to drop on a cross-folder rebind), not an identity worth logging.
 - `SyncAction` (enum) -- the action vocabulary. Each variant carries every field its handler needs, so execute never re-queries.
 - `SyncPlan` -- `{ actions: Vec<SyncAction>, new_email_state, new_mailbox_state }`. The plan plus the JMAP cursor to commit on success.
 - `SyncDirection` -- `Both | PullOnly | PushOnly`. Top-level mode set by the CLI subcommand.
@@ -148,8 +148,13 @@ The state DB is **disposable**. Nuking `state.db` and re-running must converge o
 
 2. `reconcile` consults `message_map` (by JMAP id) -> `LocalIndex` (by Message-ID) before emitting a `DownloadMessage`. The Message-ID lookup is what saves us after a DB wipe: a known server email whose Message-ID we already have on disk is adopted into `message_map` rather than re-downloaded.
 
-Don't add a code path that writes to a maildir outside `execute::execute` (or `dedupe`'s deletion of duplicates). Every
-other writer would skip the Message-ID anchor.
+3. **Both ingest boundaries refuse Message-ID-less messages.** Local files without a parseable `Message-ID` header are skipped with `error!` by `maildir_ops::scan::scan_folder` and `maildir_ops::dedupe::dedupe_and_index`. Remote emails whose `Email/get` response carries no `messageId` and aren't already bound by JMAP id are skipped at `sync::reconcile::process_remote_emails`. The known-JMAP-id path still applies flag/move updates -- the existing `message_map` row is itself the anchor, so a server that strips Message-ID from updates doesn't break flag sync. The result: no row enters `message_map`, and no `LocalChange::NewMessage` is emitted, without an anchor.
+
+Don't add a code path that writes to a maildir outside `execute::execute` (or `dedupe`'s deletion of duplicates). Every other writer would skip the Message-ID check.
+
+### Schema migration: dropping the DB
+
+The `message_id` column on `message_map` is `NOT NULL`, and `MessageRecord.message_id` / `LocalId.message_id` / `RemoteId.message_id` / `BoundId.message_id` are non-`Option`. There is no in-place migration from older schemas that allowed `NULL` here -- if you're upgrading from a pre-tightening jmapsync, **delete `state.db` and re-sync**. Disposability is the migration story: the dedupe pass plus the Message-ID-anchored adopt path will rebind every existing local file without re-downloading.
 
 ## State DB concurrency model
 
@@ -349,7 +354,7 @@ A handful of handler-specific notes:
 
 - `adopt_messages` -- when `old_maildir_id` is set (cross-folder local move), call `delete_local_state(old)` first so the orphan row from the source folder is removed before the new binding is written.
 - `update_local_flags` -- flag changes go to disk via `store::set_flags` (which renames the file), then DB. If the disk rename fails the DB is left untouched and the cycle continues (the next cycle will re-derive the change).
-- `upload_messages` -- extracts flags from the on-disk filename rather than trusting the action payload, because the maildir filename is the single source of truth for flag state. Catches `alreadyExists` and warns rather than failing the cycle: hitting this means reconcile's adoption guard didn't fire (typically the Message-ID was unparseable), and bailing on a single bad message shouldn't kill the run.
+- `upload_messages` -- extracts flags from the on-disk filename rather than trusting the action payload, because the maildir filename is the single source of truth for flag state. Catches `alreadyExists` and warns rather than failing the cycle: hitting this means reconcile's adoption guard didn't fire (typically a race with another writer between scan and import), and bailing on a single bad message shouldn't kill the run.
 - `apply_remote_set` -- see above. Per-id failures are silently skipped from the DB-mirror pass so the local DB never claims the server is in a state it isn't.
 
 #### Download concurrency and rate-limit halving
