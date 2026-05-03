@@ -80,6 +80,7 @@ Configuration for `jmapsync` lives in `~/.config/jmapsync/config.toml`. The key 
 
 Other `[account]` keys:
 
+  * `email`: The email address for this account. Required. The domain part is used to discover the JMAP session URL via DNS SRV (`_jmap._tcp.<domain>`) and `/.well-known/jmap`, per RFC 8620 section 2.2.
   * `session_url`: The JMAP session URL for your provider; `jmapsync` defaults to the Fastmail session URL.
 
 ### Sync `[sync]`

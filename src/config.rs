@@ -14,6 +14,10 @@ pub struct Config {
 
 #[derive(Debug, Deserialize)]
 pub struct AccountConfig {
+    /// Email address for the account. The domain is used to discover
+    /// the JMAP session URL via DNS SRV (`_jmap._tcp.<domain>`) and
+    /// the `/.well-known/jmap` HTTPS endpoint.
+    pub email: String,
     /// API token. Lowest-priority fallback after JMAPSYNC_TOKEN and
     /// the OS keychain (`jmapsync auth set-token`). Kept supported
     /// indefinitely for headless servers and CI where the keychain
@@ -220,6 +224,10 @@ pub fn expand_tilde(path: &Path) -> PathBuf {
 /// Generate a default config file template.
 pub fn default_config_template() -> &'static str {
     r#"[account]
+# Email address for this account. The domain is used to discover the
+# JMAP session URL via DNS SRV (_jmap._tcp.<domain>) and the
+# /.well-known/jmap HTTPS endpoint, per RFC 8620 §2.2.
+email = "you@example.com"
 # API token (app-specific password). Generate at:
 #   https://www.fastmail.com/settings/security/tokens
 #
