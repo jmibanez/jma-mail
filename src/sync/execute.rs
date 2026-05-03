@@ -103,13 +103,17 @@ pub async fn execute(
     let outcome =
         apply_remote_set(client, conn, remote_keywords, remote_moves, remote_destroys).await?;
     apply_move_pair_adopts(conn, move_pair_adopts, &outcome.failed_updates)?;
+    let failed_remote_actions = outcome.failed_updates.len() + outcome.failed_destroys.len();
 
     if let Some(state) = new_email_state {
         queries::set_jmap_state(conn, account_id.as_ref(), "Email", &state)?;
         debug!("Persisted new Email state: {}", state);
     }
 
-    Ok(SyncOutcome { downloaded })
+    Ok(SyncOutcome {
+        downloaded,
+        failed_remote_actions,
+    })
 }
 
 /// Bind already-on-server messages to existing local files (DB only).
@@ -469,6 +473,11 @@ async fn apply_remote_set(
             continue;
         };
         if outcome.failed_updates.contains(&id.jmap_email_id) {
+            warn!(
+                "UpdateRemoteKeywords for {} rejected by server. \
+                 DB retains stale keywords; will be re-detected and re-attempted next cycle.",
+                id
+            );
             continue;
         }
         if let Some(rec) = queries::get_message_by_jmap_id(conn, &id.jmap_email_id)? {
@@ -508,7 +517,8 @@ async fn apply_remote_set(
         };
         if outcome.failed_updates.contains(&id.jmap_email_id) {
             warn!(
-                "MoveRemote {} from {} to {} rejected by server",
+                "MoveRemote {} from {} to {} rejected by server. \
+                 DB retains source folder; will be re-detected and re-attempted next cycle.",
                 id, from_folder, to_folder
             );
         } else {
@@ -525,6 +535,12 @@ async fn apply_remote_set(
             continue;
         };
         if outcome.failed_destroys.contains(&id.jmap_email_id) {
+            warn!(
+                "DestroyRemote {} rejected by server. \
+                 Local file is already gone; server still holds the message. \
+                 Next scan will re-emit DeletedMessage and the destroy will be re-attempted.",
+                id
+            );
             continue;
         }
         if let Some(rec) = queries::get_message_by_jmap_id(conn, &id.jmap_email_id)?

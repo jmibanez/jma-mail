@@ -93,10 +93,18 @@ fn build_known_indices(
 }
 
 /// Outcome of one sync iteration -- enough for the daemon loop to know
-/// whether to fire the post-arrival hook.
+/// whether to fire the post-arrival hook and to flag a degraded cycle.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SyncOutcome {
     pub downloaded: usize,
+    /// Per-id failures from the remote-side Email/set batch
+    /// (notUpdated + notDestroyed). Each one is also logged at warn
+    /// level with id and folder context; this count is the
+    /// at-a-glance summary so the user doesn't have to grep across a
+    /// long cycle log to notice anything went wrong. These conditions
+    /// are self-healing -- the next cycle re-detects and re-attempts
+    /// each rejected action -- so they stay below the `error!` bar.
+    pub failed_remote_actions: usize,
 }
 
 /// Single orchestration path. `direction` selects which side(s) of the
@@ -172,6 +180,13 @@ pub async fn run(
     // Phase 5: execute.
     let outcome =
         execute::execute(client, conn, config, filtered, &maildir_root, &account_id).await?;
+
+    if outcome.failed_remote_actions > 0 {
+        warn!(
+            "Cycle completed with {} rejected remote action(s); see preceding warnings",
+            outcome.failed_remote_actions
+        );
+    }
 
     if used_initial_path {
         info!("Initial sync complete ({} downloaded)", outcome.downloaded);
