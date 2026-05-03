@@ -1,3 +1,4 @@
+pub mod discovery;
 pub mod email;
 pub mod mailbox;
 pub mod retry;

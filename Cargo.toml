@@ -55,6 +55,16 @@ chrono = { version = "0.4", features = ["serde"] }
 reqwest-eventsource = "0.6"
 futures-util = "0.3"
 
+# DNS SRV lookup for JMAP autodiscovery (RFC 8620 section 2.2).
+# `tokio` enables the async runtime; `system-config` lets the
+# resolver pick up /etc/resolv.conf (or the Windows registry) so it
+# routes through the same recursive resolver the rest of the system
+# uses. We don't need DoH/DoT/DNSSEC features here.
+hickory-resolver = { version = "0.26", default-features = false, features = [
+    "tokio",
+    "system-config",
+] }
+
 # Filesystem watcher for daemon mode
 notify = "8"
 notify-debouncer-mini = "0.7"
