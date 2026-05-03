@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::config::ConflictStrategy;
 use crate::ids::{JmapBlobId, JmapEmailId, JmapMailboxId, JmapThreadId, MaildirId, MessageId};
@@ -333,6 +333,9 @@ fn process_remote_emails(
         };
 
         // Path 1: already bound by JMAP id -- flag/move updates only.
+        // The wire-format Message-ID is irrelevant here: the existing
+        // message_map row already anchors this email, so we proceed
+        // even if Email/get omitted the header field.
         if let Some(existing) = ctx.known_by_jmap.get(email.id.as_ref()) {
             handle_known_remote(
                 ctx,
@@ -345,12 +348,29 @@ fn process_remote_emails(
             continue;
         }
 
+        // Unknown JMAP id and no Message-ID: refuse to ingest.
+        // jmapsync's idempotency invariant requires Message-ID as the
+        // adopt anchor across state-DB wipes; downloading without one
+        // means the next state-DB wipe would re-download the same
+        // bytes as a fresh local file (dup on disk) instead of
+        // adopting the existing one. Skip the email; it stays on the
+        // server, and the cycle still advances state. error! because
+        // the user (or the server admin) must fix the source: sync
+        // cannot synthesize a Message-ID retroactively.
+        let Some(local_msg_id) = local_msg_id else {
+            error!(
+                "Skipping remote email {} (folder {}): no Message-ID in Email/get response. \
+                 jmapsync requires Message-ID to anchor idempotency across state-DB wipes; \
+                 the server returned an RFC-violating email and we won't ingest it.",
+                email.id, target_folder
+            );
+            continue;
+        };
+
         // Path 2: not bound by JMAP id, but Message-ID matches a local file
         // (either via DB carry-over from a half-completed prior run, or via
         // the dedupe-pass index after a state DB wipe). Adopt it.
-        if let Some(ref mid) = local_msg_id
-            && try_adopt_remote(ctx, &matched, mid, adopted_maildir_ids, plan)
-        {
+        if try_adopt_remote(ctx, &matched, &local_msg_id, adopted_maildir_ids, plan) {
             continue;
         }
 
@@ -358,7 +378,7 @@ fn process_remote_emails(
         plan.actions.push(SyncAction::DownloadMessage {
             id: RemoteId {
                 jmap_email_id: email.id.clone(),
-                message_id: local_msg_id,
+                message_id: Some(local_msg_id),
             },
             jmap_blob_id: email.blob_id.clone(),
             jmap_thread_id: email.thread_id.clone(),
@@ -940,6 +960,58 @@ mod tests {
             plan.actions[0],
             SyncAction::DownloadMessage { id: RemoteId { ref jmap_email_id, .. }, .. } if jmap_email_id.as_ref() == "E1"
         ));
+    }
+
+    /// Server returned an email with no Message-ID at all (the
+    /// `messageId` field absent or empty). With no JMAP-id binding in
+    /// our DB and no Message-ID to anchor adoption against, ingesting
+    /// would break the disposable-state-DB invariant: a wipe + resync
+    /// would re-download the same bytes as a fresh local file. Refuse
+    /// at the reconcile boundary -- emit zero actions and let the
+    /// cycle advance state. The email stays on the server untouched.
+    #[test]
+    fn unknown_remote_email_without_message_id_emits_nothing() {
+        let plan = run(
+            &[email("E1", "MB-INBOX", "S", None)],
+            &[],
+            &[],
+            &[],
+            &empty_index(),
+            ConflictStrategy::ServerWins,
+        );
+        assert!(
+            plan.is_empty(),
+            "expected no actions for an unknown remote without Message-ID, got {:?}",
+            plan.actions
+        );
+    }
+
+    /// Server returned an Email/get response with no Message-ID, but
+    /// we already have a binding for this JMAP id (existing
+    /// message_map row from a prior cycle that anchored it). The
+    /// binding itself is the idempotency anchor; we don't need the
+    /// wire-format Message-ID to safely apply flag updates. Refusing
+    /// known emails on a missing wire field would mean any server
+    /// that strips Message-ID from updates breaks flag sync forever.
+    #[test]
+    fn known_remote_email_without_message_id_still_updates_flags() {
+        let rec = record("E1", "MB-INBOX", "INBOX", Some("M-1"), "", Some("<a@x>"));
+        let plan = run(
+            &[email("E1", "MB-INBOX", "S", None)],
+            &[],
+            &[],
+            &[rec],
+            &empty_index(),
+            ConflictStrategy::ServerWins,
+        );
+        assert!(
+            plan.actions.iter().any(|a| matches!(
+                a,
+                SyncAction::UpdateLocalFlags { new_flags, .. } if new_flags == "S"
+            )),
+            "expected UpdateLocalFlags despite the missing wire Message-ID, got {:?}",
+            plan.actions
+        );
     }
 
     /// Remote email lives in a mailbox not in the synced set: skip silently
