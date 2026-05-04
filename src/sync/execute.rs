@@ -3,19 +3,19 @@ use futures_util::stream::{self, StreamExt};
 use jmap_client::client::Client;
 use rusqlite::Connection;
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
-use crate::ids::{JmapAccountId, JmapEmailId};
+use crate::ids::{JmapAccountId, JmapEmailId, JmapMailboxId};
 use crate::jmap::email::{self as jmap_email, EmailSetOp};
 use crate::jmap::limits;
 use crate::jmap::retry::is_transient_error;
 use crate::maildir_ops::{flags::keywords_to_flags, store};
 use crate::state::queries::{self, MessageRecord};
 use crate::sync::engine::SyncOutcome;
-use crate::sync::plan::{BoundId, RemoteId, SyncAction, SyncPlan};
+use crate::sync::plan::{BoundId, LocalId, RemoteId, SyncAction, SyncPlan};
 
 /// Walk a SyncPlan in dependency order:
 /// adopt → download → local-flags → local-move → local-delete →
@@ -87,7 +87,7 @@ pub async fn execute(
     update_local_flags(conn, local_flags, maildir_root)?;
     move_local_messages(conn, local_moves, maildir_root)?;
     delete_local_messages(conn, local_deletes, maildir_root)?;
-    upload_messages(client, conn, uploads).await?;
+    upload_messages(client, conn, config, uploads).await?;
     let outcome =
         apply_remote_set(client, conn, remote_keywords, remote_moves, remote_destroys).await?;
     apply_move_pair_adopts(conn, move_pair_adopts, &outcome.failed_updates)?;
@@ -362,12 +362,52 @@ fn delete_local_messages(
     Ok(())
 }
 
+/// Per-future state for a single upload — extracted from the
+/// `SyncAction` so the async block can `move` it without keeping a
+/// borrow on the original `Vec<SyncAction>` alive across awaits.
+struct UploadJob {
+    id: LocalId,
+    maildir_folder: String,
+    file_path: PathBuf,
+    mailbox_id: JmapMailboxId,
+    flags: String,
+}
+
+/// Outcome of a single upload future. `Skipped` covers the
+/// non-fatal cases: oversize-cap, stat failure, read failure, and
+/// the server's `alreadyExists` (logged inside `upload_one`). Hard
+/// JMAP errors are returned as `Err` and propagated by the caller.
+enum UploadOutcome {
+    Uploaded(JmapEmailId),
+    Skipped,
+}
+
 async fn upload_messages(
     client: &Client,
     conn: &Connection,
+    config: &Config,
     actions: Vec<SyncAction>,
 ) -> Result<()> {
-    for action in actions {
+    if actions.is_empty() {
+        return Ok(());
+    }
+    let n = limits::upload_concurrency(client, config.sync.upload_concurrency);
+    if n != config.sync.upload_concurrency {
+        info!(
+            "Clamped upload concurrency from {} to {} per server maxConcurrentUpload",
+            config.sync.upload_concurrency, n
+        );
+    }
+    let pending = actions;
+
+    // Build one future per upload. Each future owns its UploadJob
+    // (via clone from the borrowed action), so the async block
+    // doesn't keep `pending` borrowed across awaits. The `i` from
+    // `enumerate` flows through into each completion so the post-
+    // stream DB pass can correlate with `pending[i]` even though
+    // `buffer_unordered` returns out of order. Same shape as
+    // `run_downloads`.
+    let futures = pending.iter().enumerate().map(|(i, action)| {
         let SyncAction::UploadMessage {
             id,
             maildir_folder,
@@ -376,80 +416,144 @@ async fn upload_messages(
             flags,
         } = action
         else {
-            continue;
+            unreachable!("non-upload in uploads bucket");
         };
-        let raw_message = match std::fs::read(&file_path) {
-            Ok(b) => b,
-            Err(e) => {
-                warn!("Failed to read {} for upload: {}", file_path.display(), e);
-                continue;
-            }
+        let job = UploadJob {
+            id: id.clone(),
+            maildir_folder: maildir_folder.clone(),
+            file_path: file_path.clone(),
+            mailbox_id: mailbox_id.clone(),
+            flags: flags.clone(),
         };
-        let keywords = crate::maildir_ops::flags::flags_to_keywords(&flags);
+        async move { (i, upload_one(client, job).await) }
+    });
 
-        let result = jmap_email::import_email(
-            client,
-            &raw_message,
-            mailbox_id.as_ref(),
-            &maildir_folder,
-            &id,
-            &keywords,
-        )
-        .await;
+    // Errors don't abort the stream: we let in-flight futures drain
+    // so any work already on the wire either succeeds or fails on
+    // its own merits.
+    let mut stream = stream::iter(futures).buffer_unordered(n);
+
+    let mut succeeded: Vec<(usize, JmapEmailId)> = Vec::new();
+    let mut hard_error: Option<anyhow::Error> = None;
+
+    while let Some((i, result)) = stream.next().await {
         match result {
-            Ok(jmap_email_id) => {
-                let keywords_json = serde_json::to_string(&keywords)?;
-                // Per-iteration transaction: pair the message_map and
-                // local_state upserts so a failure between them can't
-                // leave the just-uploaded message visible in only one
-                // of the two tables.
-                let txn = conn.unchecked_transaction()?;
-                queries::upsert_message(
-                    &txn,
-                    &MessageRecord {
-                        jmap_email_id: jmap_email_id.clone(),
-                        jmap_blob_id: None,
-                        jmap_thread_id: None,
-                        mailbox_id: mailbox_id.clone(),
-                        maildir_id: Some(id.maildir_id.clone()),
-                        maildir_folder: Some(maildir_folder.clone()),
-                        message_id: id.message_id.clone(),
-                        flags: flags.clone(),
-                        jmap_keywords: keywords_json,
-                    },
-                )?;
-                queries::upsert_local_state(&txn, &id.maildir_id, &maildir_folder, &flags, None)?;
-                txn.commit()?;
-                let target = RemoteId {
-                    jmap_email_id,
-                    message_id: id.message_id.clone(),
-                };
-                info!("Uploaded local message {} -> {}", id.maildir_id, target);
-            }
+            Ok(UploadOutcome::Uploaded(jmap_email_id)) => succeeded.push((i, jmap_email_id)),
+            Ok(UploadOutcome::Skipped) => {}
             Err(e) => {
-                let s = e.to_string();
-                if s.contains("alreadyExists") {
-                    // Reconcile's adopt path should have caught this -
-                    // a same-Message-ID server email already exists in
-                    // a folder we know about. Hitting this branch
-                    // means we raced another writer (another mail
-                    // client uploaded the same message between our
-                    // scan and our import), or our message_map index
-                    // is missing a row reconcile would have used.
-                    // Either way it's self-healing: the next cycle
-                    // sees the server's copy and adopts. Don't fail
-                    // the run.
-                    warn!(
-                        "Upload of {} from {} hit alreadyExists; skipping. Reconcile will adopt the existing server copy on the next cycle.",
-                        id, maildir_folder
-                    );
-                } else {
-                    return Err(e);
+                if hard_error.is_none() {
+                    hard_error = Some(e);
                 }
             }
         }
     }
+    drop(stream);
+
+    // DB writes happen serially after the stream drains: rusqlite's
+    // Connection isn't Send, so it can't cross await points inside
+    // the parallel futures. Per-iteration transactions pair the
+    // message_map and local_state upserts so a mid-loop crash can't
+    // leave a row in only one table.
+    for (i, jmap_email_id) in &succeeded {
+        let SyncAction::UploadMessage {
+            id,
+            maildir_folder,
+            mailbox_id,
+            flags,
+            ..
+        } = &pending[*i]
+        else {
+            unreachable!("non-upload in uploads bucket");
+        };
+        let keywords = crate::maildir_ops::flags::flags_to_keywords(flags);
+        let keywords_json = serde_json::to_string(&keywords)?;
+        let txn = conn.unchecked_transaction()?;
+        queries::upsert_message(
+            &txn,
+            &MessageRecord {
+                jmap_email_id: jmap_email_id.clone(),
+                jmap_blob_id: None,
+                jmap_thread_id: None,
+                mailbox_id: mailbox_id.clone(),
+                maildir_id: Some(id.maildir_id.clone()),
+                maildir_folder: Some(maildir_folder.clone()),
+                message_id: id.message_id.clone(),
+                flags: flags.clone(),
+                jmap_keywords: keywords_json,
+            },
+        )?;
+        queries::upsert_local_state(&txn, &id.maildir_id, maildir_folder, flags, None)?;
+        txn.commit()?;
+        let target = RemoteId {
+            jmap_email_id: jmap_email_id.clone(),
+            message_id: id.message_id.clone(),
+        };
+        info!("Uploaded local message {} -> {}", id.maildir_id, target);
+    }
+
+    if let Some(e) = hard_error {
+        return Err(e);
+    }
     Ok(())
+}
+
+/// One upload's worth of work: read + import. Sync `std::fs::read`
+/// is acceptable inside the future — the blocking is bounded by the
+/// upload concurrency cap, file IO is brief, and per-future reading
+/// keeps memory bounded by N * max_size rather than total_files *
+/// max_size if we pre-buffered everything. Reconcile already
+/// refused oversized files via `max_upload_size`, so any file that
+/// reaches here is within the cap.
+async fn upload_one(client: &Client, job: UploadJob) -> Result<UploadOutcome> {
+    let UploadJob {
+        id,
+        maildir_folder,
+        file_path,
+        mailbox_id,
+        flags,
+    } = job;
+    let raw_message = match std::fs::read(&file_path) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("Failed to read {} for upload: {}", file_path.display(), e);
+            return Ok(UploadOutcome::Skipped);
+        }
+    };
+    let keywords = crate::maildir_ops::flags::flags_to_keywords(&flags);
+
+    match jmap_email::import_email(
+        client,
+        &raw_message,
+        mailbox_id.as_ref(),
+        &maildir_folder,
+        &id,
+        &keywords,
+    )
+    .await
+    {
+        Ok(jmap_email_id) => Ok(UploadOutcome::Uploaded(jmap_email_id)),
+        Err(e) => {
+            let s = e.to_string();
+            if s.contains("alreadyExists") {
+                // Reconcile's adopt path should have caught this —
+                // a same-Message-ID server email already exists in
+                // a folder we know about. Hitting this branch means
+                // we raced another writer (another mail client
+                // uploaded the same message between our scan and
+                // our import), or our message_map index is missing
+                // a row reconcile would have used. Either way it's
+                // self-healing: the next cycle sees the server's
+                // copy and adopts. Don't fail the run.
+                warn!(
+                    "Upload of {} from {} hit alreadyExists; skipping. Reconcile will adopt the existing server copy on the next cycle.",
+                    id, maildir_folder
+                );
+                Ok(UploadOutcome::Skipped)
+            } else {
+                Err(e)
+            }
+        }
+    }
 }
 
 /// Collapse all remote-side mutations onto a single Email/set call.
