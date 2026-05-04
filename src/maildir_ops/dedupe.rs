@@ -1,7 +1,7 @@
 use anyhow::Result;
 use maildir::Maildir;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::SystemTime;
 use tracing::{debug, error, info, warn};
 
@@ -20,7 +20,6 @@ struct GroupKey {
 /// One file that might be the kept copy for a `GroupKey`. Built up
 /// during the maildir walk; the oldest mtime per group wins.
 struct Candidate {
-    path: PathBuf,
     mtime: SystemTime,
     maildir_id: MaildirId,
 }
@@ -30,7 +29,6 @@ struct Candidate {
 pub struct LocalEntry {
     pub folder: String,
     pub maildir_id: MaildirId,
-    pub path: PathBuf,
 }
 
 /// In-memory index of `Message-ID -> [location]` built from the maildir at
@@ -91,11 +89,7 @@ pub fn dedupe_and_index(maildir_root: &Path, folders: &[String]) -> Result<Local
                     msgid,
                 })
                 .or_default()
-                .push(Candidate {
-                    path,
-                    mtime,
-                    maildir_id,
-                });
+                .push(Candidate { mtime, maildir_id });
         }
     }
 
@@ -117,7 +111,6 @@ pub fn dedupe_and_index(maildir_root: &Path, folders: &[String]) -> Result<Local
             .push(LocalEntry {
                 folder: folder.clone(),
                 maildir_id: keep.maildir_id.clone(),
-                path: keep.path.clone(),
             });
 
         for dup in iter {

@@ -120,7 +120,7 @@ The sync pipeline moves a small set of internal types between phases. Each one l
   - `NewMessage { maildir_id, folder, flags, path, message_id }` -- a file appeared that wasn't in `local_state`. `message_id` is non-`Option`: `scan::scan_folder` refuses to construct a `NewMessage` for a file without a parseable Message-ID header (it `error!`s and skips the file), so reconcile never has to defend against the missing-anchor case.
   - `FlagsChanged { maildir_id, folder, old_flags, new_flags }` -- the maildir filename suffix changed.
   - `DeletedMessage { maildir_id, folder }` -- a `local_state` row has no corresponding file on disk.
-- `LocalEntry` -- `{ folder, maildir_id, path }`. One on-disk file's location.
+- `LocalEntry` -- `{ folder, maildir_id }`. One on-disk file's location.
 - `LocalIndex` -- `{ by_message_id: HashMap<message_id, Vec<LocalEntry>> }`. Built once per cycle by `dedupe_and_index` after dedupe deletes within-folder duplicates. The `Vec` here, like `known_by_message_id`, exists because the same Message-ID can legitimately live in several folders.
 
 **Plan types** (`src/sync/plan.rs`). The bridge between `reconcile` and `execute`. Detailed in [`plan.rs`](#plan-rs--the-action-vocabulary) and [`reconcile.rs`](#reconcile-rs--building-the-plan); summarised here for the cast list:

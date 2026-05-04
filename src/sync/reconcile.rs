@@ -1083,7 +1083,6 @@ mod tests {
             vec![LocalEntry {
                 folder: "INBOX".into(),
                 maildir_id: "FILE-1".into(),
-                path: PathBuf::from("/dev/null"),
             }],
         );
         let plan = run(
