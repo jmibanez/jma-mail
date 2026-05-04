@@ -275,7 +275,8 @@ async fn initial_remote_state(
 
 async fn batched_get(client: &Client, ids: &[JmapEmailId]) -> Result<Vec<EmailObject>> {
     let mut out: Vec<EmailObject> = Vec::new();
-    for chunk in ids.chunks(50) {
+    let chunk_size = limits::max_objects_in_get(client);
+    for chunk in ids.chunks(chunk_size) {
         let batch = jmap_email::get_by_ids(client, chunk).await?;
         out.extend(batch);
     }

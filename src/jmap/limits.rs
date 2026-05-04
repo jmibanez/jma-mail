@@ -34,6 +34,15 @@ use jmap_client::client::Client;
 /// real JMAP server's limit (Fastmail's is in the thousands).
 pub const MAX_SET_BATCH_SIZE: usize = 500;
 
+/// Maximum number of object ids we'll request in a single `Foo/get`
+/// call, regardless of what the server advertises for
+/// `maxObjectsInGet`. A hostile or buggy server could otherwise
+/// advertise an absurd value and force us to request megabytes of
+/// metadata in one response. 200 is 4× our previous hardcoded
+/// `chunks(50)` for `Email/get`, cutting round-trips on large
+/// mailboxes while staying well within any realistic server's limit.
+pub const MAX_GET_BATCH_SIZE: usize = 200;
+
 /// Maximum byte size of a single message we'll attempt to upload,
 /// regardless of what the server advertises for `maxSizeUpload`. A
 /// hostile or buggy server could otherwise advertise a multi-TiB cap
@@ -69,6 +78,18 @@ pub fn max_objects_in_set(client: &Client) -> usize {
         .core_capabilities()
         .map(|c| c.max_objects_in_set())
         .map_or(MAX_SET_BATCH_SIZE, |s| s.min(MAX_SET_BATCH_SIZE))
+        .max(1)
+}
+
+/// Effective `Foo/get` batch size. Clamps the server's advertised
+/// `maxObjectsInGet` against `MAX_GET_BATCH_SIZE`; whichever is
+/// smaller wins.
+pub fn max_objects_in_get(client: &Client) -> usize {
+    client
+        .session()
+        .core_capabilities()
+        .map(|c| c.max_objects_in_get())
+        .map_or(MAX_GET_BATCH_SIZE, |s| s.min(MAX_GET_BATCH_SIZE))
         .max(1)
 }
 

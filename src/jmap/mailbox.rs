@@ -93,6 +93,17 @@ pub fn is_mailbox_synced(
 }
 
 /// Fetch all mailboxes from the server using the convenience helper.
+///
+/// Sends `Mailbox/get` with `ids: null`, which per RFC 8620 §5.1
+/// asks the server to return every mailbox in the account — but only
+/// if the count fits inside the server's `maxObjectsInGet`. Above
+/// that, the server returns a `requestTooLarge` error. We don't
+/// chunk this call (which would require a `Mailbox/query` first to
+/// enumerate ids and a separate state-handling story across chunks)
+/// because real accounts have tens of mailboxes and every plausible
+/// server's `maxObjectsInGet` is well into the hundreds. If we ever
+/// hit `requestTooLarge` here, the right fix is the query+chunked-
+/// get refactor, not raising a hardcoded constant.
 pub async fn get_all(client: &Client) -> Result<Vec<MailboxObject>> {
     let mut request = client.build();
     let get_request = request
