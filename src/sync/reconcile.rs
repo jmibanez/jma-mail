@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use tracing::{debug, error, warn};
 
@@ -17,11 +18,17 @@ use crate::sync::plan::{BoundId, LocalId, RemoteId, SyncAction, SyncPlan};
 /// same Message-ID can legitimately appear in more than one folder.
 /// Built once per cycle from `message_map` and consulted everywhere
 /// reconcile needs to ask "do I already know about this?".
+///
+/// The three projections hold `Arc<MessageRecord>` rather than
+/// `MessageRecord` by value: `build_known_indices` wraps each row
+/// once and the projections share via refcount, instead of cloning
+/// the full record into two of the three maps. Consumer code reads
+/// fields through `Arc`'s deref so the call shape is unchanged.
 #[derive(Default)]
 pub struct MessageRecordIndex {
-    pub by_maildir: HashMap<MaildirId, MessageRecord>,
-    pub by_jmap: HashMap<JmapEmailId, MessageRecord>,
-    pub by_message_id: HashMap<MessageId, Vec<MessageRecord>>,
+    pub by_maildir: HashMap<MaildirId, Arc<MessageRecord>>,
+    pub by_jmap: HashMap<JmapEmailId, Arc<MessageRecord>>,
+    pub by_message_id: HashMap<MessageId, Vec<Arc<MessageRecord>>>,
 }
 
 /// Bundle of immutable inputs and derived indices that every reconcile
@@ -31,9 +38,9 @@ struct ReconcileCtx<'a> {
     remote_emails: &'a [EmailObject],
     mailboxes: &'a [(JmapMailboxId, String)],
     strategy: ConflictStrategy,
-    known_by_maildir: &'a HashMap<MaildirId, MessageRecord>,
-    known_by_jmap: &'a HashMap<JmapEmailId, MessageRecord>,
-    known_by_message_id: &'a HashMap<MessageId, Vec<MessageRecord>>,
+    known_by_maildir: &'a HashMap<MaildirId, Arc<MessageRecord>>,
+    known_by_jmap: &'a HashMap<JmapEmailId, Arc<MessageRecord>>,
+    known_by_message_id: &'a HashMap<MessageId, Vec<Arc<MessageRecord>>>,
     local_index: &'a LocalIndex,
     local_flag_changes: HashMap<JmapEmailId, &'a LocalChange>,
     local_deletes: HashSet<JmapEmailId>,
@@ -557,7 +564,7 @@ fn try_adopt_remote(
 
 fn process_remote_destroys(
     remote_destroyed: &[JmapEmailId],
-    known_by_jmap: &HashMap<JmapEmailId, MessageRecord>,
+    known_by_jmap: &HashMap<JmapEmailId, Arc<MessageRecord>>,
     plan: &mut SyncPlan,
 ) {
     for jmap_id in remote_destroyed {
@@ -914,14 +921,15 @@ mod tests {
     fn indices(records: &[MessageRecord]) -> MessageRecordIndex {
         let mut idx = MessageRecordIndex::default();
         for r in records {
-            if let Some(ref m) = r.maildir_id {
-                idx.by_maildir.insert(m.clone(), r.clone());
+            let rec = Arc::new(r.clone());
+            if let Some(ref m) = rec.maildir_id {
+                idx.by_maildir.insert(m.clone(), Arc::clone(&rec));
             }
             idx.by_message_id
-                .entry(r.message_id.clone())
+                .entry(rec.message_id.clone())
                 .or_default()
-                .push(r.clone());
-            idx.by_jmap.insert(r.jmap_email_id.clone(), r.clone());
+                .push(Arc::clone(&rec));
+            idx.by_jmap.insert(rec.jmap_email_id.clone(), rec);
         }
         idx
     }

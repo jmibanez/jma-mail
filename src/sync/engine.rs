@@ -2,6 +2,7 @@ use anyhow::Result;
 use jmap_client::client::Client;
 use rusqlite::Connection;
 use std::collections::HashSet;
+use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
@@ -78,14 +79,21 @@ fn build_known_indices(
     for (_, folder_name) in mailboxes {
         let messages = queries::get_messages_by_folder(conn, folder_name)?;
         for msg in messages {
-            if let Some(ref mid) = msg.maildir_id {
-                idx.by_maildir.insert(mid.clone(), msg.clone());
+            // Wrap once; the three projections share via Arc
+            // refcount instead of cloning the full record into two
+            // of them. Per-cycle peak shrinks roughly 2.5x at the
+            // big-mailbox limit because a record's heap data
+            // (Strings, Options) is allocated once instead of three
+            // times.
+            let rec = Arc::new(msg);
+            if let Some(ref mid) = rec.maildir_id {
+                idx.by_maildir.insert(mid.clone(), Arc::clone(&rec));
             }
             idx.by_message_id
-                .entry(msg.message_id.clone())
+                .entry(rec.message_id.clone())
                 .or_default()
-                .push(msg.clone());
-            idx.by_jmap.insert(msg.jmap_email_id.clone(), msg);
+                .push(Arc::clone(&rec));
+            idx.by_jmap.insert(rec.jmap_email_id.clone(), rec);
         }
     }
     Ok(idx)
