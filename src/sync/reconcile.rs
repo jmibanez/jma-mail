@@ -587,28 +587,11 @@ fn process_local_changes(
 ) {
     for change in local_changes {
         match change {
-            LocalChange::NewMessage {
-                maildir_id,
-                folder,
-                flags,
-                path,
-                message_id,
-                size_bytes,
-            } => {
+            LocalChange::NewMessage { maildir_id, .. } => {
                 if consumed_news.contains(maildir_id) {
                     continue;
                 }
-                handle_local_new(
-                    ctx,
-                    maildir_id,
-                    folder,
-                    path,
-                    message_id,
-                    flags,
-                    *size_bytes,
-                    adopted_maildir_ids,
-                    plan,
-                )
+                handle_local_new(ctx, change, adopted_maildir_ids, plan);
             }
             LocalChange::FlagsChanged {
                 maildir_id,
@@ -627,22 +610,27 @@ fn process_local_changes(
     }
 }
 
-// 9 args: 6 of them are the `LocalChange::NewMessage` payload
-// (maildir_id, folder, path, message_id, flags, size_bytes). Bundling
-// them into a wrapper just to satisfy the heuristic adds noise
-// without making the dispatch any clearer.
-#[allow(clippy::too_many_arguments)]
+/// Decide what to do with a `LocalChange::NewMessage`: adopt
+/// against an existing server email, refuse as a duplicate, refuse
+/// as oversized, or emit `UploadMessage`. Caller is `process_local_changes`,
+/// which has already filtered out moved-paired entries via `consumed_news`.
 fn handle_local_new(
     ctx: &ReconcileCtx<'_>,
-    maildir_id: &MaildirId,
-    folder: &str,
-    path: &std::path::Path,
-    message_id: &MessageId,
-    flags: &str,
-    size_bytes: u64,
+    change: &LocalChange,
     adopted_maildir_ids: &HashSet<MaildirId>,
     plan: &mut SyncPlan,
 ) {
+    let LocalChange::NewMessage {
+        maildir_id,
+        folder,
+        flags,
+        path,
+        message_id,
+        size_bytes,
+    } = change
+    else {
+        unreachable!("handle_local_new called with non-NewMessage variant");
+    };
     if adopted_maildir_ids.contains(maildir_id) {
         // Already covered by an AdoptLocalMessage emitted above.
         return;
@@ -717,7 +705,7 @@ fn handle_local_new(
     // actually attempt. A too-large file is user-actionable (the
     // user has to remove it from the maildir), so error! rather
     // than warn!.
-    if size_bytes > ctx.max_upload_size as u64 {
+    if *size_bytes > ctx.max_upload_size as u64 {
         error!(
             "Skipping upload of {} from {}: size {} bytes exceeds server/client cap of {} bytes. \
              Remove the file from the maildir.",
