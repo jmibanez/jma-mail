@@ -1402,6 +1402,7 @@ dependencies = [
  "jmap-client",
  "keyring-core",
  "maildir",
+ "mailparse",
  "notify",
  "notify-debouncer-mini",
  "reqwest 0.12.28",

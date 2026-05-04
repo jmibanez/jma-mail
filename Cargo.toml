@@ -34,6 +34,14 @@ fd-lock = "4"
 # Maildir
 maildir = "0.6"
 
+# RFC 5322 header parsing. Already pulled in transitively via the
+# maildir crate (which uses it for `MailEntry::headers()`); declare
+# it directly so `parse_message_id_from_file` can call
+# `mailparse::parse_headers` on a bounded buffer instead of routing
+# through `MailEntry`, which would force a full-file read just to
+# pull one header.
+mailparse = "0.14"
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
