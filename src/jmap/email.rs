@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use tracing::{debug, info};
 
 use crate::ids::{JmapBlobId, JmapEmailId, JmapMailboxId, JmapThreadId, MessageId};
+use crate::jmap::limits;
 use crate::jmap::retry::with_retry;
 use crate::jmap::types::{ChangesResponse, EmailObject};
 use crate::sync::plan::LocalId;
@@ -215,12 +216,30 @@ pub struct EmailSetOutcome {
     pub failed_destroys: std::collections::HashSet<JmapEmailId>,
 }
 
-/// Apply a batch of Email/set operations in a single JMAP method call.
+impl EmailSetOutcome {
+    /// Fold one chunk's outcome into this accumulator. Used by
+    /// `set_email_batch` when the op list is split across multiple
+    /// `Email/set` calls to honor `maxObjectsInSet`.
+    pub(crate) fn merge(&mut self, other: EmailSetOutcome) {
+        self.failed_updates.extend(other.failed_updates);
+        self.failed_destroys.extend(other.failed_destroys);
+    }
+}
+
+/// Apply a batch of Email/set operations, splitting across as many
+/// JMAP method calls as needed to honor `maxObjectsInSet`.
 ///
-/// JMAP allows arbitrarily many `update` and `destroy` entries in one
-/// Email/set, capped server-side by `maxObjectsInSet`. Per-id failures
-/// land in `notUpdated`/`notDestroyed` and are surfaced as warnings;
-/// they do not fail the batch.
+/// JMAP allows multiple `update` and `destroy` entries in one
+/// Email/set, capped server-side by `maxObjectsInSet`. Caller op
+/// counts can exceed that cap on a busy cycle; we chunk via
+/// `limits::max_objects_in_set` (which itself caps the server's
+/// advertised value at our own ceiling) and fold per-chunk outcomes
+/// into a combined result. Per-id failures land in
+/// `notUpdated`/`notDestroyed` and are surfaced as warnings; they do
+/// not fail the chunk. A chunk that fails after retries propagates
+/// `Err`, dropping the combined outcome — already-applied chunks
+/// remain on the server and are picked up by reconcile on the next
+/// cycle.
 ///
 /// Moves are emitted as a *full replacement* of `mailboxIds` (the
 /// caller-supplied `target_mailbox_ids`) rather than a per-key patch.
@@ -237,57 +256,71 @@ pub async fn set_email_batch(client: &Client, ops: &[EmailSetOp]) -> Result<Emai
         return Ok(EmailSetOutcome::default());
     }
 
-    let outcome = with_retry("Email/set (batch)", || async {
-        let mut request = client.build();
-        {
-            let set = request.set_email().account_id(client.default_account_id());
-            for op in ops {
-                match op {
-                    EmailSetOp::Keywords { email_id, keywords } => {
-                        let upd = set.update(email_id.as_ref());
-                        for (kw, val) in keywords {
-                            upd.keyword(kw, *val);
+    let chunk_size = limits::max_objects_in_set(client);
+    let mut combined = EmailSetOutcome::default();
+    let mut chunk_count = 0usize;
+
+    for chunk in ops.chunks(chunk_size) {
+        let chunk_outcome = with_retry("Email/set (batch)", || async {
+            let mut request = client.build();
+            {
+                let set = request.set_email().account_id(client.default_account_id());
+                for op in chunk {
+                    match op {
+                        EmailSetOp::Keywords { email_id, keywords } => {
+                            let upd = set.update(email_id.as_ref());
+                            for (kw, val) in keywords {
+                                upd.keyword(kw, *val);
+                            }
                         }
-                    }
-                    EmailSetOp::SetMailboxes {
-                        email_id,
-                        target_mailbox_ids,
-                    } => {
-                        set.update(email_id.as_ref())
-                            .mailbox_ids(target_mailbox_ids.iter());
-                    }
-                    EmailSetOp::Destroy { email_id } => {
-                        set.destroy([email_id.as_ref()]);
+                        EmailSetOp::SetMailboxes {
+                            email_id,
+                            target_mailbox_ids,
+                        } => {
+                            set.update(email_id.as_ref())
+                                .mailbox_ids(target_mailbox_ids.iter());
+                        }
+                        EmailSetOp::Destroy { email_id } => {
+                            set.destroy([email_id.as_ref()]);
+                        }
                     }
                 }
             }
-        }
 
-        let response = request
-            .send_single::<jmap_client::core::response::EmailSetResponse>()
-            .await
-            .context("Email/set batch failed")?;
+            let response = request
+                .send_single::<jmap_client::core::response::EmailSetResponse>()
+                .await
+                .context("Email/set batch failed")?;
 
-        let mut outcome = EmailSetOutcome::default();
-        if let Some(not_updated) = response.not_updated_ids() {
-            for id in not_updated {
-                tracing::warn!("Email/set batch: notUpdated {}", id);
-                outcome.failed_updates.insert(id.as_str().into());
+            let mut outcome = EmailSetOutcome::default();
+            if let Some(not_updated) = response.not_updated_ids() {
+                for id in not_updated {
+                    tracing::warn!("Email/set batch: notUpdated {}", id);
+                    outcome.failed_updates.insert(id.as_str().into());
+                }
             }
-        }
-        if let Some(not_destroyed) = response.not_destroyed_ids() {
-            for id in not_destroyed {
-                tracing::warn!("Email/set batch: notDestroyed {}", id);
-                outcome.failed_destroys.insert(id.as_str().into());
+            if let Some(not_destroyed) = response.not_destroyed_ids() {
+                for id in not_destroyed {
+                    tracing::warn!("Email/set batch: notDestroyed {}", id);
+                    outcome.failed_destroys.insert(id.as_str().into());
+                }
             }
-        }
 
-        Ok(outcome)
-    })
-    .await?;
+            Ok(outcome)
+        })
+        .await?;
 
-    debug!("Applied {} Email/set operations in one call", ops.len());
-    Ok(outcome)
+        combined.merge(chunk_outcome);
+        chunk_count += 1;
+    }
+
+    debug!(
+        "Applied {} Email/set operations across {} call(s) (chunk size {})",
+        ops.len(),
+        chunk_count,
+        chunk_size
+    );
+    Ok(combined)
 }
 
 /// Normalize line endings to CRLF for RFC 5322 wire format.
@@ -394,5 +427,35 @@ fn parse_email_object(email: &jmap_client::email::Email<jmap_client::Get>) -> Em
         keywords,
         message_id,
         subject: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two chunks' worth of failed-id sets merge into the union, with
+    /// updates and destroys staying in their respective buckets.
+    /// Pins the contract that `set_email_batch` relies on when it
+    /// folds per-chunk outcomes after splitting by maxObjectsInSet.
+    #[test]
+    fn email_set_outcome_merge_takes_union() {
+        let mut acc = EmailSetOutcome::default();
+        acc.failed_updates.insert(JmapEmailId::from("a"));
+        acc.failed_destroys.insert(JmapEmailId::from("d1"));
+
+        let mut other = EmailSetOutcome::default();
+        other.failed_updates.insert(JmapEmailId::from("b"));
+        other.failed_updates.insert(JmapEmailId::from("a")); // duplicate
+        other.failed_destroys.insert(JmapEmailId::from("d2"));
+
+        acc.merge(other);
+
+        assert_eq!(acc.failed_updates.len(), 2);
+        assert!(acc.failed_updates.contains(&JmapEmailId::from("a")));
+        assert!(acc.failed_updates.contains(&JmapEmailId::from("b")));
+        assert_eq!(acc.failed_destroys.len(), 2);
+        assert!(acc.failed_destroys.contains(&JmapEmailId::from("d1")));
+        assert!(acc.failed_destroys.contains(&JmapEmailId::from("d2")));
     }
 }

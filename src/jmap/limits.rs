@@ -14,8 +14,8 @@
 //! 255-byte cap stayed hardcoded because trusting the server's
 //! advertised value would let a malicious server pick an arbitrary
 //! upper bound. The same risk applies to every other server cap, so
-//! every accessor here uses
-//! `map_or(OUR_CEILING, |s| s.min(OUR_CEILING))`.
+//! every accessor here uses `map_or(C, |s| s.min(C))` against the
+//! appropriate `MAX_*` constant declared up top of this module.
 //!
 //! For the `maxConcurrentRequests` variant, the user's
 //! `download_concurrency` config plays the role of the ceiling
@@ -24,6 +24,15 @@
 //! it.
 
 use jmap_client::client::Client;
+
+/// Maximum number of operations we'll bundle into a single
+/// `Email/set` request body, regardless of what the server
+/// advertises for `maxObjectsInSet`. A hostile or buggy server could
+/// otherwise advertise an absurd value and force us to bundle
+/// arbitrarily many ops into one HTTP body. 500 leaves plenty of
+/// headroom for a busy sync cycle while staying well inside any
+/// real JMAP server's limit (Fastmail's is in the thousands).
+pub const MAX_SET_BATCH_SIZE: usize = 500;
 
 /// Effective concurrency for the per-cycle download buffer. Clamps
 /// the user-configured `download_concurrency` to the server's
@@ -36,5 +45,17 @@ pub fn concurrent_requests(client: &Client, configured: usize) -> usize {
         .core_capabilities()
         .map(|c| c.max_concurrent_requests())
         .map_or(configured, |s| configured.min(s))
+        .max(1)
+}
+
+/// Effective `Email/set` batch size. Clamps the server's advertised
+/// `maxObjectsInSet` against `MAX_SET_BATCH_SIZE`; whichever is
+/// smaller wins.
+pub fn max_objects_in_set(client: &Client) -> usize {
+    client
+        .session()
+        .core_capabilities()
+        .map(|c| c.max_objects_in_set())
+        .map_or(MAX_SET_BATCH_SIZE, |s| s.min(MAX_SET_BATCH_SIZE))
         .max(1)
 }
