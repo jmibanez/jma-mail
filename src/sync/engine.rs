@@ -263,8 +263,7 @@ async fn fetch_remote_state(
                     current = next;
                 }
                 Err(e) => {
-                    let s = e.to_string();
-                    if s.contains("Cannot calculate changes") {
+                    if jmap_email::is_cannot_calculate_changes(&e) {
                         info!("Server cannot calculate changes; falling back to initial pull");
                         queries::set_jmap_state(conn, account_id.as_ref(), "Email", "")?;
                         return initial_remote_state(client, mailboxes).await;

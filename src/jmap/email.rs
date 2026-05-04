@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
+use jmap_client::Error as JmapError;
 use jmap_client::client::Client;
+use jmap_client::core::error::MethodErrorType;
 use jmap_client::email;
 use std::collections::HashMap;
 use tracing::{debug, info};
@@ -9,6 +11,21 @@ use crate::jmap::limits;
 use crate::jmap::retry::with_retry;
 use crate::jmap::types::{ChangesResponse, EmailObject};
 use crate::sync::plan::LocalId;
+
+/// True iff `err`'s anyhow chain carries a JMAP method-level
+/// `cannotCalculateChanges`. Walks the chain and downcasts to
+/// `jmap_client::Error::Method(MethodError)`, mirroring
+/// `is_transient_error` in `src/jmap/retry.rs`. Pair with
+/// `set_jmap_state(.., "")` to wipe the cursor and route the next
+/// cycle through the initial-pull path.
+pub fn is_cannot_calculate_changes(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        if let Some(JmapError::Method(m)) = cause.downcast_ref::<JmapError>() {
+            return matches!(m.error(), MethodErrorType::CannotCalculateChanges);
+        }
+    }
+    false
+}
 
 /// Properties we request for Email/get calls.
 fn email_properties() -> Vec<email::Property> {
