@@ -3,6 +3,8 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use tracing::warn;
 
+use rand::Rng;
+
 use jmap_client::Error as JmapError;
 use jmap_client::core::error::MethodErrorType;
 use jmap_client::core::set::SetErrorType;
@@ -155,6 +157,13 @@ where
         match f().await {
             Ok(v) => return Ok(v),
             Err(e) if attempt < config.max_attempts && is_transient_error(&e) => {
+                // Full jitter: actual sleep is uniform in [0, backoff].
+                // Decorrelates retries from clients that hit the same
+                // transient at the same instant; worst case is the
+                // unjittered backoff, best case is near-zero. The log
+                // shows the jittered value (what we actually wait) so
+                // operator-facing math matches reality.
+                let sleep = jitter(backoff);
                 // {:#} renders the full anyhow chain joined by ": ", so
                 // logs still surface the underlying jmap-client message
                 // (e.g. "Failed to download blob B-xyz: Server failed:
@@ -162,15 +171,24 @@ where
                 // shows the top layer at {}.
                 warn!(
                     "{}: transient error ({:#}); retry {}/{} in {:?}",
-                    label, e, attempt, config.max_attempts, backoff
+                    label, e, attempt, config.max_attempts, sleep
                 );
-                tokio::time::sleep(backoff).await;
+                tokio::time::sleep(sleep).await;
                 backoff = (backoff * 2).min(config.max_backoff);
             }
             Err(e) => return Err(e),
         }
     }
     unreachable!("do_retry loop exited without returning")
+}
+
+/// Full-jitter helper: returns a random `Duration` uniformly drawn
+/// from `[0, upper]` (in millisecond resolution). Pulled out so the
+/// jitter math is testable in isolation.
+fn jitter(upper: Duration) -> Duration {
+    let upper_ms = upper.as_millis() as u64;
+    let chosen_ms = rand::rng().random_range(0..=upper_ms);
+    Duration::from_millis(chosen_ms)
 }
 
 #[cfg(test)]
@@ -314,6 +332,18 @@ mod tests {
         .await;
         assert!(result.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 5);
+    }
+
+    /// Full jitter is bounded above by the supplied upper duration
+    /// and below by zero. Hammered with 1000 samples to catch any
+    /// off-by-one in the inclusive-range bound.
+    #[test]
+    fn jitter_stays_within_upper_bound() {
+        let upper = Duration::from_millis(100);
+        for _ in 0..1000 {
+            let j = jitter(upper);
+            assert!(j <= upper, "jitter {:?} exceeded upper {:?}", j, upper);
+        }
     }
 
     /// `do_retry` honors a custom `max_attempts` independently of the

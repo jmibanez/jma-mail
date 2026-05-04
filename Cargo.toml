@@ -56,6 +56,11 @@ dirs = "5"
 # Unique IDs
 uuid = { version = "1", features = ["v4"] }
 
+# Random jitter for JMAP retry backoff. Already pulled in transitively
+# (e.g. via uuid); declared directly so retry.rs can call
+# `rand::rng().random_range(...)` without sneaking through a re-export.
+rand = "0.9"
+
 # Time
 chrono = { version = "0.4", features = ["serde"] }
 
