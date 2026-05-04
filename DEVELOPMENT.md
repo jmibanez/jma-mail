@@ -159,22 +159,38 @@ There is no in-place migration system. Whenever the SQLite schema or the invaria
 On open, the binary compares the on-disk version against `SCHEMA_VERSION`:
 
 - **Match** -- proceed.
-- **Mismatch** under a mutating command (`sync`, `pull`, `push`, `watch`) -- `open_or_recreate` `warn!`s and unlinks `state.db` plus its `-wal` and `-shm` siblings, then recreates an empty schema. The mutating command holds the advisory lock at this point, so no concurrent jmapsync can race with the unlink. The disposability invariant is what makes this safe: the maildir + JMAP server are the source of truth, and the dedupe pass plus Message-ID-anchored adoption rebind every existing local file without re-downloading bytes.
-- **Mismatch** under a read-only command (`status`, `mailboxes`, `auth rediscover`) -- `open` refuses with an actionable error pointing the user at `jmapsync sync`. Read-only paths don't hold the lock and so can't safely nuke; deferring to the next mutating run keeps the locking invariant intact.
+- **Mismatch** under a mutating command (`sync`, `pull`, `push`, `watch`) -- `open_or_recreate` `warn!`s and unlinks `state.db` plus its `-wal` and `-shm` siblings, then recreates an empty schema. The mutating command holds the state DB lock at this point, so no concurrent jmapsync sharing this DB (same config, or — once the multi-account refactor lands — sibling per-account drivers against a shared DB) can race with the unlink. The disposability invariant is what makes this safe: the maildir + JMAP server are the source of truth, and the dedupe pass plus Message-ID-anchored adoption rebind every existing local file without re-downloading bytes.
+- **Mismatch** under a read-only command (`status`, `mailboxes`, `auth rediscover`) -- `open` refuses with an actionable error pointing the user at `jmapsync sync`. Read-only paths don't hold the state DB lock and so can't safely nuke; deferring to the next mutating run keeps the locking invariant intact.
 
 Both directions of mismatch (older binary, newer DB; or newer binary, older DB) take the same auto-nuke path. Disposability cuts both ways. A pre-versioning DB (`user_version = 0` with populated tables) is treated as stale.
 
 When you bump `SCHEMA_VERSION`, you don't need to write migration code -- but you DO need to mention the field/invariant change in the commit message, and ideally add a regression test that constructs an old-schema DB on disk and checks `open_or_recreate` rebuilds correctly.
 
-## State DB concurrency model
+## Concurrency model
 
-Three layers, each protecting against a different mutation source:
+Two distinct surfaces need protection from concurrent mutation, plus write-coherence inside the cycle. They get different mechanisms because they have different threat models.
 
-1. **Inter-jmapsync coordination** -- `state::db::acquire_lock` takes a `flock`-backed advisory lock on `<state.db>.lock`. Two jmapsync invocations (`sync`, `pull`, `push`, `watch`) against the same DB can't both run; the second fails with the first's PID in the error message. Read-only commands (`status`, `mailboxes`) and DB-less commands (`init`, `auth`) skip this. The lock is held *before* `open_or_recreate` runs, so the schema-version recovery path (which unlinks `state.db`) is also serialized.
+### Maildir mutual exclusion
 
-2. **Intra-cycle write atomicity** -- `src/sync/execute.rs` wraps each mutation phase in a SQLite transaction via `Connection::unchecked_transaction()`. Pure-DB phases (`adopt_messages`, `apply_move_pair_adopts`, the post-network section of `apply_remote_set`) take one transaction per phase, so a panic mid-loop rolls the whole phase back. FS-mutating phases (`update_local_flags`, `move_local_messages`, `delete_local_messages`, `upload_messages`, `run_downloads`) take one transaction per iteration around the paired DB writes that follow each successful FS op, so a row's `message_map` and `local_state` never disagree even if the second DB write fails. Side benefit: SQLite's WAL writer-lock serializes any other writer on the file from the first write through commit; the eventual multi-account refactor (one engine per account against a shared DB) inherits this serialization for free.
+`maildir_ops::lock::acquire_lock` takes a `flock`-backed advisory lock on `<maildir_root>/.jmapsync.lock`. Mutating jmapsync invocations (`sync`, `pull`, `push`, `watch`) against the same maildir can't both run; the second fails with the first's PID in the error message. Read-only commands (`status`, `mailboxes`) and maildir-less commands (`init`, `auth`) skip this.
 
-3. **External writers** -- a deliberate bypass (e.g. `sqlite3 state.db "UPDATE ..."` typed in error, or any tool that opens the DB without going through `acquire_lock`) is not prevented. Per-batch transactions block such writers from interleaving *within* a phase, but they can still interleave between phases. The recovery story is "next sync cycle re-reconciles from server state"; the design accepts this rather than holding cycle-spanning transactions across network I/O (which would balloon the WAL during long initial syncs and lose Ctrl-C-mid-cycle partial-progress recovery).
+The lock keys on the maildir root, not the state DB, because the maildir is the shared mutation surface across processes. Two configs pointing at *different* state DBs but the *same* maildir would otherwise race -- both could write the same Message-ID under different filenames and clobber each other. Per-account-Maildir-root is the universal convention across mbsync, OfflineIMAP, getmail, etc., so this serializes exactly what needs serializing without artificially preventing legitimate multi-account setups (different accounts -> different roots -> different locks).
+
+### State DB lock (the unlink gate)
+
+`state::db::acquire_lock` takes a separate `flock` on `<db_path>.lock`. This lock specifically gates `open_or_recreate`'s schema-mismatch unlink path: without it, a process that decides the on-disk schema is stale would `unlink` the DB out from under any concurrent process that opened the same DB but doesn't realise it's about to be deleted (writes vanish into the orphaned inode; a later checkpoint can corrupt or panic).
+
+The maildir lock alone doesn't cover this, because two processes can hold *different* maildir locks while sharing a state DB -- which is exactly the topology the multi-account refactor produces (per-account daemon drivers, each with their own maildir, all pointing at one widened-PK DB).
+
+**Lock-acquisition order: maildir lock first, then state DB lock**, consistently across every mutating call site (see `acquire_mutator_locks` in `src/main.rs`). Consistent order is what prevents deadlock between two contending pairs. Both locks are held for process lifetime; the kernel releases them when the fds close at process exit.
+
+### State DB write coherence
+
+The locks above protect against destruction; per-batch transactions plus SQLite's WAL writer-lock protect against interleaved writes:
+
+1. **Intra-cycle write atomicity** -- `src/sync/execute.rs` wraps each mutation phase in a SQLite transaction via `Connection::unchecked_transaction()`. Pure-DB phases (`adopt_messages`, `apply_move_pair_adopts`, the post-network section of `apply_remote_set`) take one transaction per phase, so a panic mid-loop rolls the whole phase back. FS-mutating phases (`update_local_flags`, `move_local_messages`, `delete_local_messages`, `upload_messages`, `run_downloads`) take one transaction per iteration around the paired DB writes that follow each successful FS op, so a row's `message_map` and `local_state` never disagree even if the second DB write fails. Side benefit: SQLite's WAL writer-lock serializes any other writer on the file from the first write through commit; the eventual multi-account refactor (one engine per account against a shared DB) inherits this serialization for free.
+
+2. **External writers** -- a deliberate bypass (e.g. `sqlite3 state.db "UPDATE ..."` typed in error, or any tool that opens the DB without going through the state DB lock) is not prevented. Per-batch transactions block such writers from interleaving *within* a phase, but they can still interleave between phases. The recovery story is "next sync cycle re-reconciles from server state"; the design accepts this rather than holding cycle-spanning transactions across network I/O (which would balloon the WAL during long initial syncs and lose Ctrl-C-mid-cycle partial-progress recovery).
 
 ## JMAP boundary quirks
 

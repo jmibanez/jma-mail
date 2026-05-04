@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 /// `state.db` and re-syncs (the maildir + JMAP server are the source
 /// of truth, and Message-ID-anchored adoption rebinds existing local
 /// files without re-downloading). Read-only commands refuse instead
-/// of nuking, since they don't hold the advisory lock.
+/// of nuking, since they don't hold the state DB lock.
 pub const SCHEMA_VERSION: u32 = 1;
 
 const SCHEMA: &str = r#"
@@ -69,7 +69,7 @@ CREATE TABLE IF NOT EXISTS jmap_discovery (
 /// Open the state database for read-only callers (`status`, `mailboxes`,
 /// `auth rediscover`). If the on-disk schema version doesn't match
 /// `SCHEMA_VERSION`, refuse with a clear instruction to run a mutating
-/// command — those hold the advisory lock and can safely nuke + recreate.
+/// command -- those hold the state DB lock and can safely nuke + recreate.
 /// Read-only paths can't, since nuking under a concurrently running
 /// `sync`/`watch` would yank the DB out from under it.
 pub fn open(path: &Path) -> Result<Connection> {
@@ -101,9 +101,15 @@ pub fn open(path: &Path) -> Result<Connection> {
 /// safe; the dedupe pass and Message-ID-anchored adoption rebind
 /// existing local files without re-downloading.
 ///
-/// Caller must hold the advisory lock from `acquire_lock` before
-/// calling this. Otherwise a concurrent jmapsync could be midway
-/// through a cycle when we unlink the file out from under it.
+/// Caller must hold the state DB lock from `acquire_lock` before
+/// calling this. Otherwise a concurrent jmapsync sharing this state DB
+/// (e.g. a misconfigured second config pointing at the same `db_path`,
+/// or -- once the multi-account refactor lands -- a sibling per-account
+/// driver against the shared DB) could be midway through a cycle when
+/// we unlink the file out from under it.
+///
+/// In practice every mutating caller also holds the maildir lock; see
+/// `acquire_mutator_locks` in `src/main.rs` for the canonical order.
 pub fn open_or_recreate(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| {
@@ -230,32 +236,41 @@ pub fn open_in_memory() -> Result<Connection> {
 }
 
 /// Path of the advisory lock file paired with a given state DB
-/// (`state.db` -> `state.db.lock`). Exposed for diagnostics and
-/// documentation; not normally needed by callers.
+/// (`state.db` -> `state.db.lock`). Exposed for diagnostics; not
+/// normally needed by callers.
 pub fn lock_path_for(db_path: &Path) -> PathBuf {
     let mut p = db_path.as_os_str().to_owned();
     p.push(".lock");
     PathBuf::from(p)
 }
 
-/// Acquire an exclusive advisory lock on `<db_path>.lock` so that
-/// at most one mutating jmapsync command (sync/pull/push/watch)
-/// touches a given state DB at a time. The lock is held for the
-/// rest of the process's lifetime; the kernel releases it when the
-/// fd closes at process exit, even on panic or SIGKILL — so a
-/// stale lock file is never blocking on its own.
+/// Acquire an exclusive advisory lock on `<db_path>.lock`. This lock
+/// specifically gates `open_or_recreate`'s schema-mismatch unlink path:
+/// without it, a process that decides the on-disk schema is stale would
+/// `unlink` the DB out from under any concurrent process that opened
+/// the same DB but doesn't realise it's about to be deleted (writes
+/// vanish into the orphaned inode; a later checkpoint can corrupt).
+///
+/// The lock is keyed on the state DB rather than the maildir because
+/// the destruction is a property of the DB file, not the maildir. The
+/// maildir lock (`maildir_ops::lock::acquire_lock`) is a separate
+/// concern: it serializes maildir mutations across processes that may
+/// not even share a DB. Both locks are held for process lifetime.
+///
+/// Lock-acquisition order is **maildir lock first, then state DB
+/// lock**, consistently across every call site, to avoid deadlock.
+///
+/// The lock is held for the rest of the process's lifetime; the kernel
+/// releases it when the fd closes at process exit, even on panic or
+/// SIGKILL -- so a stale lock file is never blocking on its own.
 ///
 /// Stamps our PID into the file purely as a diagnostic, so a second
 /// instance can name us in its error message. The PID is never
-/// consulted to decide whether to steal the lock — flock semantics
+/// consulted to decide whether to steal the lock -- flock semantics
 /// make stealing unnecessary and PID recycling makes it unsafe.
 ///
-/// Read-only commands (`status`, `mailboxes`) and commands that
-/// don't touch the state DB (`init`, `auth`) do not call this.
-///
-/// This advisory lock is layer 1 of the state DB concurrency model;
-/// see DEVELOPMENT.md "State DB concurrency model" for the full
-/// picture (per-batch transactions and the external-writer caveat).
+/// Read-only commands (`status`, `mailboxes`) and DB-less commands
+/// (`init`, `auth`) do not call this.
 pub fn acquire_lock(db_path: &Path) -> Result<()> {
     let lock_path = lock_path_for(db_path);
     if let Some(parent) = lock_path.parent() {
@@ -285,7 +300,7 @@ pub fn acquire_lock(db_path: &Path) -> Result<()> {
             // Forget the guard so the lock outlives this scope.
             // The leaked RwLock<File> still owns the fd.
             std::mem::forget(guard);
-            info!("Acquired instance lock at {}", lock_path.display());
+            info!("Acquired state DB lock at {}", lock_path.display());
             Ok(())
         }
         Err(_) => {
@@ -293,7 +308,7 @@ pub fn acquire_lock(db_path: &Path) -> Result<()> {
                 .map(|p| format!("pid {}", p))
                 .unwrap_or_else(|| "unknown pid".to_string());
             Err(anyhow::anyhow!(
-                "another jmapsync is running ({} at {})",
+                "another jmapsync is using this state DB ({} at {})",
                 holder,
                 lock_path.display()
             ))
@@ -330,7 +345,6 @@ mod tests {
         let db = dir.path().join("state.db");
         acquire_lock(&db).expect("first acquire should succeed");
 
-        // PID file should now contain our pid.
         let pid = read_pid(&lock_path_for(&db)).expect("pid file readable");
         assert_eq!(pid, std::process::id());
     }
@@ -343,7 +357,10 @@ mod tests {
 
         let err = acquire_lock(&db).expect_err("second acquire should fail");
         let msg = format!("{}", err);
-        assert!(msg.contains("another jmapsync is running"), "got: {msg}");
+        assert!(
+            msg.contains("another jmapsync is using this state DB"),
+            "got: {msg}"
+        );
         assert!(
             msg.contains(&format!("pid {}", std::process::id())),
             "expected our pid in message, got: {msg}"

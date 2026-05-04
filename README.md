@@ -59,11 +59,16 @@ If there are any changes that break state tracking, as mentioned above you can s
 
 ### Concurrency: One Mutator at a Time
 
-Mutating commands (`sync`, `pull`, `push`, `watch`) take an exclusive OS-level advisory lock on `<db_path>.lock` (e.g. `~/.local/share/jmapsync/state.db.lock`) before doing any work. If another instance already holds the lock, the second invocation fails fast with a message naming the holder's PID. This prevents two instances from racing on the SQLite state DB or double-uploading local-only messages to the server.
+Mutating commands (`sync`, `pull`, `push`, `watch`) take **two** exclusive OS-level advisory locks before doing any work:
 
-Read-only commands (`status`, `mailboxes`) and commands that don't touch the state DB (`init`, `auth`) do **not** take the lock and can run alongside a `watch` daemon.
+1. `<maildir_root>/.jmapsync.lock` -- guards the maildir against concurrent mutation by any other jmapsync process pointed at the same maildir, even if their state DB paths differ.
+2. `<db_path>.lock` (e.g. `~/.local/share/jmapsync/state.db.lock`) -- guards the state DB against the schema-mismatch unlink/recreate path racing a concurrent process that opened the same DB.
 
-The lock is held by the kernel, not by the contents of the file, so it's released automatically when the holding process exits — including on crash or `kill -9`. The `.lock` file itself may stick around on disk; that's fine, the next invocation will reuse it. You should never need to delete it by hand, but it's safe to do so when no jmapsync process is running.
+If another instance already holds either lock, the second invocation fails fast with a message naming the holder's PID. The two locks cover different topologies: same maildir / different DB (lock 1 catches it), and same DB / different maildir (lock 2 catches it). The locks are always acquired in the same order -- maildir first, then state DB -- so two contending processes can't deadlock.
+
+Read-only commands (`status`, `mailboxes`) and commands that don't touch the maildir or DB (`init`, `auth`) do **not** take either lock and can run alongside a `watch` daemon.
+
+The locks are held by the kernel, not by the contents of the files, so they're released automatically when the holding process exits -- including on crash or `kill -9`. The `.lock` files themselves may stick around on disk; that's fine, the next invocation will reuse them. You should never need to delete them by hand, but it's safe to do so when no jmapsync process is running.
 
 
 ## Configuration

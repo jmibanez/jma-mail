@@ -8,6 +8,7 @@ use jmapsync::config::{self, Config};
 use jmapsync::daemon;
 use jmapsync::jmap::retry::{self, RetryConfig};
 use jmapsync::jmap::session;
+use jmapsync::maildir_ops;
 use jmapsync::state;
 use jmapsync::sync::engine;
 
@@ -76,9 +77,10 @@ async fn cmd_auth(cli: &Cli, action: AuthAction) -> Result<()> {
             }
             let domain = config.account.email_domain()?;
             let db_path = config.db_path();
-            // No acquire_lock: this only touches the discovery cache,
-            // which SQLite serializes internally. It's safe to run
-            // alongside an in-progress sync/watch.
+            // No maildir lock here: this only touches the discovery
+            // cache, which SQLite serializes internally and which is
+            // independent of the maildir. Safe to run alongside an
+            // in-progress sync/watch.
             let conn = state::db::open(&db_path)?;
 
             let prev = jmapsync::state::queries::get_cached_session_url(&conn, domain)?;
@@ -191,9 +193,9 @@ fn provision_maildirs(config: &Config) -> Result<()> {
 async fn cmd_mailboxes(cli: &Cli) -> Result<()> {
     let config = load_config(cli)?;
     // Read-only listing, but we still open the state DB so
-    // `session::connect` can hit the JMAP discovery cache. No
-    // `acquire_lock` here -- this command shouldn't block while a
-    // sync/watch invocation holds the lock.
+    // `session::connect` can hit the JMAP discovery cache. No maildir
+    // lock here -- this command shouldn't block while a sync/watch
+    // invocation holds it.
     let db_path = config.db_path();
     let conn = state::db::open(&db_path)?;
     let client = session::connect(&config.account, &conn).await?;
@@ -226,11 +228,22 @@ async fn cmd_mailboxes(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
+/// Acquire both process-lifetime locks in the canonical order: maildir
+/// first, then state DB. Order is load-bearing -- consistent acquisition
+/// order across every mutating call site is what prevents deadlock when
+/// two processes contend on different pairs. See the doc comments on
+/// `maildir_ops::lock::acquire_lock` and `state::db::acquire_lock` for
+/// what each lock protects.
+fn acquire_mutator_locks(config: &Config) -> Result<()> {
+    maildir_ops::lock::acquire_lock(&config.maildir_path())?;
+    state::db::acquire_lock(&config.db_path())?;
+    Ok(())
+}
+
 async fn cmd_sync(cli: &Cli) -> Result<()> {
     let config = load_config(cli)?;
-    let db_path = config.db_path();
-    state::db::acquire_lock(&db_path)?;
-    let conn = state::db::open_or_recreate(&db_path)?;
+    acquire_mutator_locks(&config)?;
+    let conn = state::db::open_or_recreate(&config.db_path())?;
     let client = session::connect(&config.account, &conn).await?;
 
     engine::sync(&client, &conn, &config, cli.dry_run).await?;
@@ -240,9 +253,8 @@ async fn cmd_sync(cli: &Cli) -> Result<()> {
 
 async fn cmd_pull(cli: &Cli) -> Result<()> {
     let config = load_config(cli)?;
-    let db_path = config.db_path();
-    state::db::acquire_lock(&db_path)?;
-    let conn = state::db::open_or_recreate(&db_path)?;
+    acquire_mutator_locks(&config)?;
+    let conn = state::db::open_or_recreate(&config.db_path())?;
     let client = session::connect(&config.account, &conn).await?;
 
     engine::pull_only(&client, &conn, &config).await?;
@@ -252,9 +264,8 @@ async fn cmd_pull(cli: &Cli) -> Result<()> {
 
 async fn cmd_push(cli: &Cli) -> Result<()> {
     let config = load_config(cli)?;
-    let db_path = config.db_path();
-    state::db::acquire_lock(&db_path)?;
-    let conn = state::db::open_or_recreate(&db_path)?;
+    acquire_mutator_locks(&config)?;
+    let conn = state::db::open_or_recreate(&config.db_path())?;
     let client = session::connect(&config.account, &conn).await?;
 
     engine::push_only(&client, &conn, &config).await?;
@@ -264,9 +275,8 @@ async fn cmd_push(cli: &Cli) -> Result<()> {
 
 async fn cmd_watch(cli: &Cli) -> Result<()> {
     let config = load_config(cli)?;
-    let db_path = config.db_path();
-    state::db::acquire_lock(&db_path)?;
-    let conn = state::db::open_or_recreate(&db_path)?;
+    acquire_mutator_locks(&config)?;
+    let conn = state::db::open_or_recreate(&config.db_path())?;
     let client = session::connect(&config.account, &conn).await?;
 
     daemon::runner::run(&client, &conn, &config).await?;
