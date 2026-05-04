@@ -7,23 +7,23 @@ use std::collections::HashMap;
 ///
 /// JMAP keywords:
 ///   $draft, $flagged, $answered, $seen, $deleted (and others)
-const FLAG_MAPPINGS: &[(&str, char)] = &[
-    ("$draft", 'D'),
-    ("$flagged", 'F'),
-    ("$answered", 'R'),
-    ("$seen", 'S'),
-    ("$deleted", 'T'),
+const FLAG_MAPPINGS: &[(&str, &str)] = &[
+    ("$draft", "D"),
+    ("$flagged", "F"),
+    ("$answered", "R"),
+    ("$seen", "S"),
+    ("$deleted", "T"),
 ];
 
 /// Convert JMAP keywords to a Maildir flags string (sorted).
 pub fn keywords_to_flags(keywords: &HashMap<String, bool>) -> String {
-    let mut flags: Vec<char> = FLAG_MAPPINGS
+    let mut flags: Vec<&str> = FLAG_MAPPINGS
         .iter()
         .filter(|(kw, _)| keywords.get(*kw).copied().unwrap_or(false))
         .map(|(_, flag)| *flag)
         .collect();
     flags.sort();
-    flags.into_iter().collect()
+    flags.concat()
 }
 
 /// Convert a Maildir flags string to JMAP keywords.
