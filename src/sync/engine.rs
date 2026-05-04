@@ -387,3 +387,194 @@ pub async fn push_only(client: &Client, conn: &Connection, config: &Config) -> R
     run(client, conn, config, false, SyncDirection::PushOnly).await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ids::{JmapEmailId, MaildirId, MessageId};
+    use crate::state::db;
+    use crate::state::queries::MessageRecord;
+
+    fn record(
+        jmap_id: &str,
+        mailbox_id: &str,
+        folder: &str,
+        maildir_id: Option<&str>,
+        message_id: &str,
+    ) -> MessageRecord {
+        MessageRecord {
+            jmap_email_id: jmap_id.into(),
+            jmap_blob_id: Some(format!("blob-{jmap_id}").into()),
+            jmap_thread_id: Some(format!("thr-{jmap_id}").into()),
+            mailbox_id: mailbox_id.into(),
+            maildir_id: maildir_id.map(Into::into),
+            maildir_folder: Some(folder.into()),
+            message_id: message_id.into(),
+            flags: "S".into(),
+            jmap_keywords: r#"{"$seen":true}"#.into(),
+        }
+    }
+
+    fn seed(conn: &Connection, records: &[MessageRecord]) {
+        for r in records {
+            queries::upsert_message(conn, r).unwrap();
+        }
+    }
+
+    fn mailboxes(folders: &[(&str, &str)]) -> Vec<(JmapMailboxId, String)> {
+        folders
+            .iter()
+            .map(|(id, folder)| ((*id).into(), (*folder).to_string()))
+            .collect()
+    }
+
+    /// No mailboxes -> no rows queried -> all three projections empty.
+    #[test]
+    fn build_known_indices_with_no_mailboxes_returns_empty() {
+        let conn = db::open_in_memory().unwrap();
+        seed(
+            &conn,
+            &[record("E1", "MB-INBOX", "INBOX", Some("M1"), "<a@x>")],
+        );
+
+        let idx = build_known_indices(&conn, &[]).unwrap();
+
+        assert!(idx.by_jmap.is_empty());
+        assert!(idx.by_maildir.is_empty());
+        assert!(idx.by_message_id.is_empty());
+    }
+
+    /// A single fully-bound row appears in all three projections, keyed
+    /// on its respective identifier. The `Vec` in `by_message_id` holds
+    /// exactly one entry.
+    #[test]
+    fn build_known_indices_single_record_in_all_three_projections() {
+        let conn = db::open_in_memory().unwrap();
+        seed(
+            &conn,
+            &[record("E1", "MB-INBOX", "INBOX", Some("M1"), "<a@x>")],
+        );
+
+        let idx = build_known_indices(&conn, &mailboxes(&[("MB-INBOX", "INBOX")])).unwrap();
+
+        assert_eq!(idx.by_jmap.len(), 1);
+        assert_eq!(idx.by_maildir.len(), 1);
+        assert_eq!(idx.by_message_id.len(), 1);
+        assert!(idx.by_jmap.contains_key(&JmapEmailId::from("E1")));
+        assert!(idx.by_maildir.contains_key(&MaildirId::from("M1")));
+        let bucket = idx
+            .by_message_id
+            .get(&MessageId::from("<a@x>"))
+            .expect("message_id must index the row");
+        assert_eq!(bucket.len(), 1);
+    }
+
+    /// A row whose `maildir_id` is NULL (e.g. mid-flight before adoption
+    /// landed the maildir binding) is invisible to `by_maildir` but still
+    /// indexed by jmap id and Message-ID. Matches the explicit `if let
+    /// Some(ref mid)` guard in build_known_indices.
+    #[test]
+    fn build_known_indices_skips_by_maildir_when_maildir_id_is_none() {
+        let conn = db::open_in_memory().unwrap();
+        seed(&conn, &[record("E1", "MB-INBOX", "INBOX", None, "<a@x>")]);
+
+        let idx = build_known_indices(&conn, &mailboxes(&[("MB-INBOX", "INBOX")])).unwrap();
+
+        assert_eq!(idx.by_jmap.len(), 1);
+        assert!(idx.by_maildir.is_empty());
+        assert_eq!(
+            idx.by_message_id
+                .get(&MessageId::from("<a@x>"))
+                .map(Vec::len),
+            Some(1)
+        );
+    }
+
+    /// Same Message-ID in two different folders (legitimate: same email
+    /// delivered to Inbox and a Sent/thread folder) collapses to two
+    /// entries in `by_message_id` while staying 1:1 in `by_jmap` and
+    /// `by_maildir`. This is the 1:N invariant the engine relies on for
+    /// post-DB-wipe adoption.
+    #[test]
+    fn build_known_indices_groups_same_message_id_across_folders() {
+        let conn = db::open_in_memory().unwrap();
+        seed(
+            &conn,
+            &[
+                record("E1", "MB-INBOX", "INBOX", Some("M1"), "<a@x>"),
+                record("E2", "MB-ARCH", "Archive", Some("M2"), "<a@x>"),
+            ],
+        );
+
+        let idx = build_known_indices(
+            &conn,
+            &mailboxes(&[("MB-INBOX", "INBOX"), ("MB-ARCH", "Archive")]),
+        )
+        .unwrap();
+
+        assert_eq!(idx.by_jmap.len(), 2);
+        assert_eq!(idx.by_maildir.len(), 2);
+        let bucket = idx
+            .by_message_id
+            .get(&MessageId::from("<a@x>"))
+            .expect("both rows must group under the shared Message-ID");
+        assert_eq!(bucket.len(), 2);
+        let jmap_ids: HashSet<&JmapEmailId> = bucket.iter().map(|r| &r.jmap_email_id).collect();
+        assert!(jmap_ids.contains(&JmapEmailId::from("E1")));
+        assert!(jmap_ids.contains(&JmapEmailId::from("E2")));
+    }
+
+    /// `mailboxes` is the folder filter: rows whose `maildir_folder`
+    /// isn't in the listed folders are not indexed. `get_messages_by_folder`
+    /// queries only the listed folders; nothing enumerates the table.
+    /// Pinning this prevents a refactor from accidentally widening the
+    /// scope to "every row in message_map".
+    #[test]
+    fn build_known_indices_only_indexes_listed_folders() {
+        let conn = db::open_in_memory().unwrap();
+        seed(
+            &conn,
+            &[
+                record("E1", "MB-INBOX", "INBOX", Some("M1"), "<a@x>"),
+                record("E2", "MB-ARCH", "Archive", Some("M2"), "<b@x>"),
+                record("E3", "MB-SPAM", "Spam", Some("M3"), "<c@x>"),
+            ],
+        );
+
+        // Only INBOX listed; Archive and Spam rows must be invisible.
+        let idx = build_known_indices(&conn, &mailboxes(&[("MB-INBOX", "INBOX")])).unwrap();
+
+        assert_eq!(idx.by_jmap.len(), 1);
+        assert!(idx.by_jmap.contains_key(&JmapEmailId::from("E1")));
+        assert!(!idx.by_jmap.contains_key(&JmapEmailId::from("E2")));
+        assert!(!idx.by_jmap.contains_key(&JmapEmailId::from("E3")));
+    }
+
+    /// All three projections hold the *same* `Arc<MessageRecord>` for a
+    /// given row (refcount-shared, not three independent clones). This
+    /// is the documented memory-saving contract: a record's heap data
+    /// is allocated once instead of three times.
+    #[test]
+    fn build_known_indices_shares_arc_across_projections() {
+        let conn = db::open_in_memory().unwrap();
+        seed(
+            &conn,
+            &[record("E1", "MB-INBOX", "INBOX", Some("M1"), "<a@x>")],
+        );
+
+        let idx = build_known_indices(&conn, &mailboxes(&[("MB-INBOX", "INBOX")])).unwrap();
+
+        let from_jmap = idx.by_jmap.get(&JmapEmailId::from("E1")).unwrap();
+        let from_maildir = idx.by_maildir.get(&MaildirId::from("M1")).unwrap();
+        let from_msgid = &idx.by_message_id.get(&MessageId::from("<a@x>")).unwrap()[0];
+
+        assert!(
+            Arc::ptr_eq(from_jmap, from_maildir),
+            "by_jmap and by_maildir must share the same Arc"
+        );
+        assert!(
+            Arc::ptr_eq(from_jmap, from_msgid),
+            "by_jmap and by_message_id must share the same Arc"
+        );
+    }
+}
