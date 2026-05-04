@@ -6,7 +6,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::ids::{JmapAccountId, JmapEmailId, JmapMailboxId};
-use crate::jmap::{email as jmap_email, mailbox as jmap_mailbox, types::EmailObject};
+use crate::jmap::{email as jmap_email, limits, mailbox as jmap_mailbox, types::EmailObject};
 use crate::maildir_ops::{dedupe, scan, store};
 use crate::state::queries;
 use crate::sync::execute;
@@ -150,6 +150,7 @@ pub async fn run(
         mailboxes: &mailboxes,
         strategy: config.sync.conflict_strategy,
         new_email_state: Some(new_state),
+        max_upload_size: limits::max_size_upload(client),
     });
 
     if dry_run {

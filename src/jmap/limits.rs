@@ -34,6 +34,18 @@ use jmap_client::client::Client;
 /// real JMAP server's limit (Fastmail's is in the thousands).
 pub const MAX_SET_BATCH_SIZE: usize = 500;
 
+/// Maximum byte size of a single message we'll attempt to upload,
+/// regardless of what the server advertises for `maxSizeUpload`. A
+/// hostile or buggy server could otherwise advertise a multi-TiB cap
+/// and let a pathologically large local file OOM us when
+/// `upload_messages` reads the whole thing into RAM. 100 MiB sits
+/// above known real-world server caps (Fastmail advertises 70 MiB),
+/// so the server's tighter value is what bites in practice on a
+/// normal account; the ceiling only matters as a finite worst case
+/// if the server omits the capability or advertises something
+/// absurd.
+pub const MAX_UPLOAD_FILE_SIZE: usize = 100 * 1024 * 1024;
+
 /// Effective concurrency for the per-cycle download buffer. Clamps
 /// the user-configured `download_concurrency` to the server's
 /// advertised `maxConcurrentRequests`; whichever is smaller wins,
@@ -57,5 +69,17 @@ pub fn max_objects_in_set(client: &Client) -> usize {
         .core_capabilities()
         .map(|c| c.max_objects_in_set())
         .map_or(MAX_SET_BATCH_SIZE, |s| s.min(MAX_SET_BATCH_SIZE))
+        .max(1)
+}
+
+/// Effective upload size cap in bytes. Clamps the server's
+/// advertised `maxSizeUpload` against `MAX_UPLOAD_FILE_SIZE`;
+/// whichever is smaller wins.
+pub fn max_size_upload(client: &Client) -> usize {
+    client
+        .session()
+        .core_capabilities()
+        .map(|c| c.max_size_upload())
+        .map_or(MAX_UPLOAD_FILE_SIZE, |s| s.min(MAX_UPLOAD_FILE_SIZE))
         .max(1)
 }

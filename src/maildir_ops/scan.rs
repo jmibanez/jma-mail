@@ -24,6 +24,13 @@ pub enum LocalChange {
         flags: String,
         path: PathBuf,
         message_id: MessageId,
+        /// On-disk byte size at scan time, captured by the same
+        /// pass that opens the file for Message-ID parsing. Carried
+        /// so reconcile can refuse oversized uploads without doing
+        /// its own I/O. `0` for files whose size couldn't be
+        /// stat'd; reconcile treats that as "let it through and let
+        /// the upload path surface the error."
+        size_bytes: u64,
     },
     /// A message file we had recorded is now missing.
     DeletedMessage {
@@ -77,12 +84,14 @@ pub fn scan_folder(
                 let Some(message_id) = require_message_id(&maildir_id, &path)? else {
                     continue;
                 };
+                let size_bytes = stat_size(&path);
                 changes.push(LocalChange::NewMessage {
                     maildir_id,
                     folder: folder_name.to_string(),
                     flags,
                     path,
                     message_id,
+                    size_bytes,
                 });
             }
             Some((_, known_flags)) => {
@@ -105,12 +114,14 @@ pub fn scan_folder(
                 let Some(message_id) = require_message_id(&maildir_id, &path)? else {
                     continue;
                 };
+                let size_bytes = stat_size(&path);
                 changes.push(LocalChange::NewMessage {
                     maildir_id,
                     folder: folder_name.to_string(),
                     flags,
                     path,
                     message_id,
+                    size_bytes,
                 });
             }
         }
@@ -143,12 +154,14 @@ pub fn scan_folder(
             let Some(message_id) = require_message_id(&maildir_id, &path)? else {
                 continue;
             };
+            let size_bytes = stat_size(&path);
             changes.push(LocalChange::NewMessage {
                 maildir_id,
                 folder: folder_name.to_string(),
                 flags: String::new(),
                 path,
                 message_id,
+                size_bytes,
             });
         }
     }
@@ -165,6 +178,16 @@ pub fn scan_folder(
     }
 
     Ok((changes, seen_ids))
+}
+
+/// Capture the file's on-disk byte size, returning 0 if stat fails.
+/// Plumbed onto `LocalChange::NewMessage` so reconcile can refuse
+/// oversized uploads without doing its own I/O. Stat failures fall
+/// through as 0 — we'd rather let the upload path surface a clear
+/// per-file error than swallow the change at scan time on transient
+/// metadata failures.
+fn stat_size(path: &Path) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
 /// Parse the file's `Message-ID` header, returning `Ok(Some(_))` when

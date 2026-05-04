@@ -38,6 +38,7 @@ struct ReconcileCtx<'a> {
     local_flag_changes: HashMap<JmapEmailId, &'a LocalChange>,
     local_deletes: HashSet<JmapEmailId>,
     destroyed_set: HashSet<&'a str>,
+    max_upload_size: usize,
 }
 
 /// One reconcile cycle's inputs, gathered into a single struct so the
@@ -63,6 +64,12 @@ pub struct ReconcileInput<'a> {
     pub mailboxes: &'a [(JmapMailboxId, String)],
     pub strategy: ConflictStrategy,
     pub new_email_state: Option<String>,
+    /// Effective `maxSizeUpload` cap for this cycle. Resolved by the
+    /// caller (engine) via `limits::max_size_upload(client)` so
+    /// reconcile stays I/O-free. NewMessage entries whose
+    /// `size_bytes` exceeds this don't get an `UploadMessage` in
+    /// the plan.
+    pub max_upload_size: usize,
 }
 
 /// Reconcile remote changes and local changes into a sync plan.
@@ -76,6 +83,7 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
         mailboxes,
         strategy,
         new_email_state,
+        max_upload_size,
     } = input;
     let known_by_maildir = &known.by_maildir;
     let known_by_jmap = &known.by_jmap;
@@ -197,6 +205,7 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
         local_flag_changes,
         local_deletes,
         destroyed_set,
+        max_upload_size,
     };
 
     // Track local maildir_ids that have been claimed by an adoption emitted
@@ -584,6 +593,7 @@ fn process_local_changes(
                 flags,
                 path,
                 message_id,
+                size_bytes,
             } => {
                 if consumed_news.contains(maildir_id) {
                     continue;
@@ -595,6 +605,7 @@ fn process_local_changes(
                     path,
                     message_id,
                     flags,
+                    *size_bytes,
                     adopted_maildir_ids,
                     plan,
                 )
@@ -616,10 +627,10 @@ fn process_local_changes(
     }
 }
 
-// 8 args: 5 of them are the `LocalChange::NewMessage` payload
-// (maildir_id, folder, path, message_id, flags). Bundling them into a
-// wrapper just to satisfy the heuristic adds noise without making the
-// dispatch any clearer.
+// 9 args: 6 of them are the `LocalChange::NewMessage` payload
+// (maildir_id, folder, path, message_id, flags, size_bytes). Bundling
+// them into a wrapper just to satisfy the heuristic adds noise
+// without making the dispatch any clearer.
 #[allow(clippy::too_many_arguments)]
 fn handle_local_new(
     ctx: &ReconcileCtx<'_>,
@@ -628,6 +639,7 @@ fn handle_local_new(
     path: &std::path::Path,
     message_id: &MessageId,
     flags: &str,
+    size_bytes: u64,
     adopted_maildir_ids: &HashSet<MaildirId>,
     plan: &mut SyncPlan,
 ) {
@@ -693,6 +705,23 @@ fn handle_local_new(
             message_id,
             other.jmap_email_id,
             other.maildir_folder.as_deref().unwrap_or("?"),
+        );
+        return;
+    }
+
+    // Size cap is enforced here, at plan time, rather than in
+    // execute: catching the oversized file at this point keeps it
+    // out of the upload concurrency budget entirely (a slot held by
+    // a doomed upload is a slot another message could have used)
+    // and lets dry-run show a plan that matches what execute would
+    // actually attempt. A too-large file is user-actionable (the
+    // user has to remove it from the maildir), so error! rather
+    // than warn!.
+    if size_bytes > ctx.max_upload_size as u64 {
+        error!(
+            "Skipping upload of {} from {}: size {} bytes exceeds server/client cap of {} bytes. \
+             Remove the file from the maildir.",
+            maildir_id, folder, size_bytes, ctx.max_upload_size
         );
         return;
     }
@@ -932,6 +961,9 @@ mod tests {
             mailboxes: &mailboxes,
             strategy,
             new_email_state: None,
+            // Tests pass usize::MAX so the size cap never bites
+            // unless a test explicitly opts in to it.
+            max_upload_size: usize::MAX,
         })
     }
 
@@ -1239,6 +1271,39 @@ mod tests {
         );
     }
 
+    /// A NewMessage whose `size_bytes` exceeds `max_upload_size`
+    /// must NOT produce an UploadMessage in the plan. The check
+    /// belongs at plan time so the file never enters the upload
+    /// concurrency budget; dry-run also reflects what execute will
+    /// actually attempt.
+    #[test]
+    fn local_new_oversized_skips_upload() {
+        let known = indices(&[]);
+        let mailboxes = mailboxes();
+        let local_index = empty_index();
+        let local_changes = [LocalChange::NewMessage {
+            maildir_id: "M-BIG".into(),
+            folder: "INBOX".into(),
+            flags: "".into(),
+            path: PathBuf::from("/tmp/m-big"),
+            message_id: "<big@x>".into(),
+            size_bytes: 2_000,
+        }];
+        let plan = reconcile(ReconcileInput {
+            remote_emails: &[],
+            remote_destroyed: &[],
+            local_changes: &local_changes,
+            known: &known,
+            local_index: &local_index,
+            mailboxes: &mailboxes,
+            strategy: ConflictStrategy::ServerWins,
+            new_email_state: None,
+            max_upload_size: 1_000,
+        });
+        assert_eq!(plan.upload_count(), 0);
+        assert!(plan.actions.is_empty());
+    }
+
     /// Local NewMessage with no Message-ID match anywhere: upload.
     #[test]
     fn local_new_with_no_match_uploads() {
@@ -1251,6 +1316,7 @@ mod tests {
                 flags: "S".into(),
                 path: PathBuf::from("/tmp/m-new"),
                 message_id: "<new@x>".into(),
+                size_bytes: 0,
             }],
             &[],
             &empty_index(),
@@ -1273,6 +1339,7 @@ mod tests {
                 flags: "".into(),
                 path: PathBuf::from("/tmp/m-dup"),
                 message_id: "<a@x>".into(),
+                size_bytes: 0,
             }],
             &[rec],
             &empty_index(),
@@ -1350,6 +1417,7 @@ mod tests {
                     flags: "".into(),
                     path: PathBuf::from("/tmp/m-new"),
                     message_id: "<a@x>".into(),
+                    size_bytes: 0,
                 },
             ],
             &[rec],
@@ -1401,6 +1469,7 @@ mod tests {
                     flags: "S".into(),
                     path: PathBuf::from("/tmp/m-new"),
                     message_id: "<a@x>".into(),
+                    size_bytes: 0,
                 },
             ],
             &[rec],
@@ -1441,6 +1510,7 @@ mod tests {
                     flags: "FS".into(),
                     path: PathBuf::from("/tmp/m1"),
                     message_id: "<a@x>".into(),
+                    size_bytes: 0,
                 },
             ],
             &[rec],
@@ -1511,6 +1581,7 @@ mod tests {
                     flags: "".into(),
                     path: PathBuf::from("/tmp/m-new"),
                     message_id: "<a@x>".into(),
+                    size_bytes: 0,
                 },
             ],
             &[rec],
