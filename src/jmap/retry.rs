@@ -1,10 +1,53 @@
 use std::future::Future;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tracing::warn;
 
 use jmap_client::Error as JmapError;
 use jmap_client::core::error::MethodErrorType;
 use jmap_client::core::set::SetErrorType;
+
+/// Tunable parameters for `with_retry`. Loaded once at startup from
+/// `[sync].retry_*` config fields via `init_retry_config`; `with_retry`
+/// reads from the static at call time and falls back to `Default` when
+/// the static hasn't been initialized (test harness, library use).
+#[derive(Debug, Clone, Copy)]
+pub struct RetryConfig {
+    pub max_attempts: u32,
+    pub initial_backoff: Duration,
+    pub max_backoff: Duration,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: 5,
+            initial_backoff: Duration::from_millis(500),
+            max_backoff: Duration::from_secs(8),
+        }
+    }
+}
+
+static RETRY_CONFIG: OnceLock<RetryConfig> = OnceLock::new();
+
+/// Set the retry parameters used by every subsequent `with_retry`
+/// call in this process. Idempotent: only the first call wins;
+/// subsequent calls are no-ops and the supplied value is dropped.
+/// This is the right shape today (one process-wide config) but will
+/// need to change if per-account `RetryConfig` ever becomes a thing
+/// — the multi-account refactor would have to either thread
+/// `&RetryConfig` explicitly or move the lock onto a per-account
+/// handle. Call once from `load_config`, before any JMAP work; do
+/// **not** call from tests — drive `do_retry` directly with a
+/// custom `RetryConfig` so the process-wide `OnceLock` stays at its
+/// uninit default and other tests aren't affected.
+pub fn init_retry_config(config: RetryConfig) {
+    RETRY_CONFIG.get_or_init(|| config);
+}
+
+fn current_config() -> RetryConfig {
+    RETRY_CONFIG.get().copied().unwrap_or_default()
+}
 
 /// Decide whether an error from a JMAP call is worth retrying.
 ///
@@ -86,21 +129,32 @@ fn is_transient_substring(s: &str) -> bool {
         || s.contains("connection closed")
 }
 
-/// Retry an async operation with exponential backoff (500ms, 1s, 2s, 4s,
-/// 8s) on transient errors. Hard errors propagate immediately.
-pub async fn with_retry<F, Fut, T>(label: &str, mut f: F) -> anyhow::Result<T>
+/// Retry an async operation with exponential backoff on transient
+/// errors. Hard errors propagate immediately. Tunables come from the
+/// process-wide `RetryConfig` set by `init_retry_config` (defaults:
+/// 5 attempts, 500ms initial, 8s cap).
+pub async fn with_retry<F, Fut, T>(label: &str, f: F) -> anyhow::Result<T>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = anyhow::Result<T>>,
 {
-    let max_attempts = 5;
-    let mut backoff = Duration::from_millis(500);
-    let cap = Duration::from_secs(8);
+    do_retry(&current_config(), label, f).await
+}
 
-    for attempt in 1..=max_attempts {
+/// Inner retry loop, parameterized over `RetryConfig` so tests can
+/// drive it with custom max-attempts / backoff values without
+/// touching the process-wide `OnceLock`.
+async fn do_retry<F, Fut, T>(config: &RetryConfig, label: &str, mut f: F) -> anyhow::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = anyhow::Result<T>>,
+{
+    let mut backoff = config.initial_backoff;
+
+    for attempt in 1..=config.max_attempts {
         match f().await {
             Ok(v) => return Ok(v),
-            Err(e) if attempt < max_attempts && is_transient_error(&e) => {
+            Err(e) if attempt < config.max_attempts && is_transient_error(&e) => {
                 // {:#} renders the full anyhow chain joined by ": ", so
                 // logs still surface the underlying jmap-client message
                 // (e.g. "Failed to download blob B-xyz: Server failed:
@@ -108,15 +162,15 @@ where
                 // shows the top layer at {}.
                 warn!(
                     "{}: transient error ({:#}); retry {}/{} in {:?}",
-                    label, e, attempt, max_attempts, backoff
+                    label, e, attempt, config.max_attempts, backoff
                 );
                 tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(cap);
+                backoff = (backoff * 2).min(config.max_backoff);
             }
             Err(e) => return Err(e),
         }
     }
-    unreachable!("with_retry loop exited without returning")
+    unreachable!("do_retry loop exited without returning")
 }
 
 #[cfg(test)]
@@ -260,5 +314,29 @@ mod tests {
         .await;
         assert!(result.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 5);
+    }
+
+    /// `do_retry` honors a custom `max_attempts` independently of the
+    /// process-wide `RETRY_CONFIG`. Pins the contract that
+    /// `init_retry_config`'s value flows into the retry loop.
+    #[tokio::test(start_paused = true)]
+    async fn do_retry_honors_custom_max_attempts() {
+        let config = RetryConfig {
+            max_attempts: 2,
+            initial_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(1),
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = calls.clone();
+        let result: anyhow::Result<()> = do_retry(&config, "test", move || {
+            let calls = calls_c.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(anyhow::anyhow!("status 503"))
+            }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }

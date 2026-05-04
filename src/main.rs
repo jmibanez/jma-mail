@@ -1,10 +1,12 @@
 use anyhow::{Context, Result};
 use clap::Parser;
+use std::time::Duration;
 use tracing_subscriber::EnvFilter;
 
 use jmapsync::cli::{AuthAction, Cli, Command};
 use jmapsync::config::{self, Config};
 use jmapsync::daemon;
+use jmapsync::jmap::retry::{self, RetryConfig};
 use jmapsync::jmap::session;
 use jmapsync::state;
 use jmapsync::sync::engine;
@@ -300,5 +302,15 @@ async fn cmd_status(cli: &Cli) -> Result<()> {
 }
 
 fn load_config(cli: &Cli) -> Result<Config> {
-    Config::load(&cli.config).context("Failed to load config")
+    let config = Config::load(&cli.config).context("Failed to load config")?;
+    // Apply runtime tunables that live behind a process-wide
+    // OnceLock. Idempotent: only the first call per process takes
+    // effect, which is fine because every subcommand resolves the
+    // same config file.
+    retry::init_retry_config(RetryConfig {
+        max_attempts: config.sync.retry_max_attempts,
+        initial_backoff: Duration::from_millis(config.sync.retry_initial_backoff_ms),
+        max_backoff: Duration::from_millis(config.sync.retry_max_backoff_ms),
+    });
+    Ok(config)
 }

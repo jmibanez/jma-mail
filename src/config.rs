@@ -54,6 +54,20 @@ pub struct SyncConfig {
     /// upstream bandwidth is constrained.
     #[serde(default = "default_upload_concurrency")]
     pub upload_concurrency: usize,
+    /// Max attempts for a transient JMAP call (the original try plus
+    /// retries). The default of 5 gives a wall-clock ceiling of about
+    /// 15s with the other defaults.
+    #[serde(default = "default_retry_max_attempts")]
+    pub retry_max_attempts: u32,
+    /// Initial exponential-backoff delay between retries, in
+    /// milliseconds. Each subsequent retry doubles the delay until
+    /// it hits `retry_max_backoff_ms`.
+    #[serde(default = "default_retry_initial_backoff_ms")]
+    pub retry_initial_backoff_ms: u64,
+    /// Cap on the exponential backoff between retries, in milliseconds.
+    /// Once reached, all subsequent retries wait this long.
+    #[serde(default = "default_retry_max_backoff_ms")]
+    pub retry_max_backoff_ms: u64,
 }
 
 #[derive(Debug, Deserialize, Default, Clone, Copy)]
@@ -107,6 +121,18 @@ fn default_download_concurrency() -> usize {
 
 fn default_upload_concurrency() -> usize {
     8
+}
+
+fn default_retry_max_attempts() -> u32 {
+    5
+}
+
+fn default_retry_initial_backoff_ms() -> u64 {
+    500
+}
+
+fn default_retry_max_backoff_ms() -> u64 {
+    8_000
 }
 
 impl Default for StateConfig {
@@ -289,6 +315,13 @@ download_concurrency = 8
 # advertised maxConcurrentUpload. Tune down if your upstream bandwidth
 # is constrained.
 upload_concurrency = 8
+# JMAP retry tuning. The default sequence is roughly 500ms -> 1s -> 2s
+# -> 4s -> 8s, giving up after 5 total attempts (~15s wall-clock).
+# Drop max_attempts to 1 to disable retries; raise initial_backoff_ms
+# on flaky links to give the server more breathing room.
+retry_max_attempts = 5
+retry_initial_backoff_ms = 500
+retry_max_backoff_ms = 8000
 
 [state]
 # Path to SQLite state database
