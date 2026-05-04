@@ -47,8 +47,15 @@ pub struct LocalIndex {
 /// copy is, by construction, the duplicate jmapsync wrote on top of an
 /// existing file). Cross-folder copies of the same Message-ID are preserved
 /// — a user copying a message into another mailbox is a distinct instance.
-/// The kept file (oldest mtime) per folder becomes an entry in the index.
-pub fn dedupe_and_index(maildir_root: &Path, folders: &[String]) -> Result<LocalIndex> {
+///
+/// `on_kept` fires once per (folder, Message-ID) group, with the kept
+/// file's identifying tuple. Callers that want a `LocalIndex` build one
+/// inside the closure; callers that don't pass a no-op and pay nothing
+/// for indexing.
+pub fn dedupe<F>(maildir_root: &Path, folders: &[String], mut on_kept: F) -> Result<()>
+where
+    F: FnMut(&str, &MessageId, &MaildirId),
+{
     let mut groups: HashMap<GroupKey, Vec<Candidate>> = HashMap::new();
 
     for folder in folders {
@@ -93,7 +100,6 @@ pub fn dedupe_and_index(maildir_root: &Path, folders: &[String]) -> Result<Local
         }
     }
 
-    let mut index = LocalIndex::default();
     let mut deleted = 0usize;
 
     for (GroupKey { folder, msgid }, mut candidates) in groups {
@@ -104,14 +110,7 @@ pub fn dedupe_and_index(maildir_root: &Path, folders: &[String]) -> Result<Local
             continue;
         };
 
-        index
-            .by_message_id
-            .entry(msgid.clone())
-            .or_default()
-            .push(LocalEntry {
-                folder: folder.clone(),
-                maildir_id: keep.maildir_id.clone(),
-            });
+        on_kept(&folder, &msgid, &keep.maildir_id);
 
         for dup in iter {
             // Same Message-ID, same folder — delete this newer copy via the
@@ -139,7 +138,7 @@ pub fn dedupe_and_index(maildir_root: &Path, folders: &[String]) -> Result<Local
         debug!("Dedupe pass: no duplicates found");
     }
 
-    Ok(index)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -150,10 +149,10 @@ mod tests {
     use tempfile::TempDir;
 
     /// Finder writes .DS_Store metadata into folders it browses,
-    /// including a maildir's cur/ and new/. dedupe_and_index walks
-    /// via the maildir crate's list_cur/list_new iterators
-    /// specifically because they filter dot-prefixed entries — guard
-    /// that delegation so a future "let's avoid the crate dependency
+    /// including a maildir's cur/ and new/. dedupe walks via the
+    /// maildir crate's list_cur/list_new iterators specifically
+    /// because they filter dot-prefixed entries — guard that
+    /// delegation so a future "let's avoid the crate dependency
     /// here" refactor can't silently regress and trip the
     /// require-Message-ID error path on every sync.
     #[test]
@@ -173,7 +172,18 @@ mod tests {
         fs::write(inbox_path.join("new").join(".keep"), b"").unwrap();
 
         let folders = vec!["INBOX".to_string()];
-        let index = dedupe_and_index(tmp.path(), &folders).unwrap();
+        let mut index = LocalIndex::default();
+        dedupe(tmp.path(), &folders, |folder, msgid, mid| {
+            index
+                .by_message_id
+                .entry(msgid.clone())
+                .or_default()
+                .push(LocalEntry {
+                    folder: folder.to_string(),
+                    maildir_id: mid.clone(),
+                });
+        })
+        .unwrap();
 
         assert_eq!(
             index.by_message_id.len(),

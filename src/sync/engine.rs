@@ -7,6 +7,7 @@ use tracing::{debug, info, warn};
 use crate::config::Config;
 use crate::ids::{JmapAccountId, JmapEmailId, JmapMailboxId};
 use crate::jmap::{email as jmap_email, limits, mailbox as jmap_mailbox, types::EmailObject};
+use crate::maildir_ops::dedupe::{LocalEntry, LocalIndex};
 use crate::maildir_ops::{dedupe, scan, store};
 use crate::state::queries;
 use crate::sync::execute;
@@ -118,11 +119,36 @@ pub async fn run(
     let mailboxes = resolve_mailboxes(client, conn, config).await?;
     let maildir_root = config.maildir_path();
 
-    // Phase 0: dedupe + index. Always before scan so newly-introduced
-    // duplicates from a prior aborted run don't get treated as local
-    // changes to push.
+    // Phase 0: dedupe + (conditionally) index. Always before scan so
+    // newly-introduced duplicates from a prior aborted run don't get
+    // treated as local changes to push.
+    //
+    // Reconcile only consults `LocalIndex` when its DB-derived
+    // lookup misses (initial sync, post-`c7a86e6`-recovery wipe, or
+    // any other state where `message_map` is empty). In steady
+    // state every remote Message-ID resolves through the DB, the
+    // index is allocated and never read. Skip the build entirely
+    // when the DB has rows: dedupe still runs (its delete behavior
+    // is unconditional), but its `on_kept` callback is a no-op and
+    // `LocalIndex` stays at default-empty. Empty-HashMap lookups
+    // return None, which is exactly what the existing reconcile
+    // stage-2 check already handles.
     let folder_names: Vec<String> = mailboxes.iter().map(|(_, f)| f.clone()).collect();
-    let local_index = dedupe::dedupe_and_index(&maildir_root, &folder_names)?;
+    let mut local_index = LocalIndex::default();
+    if queries::has_message_map_rows(conn)? {
+        dedupe::dedupe(&maildir_root, &folder_names, |_, _, _| ())?;
+    } else {
+        dedupe::dedupe(&maildir_root, &folder_names, |folder, msgid, mid| {
+            local_index
+                .by_message_id
+                .entry(msgid.clone())
+                .or_default()
+                .push(LocalEntry {
+                    folder: folder.to_string(),
+                    maildir_id: mid.clone(),
+                });
+        })?;
+    }
 
     // Phase 1: scan local changes.
     let mut all_local_changes = Vec::new();

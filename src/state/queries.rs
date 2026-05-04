@@ -124,6 +124,19 @@ pub fn delete_message_by_jmap_id(conn: &Connection, jmap_email_id: &JmapEmailId)
     Ok(())
 }
 
+/// True iff `message_map` has at least one row. Used by the dedupe
+/// pass to decide whether reconcile will need a `LocalIndex` this
+/// cycle: an empty table means initial sync or post-recovery wipe,
+/// where reconcile's stage-1 (DB-derived) lookup will miss every
+/// remote Message-ID and the on-disk index is the only thing that
+/// avoids re-downloading already-present files.
+pub fn has_message_map_rows(conn: &Connection) -> Result<bool> {
+    let n: i64 = conn.query_row("SELECT EXISTS(SELECT 1 FROM message_map)", [], |row| {
+        row.get(0)
+    })?;
+    Ok(n != 0)
+}
+
 /// Get all messages in a given mailbox folder.
 pub fn get_messages_by_folder(conn: &Connection, folder: &str) -> Result<Vec<MessageRecord>> {
     let mut stmt = conn.prepare(
