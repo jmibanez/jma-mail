@@ -78,6 +78,21 @@ pub fn concurrent_requests(client: &Client, configured: usize) -> usize {
         .max(1)
 }
 
+/// Effective concurrency for the per-cycle upload buffer. Clamps
+/// the user-configured `upload_concurrency` to the server's
+/// advertised `maxConcurrentUpload`; whichever is smaller wins,
+/// with a floor of 1. Same shape as `concurrent_requests` — the
+/// user opted into a parallelism level and the server cap can only
+/// lower it, never raise it.
+pub fn upload_concurrency(client: &Client, configured: usize) -> usize {
+    client
+        .session()
+        .core_capabilities()
+        .map(|c| c.max_concurrent_upload())
+        .map_or(configured, |s| configured.min(s))
+        .max(1)
+}
+
 /// Effective `Email/set` batch size. Clamps the server's advertised
 /// `maxObjectsInSet` against `MAX_SET_BATCH_SIZE`; whichever is
 /// smaller wins.

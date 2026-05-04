@@ -49,6 +49,11 @@ pub struct SyncConfig {
     /// server's advertised `maxConcurrentRequests`.
     #[serde(default = "default_download_concurrency")]
     pub download_concurrency: usize,
+    /// Max concurrent message uploads during push. Clamped at runtime to the
+    /// server's advertised `maxConcurrentUpload`. Tune this down if your
+    /// upstream bandwidth is constrained.
+    #[serde(default = "default_upload_concurrency")]
+    pub upload_concurrency: usize,
 }
 
 #[derive(Debug, Deserialize, Default, Clone, Copy)]
@@ -97,6 +102,10 @@ fn default_ping_interval() -> u64 {
 }
 
 fn default_download_concurrency() -> usize {
+    8
+}
+
+fn default_upload_concurrency() -> usize {
     8
 }
 
@@ -276,6 +285,10 @@ conflict_strategy = "server-wins"
 # Max concurrent blob downloads during pull. Clamped to the server's
 # advertised maxConcurrentRequests (Fastmail: 10).
 download_concurrency = 8
+# Max concurrent message uploads during push. Clamped to the server's
+# advertised maxConcurrentUpload. Tune down if your upstream bandwidth
+# is constrained.
+upload_concurrency = 8
 
 [state]
 # Path to SQLite state database
