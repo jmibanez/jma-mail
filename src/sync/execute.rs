@@ -10,24 +10,12 @@ use tracing::{debug, info, warn};
 use crate::config::Config;
 use crate::ids::{JmapAccountId, JmapEmailId};
 use crate::jmap::email::{self as jmap_email, EmailSetOp};
+use crate::jmap::limits;
 use crate::jmap::retry::is_transient_error;
 use crate::maildir_ops::{flags::keywords_to_flags, store};
 use crate::state::queries::{self, MessageRecord};
 use crate::sync::engine::SyncOutcome;
 use crate::sync::plan::{BoundId, RemoteId, SyncAction, SyncPlan};
-
-/// Resolve effective per-cycle concurrency by clamping the configured
-/// value to the server's advertised maxConcurrentRequests.
-fn effective_concurrency(client: &Client, configured: usize) -> usize {
-    let session = client.session();
-    let cap = session
-        .core_capabilities()
-        .map(|c| c.max_concurrent_requests());
-    match cap {
-        Some(server) => configured.min(server).max(1),
-        None => configured.max(1),
-    }
-}
 
 /// Walk a SyncPlan in dependency order:
 /// adopt → download → local-flags → local-move → local-delete →
@@ -44,7 +32,7 @@ pub async fn execute(
     maildir_root: &Path,
     account_id: &JmapAccountId,
 ) -> Result<SyncOutcome> {
-    let mut concurrency = effective_concurrency(client, config.sync.download_concurrency);
+    let mut concurrency = limits::concurrent_requests(client, config.sync.download_concurrency);
     if concurrency != config.sync.download_concurrency {
         info!(
             "Clamped download concurrency from {} to {} per server maxConcurrentRequests",
