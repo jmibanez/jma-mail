@@ -10,7 +10,7 @@ use jmapsync::jmap::retry::{self, RetryConfig};
 use jmapsync::jmap::session;
 use jmapsync::maildir_ops;
 use jmapsync::state;
-use jmapsync::sync::engine;
+use jmapsync::sync::engine::SyncEngine;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -246,7 +246,9 @@ async fn cmd_sync(cli: &Cli) -> Result<()> {
     let conn = state::db::open_or_recreate(&config.db_path())?;
     let client = session::connect(&config.account, &conn).await?;
 
-    engine::sync(&client, &conn, &config, cli.dry_run).await?;
+    SyncEngine::new(&client, &conn, &config)
+        .sync(cli.dry_run)
+        .await?;
 
     Ok(())
 }
@@ -257,7 +259,7 @@ async fn cmd_pull(cli: &Cli) -> Result<()> {
     let conn = state::db::open_or_recreate(&config.db_path())?;
     let client = session::connect(&config.account, &conn).await?;
 
-    engine::pull_only(&client, &conn, &config).await?;
+    SyncEngine::new(&client, &conn, &config).pull_only().await?;
 
     Ok(())
 }
@@ -268,7 +270,7 @@ async fn cmd_push(cli: &Cli) -> Result<()> {
     let conn = state::db::open_or_recreate(&config.db_path())?;
     let client = session::connect(&config.account, &conn).await?;
 
-    engine::push_only(&client, &conn, &config).await?;
+    SyncEngine::new(&client, &conn, &config).push_only().await?;
 
     Ok(())
 }

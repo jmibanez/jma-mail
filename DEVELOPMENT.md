@@ -38,7 +38,7 @@ CC=/usr/bin/cc cargo test --lib maildir_ops::headers::tests::parses_folded_value
   - `mailbox_map` -- server mailbox metadata.
   - `local_state` -- filesystem snapshot for change detection. All access goes through `queries.rs`. Don't `prepare` ad-hoc SQL elsewhere; if you need a new query, add it there.
 - `src/sync/` -- orchestration. See [Sync internals](#sync-internals) below.
-- `src/daemon/` -- `watch` mode. `runner.rs` runs an initial sync then concurrently spawns `eventsource.rs` (SSE listener on the JMAP `eventSourceUrl` from the session) and `watcher.rs` (filesystem `notify` with debouncing). Both feed a `tokio::sync::mpsc` channel of `SyncTrigger`s; the main loop drains and re-runs `engine::sync` per trigger. `hook.rs` runs `post_arrival_command` after sync cycles that downloaded mail, coalescing overlapping triggers.
+- `src/daemon/` -- `watch` mode. `runner.rs` runs an initial sync then concurrently spawns `eventsource.rs` (SSE listener on the JMAP `eventSourceUrl` from the session) and `watcher.rs` (filesystem `notify` with debouncing). Both feed a `tokio::sync::mpsc` channel of `SyncTrigger`s; the main loop drains and re-runs `SyncEngine::sync` per trigger. `hook.rs` runs `post_arrival_command` after sync cycles that downloaded mail, coalescing overlapping triggers.
 
 ## Identifiers
 
@@ -121,7 +121,7 @@ The sync pipeline moves a small set of internal types between phases. Each one l
   - `FlagsChanged { maildir_id, folder, old_flags, new_flags }` -- the maildir filename suffix changed.
   - `DeletedMessage { maildir_id, folder }` -- a `local_state` row has no corresponding file on disk.
 - `LocalEntry` -- `{ folder, maildir_id }`. One on-disk file's location.
-- `LocalIndex` -- `{ by_message_id: HashMap<message_id, Vec<LocalEntry>> }`. Assembled once per cycle by `engine::run` from the `on_kept` callback `dedupe` invokes per surviving file. The `Vec` here, like `known_by_message_id`, exists because the same Message-ID can legitimately live in several folders.
+- `LocalIndex` -- `{ by_message_id: HashMap<message_id, Vec<LocalEntry>> }`. Assembled once per cycle by `SyncEngine::run` from the `on_kept` callback `dedupe` invokes per surviving file. The `Vec` here, like `known_by_message_id`, exists because the same Message-ID can legitimately live in several folders.
 
 **Plan types** (`src/sync/plan.rs`). The bridge between `reconcile` and `execute`. Detailed in [`plan.rs`](#plan-rs--the-action-vocabulary) and [`reconcile.rs`](#reconcile-rs--building-the-plan); summarised here for the cast list:
 
@@ -144,13 +144,13 @@ Two distinct identifiers anchor the system:
 
 The state DB is **disposable**. Nuking `state.db` and re-running must converge on the existing maildir without re-downloading or duplicating files. That property is enforced by:
 
-1. `maildir_ops::dedupe::dedupe` runs at the start of every sync cycle. It walks each synced folder, groups files by Message-ID (parsed from headers in `maildir_ops::headers`), and **deletes the newest by mtime** within each group. Newer copies are presumed to be jmapsync-introduced duplicates from a prior aborted run. Fires an `on_kept` callback once per surviving file; `engine::run` uses that callback to build a `LocalIndex` keyed on Message-ID.
+1. `maildir_ops::dedupe::dedupe` runs at the start of every sync cycle. It walks each synced folder, groups files by Message-ID (parsed from headers in `maildir_ops::headers`), and **deletes the newest by mtime** within each group. Newer copies are presumed to be jmapsync-introduced duplicates from a prior aborted run. Fires an `on_kept` callback once per surviving file; `SyncEngine::run` uses that callback to build a `LocalIndex` keyed on Message-ID.
 
 2. `reconcile` consults `message_map` (by JMAP id) -> `LocalIndex` (by Message-ID) before emitting a `DownloadMessage`. The Message-ID lookup is what saves us after a DB wipe: a known server email whose Message-ID we already have on disk is adopted into `message_map` rather than re-downloaded.
 
 3. **Both ingest boundaries refuse Message-ID-less messages.** Local files without a parseable `Message-ID` header are skipped with `error!` by `maildir_ops::scan::scan_folder` and `maildir_ops::dedupe::dedupe`. Remote emails whose `Email/get` response carries no `messageId` and aren't already bound by JMAP id are skipped at `sync::reconcile::process_remote_emails`. The known-JMAP-id path still applies flag/move updates -- the existing `message_map` row is itself the anchor, so a server that strips Message-ID from updates doesn't break flag sync. The result: no row enters `message_map`, and no `LocalChange::NewMessage` is emitted, without an anchor.
 
-Don't add a code path that writes to a maildir outside `execute::execute` (or `dedupe`'s deletion of duplicates). Every other writer would skip the Message-ID check.
+Don't add a code path that writes to a maildir outside `Executor::execute` (or `dedupe`'s deletion of duplicates). Every other writer would skip the Message-ID check.
 
 ### Schema versioning: nuke-and-resync as the migration story
 
@@ -211,7 +211,7 @@ The orchestration lives in `src/sync/` and is layered:
 
 ### The sync cycle
 
-One call to `engine::sync` (or `pull_only` / `push_only`) goes through five phases. Phases 1-3 are pure data-gathering and
+One call to `SyncEngine::sync` (or `pull_only` / `push_only`) goes through five phases. Phases 1-3 are pure data-gathering and
 planning; phase 5 is the only place we mutate anything.
 
 1. **Resolve mailboxes.** `resolve_mailboxes` queries `Mailbox/get`, honours `[sync].mailboxes`, applies the `INBOX` magic alias, and upserts each into `mailbox_map`. Returns a `Vec<(jmap_id, folder_name)>` that every later phase indexes against.
@@ -230,7 +230,7 @@ planning; phase 5 is the only place we mutate anything.
 
 4. **Filter by direction.** `SyncPlan::into_filtered(direction)` splits the plan into `(kept, dropped)`. `AdoptLocalMessage` is always kept regardless of direction (see [documentation on `plan.rs`, next](#plan-rs--the-action-vocabulary)). Dropped actions are logged so a `pull` or `push` user sees what was suppressed.
 
-5. **Execute.** `execute::execute` walks the plan in a fixed order (adopt -> download -> local-flags -> local-move -> local-delete -> upload -> remote-set), then persists `new_email_state` into `jmap_state`.
+5. **Execute.** `Executor::execute` walks the plan in a fixed order (adopt -> download -> local-flags -> local-move -> local-delete -> upload -> remote-set), then persists `new_email_state` into `jmap_state`.
 
 ### `plan.rs` -- the action vocabulary
 
@@ -405,7 +405,7 @@ When you need to model a new outcome, the checklist is:
 1. Add a variant to `SyncAction` with all the fields needed to execute it without re-querying.
 2. Decide its `direction()` -- Pull, Push, or Both. If Both, it must be byte-cheap (no network), since it survives every direction filter.
 3. If it should appear in the dry-run summary, add a `*_count` helper and a `Display` arm.
-4. Add a bucket in `execute::execute` and slot it into the dependency order. Think about whether it should run before or after adopt.
+4. Add a bucket in `Executor::execute` and slot it into the dependency order. Think about whether it should run before or after adopt.
 5. Add a handler. Follow the destructure-then-IO-then-DB pattern; keep DB writes idempotent.
 6. Emit the variant from reconcile in exactly one place if you can, so the conditions under which it fires are localised.
 
@@ -413,4 +413,4 @@ Things to avoid:
 
 - Don't write to a maildir outside `execute` (or `dedupe`'s deletion of duplicates). Every other writer would skip the Message-ID check that anchors the idempotency model.
 - Don't add an `Email/set` call outside `apply_remote_set` -- keep remote mutations batched.
-- Don't advance `jmap_state` from anywhere except the tail of `execute::execute`.
+- Don't advance `jmap_state` from anywhere except the tail of `Executor::execute`.

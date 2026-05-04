@@ -2,9 +2,9 @@
 //! engine's interaction with a JMAP server end-to-end:
 //!
 //! - `resolve_mailboxes` -- INBOX magic alias and the `mailboxes` filter.
-//! - `engine::sync` initial pull -- Mailbox/get + Email/query + Email/get
+//! - `SyncEngine::sync` initial pull -- Mailbox/get + Email/query + Email/get
 //!   + blob download + maildir write + state cursor advancement.
-//! - `engine::sync` already-in-sync -- Email/changes returning no
+//! - `SyncEngine::sync` already-in-sync -- Email/changes returning no
 //!   created/updated/destroyed.
 //! - `fetch_remote_state` cannotCalculateChanges fallback -- Email/changes
 //!   error wipes the cursor and re-runs the initial path, leaving the
@@ -27,7 +27,7 @@ use jmapsync::config::{
 };
 use jmapsync::ids::{JmapEmailId, JmapMailboxId};
 use jmapsync::state::{db, queries};
-use jmapsync::sync::engine;
+use jmapsync::sync::engine::SyncEngine;
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path, path_regex};
@@ -402,7 +402,8 @@ async fn resolve_mailboxes_applies_inbox_magic_alias() {
     let conn = fresh_db(&temp);
     let config = test_config(temp.path(), vec![]);
 
-    let resolved = engine::resolve_mailboxes(&client, &conn, &config)
+    let resolved = SyncEngine::new(&client, &conn, &config)
+        .resolve_mailboxes()
         .await
         .expect("resolve_mailboxes succeeds");
 
@@ -460,7 +461,8 @@ async fn resolve_mailboxes_filter_drops_unlisted() {
         vec!["INBOX".to_string(), "Archive".to_string()],
     );
 
-    let resolved = engine::resolve_mailboxes(&client, &conn, &config)
+    let resolved = SyncEngine::new(&client, &conn, &config)
+        .resolve_mailboxes()
         .await
         .expect("resolve_mailboxes succeeds");
 
@@ -524,7 +526,8 @@ async fn sync_initial_pull_downloads_email_into_maildir() {
     let conn = fresh_db(&temp);
     let config = test_config(temp.path(), vec![]);
 
-    let outcome = engine::sync(&client, &conn, &config, false)
+    let outcome = SyncEngine::new(&client, &conn, &config)
+        .sync(false)
         .await
         .expect("sync succeeds");
 
@@ -585,7 +588,8 @@ async fn sync_already_in_sync_is_a_noop() {
     // Pre-seed the cursor so the engine takes the Email/changes branch.
     queries::set_jmap_state(&conn, ACCOUNT_ID, "Email", "e-1").unwrap();
 
-    let outcome = engine::sync(&client, &conn, &config, false)
+    let outcome = SyncEngine::new(&client, &conn, &config)
+        .sync(false)
         .await
         .expect("sync succeeds");
 
@@ -649,7 +653,8 @@ async fn sync_falls_back_when_email_changes_cannot_calculate() {
     // Stale cursor; rigged Email/changes will reject it on the first call.
     queries::set_jmap_state(&conn, ACCOUNT_ID, "Email", "stale-cursor").unwrap();
 
-    let outcome = engine::sync(&client, &conn, &config, false)
+    let outcome = SyncEngine::new(&client, &conn, &config)
+        .sync(false)
         .await
         .expect("sync succeeds via the initial-pull fallback");
 
@@ -725,7 +730,8 @@ async fn sync_delta_cycle_after_initial_pull_picks_up_new_email() {
 
     // Cycle 1: initial pull. Cursor starts empty so the engine runs
     // Email/query + Email/get and bootstraps via get_current_state.
-    let first = engine::sync(&client, &conn, &config, false)
+    let first = SyncEngine::new(&client, &conn, &config)
+        .sync(false)
         .await
         .expect("initial pull succeeds");
     assert_eq!(first.downloaded, 1);
@@ -761,7 +767,8 @@ async fn sync_delta_cycle_after_initial_pull_picks_up_new_email() {
     // Cycle 2: delta path. Engine consults Email/changes from "e-1",
     // gets [E2] as created, fetches just E2 via Email/get, downloads
     // its blob, and advances the cursor to the new state.
-    let second = engine::sync(&client, &conn, &config, false)
+    let second = SyncEngine::new(&client, &conn, &config)
+        .sync(false)
         .await
         .expect("delta cycle succeeds");
     assert_eq!(

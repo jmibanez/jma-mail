@@ -9,7 +9,7 @@ use crate::config::Config;
 use crate::ids::JmapAccountId;
 use crate::jmap::session;
 use crate::state::queries;
-use crate::sync::engine;
+use crate::sync::engine::SyncEngine;
 
 /// What triggered a sync cycle.
 #[derive(Debug, Clone)]
@@ -30,7 +30,7 @@ pub async fn run(client: &Client, conn: &Connection, config: &Config) -> Result<
 
     // Run initial sync
     info!("Running initial sync before entering watch mode");
-    match engine::sync(client, conn, config, false).await {
+    match SyncEngine::new(client, conn, config).sync(false).await {
         Ok(outcome) => {
             if outcome.downloaded > 0 {
                 hook.trigger().await;
@@ -93,7 +93,7 @@ pub async fn run(client: &Client, conn: &Connection, config: &Config) -> Result<
     // Main event loop
     while let Some(trigger) = rx.recv().await {
         info!("Sync triggered by {:?}", trigger);
-        match engine::sync(client, conn, config, false).await {
+        match SyncEngine::new(client, conn, config).sync(false).await {
             Ok(outcome) => {
                 if outcome.downloaded > 0 {
                     hook.trigger().await;
