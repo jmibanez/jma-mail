@@ -55,6 +55,15 @@ pub const MAX_GET_BATCH_SIZE: usize = 200;
 /// absurd.
 pub const MAX_UPLOAD_FILE_SIZE: usize = 100 * 1024 * 1024;
 
+/// Maximum byte length of a server-supplied mailbox name we'll
+/// accept before joining onto the local maildir root, regardless of
+/// what the server advertises for `maxSizeMailboxName`. 255 matches
+/// the most common filesystem `NAME_MAX`; a longer name could not
+/// be stored as a single maildir directory anyway. Exported so
+/// `validate_mailbox_name` and its tests can pin against the same
+/// number `max_size_mailbox_name` enforces.
+pub const MAX_MAILBOX_NAME_LEN: usize = 255;
+
 /// Effective concurrency for the per-cycle download buffer. Clamps
 /// the user-configured `download_concurrency` to the server's
 /// advertised `maxConcurrentRequests`; whichever is smaller wins,
@@ -102,5 +111,36 @@ pub fn max_size_upload(client: &Client) -> usize {
         .core_capabilities()
         .map(|c| c.max_size_upload())
         .map_or(MAX_UPLOAD_FILE_SIZE, |s| s.min(MAX_UPLOAD_FILE_SIZE))
+        .max(1)
+}
+
+/// Effective mailbox-name byte-length cap. Clamps the server's
+/// advertised `maxSizeMailboxName` against `MAX_MAILBOX_NAME_LEN`;
+/// whichever is smaller wins.
+///
+/// Commit `313ab36b` ("jmap: Reject mailbox names that would escape
+/// the maildir tree") originally chose to ignore `maxSizeMailboxName`
+/// entirely and hardcode 255, on the reasoning that trusting the
+/// server's advertisement would let a hostile server pick an
+/// arbitrary upper bound. This accessor reverses that decision in
+/// the controlled way the rest of the module follows: the server's
+/// value passes through the `min()` only when it sits at or under
+/// our 255 ceiling.
+///
+/// In practice that's the only sensible thing for a server to
+/// advertise — names longer than the filesystem `NAME_MAX` of 255
+/// bytes could not be stored as a single maildir directory anyway,
+/// so any sensible server caps its `maxSizeMailboxName` at or under
+/// 255 and the `min()` honors it as-is, giving us defense in depth
+/// on top of the existing path-traversal validation. A server
+/// advertising *above* 255 is the threat model `313ab36b` originally
+/// guarded against; the 255 ceiling clamps it back, preserving that
+/// guard verbatim.
+pub fn max_size_mailbox_name(client: &Client) -> usize {
+    client
+        .session()
+        .mail_capabilities()
+        .map(|c| c.max_size_mailbox_name())
+        .map_or(MAX_MAILBOX_NAME_LEN, |s| s.min(MAX_MAILBOX_NAME_LEN))
         .max(1)
 }

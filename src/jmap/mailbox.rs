@@ -5,12 +5,8 @@ use std::path::{Component, Path};
 use tracing::{debug, info};
 
 use crate::ids::JmapMailboxId;
+use crate::jmap::limits;
 use crate::jmap::types::MailboxObject;
-
-/// Cap on accepted mailbox-name byte length. 255 matches the most
-/// common filesystem `NAME_MAX`; anything longer would also fail at
-/// `mkdir` time, so reject early with a clearer error.
-const MAX_MAILBOX_NAME_LEN: usize = 255;
 
 /// Validate a mailbox name received from the JMAP server before it is
 /// joined onto the local maildir root. A malicious or compromised
@@ -18,19 +14,25 @@ const MAX_MAILBOX_NAME_LEN: usize = 255;
 /// `Path::join` will happily escape the maildir tree (relative `..`
 /// segments) or replace the base entirely (absolute paths).
 ///
+/// `cap` is the effective byte-length cap, normally
+/// `limits::max_size_mailbox_name(client)` — the server's
+/// `maxSizeMailboxName` clamped against `MAX_MAILBOX_NAME_LEN`. The
+/// ceiling matches the most common filesystem `NAME_MAX`; anything
+/// longer could not be stored as a single maildir directory anyway.
+///
 /// Rejects: empty strings, NUL bytes, `/` or `\` separators, `.` or
-/// `..` components, absolute paths, and names longer than
-/// `MAX_MAILBOX_NAME_LEN`. JMAP nests mailboxes via `parent_id`, never
-/// via separators inside `name`, so a single normal component is
-/// always the right shape here.
-fn validate_mailbox_name(name: &str) -> Result<()> {
+/// `..` components, absolute paths, and names longer than `cap`.
+/// JMAP nests mailboxes via `parent_id`, never via separators inside
+/// `name`, so a single normal component is always the right shape
+/// here.
+fn validate_mailbox_name(name: &str, cap: usize) -> Result<()> {
     if name.is_empty() {
         anyhow::bail!("mailbox name is empty");
     }
-    if name.len() > MAX_MAILBOX_NAME_LEN {
+    if name.len() > cap {
         anyhow::bail!(
             "mailbox name longer than {} bytes ({} bytes): {:?}",
-            MAX_MAILBOX_NAME_LEN,
+            cap,
             name.len(),
             name
         );
@@ -105,6 +107,7 @@ pub fn is_mailbox_synced(
 /// hit `requestTooLarge` here, the right fix is the query+chunked-
 /// get refactor, not raising a hardcoded constant.
 pub async fn get_all(client: &Client) -> Result<Vec<MailboxObject>> {
+    let name_cap = limits::max_size_mailbox_name(client);
     let mut request = client.build();
     let get_request = request
         .get_mailbox()
@@ -137,7 +140,8 @@ pub async fn get_all(client: &Client) -> Result<Vec<MailboxObject>> {
         .map(|mb| -> Result<MailboxObject> {
             let id = JmapMailboxId::from(mb.id().unwrap_or_default());
             let name = mb.name().unwrap_or("(unnamed)").to_string();
-            validate_mailbox_name(&name).with_context(|| format!("rejecting mailbox id={}", id))?;
+            validate_mailbox_name(&name, name_cap)
+                .with_context(|| format!("rejecting mailbox id={}", id))?;
             let parent_id = mb.parent_id().map(JmapMailboxId::from);
             let role = mb.role();
             let role_str = match role {
@@ -173,6 +177,7 @@ pub async fn get_all(client: &Client) -> Result<Vec<MailboxObject>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jmap::limits::MAX_MAILBOX_NAME_LEN;
 
     fn mb(name: &str, role: Option<&str>) -> MailboxObject {
         MailboxObject {
@@ -279,20 +284,20 @@ mod tests {
             "受信箱",
             "(unnamed)",
         ] {
-            validate_mailbox_name(name)
+            validate_mailbox_name(name, MAX_MAILBOX_NAME_LEN)
                 .unwrap_or_else(|e| panic!("expected {:?} to validate, got {}", name, e));
         }
     }
 
     #[test]
     fn validate_mailbox_name_rejects_empty() {
-        assert!(validate_mailbox_name("").is_err());
+        assert!(validate_mailbox_name("", MAX_MAILBOX_NAME_LEN).is_err());
     }
 
     #[test]
     fn validate_mailbox_name_rejects_dot_components() {
-        assert!(validate_mailbox_name(".").is_err());
-        assert!(validate_mailbox_name("..").is_err());
+        assert!(validate_mailbox_name(".", MAX_MAILBOX_NAME_LEN).is_err());
+        assert!(validate_mailbox_name("..", MAX_MAILBOX_NAME_LEN).is_err());
     }
 
     #[test]
@@ -307,7 +312,7 @@ mod tests {
             "\\\\server\\share",
         ] {
             assert!(
-                validate_mailbox_name(bad).is_err(),
+                validate_mailbox_name(bad, MAX_MAILBOX_NAME_LEN).is_err(),
                 "expected {:?} to be rejected",
                 bad
             );
@@ -316,15 +321,26 @@ mod tests {
 
     #[test]
     fn validate_mailbox_name_rejects_nul_byte() {
-        assert!(validate_mailbox_name("foo\0bar").is_err());
-        assert!(validate_mailbox_name("\0").is_err());
+        assert!(validate_mailbox_name("foo\0bar", MAX_MAILBOX_NAME_LEN).is_err());
+        assert!(validate_mailbox_name("\0", MAX_MAILBOX_NAME_LEN).is_err());
     }
 
     #[test]
     fn validate_mailbox_name_rejects_overlong() {
         let long = "a".repeat(MAX_MAILBOX_NAME_LEN + 1);
-        assert!(validate_mailbox_name(&long).is_err());
+        assert!(validate_mailbox_name(&long, MAX_MAILBOX_NAME_LEN).is_err());
         let at_limit = "a".repeat(MAX_MAILBOX_NAME_LEN);
-        assert!(validate_mailbox_name(&at_limit).is_ok());
+        assert!(validate_mailbox_name(&at_limit, MAX_MAILBOX_NAME_LEN).is_ok());
+    }
+
+    /// A server advertising a tighter cap than our 255 ceiling
+    /// becomes the binding limit. Pins the new behavior introduced
+    /// by routing the cap through `validate_mailbox_name` rather
+    /// than hardcoding it inside the function.
+    #[test]
+    fn validate_mailbox_name_honors_tighter_caller_cap() {
+        let name = "a".repeat(50);
+        assert!(validate_mailbox_name(&name, 50).is_ok());
+        assert!(validate_mailbox_name(&name, 49).is_err());
     }
 }
