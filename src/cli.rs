@@ -45,8 +45,6 @@ pub enum Command {
     Watch,
     /// Initialize config file and local maildir structure
     Init,
-    /// Show sync state info
-    Status,
     /// List remote mailboxes and their local mapping
     Mailboxes,
     /// Manage account credentials and the JMAP discovery cache

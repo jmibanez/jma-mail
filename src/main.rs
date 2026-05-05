@@ -39,7 +39,6 @@ async fn main() -> Result<()> {
         Command::Pull => cmd_pull(&cli).await,
         Command::Push => cmd_push(&cli).await,
         Command::Watch => cmd_watch(&cli).await,
-        Command::Status => cmd_status(&cli).await,
         Command::Auth { action, account } => cmd_auth(&cli, action, account).await,
     }
 }
@@ -282,33 +281,6 @@ async fn cmd_watch(cli: &Cli) -> Result<()> {
     let client = session::connect(&config.account, &conn).await?;
 
     daemon::runner::run(&client, &conn, &config).await?;
-
-    Ok(())
-}
-
-async fn cmd_status(cli: &Cli) -> Result<()> {
-    let config = load_config(cli)?;
-    let db_path = config.db_path();
-
-    if !db_path.exists() {
-        println!("No state database found. Run `jmapsync sync` first.");
-        return Ok(());
-    }
-
-    let conn = state::db::open(&db_path)?;
-
-    // Show mailbox info
-    let mailboxes = jmapsync::state::queries::get_all_mailboxes(&conn)?;
-    if mailboxes.is_empty() {
-        println!("No mailboxes synced yet.");
-        return Ok(());
-    }
-
-    println!("Synced mailboxes:");
-    for mb in &mailboxes {
-        let messages = jmapsync::state::queries::get_messages_by_folder(&conn, &mb.maildir_folder)?;
-        println!("  {} ({} messages)", mb.maildir_folder, messages.len());
-    }
 
     Ok(())
 }

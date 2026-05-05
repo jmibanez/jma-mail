@@ -66,7 +66,7 @@ Mutating commands (`sync`, `pull`, `push`, `watch`) take **two** exclusive OS-le
 
 If another instance already holds either lock, the second invocation fails fast with a message naming the holder's PID. The two locks cover different topologies: same maildir / different DB (lock 1 catches it), and same DB / different maildir (lock 2 catches it). The locks are always acquired in the same order -- maildir first, then state DB -- so two contending processes can't deadlock.
 
-Read-only commands (`status`, `mailboxes`) and commands that don't touch the maildir or DB (`init`, `auth`) do **not** take either lock and can run alongside a `watch` daemon.
+Read-only commands (`mailboxes`) and commands that don't touch the maildir or DB (`init`, `auth`) do **not** take either lock and can run alongside a `watch` daemon.
 
 The locks are held by the kernel, not by the contents of the files, so they're released automatically when the holding process exits -- including on crash or `kill -9`. The `.lock` files themselves may stick around on disk; that's fine, the next invocation will reuse them. You should never need to delete them by hand, but it's safe to do so when no jmapsync process is running.
 
@@ -126,7 +126,6 @@ Commands:
   push       One-way sync: local -> server only
   watch      Daemon mode: watch for push events + local changes, sync continuously
   init       Initialize config file and local maildir structure
-  status     Show sync state info
   mailboxes  List remote mailboxes and their local mapping
   help       Print this message or the help of the given subcommand(s)
 
@@ -155,11 +154,9 @@ Options:
 
 `sync` is generally the command you want, and is equivalent to running `mbsync -a` or `mbsync` against a specific channel. By default, if you run `jmapsync` without any subcommands it is equivalent to running `jmapsync sync`.
 
-### status, mailboxes : Status info
+### mailboxes : Status info
 
-`status` and `mailboxes` are read-only status subcommands. `status` shows what `jmapsync` thinks of the current sync state -- which mailboxes are already synced from the last time a sync was ran, and which mailboxes need to be synced as they have local changes. Run `status` if you need to get an idea of what mailboxes `sync` will operate on.
-
-`mailboxes` shows the mapping between your server's mailboxes and your own local Maildir mailboxes. It also displays which mailbox corresponds to which role (drafts, sent, etc):
+`mailboxes` is a read-only subcommand that shows the mapping between your server's mailboxes and your own local Maildir mailboxes. It also displays which mailbox corresponds to which role (drafts, sent, etc):
 
 ```console
 $ jmapsync mailboxes
