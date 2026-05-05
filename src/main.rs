@@ -243,11 +243,8 @@ async fn cmd_sync(cli: &Cli) -> Result<()> {
     let config = load_config(cli)?;
     acquire_mutator_locks(&config)?;
     let conn = state::db::open_or_recreate(&config.db_path())?;
-    let client = session::connect(&config.account, &conn).await?;
 
-    SyncEngine::new(&client, &conn, &config)
-        .sync(cli.dry_run)
-        .await?;
+    SyncEngine::sync(&conn, &config, cli.dry_run).await?;
 
     Ok(())
 }
@@ -256,9 +253,8 @@ async fn cmd_pull(cli: &Cli) -> Result<()> {
     let config = load_config(cli)?;
     acquire_mutator_locks(&config)?;
     let conn = state::db::open_or_recreate(&config.db_path())?;
-    let client = session::connect(&config.account, &conn).await?;
 
-    SyncEngine::new(&client, &conn, &config).pull_only().await?;
+    SyncEngine::pull_only(&conn, &config).await?;
 
     Ok(())
 }
@@ -267,9 +263,8 @@ async fn cmd_push(cli: &Cli) -> Result<()> {
     let config = load_config(cli)?;
     acquire_mutator_locks(&config)?;
     let conn = state::db::open_or_recreate(&config.db_path())?;
-    let client = session::connect(&config.account, &conn).await?;
 
-    SyncEngine::new(&client, &conn, &config).push_only().await?;
+    SyncEngine::push_only(&conn, &config).await?;
 
     Ok(())
 }
@@ -278,9 +273,8 @@ async fn cmd_watch(cli: &Cli) -> Result<()> {
     let config = load_config(cli)?;
     acquire_mutator_locks(&config)?;
     let conn = state::db::open_or_recreate(&config.db_path())?;
-    let client = session::connect(&config.account, &conn).await?;
 
-    daemon::runner::run(&client, &conn, &config).await?;
+    daemon::runner::run(&conn, &config).await?;
 
     Ok(())
 }

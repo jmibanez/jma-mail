@@ -7,7 +7,10 @@ use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::ids::{JmapAccountId, JmapEmailId, JmapMailboxId};
-use crate::jmap::{email as jmap_email, limits, mailbox as jmap_mailbox, types::EmailObject};
+use crate::jmap::{
+    email as jmap_email, limits, mailbox as jmap_mailbox, session,
+    types::{EmailObject, SessionInfo},
+};
 use crate::maildir_ops::dedupe::{LocalEntry, LocalIndex};
 use crate::maildir_ops::{dedupe, scan, store};
 use crate::state::queries;
@@ -30,50 +33,86 @@ pub struct SyncOutcome {
     pub failed_remote_actions: usize,
 }
 
-/// Bundles the immutable per-cycle state every engine helper threads
-/// through (client, DB connection, config, account id). The struct
-/// lets us add another shared field without touching every helper
-/// signature. Helpers that take only a `&Connection` (e.g.
-/// `build_known_indices`) and stateless helpers (`log_dropped`) stay
-/// free functions so they remain callable from tests that don't
-/// fabricate a JMAP client.
+/// Bundles the immutable state every engine helper threads through
+/// (client, DB connection, config, account id) for the engine's
+/// lifetime -- one-shot CLI commands drop it at the end of the call,
+/// the daemon keeps it for the whole watch loop and reuses it across
+/// every trigger. The struct lets us add another shared field without
+/// touching every helper signature. Helpers that take only a
+/// `&Connection` (e.g. `build_known_indices`) and stateless helpers
+/// (`log_dropped`) stay free functions because they don't need the
+/// client; keeping them off `SyncEngine` lets unit tests drive them
+/// with just an in-memory `Connection`.
 pub struct SyncEngine<'a> {
-    client: &'a Client,
+    client: Client,
     conn: &'a Connection,
     config: &'a Config,
     account_id: JmapAccountId,
 }
 
 impl<'a> SyncEngine<'a> {
-    pub fn new(client: &'a Client, conn: &'a Connection, config: &'a Config) -> Self {
+    /// Open a JMAP session for `config`'s account and bind it to the
+    /// given DB connection. The engine owns the resulting `Client` for
+    /// the rest of its lifetime; `cmd_sync`/`cmd_pull`/`cmd_push` build
+    /// one and drop it at the end of the command, while
+    /// `daemon::runner::run` builds one and drives it across every
+    /// trigger.
+    pub async fn connect(conn: &'a Connection, config: &'a Config) -> Result<Self> {
+        let client = session::connect(&config.account, conn).await?;
         let account_id: JmapAccountId = client.default_account_id().into();
-        Self {
+        Ok(Self {
             client,
             conn,
             config,
             account_id,
-        }
+        })
     }
 
-    /// Run a full bidirectional sync.
-    pub async fn sync(&self, dry_run: bool) -> Result<SyncOutcome> {
-        self.run(dry_run, SyncDirection::Both).await
+    /// Snapshot the JMAP session metadata the daemon needs for SSE
+    /// setup (event-source URL, account id, etc.). Delegates to
+    /// `session::session_info` against the engine's owned `Client`.
+    pub fn session_info(&self) -> Result<SessionInfo> {
+        session::session_info(&self.client)
     }
 
-    /// Run pull only (server -> local). Adoption still runs.
-    pub async fn pull_only(&self) -> Result<SyncOutcome> {
-        self.run(false, SyncDirection::PullOnly).await
+    /// Connect a fresh engine and run a full bidirectional sync.
+    /// Convenience entry point for `cmd_sync`; the daemon, which keeps
+    /// one engine across many triggers, drives `run` directly instead.
+    pub async fn sync(
+        conn: &'a Connection,
+        config: &'a Config,
+        dry_run: bool,
+    ) -> Result<SyncOutcome> {
+        Self::connect(conn, config)
+            .await?
+            .run(dry_run, SyncDirection::Both)
+            .await
     }
 
-    /// Run push only (local -> server). Adoption still runs.
-    pub async fn push_only(&self) -> Result<()> {
-        self.run(false, SyncDirection::PushOnly).await?;
+    /// Connect a fresh engine and pull only (server -> local). Adoption
+    /// still runs.
+    pub async fn pull_only(conn: &'a Connection, config: &'a Config) -> Result<SyncOutcome> {
+        Self::connect(conn, config)
+            .await?
+            .run(false, SyncDirection::PullOnly)
+            .await
+    }
+
+    /// Connect a fresh engine and push only (local -> server). Adoption
+    /// still runs.
+    pub async fn push_only(conn: &'a Connection, config: &'a Config) -> Result<()> {
+        Self::connect(conn, config)
+            .await?
+            .run(false, SyncDirection::PushOnly)
+            .await?;
         Ok(())
     }
 
     /// Single orchestration path. `direction` selects which side(s) of
-    /// the plan execute; adoption always runs.
-    async fn run(&self, dry_run: bool, direction: SyncDirection) -> Result<SyncOutcome> {
+    /// the plan execute; adoption always runs. Public so the daemon
+    /// can drive its long-lived engine across triggers without
+    /// reconnecting.
+    pub async fn run(&self, dry_run: bool, direction: SyncDirection) -> Result<SyncOutcome> {
         let mailboxes = self.resolve_mailboxes().await?;
         let maildir_root = self.config.maildir_path();
 
@@ -134,7 +173,7 @@ impl<'a> SyncEngine<'a> {
             mailboxes: &mailboxes,
             strategy: self.config.sync.conflict_strategy,
             new_email_state: Some(new_state),
-            max_upload_size: limits::max_size_upload(self.client),
+            max_upload_size: limits::max_size_upload(&self.client),
         });
 
         if dry_run {
@@ -161,7 +200,7 @@ impl<'a> SyncEngine<'a> {
         );
 
         // Phase 5: execute.
-        let executor = Executor::new(self.client, self.conn, self.config);
+        let executor = Executor::new(&self.client, self.conn, self.config);
         let outcome = executor.execute(filtered).await?;
 
         if outcome.failed_remote_actions > 0 {
@@ -181,7 +220,7 @@ impl<'a> SyncEngine<'a> {
 
     /// Resolve the list of mailboxes to sync, returning (jmap_id, folder_name) pairs.
     pub async fn resolve_mailboxes(&self) -> Result<Vec<(JmapMailboxId, String)>> {
-        let remote_mailboxes = jmap_mailbox::get_all(self.client).await?;
+        let remote_mailboxes = jmap_mailbox::get_all(&self.client).await?;
 
         let mut synced = Vec::new();
 
@@ -248,7 +287,7 @@ impl<'a> SyncEngine<'a> {
             let mut all_destroyed: Vec<JmapEmailId> = Vec::new();
 
             let final_state = loop {
-                let res = jmap_email::get_changes(self.client, &current).await;
+                let res = jmap_email::get_changes(&self.client, &current).await;
                 match res {
                     Ok(changes) => {
                         all_created.extend(changes.created);
@@ -298,7 +337,7 @@ impl<'a> SyncEngine<'a> {
         let mut seen: HashSet<JmapEmailId> = HashSet::new();
         for (mailbox_id, folder_name) in mailboxes {
             let ids =
-                jmap_email::query_mailbox(self.client, mailbox_id.as_ref(), folder_name).await?;
+                jmap_email::query_mailbox(&self.client, mailbox_id.as_ref(), folder_name).await?;
             for id in ids {
                 if seen.insert(id.clone()) {
                     all_ids.push(id);
@@ -306,15 +345,15 @@ impl<'a> SyncEngine<'a> {
             }
         }
         let emails = self.batched_get(&all_ids).await?;
-        let state = jmap_email::get_current_state(self.client).await?;
+        let state = jmap_email::get_current_state(&self.client).await?;
         Ok((emails, Vec::new(), state, true))
     }
 
     async fn batched_get(&self, ids: &[JmapEmailId]) -> Result<Vec<EmailObject>> {
         let mut out: Vec<EmailObject> = Vec::new();
-        let chunk_size = limits::max_objects_in_get(self.client);
+        let chunk_size = limits::max_objects_in_get(&self.client);
         for chunk in ids.chunks(chunk_size) {
-            let batch = jmap_email::get_by_ids(self.client, chunk).await?;
+            let batch = jmap_email::get_by_ids(&self.client, chunk).await?;
             out.extend(batch);
         }
         Ok(out)

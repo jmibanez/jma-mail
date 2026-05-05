@@ -1,15 +1,13 @@
 use anyhow::Result;
-use jmap_client::client::Client;
 use rusqlite::Connection;
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
 use crate::config::Config;
-use crate::ids::JmapAccountId;
-use crate::jmap::session;
 use crate::state::queries;
 use crate::sync::engine::SyncEngine;
+use crate::sync::plan::SyncDirection;
 
 /// What triggered a sync cycle.
 #[derive(Debug, Clone)]
@@ -20,7 +18,7 @@ pub enum SyncTrigger {
 }
 
 /// Run the daemon loop: initial sync, then react to triggers.
-pub async fn run(client: &Client, conn: &Connection, config: &Config) -> Result<()> {
+pub async fn run(conn: &Connection, config: &Config) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<SyncTrigger>(32);
 
     let hook = super::hook::Hook::new(config.watch.post_arrival_command.clone());
@@ -28,9 +26,16 @@ pub async fn run(client: &Client, conn: &Connection, config: &Config) -> Result<
         info!("Post-arrival hook configured");
     }
 
+    // One engine for the lifetime of the watcher: opens its session in
+    // `connect`, drives the initial sync, and is reused on every
+    // trigger below. SSE setup pulls the event-source URL and account
+    // id straight off the engine -- no separate `Client` floating
+    // through the runner.
+    let engine = SyncEngine::connect(conn, config).await?;
+
     // Run initial sync
     info!("Running initial sync before entering watch mode");
-    match SyncEngine::new(client, conn, config).sync(false).await {
+    match engine.run(false, SyncDirection::Both).await {
         Ok(outcome) => {
             if outcome.downloaded > 0 {
                 hook.trigger().await;
@@ -40,10 +45,10 @@ pub async fn run(client: &Client, conn: &Connection, config: &Config) -> Result<
     }
 
     // Get session info for EventSource URL
-    let session_info = session::session_info(client)?;
+    let session_info = engine.session_info()?;
     let token = config.account.token()?;
     let maildir_root = config.maildir_path();
-    let account_id: JmapAccountId = client.default_account_id().into();
+    let account_id = session_info.account_id.clone();
     let ping_interval = config.watch.ping_interval;
 
     // Seed the SSE dedup cache from current DB state so the first event
@@ -93,7 +98,7 @@ pub async fn run(client: &Client, conn: &Connection, config: &Config) -> Result<
     // Main event loop
     while let Some(trigger) = rx.recv().await {
         info!("Sync triggered by {:?}", trigger);
-        match SyncEngine::new(client, conn, config).sync(false).await {
+        match engine.run(false, SyncDirection::Both).await {
             Ok(outcome) => {
                 if outcome.downloaded > 0 {
                     hook.trigger().await;

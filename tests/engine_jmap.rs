@@ -21,7 +21,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use jmap_client::client::{Client, Credentials};
 use jmapsync::config::{
     AccountConfig, Config, ConflictStrategy, StateConfig, SyncConfig, WatchConfig,
 };
@@ -334,14 +333,6 @@ fn email_changes(args: &Value, call_id: &str, state: &MockState) -> Value {
     ])
 }
 
-async fn build_client(server: &MockServer) -> Client {
-    Client::new()
-        .credentials(Credentials::bearer("test-token"))
-        .connect(&server.uri())
-        .await
-        .expect("client connect")
-}
-
 /// Open a fresh on-disk state DB inside the given temp dir. Integration
 /// tests can't use `db::open_in_memory` (gated on `cfg(test)` for unit
 /// tests), so route through the public `open_or_recreate` against a
@@ -351,12 +342,19 @@ fn fresh_db(temp: &tempfile::TempDir) -> Connection {
     db::open_or_recreate(&db_path).expect("open state DB")
 }
 
-fn test_config(maildir_root: &std::path::Path, mailboxes: Vec<String>) -> Config {
+fn test_config(
+    server: &MockServer,
+    maildir_root: &std::path::Path,
+    mailboxes: Vec<String>,
+) -> Config {
     Config {
         account: AccountConfig {
             email: "test@example.com".to_string(),
             token: Some("test-token".to_string()),
-            session_url: None,
+            // Force `session::connect` down the explicit-override path
+            // so it `Client::connect`s the wiremock server instead of
+            // doing real DNS/well-known autodiscovery.
+            session_url: Some(server.uri()),
         },
         sync: SyncConfig {
             maildir_path: maildir_root.to_string_lossy().into_owned(),
@@ -397,12 +395,13 @@ async fn resolve_mailboxes_applies_inbox_magic_alias() {
     }));
     mount_jmap(&server, state.clone()).await;
 
-    let client = build_client(&server).await;
     let temp = tempfile::tempdir().unwrap();
     let conn = fresh_db(&temp);
-    let config = test_config(temp.path(), vec![]);
+    let config = test_config(&server, temp.path(), vec![]);
 
-    let resolved = SyncEngine::new(&client, &conn, &config)
+    let resolved = SyncEngine::connect(&conn, &config)
+        .await
+        .expect("connect")
         .resolve_mailboxes()
         .await
         .expect("resolve_mailboxes succeeds");
@@ -453,15 +452,17 @@ async fn resolve_mailboxes_filter_drops_unlisted() {
     }));
     mount_jmap(&server, state.clone()).await;
 
-    let client = build_client(&server).await;
     let temp = tempfile::tempdir().unwrap();
     let conn = fresh_db(&temp);
     let config = test_config(
+        &server,
         temp.path(),
         vec!["INBOX".to_string(), "Archive".to_string()],
     );
 
-    let resolved = SyncEngine::new(&client, &conn, &config)
+    let resolved = SyncEngine::connect(&conn, &config)
+        .await
+        .expect("connect")
         .resolve_mailboxes()
         .await
         .expect("resolve_mailboxes succeeds");
@@ -521,13 +522,11 @@ async fn sync_initial_pull_downloads_email_into_maildir() {
     mount_jmap(&server, state.clone()).await;
     mount_blob_downloads(&server, state.clone()).await;
 
-    let client = build_client(&server).await;
     let temp = tempfile::tempdir().unwrap();
     let conn = fresh_db(&temp);
-    let config = test_config(temp.path(), vec![]);
+    let config = test_config(&server, temp.path(), vec![]);
 
-    let outcome = SyncEngine::new(&client, &conn, &config)
-        .sync(false)
+    let outcome = SyncEngine::sync(&conn, &config, false)
         .await
         .expect("sync succeeds");
 
@@ -580,16 +579,14 @@ async fn sync_already_in_sync_is_a_noop() {
     }));
     mount_jmap(&server, state.clone()).await;
 
-    let client = build_client(&server).await;
     let temp = tempfile::tempdir().unwrap();
     let conn = fresh_db(&temp);
-    let config = test_config(temp.path(), vec![]);
+    let config = test_config(&server, temp.path(), vec![]);
 
     // Pre-seed the cursor so the engine takes the Email/changes branch.
     queries::set_jmap_state(&conn, ACCOUNT_ID, "Email", "e-1").unwrap();
 
-    let outcome = SyncEngine::new(&client, &conn, &config)
-        .sync(false)
+    let outcome = SyncEngine::sync(&conn, &config, false)
         .await
         .expect("sync succeeds");
 
@@ -645,16 +642,14 @@ async fn sync_falls_back_when_email_changes_cannot_calculate() {
     mount_jmap(&server, state.clone()).await;
     mount_blob_downloads(&server, state.clone()).await;
 
-    let client = build_client(&server).await;
     let temp = tempfile::tempdir().unwrap();
     let conn = fresh_db(&temp);
-    let config = test_config(temp.path(), vec![]);
+    let config = test_config(&server, temp.path(), vec![]);
 
     // Stale cursor; rigged Email/changes will reject it on the first call.
     queries::set_jmap_state(&conn, ACCOUNT_ID, "Email", "stale-cursor").unwrap();
 
-    let outcome = SyncEngine::new(&client, &conn, &config)
-        .sync(false)
+    let outcome = SyncEngine::sync(&conn, &config, false)
         .await
         .expect("sync succeeds via the initial-pull fallback");
 
@@ -723,15 +718,13 @@ async fn sync_delta_cycle_after_initial_pull_picks_up_new_email() {
     mount_jmap(&server, state.clone()).await;
     mount_blob_downloads(&server, state.clone()).await;
 
-    let client = build_client(&server).await;
     let temp = tempfile::tempdir().unwrap();
     let conn = fresh_db(&temp);
-    let config = test_config(temp.path(), vec![]);
+    let config = test_config(&server, temp.path(), vec![]);
 
     // Cycle 1: initial pull. Cursor starts empty so the engine runs
     // Email/query + Email/get and bootstraps via get_current_state.
-    let first = SyncEngine::new(&client, &conn, &config)
-        .sync(false)
+    let first = SyncEngine::sync(&conn, &config, false)
         .await
         .expect("initial pull succeeds");
     assert_eq!(first.downloaded, 1);
@@ -767,8 +760,7 @@ async fn sync_delta_cycle_after_initial_pull_picks_up_new_email() {
     // Cycle 2: delta path. Engine consults Email/changes from "e-1",
     // gets [E2] as created, fetches just E2 via Email/get, downloads
     // its blob, and advances the cursor to the new state.
-    let second = SyncEngine::new(&client, &conn, &config)
-        .sync(false)
+    let second = SyncEngine::sync(&conn, &config, false)
         .await
         .expect("delta cycle succeeds");
     assert_eq!(
