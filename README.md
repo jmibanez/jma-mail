@@ -77,11 +77,10 @@ Configuration for `jmapsync` lives in `~/.config/jmapsync/config.toml`. The key 
 
 ### Authentication and Account `[account]`
 
-`jmapsync` currently only supports Bearer tokens, AKA API tokens. On Fastmail, go to **Settings -> Privacy & Security (under Account) -> Manage API tokens** to generate a token, then provide it to `jmapsync` in one of three ways (checked in this order):
+`jmapsync` currently only supports Bearer tokens, AKA API tokens. On Fastmail, go to **Settings -> Privacy & Security (under Account) -> Manage API tokens** to generate a token, then provide it to `jmapsync` in one of two ways (checked in this order):
 
-  1. The `JMAPSYNC_TOKEN` environment variable. Best for CI and scripted use.
-  2. The OS-native secret store, via `jmapsync auth set-token`. The token goes into macOS Keychain, Linux Secret Service (D-Bus), or Windows Credential Manager — never on disk in the clear. Recommended for interactive use. Pipe a token in (`pbpaste | jmapsync auth set-token`) or let it prompt. `jmapsync auth clear-token` removes it.
-  3. The `token` key in the `[account]` section of the config file. Plaintext fallback for headless servers (no Keychain, no D-Bus session bus) and CI environments where the env var isn't a fit.
+  1. The OS-native secret store, via `jmapsync auth set-token --account <email>`. The token goes into macOS Keychain, Linux Secret Service (D-Bus), or Windows Credential Manager -- never on disk in the clear. Per-account scoping (the keyring entry is keyed on `<email>`) keeps multi-account configs from sharing or overwriting each other's credentials. Pipe a token in (`pbpaste | jmapsync auth set-token --account foo@example.com`) or let it prompt. `jmapsync auth clear-token --account <email>` removes it. The auth subcommands don't read the config -- the email you pass is what `[account].email` must be later for sync to find the token; a typo is detected when sync runs and reports "no token for ...".
+  2. The `token` key in the `[account]` block of the config file. Plaintext fallback for headless servers (no Keychain, no D-Bus session bus) where the keychain isn't available.
 
 Other `[account]` keys:
 

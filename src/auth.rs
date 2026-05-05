@@ -7,15 +7,16 @@
 //!   - Linux: `dbus-secret-service-keyring-store`
 //!   - Windows: `windows-native-keyring-store`
 //!
-//! Service name `jmapsync-bearer`, user `default`. The user key
-//! is fixed today; multi-account support will rekey it later.
+//! Service name `jmapsync-bearer`, user is the account's email.
+//! Per-account scoping means a multi-account config keeps each
+//! provider's token isolated; rotating one doesn't touch the
+//! others.
 //!
 //! Reads are tolerant: any keyring failure (no backend, locked
 //! keychain, denied prompt) is logged at debug and reported as "no
-//! token stored", so a config-file or env-var token can still be
-//! used. Writes and deletes surface errors loudly — a user who
-//! explicitly asked to manage the keychain wants to know if it
-//! failed.
+//! token stored", so a config-file token can still be used. Writes
+//! and deletes surface errors loudly -- a user who explicitly
+//! asked to manage the keychain wants to know if it failed.
 
 use anyhow::{Context, Result, anyhow, bail};
 use keyring_core::{Entry, Error};
@@ -23,7 +24,6 @@ use std::sync::OnceLock;
 use tracing::debug;
 
 const SERVICE: &str = "jmapsync-bearer";
-const DEFAULT_USER: &str = "default";
 
 /// Memoised result of registering the platform credential store as
 /// keyring-core's default. The error is stringified because
@@ -74,30 +74,31 @@ fn try_init_store() -> Result<()> {
     bail!("no keyring backend available for this platform")
 }
 
-fn entry() -> Result<Entry> {
+fn entry(account_email: &str) -> Result<Entry> {
     init_store()?;
-    Entry::new(SERVICE, DEFAULT_USER)
+    Entry::new(SERVICE, account_email)
         .map_err(|e| anyhow!("{e}"))
         .context("Failed to open keyring entry")
 }
 
-/// Store `token` in the OS keychain. Empty tokens are rejected here
-/// rather than at read time so a bad input fails fast.
-pub fn set_bearer_token(token: &str) -> Result<()> {
+/// Store `token` in the OS keychain under `account_email`. Empty
+/// tokens are rejected here rather than at read time so a bad input
+/// fails fast.
+pub fn set_bearer_token(account_email: &str, token: &str) -> Result<()> {
     if token.is_empty() {
         bail!("refusing to store an empty bearer token");
     }
-    entry()?
+    entry(account_email)?
         .set_password(token)
         .map_err(|e| anyhow!("{e}"))
         .context("Failed to write bearer token to keyring")
 }
 
-/// Read a stored bearer token. Returns `None` for both "no entry"
-/// and "backend unreachable" so callers can fall through to other
-/// resolution paths (env var, config file).
-pub fn get_bearer_token() -> Option<String> {
-    let entry = match entry() {
+/// Read the stored bearer token for `account_email`. Returns `None`
+/// for both "no entry" and "backend unreachable" so callers can fall
+/// through to other resolution paths (the in-file `token` field).
+pub fn get_bearer_token(account_email: &str) -> Option<String> {
+    let entry = match entry(account_email) {
         Ok(e) => e,
         Err(err) => {
             debug!("keyring entry unavailable; falling back: {}", err);
@@ -114,9 +115,10 @@ pub fn get_bearer_token() -> Option<String> {
     }
 }
 
-/// Remove the stored bearer token. A missing entry is not an error.
-pub fn clear_bearer_token() -> Result<()> {
-    match entry()?.delete_credential() {
+/// Remove the stored bearer token for `account_email`. A missing
+/// entry is not an error.
+pub fn clear_bearer_token(account_email: &str) -> Result<()> {
+    match entry(account_email)?.delete_credential() {
         Ok(()) => Ok(()),
         Err(Error::NoEntry) => Ok(()),
         Err(e) => Err(anyhow!("{e}")).context("Failed to clear bearer token from keyring"),

@@ -18,8 +18,8 @@ pub struct AccountConfig {
     /// the JMAP session URL via DNS SRV (`_jmap._tcp.<domain>`) and
     /// the `/.well-known/jmap` HTTPS endpoint.
     pub email: String,
-    /// API token. Lowest-priority fallback after JMAPSYNC_TOKEN and
-    /// the OS keychain (`jmapsync auth set-token`). Kept supported
+    /// API token. Lowest-priority fallback after the OS keychain
+    /// (`jmapsync auth set-token --account <email>`). Kept supported
     /// indefinitely for headless servers and CI where the keychain
     /// isn't available.
     pub token: Option<String>,
@@ -156,28 +156,25 @@ impl Default for WatchConfig {
 impl AccountConfig {
     /// Resolve the bearer token. Order of precedence:
     ///
-    /// 1. `JMAPSYNC_TOKEN` env var — explicit override; wins so CI
-    ///    and scripted use can inject a token without touching
-    ///    config or keychain.
-    /// 2. OS keychain (`jmapsync auth set-token`) — preferred
+    /// 1. OS keychain entry for this account's email
+    ///    (`jmapsync auth set-token --account <email>`) -- preferred
     ///    interactive path; the token never lives on disk in the
-    ///    clear.
-    /// 3. `token` field in the config file — back-compat fallback
-    ///    for headless servers and CI where the keychain isn't
-    ///    available. Stays supported indefinitely.
+    ///    clear, and per-email scoping keeps multi-account configs
+    ///    from sharing or overwriting each other's credentials.
+    /// 2. `token` field in the config file -- fallback for headless
+    ///    servers and CI where the keychain isn't available.
     pub fn token(&self) -> Result<String> {
-        if let Ok(t) = std::env::var("JMAPSYNC_TOKEN") {
-            return Ok(t);
-        }
-        if let Some(t) = crate::auth::get_bearer_token() {
+        if let Some(t) = crate::auth::get_bearer_token(&self.email) {
             return Ok(t);
         }
         if let Some(t) = self.token.as_deref().filter(|s| !s.is_empty()) {
             return Ok(t.to_string());
         }
         Err(anyhow::anyhow!(
-            "no API token: run `jmapsync auth set-token` to store one in your OS keychain, \
-             set the JMAPSYNC_TOKEN env var, or set `token` in the config file"
+            "no API token for {}: run `jmapsync auth set-token --account {}` to store one \
+             in your OS keychain, or set `token` under that account in the config file",
+            self.email,
+            self.email,
         ))
     }
 
@@ -244,8 +241,8 @@ pub fn check_token_perms(path: &Path, token: Option<&str>) -> Option<String> {
         if meta.mode() & 0o077 != 0 {
             return Some(format!(
                 "config file {} is readable by group or others and contains a non-empty token; \
-                 refusing to use it. Run `chmod 600 {}` (or move the token to JMAPSYNC_TOKEN \
-                 / `jmapsync auth set-token`).",
+                 refusing to use it. Run `chmod 600 {}` (or move the token to your OS \
+                 keychain via `jmapsync auth set-token --account <email>`).",
                 path.display(),
                 path.display()
             ));
@@ -280,13 +277,14 @@ email = "you@example.com"
 # API token (app-specific password). Generate at:
 #   https://www.fastmail.com/settings/security/tokens
 #
-# Three ways to provide it, in priority order:
-#   1. JMAPSYNC_TOKEN env var (best for CI / scripted use).
-#   2. OS keychain — run `jmapsync auth set-token` to store the
-#      token in macOS Keychain / Linux Secret Service / Windows
-#      Credential Manager. Recommended for interactive use.
-#   3. The `token` field below — fallback for headless servers
-#      and CI where the keychain isn't available.
+# Two ways to provide it, in priority order:
+#   1. OS keychain -- run `jmapsync auth set-token --account <email>`
+#      to store the token under this account's email in the macOS
+#      Keychain / Linux Secret Service / Windows Credential Manager.
+#      Recommended for interactive use; per-account scoping keeps
+#      multi-account configs from sharing credentials.
+#   2. The `token` field below -- fallback for headless servers and
+#      CI where the keychain isn't available.
 token = ""
 # Explicit JMAP session URL. Leave unset to have it autodiscovered
 # from the email domain (DNS SRV + /.well-known/jmap, RFC 8620

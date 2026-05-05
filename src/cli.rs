@@ -53,6 +53,11 @@ pub enum Command {
     Auth {
         #[command(subcommand)]
         action: AuthAction,
+
+        /// Operate on the token for the account with this email
+        /// address. Required.
+        #[arg(long, value_name = "EMAIL")]
+        account: String,
     },
 }
 

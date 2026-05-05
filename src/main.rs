@@ -40,11 +40,11 @@ async fn main() -> Result<()> {
         Command::Push => cmd_push(&cli).await,
         Command::Watch => cmd_watch(&cli).await,
         Command::Status => cmd_status(&cli).await,
-        Command::Auth { action } => cmd_auth(&cli, action).await,
+        Command::Auth { action, account } => cmd_auth(&cli, action, account).await,
     }
 }
 
-async fn cmd_auth(cli: &Cli, action: AuthAction) -> Result<()> {
+async fn cmd_auth(cli: &Cli, action: AuthAction, email: String) -> Result<()> {
     use std::io::{BufRead, IsTerminal};
     match action {
         AuthAction::SetToken => {
@@ -59,12 +59,12 @@ async fn cmd_auth(cli: &Cli, action: AuthAction) -> Result<()> {
                     .context("Failed to read token from stdin")?;
                 s.trim_end_matches(['\n', '\r']).to_string()
             };
-            jmapsync::auth::set_bearer_token(&token)?;
-            println!("Bearer token saved to keychain.");
+            jmapsync::auth::set_bearer_token(&email, &token)?;
+            println!("Bearer token saved to keychain for {}.", email);
         }
         AuthAction::ClearToken => {
-            jmapsync::auth::clear_bearer_token()?;
-            println!("Bearer token cleared from keychain.");
+            jmapsync::auth::clear_bearer_token(&email)?;
+            println!("Bearer token cleared from keychain for {}.", email);
         }
         AuthAction::Rediscover => {
             let config = load_config(cli)?;
