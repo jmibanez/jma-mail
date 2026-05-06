@@ -2,7 +2,7 @@ use anyhow::Result;
 use futures_util::stream::{self, StreamExt};
 use jmap_client::client::Client;
 use rusqlite::Connection;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -99,12 +99,42 @@ impl<'a> Executor<'a> {
         self.update_local_flags(local_flags)?;
         self.move_local_messages(local_moves)?;
         self.delete_local_messages(local_deletes)?;
-        self.upload_messages(uploads).await?;
+        let upload_results = self.upload_messages(uploads).await?;
         let outcome = self
             .apply_remote_set(remote_keywords, remote_moves, remote_destroys)
             .await?;
         apply_move_pair_adopts(self.conn, move_pair_adopts, &outcome.failed_updates)?;
         let failed_remote_actions = outcome.failed_updates.len() + outcome.failed_destroys.len();
+
+        // RFC 8620 section 7.1 cursor ratchet, combined across every
+        // server-state-advancing call we made this cycle (every
+        // Email/import plus the trailing Email/set batch). Each call
+        // contributes one `oldState -> newState` edge to a chain map
+        // keyed on `oldState`; we walk forward from the cursor
+        // reconcile gave us. If every edge in the map is consumed in
+        // a single contiguous walk, the chain is intact (no third-
+        // party write landed between our calls) and we ratchet the
+        // cursor to the walk's end. If any edge is unreachable from
+        // the cursor, or any of our calls returned a missing chain
+        // half (chain_intact false), we leave the cursor alone --
+        // the next cycle's `Email/changes` from the unmoved cursor
+        // catches up cleanly through the cursor-advance-on-empty-plan
+        // path.
+        let set_intact = matches!(
+            (&outcome.chain_old, &outcome.chain_new),
+            (None, None) | (Some(_), Some(_))
+        );
+        let combined_intact = upload_results.chain_intact && set_intact;
+        let new_email_state = if combined_intact {
+            let mut edges: HashMap<String, String> =
+                upload_results.chain_pairs.into_iter().collect();
+            if let (Some(o), Some(n)) = (outcome.chain_old, outcome.chain_new) {
+                edges.insert(o, n);
+            }
+            walk_chain(new_email_state, &edges)
+        } else {
+            new_email_state
+        };
 
         // Intentionally outside the per-phase transactions: if the process
         // dies between the last phase commit and this write, the cursor
@@ -264,9 +294,12 @@ impl<'a> Executor<'a> {
         Ok(())
     }
 
-    async fn upload_messages(&self, actions: Vec<SyncAction>) -> Result<()> {
+    async fn upload_messages(&self, actions: Vec<SyncAction>) -> Result<UploadResults> {
         if actions.is_empty() {
-            return Ok(());
+            return Ok(UploadResults {
+                chain_pairs: Vec::new(),
+                chain_intact: true,
+            });
         }
         let n = limits::upload_concurrency(self.client, self.config.sync.upload_concurrency);
         if n != self.config.sync.upload_concurrency {
@@ -313,10 +346,22 @@ impl<'a> Executor<'a> {
 
         let mut succeeded: Vec<(usize, JmapEmailId)> = Vec::new();
         let mut hard_error: Option<anyhow::Error> = None;
+        let mut chain_pairs: Vec<(String, String)> = Vec::new();
+        let mut chain_intact = true;
 
         while let Some((i, result)) = stream.next().await {
             match result {
-                Ok(UploadOutcome::Uploaded(jmap_email_id)) => succeeded.push((i, jmap_email_id)),
+                Ok(UploadOutcome::Uploaded {
+                    email_id,
+                    chain_old,
+                    chain_new,
+                }) => {
+                    succeeded.push((i, email_id));
+                    match (chain_old, chain_new) {
+                        (Some(o), Some(n)) => chain_pairs.push((o, n)),
+                        _ => chain_intact = false,
+                    }
+                }
                 Ok(UploadOutcome::Skipped) => {}
                 Err(e) => {
                     if hard_error.is_none() {
@@ -372,7 +417,10 @@ impl<'a> Executor<'a> {
         if let Some(e) = hard_error {
             return Err(e);
         }
-        Ok(())
+        Ok(UploadResults {
+            chain_pairs,
+            chain_intact,
+        })
     }
 
     /// Collapse all remote-side mutations onto a single Email/set call.
@@ -663,6 +711,40 @@ impl<'a> Executor<'a> {
     }
 }
 
+/// Walk a state-advance chain forward from `cursor`. The chain is the
+/// set of `(oldState -> newState)` edges produced by every server-
+/// state-advancing call we made in the cycle (Email/import per
+/// upload, plus the Email/set batch). The chain is "intact" iff
+/// every edge is consumed in one contiguous walk that begins at
+/// `cursor`: starting at the cursor we look up the next state in
+/// the map, advance, and repeat until either the lookup misses or
+/// the map is exhausted. If we walked all `edges.len()` entries
+/// successfully, return the walked end (the chain's `newState`); if
+/// any edge was unreachable (a third-party write landed mid-cycle
+/// and our calls don't form a single contiguous run), return
+/// `cursor` unchanged so the next cycle's `Email/changes` advances
+/// the cursor through the regular path.
+fn walk_chain(cursor: Option<String>, edges: &HashMap<String, String>) -> Option<String> {
+    if edges.is_empty() {
+        return cursor;
+    }
+    let mut current = cursor.clone();
+    let mut walked = 0usize;
+    while let Some(c) = current.as_deref() {
+        if let Some(next) = edges.get(c) {
+            current = Some(next.clone());
+            walked += 1;
+        } else {
+            break;
+        }
+    }
+    if walked == edges.len() {
+        current
+    } else {
+        cursor
+    }
+}
+
 /// Bind already-on-server messages to existing local files (DB only).
 /// Pure-DB phase, so the whole loop runs in one transaction: a panic
 /// or error mid-loop rolls the entire phase back instead of leaving
@@ -777,9 +859,29 @@ struct UploadJob {
 /// non-fatal cases: oversize-cap, stat failure, read failure, and
 /// the server's `alreadyExists` (logged inside `upload_one`). Hard
 /// JMAP errors are returned as `Err` and propagated by the caller.
+/// `Uploaded` carries the Email/import response's
+/// `oldState`/`newState` pair so the cycle-level cursor ratchet can
+/// chain through all imports plus the trailing Email/set.
 enum UploadOutcome {
-    Uploaded(JmapEmailId),
+    Uploaded {
+        email_id: JmapEmailId,
+        chain_old: Option<String>,
+        chain_new: Option<String>,
+    },
     Skipped,
+}
+
+/// Aggregated result of `upload_messages`. Carries the per-import
+/// chain pairs the executor's section 7.1 ratchet needs, plus a flag that
+/// goes false if any successful import returned a missing/empty
+/// state. Used by the all-or-nothing combined-chain check at the
+/// end of `execute`: if any of our calls (import or set) couldn't
+/// supply a complete chain edge, the cycle's combined chain is
+/// considered broken and the cursor stays at the pre-ratchet value.
+#[derive(Debug, Default)]
+struct UploadResults {
+    chain_pairs: Vec<(String, String)>,
+    chain_intact: bool,
 }
 
 /// One upload's worth of work: read + import. Sync `std::fs::read`
@@ -816,7 +918,11 @@ async fn upload_one(client: &Client, job: UploadJob) -> Result<UploadOutcome> {
     )
     .await
     {
-        Ok(jmap_email_id) => Ok(UploadOutcome::Uploaded(jmap_email_id)),
+        Ok(result) => Ok(UploadOutcome::Uploaded {
+            email_id: result.email_id,
+            chain_old: result.chain_old,
+            chain_new: result.chain_new,
+        }),
         Err(e) => {
             let s = e.to_string();
             if s.contains("alreadyExists") {
@@ -956,5 +1062,62 @@ mod tests {
         );
         let spam_state = queries::get_local_state_for_folder(&conn, "Spam").unwrap();
         assert!(spam_state.contains_key("M-NEW"));
+    }
+
+    fn edges_from(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(o, n)| ((*o).to_string(), (*n).to_string()))
+            .collect()
+    }
+
+    /// Empty edge map -> walk is a no-op, cursor passes through.
+    #[test]
+    fn walk_chain_empty_edges_returns_cursor_unchanged() {
+        let edges = HashMap::new();
+        assert_eq!(walk_chain(Some("S0".into()), &edges).as_deref(), Some("S0"));
+        assert_eq!(walk_chain(None, &edges), None);
+    }
+
+    /// Single edge starting at the cursor: ratchet to its newState.
+    #[test]
+    fn walk_chain_single_edge_advances_cursor() {
+        let edges = edges_from(&[("S0", "S1")]);
+        assert_eq!(walk_chain(Some("S0".into()), &edges).as_deref(), Some("S1"));
+    }
+
+    /// Three edges chained from the cursor: ratchet to the chain's end.
+    #[test]
+    fn walk_chain_consecutive_edges_advance_cursor() {
+        let edges = edges_from(&[("S0", "S1"), ("S1", "S2"), ("S2", "S3")]);
+        assert_eq!(walk_chain(Some("S0".into()), &edges).as_deref(), Some("S3"));
+    }
+
+    /// Two edges form a chain from the cursor, but a third edge sits
+    /// disconnected (a third-party write landed mid-cycle and our
+    /// later import resumed from the post-third-party state). All-
+    /// or-nothing: don't ratchet at all, cursor stays at S0.
+    #[test]
+    fn walk_chain_unreachable_edge_breaks_ratchet() {
+        let edges = edges_from(&[("S0", "S1"), ("S1", "S2"), ("Sx", "Sy")]);
+        assert_eq!(walk_chain(Some("S0".into()), &edges).as_deref(), Some("S0"));
+    }
+
+    /// All edges exist but none start at the cursor: no walking
+    /// possible, cursor preserved.
+    #[test]
+    fn walk_chain_cursor_not_in_chain_returns_unchanged() {
+        let edges = edges_from(&[("Sx", "Sy")]);
+        assert_eq!(walk_chain(Some("S0".into()), &edges).as_deref(), Some("S0"));
+    }
+
+    /// `None` cursor with any non-empty chain: nothing to ratchet
+    /// against; preserve `None`. (In practice this means reconcile
+    /// handed us no `new_email_state` -- bail out cleanly rather
+    /// than picking an arbitrary chain start.)
+    #[test]
+    fn walk_chain_none_cursor_with_non_empty_edges_stays_none() {
+        let edges = edges_from(&[("S0", "S1")]);
+        assert_eq!(walk_chain(None, &edges), None);
     }
 }

@@ -227,10 +227,22 @@ pub enum EmailSetOp {
 /// Outcome of `set_email_batch`. The two `failed_*` sets contain ids
 /// the server rejected per-row (notUpdated / notDestroyed); callers
 /// should suppress DB mirror for those ids.
+///
+/// `chain_old` / `chain_new` carry the JMAP `oldState` / `newState`
+/// fields from the `Email/set` response(s). Across multiple chunks
+/// (when the op list exceeds `maxObjectsInSet`), the chain is
+/// considered intact iff each subsequent chunk's `oldState` matches
+/// the previous chunk's `newState` -- i.e. nothing third-party landed
+/// between chunks. When intact, `chain_old` is the very first chunk's
+/// `oldState` and `chain_new` is the very last chunk's `newState`.
+/// When the chain breaks, `chain_new` is set to `None` so the section 7.1
+/// cursor ratchet at the call site won't fire.
 #[derive(Debug, Default)]
 pub struct EmailSetOutcome {
     pub failed_updates: std::collections::HashSet<JmapEmailId>,
     pub failed_destroys: std::collections::HashSet<JmapEmailId>,
+    pub chain_old: Option<String>,
+    pub chain_new: Option<String>,
 }
 
 impl EmailSetOutcome {
@@ -240,6 +252,24 @@ impl EmailSetOutcome {
     pub(crate) fn merge(&mut self, other: EmailSetOutcome) {
         self.failed_updates.extend(other.failed_updates);
         self.failed_destroys.extend(other.failed_destroys);
+
+        // Chain extension: each subsequent chunk's `chain_old` must
+        // match the previous chunk's `chain_new` for the chain to
+        // remain intact. Once broken, `chain_new` stays `None` and
+        // the section 7.1 cursor ratchet at the call site no-ops.
+        match (self.chain_new.take(), other.chain_old, other.chain_new) {
+            (None, Some(o_old), Some(o_new)) if self.chain_old.is_none() => {
+                self.chain_old = Some(o_old);
+                self.chain_new = Some(o_new);
+            }
+            (Some(prev_new), Some(o_old), Some(o_new)) if prev_new == o_old => {
+                self.chain_new = Some(o_new);
+            }
+            _ => {
+                // Chain broke, or one side was missing states.
+                // `chain_new` stays at the `None` left by `take()`.
+            }
+        }
     }
 }
 
@@ -309,7 +339,23 @@ pub async fn set_email_batch(client: &Client, ops: &[EmailSetOp]) -> Result<Emai
                 .await
                 .context("Email/set batch failed")?;
 
-            let mut outcome = EmailSetOutcome::default();
+            let chain_old = response.old_state().map(String::from);
+            // jmap-client 0.4.1 returns "" when `newState` is missing
+            // from the response. See `SetResponse::new_state` at
+            // https://github.com/stalwartlabs/jmap-client/blob/v0.4.1/src/core/set.rs#L255-L257
+            // -- the body is `self.new_state.as_deref().unwrap_or("")`.
+            // Treat the empty string as missing so a non-compliant
+            // server doesn't give us a bogus chain to ratchet against.
+            let chain_new = match response.new_state() {
+                "" => None,
+                s => Some(s.to_string()),
+            };
+
+            let mut outcome = EmailSetOutcome {
+                chain_old,
+                chain_new,
+                ..Default::default()
+            };
             if let Some(not_updated) = response.not_updated_ids() {
                 for id in not_updated {
                     tracing::warn!("Email/set batch: notUpdated {}", id);
@@ -358,6 +404,20 @@ fn normalize_crlf(input: &[u8]) -> Vec<u8> {
 
 /// Import a raw email message (RFC 5322) into a mailbox using convenience helper.
 /// `local` and `folder_name` are used only for log readability.
+/// One successful Email/import: the assigned JMAP id plus the
+/// `oldState`/`newState` pair from the response, used by the
+/// `execute`-layer cursor ratchet to chain across all Email/import +
+/// Email/set calls in the cycle. `chain_old` / `chain_new` are
+/// `None` when the server returned an incomplete response (RFC 8620
+/// section 5.6 says the response MUST carry `newState`; the wrapper
+/// is defensive).
+#[derive(Debug)]
+pub struct ImportResult {
+    pub email_id: JmapEmailId,
+    pub chain_old: Option<String>,
+    pub chain_new: Option<String>,
+}
+
 pub async fn import_email(
     client: &Client,
     raw_message: &[u8],
@@ -365,7 +425,7 @@ pub async fn import_email(
     folder_name: &str,
     local: &LocalId,
     keywords: &HashMap<String, bool>,
-) -> Result<JmapEmailId> {
+) -> Result<ImportResult> {
     let keyword_list: Vec<String> = keywords
         .iter()
         .filter(|(_, v)| **v)
@@ -379,27 +439,57 @@ pub async fn import_email(
     };
 
     let normalized = normalize_crlf(raw_message);
+    let mailbox_id_owned = mailbox_id.to_string();
+    let account_id = client.default_account_id().to_string();
 
-    let email = with_retry("Email/import", || async {
-        client
-            .email_import(
-                normalized.clone(),
-                [mailbox_id.to_string()],
-                keyword_opt.clone(),
-                None,
-            )
-            .await
-            .context("Failed to import email")
+    // Same shape as `jmap_client::email::helpers::email_import_account`,
+    // but inlined here so we can read `oldState` and `newState` off
+    // the response before extracting the created `Email`. The
+    // upload + import pair lives inside `with_retry` to match the
+    // existing transient-error budget; an upload re-try is
+    // idempotent (server dedupes by blobId), so retrying both is
+    // safe if wasteful.
+    let result = with_retry("Email/import", || async {
+        let blob_id = client
+            .upload(account_id.as_str().into(), normalized.clone(), None)
+            .await?
+            .take_blob_id();
+
+        let mut request = client.build();
+        let import_request = request
+            .import_email()
+            .account_id(&account_id)
+            .email(blob_id)
+            .mailbox_ids([mailbox_id_owned.clone()]);
+        if let Some(kw) = keyword_opt.clone() {
+            import_request.keywords(kw);
+        }
+        let create_id = import_request.create_id();
+
+        let mut response: jmap_client::email::import::EmailImportResponse =
+            request.send_single().await?;
+        let chain_old = response.old_state().map(String::from);
+        let chain_new = match response.new_state() {
+            "" => None,
+            s => Some(s.to_string()),
+        };
+        let email = response.created(&create_id)?;
+        let email_id = JmapEmailId::from(email.id().unwrap_or_default());
+
+        Ok(ImportResult {
+            email_id,
+            chain_old,
+            chain_new,
+        })
     })
-    .await?;
-
-    let email_id = JmapEmailId::from(email.id().unwrap_or_default());
+    .await
+    .context("Failed to import email")?;
 
     info!(
         "Imported email from {} into {} ({}) -> JMAP {}",
-        local, folder_name, mailbox_id, email_id
+        local, folder_name, mailbox_id, result.email_id
     );
-    Ok(email_id)
+    Ok(result)
 }
 
 /// Download the raw blob of an email.
@@ -474,5 +564,60 @@ mod tests {
         assert_eq!(acc.failed_destroys.len(), 2);
         assert!(acc.failed_destroys.contains(&JmapEmailId::from("d1")));
         assert!(acc.failed_destroys.contains(&JmapEmailId::from("d2")));
+    }
+
+    fn outcome_with_chain(old: &str, new: &str) -> EmailSetOutcome {
+        EmailSetOutcome {
+            chain_old: Some(old.into()),
+            chain_new: Some(new.into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn merge_first_chunk_seeds_chain() {
+        let mut acc = EmailSetOutcome::default();
+        acc.merge(outcome_with_chain("S0", "S1"));
+        assert_eq!(acc.chain_old.as_deref(), Some("S0"));
+        assert_eq!(acc.chain_new.as_deref(), Some("S1"));
+    }
+
+    #[test]
+    fn merge_extends_chain_when_consecutive_chunks_align() {
+        let mut acc = outcome_with_chain("S0", "S1");
+        acc.merge(outcome_with_chain("S1", "S2"));
+        acc.merge(outcome_with_chain("S2", "S3"));
+        assert_eq!(acc.chain_old.as_deref(), Some("S0"));
+        assert_eq!(acc.chain_new.as_deref(), Some("S3"));
+    }
+
+    #[test]
+    fn merge_breaks_chain_on_intervening_state() {
+        // Third-party write between our chunks: chunk 2 sees oldState=Sx,
+        // not the S1 we just left behind. The section 7.1 ratchet must NOT
+        // fire; chain_new becomes None.
+        let mut acc = outcome_with_chain("S0", "S1");
+        acc.merge(outcome_with_chain("Sx", "Sy"));
+        assert_eq!(acc.chain_old.as_deref(), Some("S0"));
+        assert!(acc.chain_new.is_none());
+    }
+
+    #[test]
+    fn merge_breaks_chain_on_missing_states() {
+        // A chunk whose response omitted oldState/newState (or
+        // jmap-client returned the empty-string default for newState)
+        // also breaks the chain. Conservative: don't ratchet on
+        // partial information.
+        let mut acc = outcome_with_chain("S0", "S1");
+        acc.merge(EmailSetOutcome::default());
+        assert!(acc.chain_new.is_none());
+    }
+
+    #[test]
+    fn merge_once_broken_stays_broken() {
+        let mut acc = outcome_with_chain("S0", "S1");
+        acc.merge(outcome_with_chain("Sx", "Sy")); // breaks
+        acc.merge(outcome_with_chain("S1", "S2")); // would chain to original, but already broken
+        assert!(acc.chain_new.is_none());
     }
 }
