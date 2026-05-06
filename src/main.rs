@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use std::collections::BTreeSet;
 use std::time::Duration;
+use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use jmapsync::cli::{AuthAction, Cli, Command};
@@ -32,6 +33,8 @@ async fn main() -> Result<()> {
         .init();
 
     let command = cli.command.clone().unwrap_or(Command::Sync);
+
+    info!("Running version {}", env!("JMAPSYNC_VERSION"));
 
     match command {
         Command::Init => cmd_init(&cli).await,
