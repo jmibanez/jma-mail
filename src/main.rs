@@ -35,6 +35,7 @@ async fn main() -> Result<()> {
     match command {
         Command::Init => cmd_init(&cli).await,
         Command::Mailboxes => cmd_mailboxes(&cli).await,
+        Command::Status => cmd_status(&cli).await,
         Command::Sync => cmd_sync(&cli).await,
         Command::Pull => cmd_pull(&cli).await,
         Command::Push => cmd_push(&cli).await,
@@ -225,6 +226,190 @@ async fn cmd_mailboxes(cli: &Cli) -> Result<()> {
     println!("\n* = synced");
 
     Ok(())
+}
+
+async fn cmd_status(cli: &Cli) -> Result<()> {
+    let config = load_config(cli)?;
+    let db_path = config.db_path();
+    // Read-only path: open without acquiring the state DB lock so this
+    // command doesn't block while a sync/watch holds it. Mirrors what
+    // `cmd_mailboxes` does.
+    let conn = state::db::open(&db_path)?;
+
+    println!("Configured account: {}", config.account.email);
+    println!("Maildir root: {}", config.maildir_path().display());
+    print_db_metadata(&db_path, &conn)?;
+
+    println!();
+    print_account_cursors(&conn)?;
+
+    println!();
+    print_maildir_drift(&conn, &config.maildir_path())?;
+
+    Ok(())
+}
+
+fn print_db_metadata(db_path: &std::path::Path, conn: &rusqlite::Connection) -> Result<()> {
+    let user_version: u32 = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .context("Failed to read PRAGMA user_version")?;
+    let size_bytes = std::fs::metadata(db_path).map(|m| m.len()).ok();
+    match size_bytes {
+        Some(n) => println!(
+            "State DB: {} ({}, schema v{})",
+            db_path.display(),
+            format_bytes(n),
+            user_version
+        ),
+        None => println!(
+            "State DB: {} (size unavailable, schema v{})",
+            db_path.display(),
+            user_version
+        ),
+    }
+    Ok(())
+}
+
+fn print_account_cursors(conn: &rusqlite::Connection) -> Result<()> {
+    use std::collections::BTreeMap;
+
+    let rows = jmapsync::state::queries::list_jmap_state_rows(conn)?;
+    if rows.is_empty() {
+        println!("No JMAP state yet -- run `jmapsync sync` to bootstrap.");
+        return Ok(());
+    }
+
+    let mut by_account: BTreeMap<String, Vec<jmapsync::state::queries::JmapStateRow>> =
+        BTreeMap::new();
+    for row in rows {
+        by_account
+            .entry(row.account_id.clone())
+            .or_default()
+            .push(row);
+    }
+
+    let now = chrono::Utc::now();
+    for (i, (acct, entries)) in by_account.iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
+        println!("JMAP cursors (account {}):", acct);
+
+        // Last cursor write = MAX(updated_at) across this account's entities.
+        // Reported as "last sync" with last-cursor-write semantics: a
+        // run that produces no state change is invisible here. Adequate
+        // for the staleness question ("should I run sync?") without
+        // adding a sync_runs table. Lexicographic max is correct because
+        // SQLite's `datetime('now')` always emits fixed-width
+        // `YYYY-MM-DD HH:MM:SS` UTC -- if a future migration switches
+        // formats, this comparison silently breaks.
+        let latest = entries
+            .iter()
+            .map(|e| e.updated_at.as_str())
+            .max()
+            .expect("BTreeMap entry built from at least one push");
+        let ago = ago_phrase(latest, &now).unwrap_or_else(|_| "?".into());
+        println!("  Last cursor write: {} ({})", latest, ago);
+
+        for entry in entries {
+            if entry.state.is_empty() {
+                println!(
+                    "  {} cursor: FORCED RESYNC -- next mutating run will full-resync",
+                    entry.entity_type
+                );
+            } else {
+                println!("  {} cursor: healthy", entry.entity_type);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn ago_phrase(sqlite_ts: &str, now: &chrono::DateTime<chrono::Utc>) -> Result<String> {
+    let dt = chrono::NaiveDateTime::parse_from_str(sqlite_ts, "%Y-%m-%d %H:%M:%S")
+        .with_context(|| format!("Failed to parse timestamp: {sqlite_ts}"))?;
+    let delta = now.signed_duration_since(dt.and_utc());
+    // Clamp negative deltas to 0: harmless display fallback if the
+    // wall clock has drifted backward since the last cursor write.
+    let secs = delta.num_seconds().max(0);
+    Ok(if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86400)
+    })
+}
+
+fn print_maildir_drift(conn: &rusqlite::Connection, maildir_root: &std::path::Path) -> Result<()> {
+    use std::collections::BTreeSet;
+
+    println!("Maildir vs DB drift (under {}):", maildir_root.display());
+
+    let known: BTreeSet<String> = jmapsync::state::queries::list_known_maildir_folders(conn)?
+        .into_iter()
+        .collect();
+
+    if !maildir_root.exists() {
+        println!("  Maildir root does not exist -- nothing to compare.");
+        return Ok(());
+    }
+
+    let on_disk: BTreeSet<String> = match std::fs::read_dir(maildir_root) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .filter_map(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                // Skip hidden entries: covers `.jmapsync.db*`, lock
+                // files, and anything else that isn't a synced folder.
+                if n.starts_with('.') { None } else { Some(n) }
+            })
+            .collect(),
+        Err(e) => {
+            println!("  Failed to read maildir root: {e}");
+            return Ok(());
+        }
+    };
+
+    if known.is_empty() {
+        println!("  No mailbox map yet -- DB has no record of synced folders.");
+        return Ok(());
+    }
+
+    let only_disk: Vec<&str> = on_disk.difference(&known).map(String::as_str).collect();
+    let only_db: Vec<&str> = known.difference(&on_disk).map(String::as_str).collect();
+
+    print_drift_line("  Folders on disk not in DB: ", &only_disk);
+    print_drift_line("  Folders in DB not on disk: ", &only_db);
+
+    Ok(())
+}
+
+fn print_drift_line(prefix: &str, items: &[&str]) {
+    if items.is_empty() {
+        println!("{prefix}(none)");
+    } else {
+        println!("{prefix}{}", items.join(", "));
+    }
+}
+
+fn format_bytes(n: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    if n >= GB {
+        format!("{:.1} GB", n as f64 / GB as f64)
+    } else if n >= MB {
+        format!("{:.1} MB", n as f64 / MB as f64)
+    } else if n >= KB {
+        format!("{:.1} KB", n as f64 / KB as f64)
+    } else {
+        format!("{n} B")
+    }
 }
 
 /// Acquire both process-lifetime locks in the canonical order: maildir

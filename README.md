@@ -127,6 +127,7 @@ Commands:
   watch      Daemon mode: watch for push events + local changes, sync continuously
   init       Initialize config file and local maildir structure
   mailboxes  List remote mailboxes and their local mapping
+  status     Show sync staleness, JMAP cursor health, and maildir-vs-DB drift. Read-only; safe to run alongside an in-progress sync or watch
   auth       Manage account credentials and the JMAP discovery cache
   help       Print this message or the help of the given subcommand(s)
 
@@ -196,6 +197,35 @@ Name                                        Total   Unread  Role
 * = synced
 
 ```
+
+### status : Sync staleness, cursor health, and maildir drift
+
+`status` is a read-only, offline subcommand for the questions that aren't answered by `mailboxes` (which goes to the server) or by counting files on disk. It opens the state DB without taking any locks, so it's safe to run alongside an in-progress `sync` or `watch`.
+
+```console
+$ jmapsync status
+Configured account: foo@example.com
+Maildir root: /Users/foo/Mail
+State DB: /Users/foo/Mail/.jmapsync.db (132.4 KB, schema v1)
+
+JMAP cursors (account a1b2c3d4e):
+  Last cursor write: 2026-05-06 14:22:01 (12m ago)
+  Email cursor: healthy
+  Mailbox cursor: healthy
+
+Maildir vs DB drift (under /Users/foo/Mail):
+  Folders on disk not in DB: SomeNewFolder
+  Folders in DB not on disk: (none)
+```
+
+What each section is for:
+
+  * **Last cursor write.** "When did the JMAP cursor for this account last advance?" Answers the staleness question without going online. The semantic is "last cursor write," not "last sync attempt completed" -- a sync run that produces no state change is invisible here, since we don't write a row when there's nothing to write. Reasonable proxy for "is this account stale, should I run sync?" but not a sync-attempt log.
+  * **Cursor health.** Each tracked entity (`Email`, `Mailbox`) is either `healthy` (a state cookie is set) or `FORCED RESYNC`. The latter means the cursor was tripped by a `cannotCalculateChanges` error from the server, and the next mutating run (`sync`/`pull`/`watch`) will do a full re-pull instead of a delta. Surfaced here so a slow next cycle isn't a surprise.
+  * **Maildir vs DB drift.** Folders on disk that aren't in `mailbox_map`, and folders in `mailbox_map` that aren't on disk. Diagnostic for "I `mkdir`'d a folder, why hasn't jmapsync noticed" and the symmetric "the DB thinks I have a folder I don't." Compares immediate non-hidden subdirectories of the maildir root.
+  * **DB metadata.** Path, size, and schema version of the state DB. Useful for bug reports and for noticing when the DB has gotten unexpectedly large.
+
+The JMAP account ID is shown raw rather than mapped to an email -- mapping back would need either a JMAP roundtrip (which would defeat the offline-capable design) or a new column to remember the email-to-ID binding. The configured email prints once at the top so you can match the section to the account it belongs to.
 
 ### auth : Manage account credentials and the JMAP discovery cache
 

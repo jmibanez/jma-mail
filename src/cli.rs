@@ -47,6 +47,9 @@ pub enum Command {
     Init,
     /// List remote mailboxes and their local mapping
     Mailboxes,
+    /// Show sync staleness, JMAP cursor health, and maildir-vs-DB drift.
+    /// Read-only; safe to run alongside an in-progress sync or watch.
+    Status,
     /// Manage account credentials and the JMAP discovery cache
     Auth {
         #[command(subcommand)]

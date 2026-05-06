@@ -39,6 +39,37 @@ pub fn set_jmap_state(
     Ok(())
 }
 
+/// One row of the `jmap_state` table, returned verbatim for inspection
+/// callers (e.g. `cmd_status`). Unlike `get_jmap_state`, this preserves
+/// the empty-string forced-resync sentinel so callers can distinguish
+/// "never synced" from "scheduled for full re-pull".
+pub struct JmapStateRow {
+    pub account_id: String,
+    pub entity_type: String,
+    pub state: String,
+    pub updated_at: String,
+}
+
+/// Read every row of `jmap_state`, sorted by `(account_id, entity_type)`
+/// for stable display. Returns an empty Vec when no sync has run yet.
+pub fn list_jmap_state_rows(conn: &Connection) -> Result<Vec<JmapStateRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT account_id, entity_type, state, updated_at FROM jmap_state \
+         ORDER BY account_id, entity_type",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(JmapStateRow {
+                account_id: row.get(0)?,
+                entity_type: row.get(1)?,
+                state: row.get(2)?,
+                updated_at: row.get(3)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 // --- Message Map ---
 
 #[derive(Clone)]
@@ -196,6 +227,19 @@ pub fn upsert_mailbox(conn: &Connection, mb: &MailboxRecord) -> Result<()> {
         ],
     )?;
     Ok(())
+}
+
+/// List the distinct `maildir_folder` names recorded in `mailbox_map`,
+/// sorted. Used by `cmd_status` to compute the maildir-vs-DB drift set
+/// without paying for the full row hydration that `get_all_mailboxes`
+/// does.
+pub fn list_known_maildir_folders(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt =
+        conn.prepare("SELECT DISTINCT maildir_folder FROM mailbox_map ORDER BY maildir_folder")?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 /// Get all mailbox mappings.
