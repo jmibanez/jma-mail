@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+use crate::maildir_ops::layout::FolderLayout;
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub account: AccountConfig,
@@ -45,6 +47,23 @@ pub struct SyncConfig {
     /// `INBOX` is always treated as an alias for the inbox role regardless.
     #[serde(default)]
     pub case_insensitive_match: bool,
+    /// On-disk layout for hierarchical mailboxes. `flat` (default)
+    /// follows mbsync's `Flatten=<sep>` convention -- nested folders
+    /// become a single dotted directory at the maildir root.
+    /// `maildir++` matches Courier/Dovecot's flat-with-leading-dot
+    /// convention. `fs` matches Dovecot's `LAYOUT=fs` recursive
+    /// directory tree. Single-level mailboxes look identical under
+    /// `flat` and `fs`; the choice only matters once a server has
+    /// nested folders.
+    #[serde(default)]
+    pub folder_layout: FolderLayout,
+    /// Hierarchy separator for `flat` and `maildir++` layouts; ignored
+    /// for `fs` (which always uses `/`). Default `.` matches mbsync
+    /// and Dovecot/Courier's typical deployments. Pick a different
+    /// character if your folder names commonly contain `.`. Must be a
+    /// single character; `/`, `\`, and NUL are rejected at runtime.
+    #[serde(default = "default_hierarchy_separator")]
+    pub hierarchy_separator: char,
     /// Max concurrent blob downloads during pull. Clamped at runtime to the
     /// server's advertised `maxConcurrentRequests`.
     #[serde(default = "default_download_concurrency")]
@@ -135,6 +154,10 @@ fn default_retry_initial_backoff_ms() -> u64 {
 
 fn default_retry_max_backoff_ms() -> u64 {
     8_000
+}
+
+fn default_hierarchy_separator() -> char {
+    '.'
 }
 
 impl Default for WatchConfig {
@@ -303,6 +326,19 @@ maildir_path = "~/Mail/Fastmail"
 mailboxes = ["INBOX", "Archive", "Sent", "Drafts", "Trash"]
 # Match `mailboxes` entries case-insensitively against server names.
 case_insensitive_match = false
+# On-disk layout for hierarchical mailboxes:
+#   "flat"      -- mbsync Flatten=<sep>: <root>/parent.child/
+#                  (default; matches what most existing setups expect)
+#   "maildir++" -- Courier/Dovecot leading-dot: <root>/.parent.child/
+#   "fs"        -- Dovecot LAYOUT=fs: <root>/parent/child/
+# Single-level mailboxes look identical under "flat" and "fs"; the
+# choice only matters once a server has nested folders.
+folder_layout = "flat"
+# Hierarchy separator for "flat" and "maildir++" layouts. Ignored
+# under "fs" (which always uses "/"). Single character; "/", "\", and
+# NUL are rejected at runtime. Default "." matches mbsync and
+# Dovecot/Courier conventions.
+hierarchy_separator = "."
 # Conflict resolution: server-wins or local-wins
 conflict_strategy = "server-wins"
 # Max concurrent blob downloads during pull. Clamped to the server's

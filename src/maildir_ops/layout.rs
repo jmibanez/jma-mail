@@ -24,6 +24,7 @@
 //! into a single directory entry.
 
 use anyhow::{Context, Result};
+use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 
 use crate::ids::JmapMailboxId;
@@ -66,9 +67,15 @@ use crate::jmap::types::MailboxObject;
 ///   segments equal to those names are rejected here. Leading-dot
 ///   segments are also rejected to avoid colliding with our own
 ///   `.jmapsync.lock` / `.jmapsync.db` markers at the root.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum FolderLayout {
+    #[default]
     Flat,
+    /// `maildir++` is the spelling users see in Dovecot/Courier docs;
+    /// keep the config key matching that rather than serde's
+    /// kebab-case fallback (`maildir-pp`).
+    #[serde(rename = "maildir++")]
     MaildirPP,
     Fs,
 }
