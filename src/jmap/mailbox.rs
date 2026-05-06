@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use jmap_client::client::Client;
 use jmap_client::mailbox;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path};
 use tracing::{debug, info};
 
@@ -64,35 +65,63 @@ fn validate_mailbox_name(name: &str, cap: usize) -> Result<()> {
     }
 }
 
-/// Decide whether `mb` matches any entry in the user's configured mailbox
-/// list. An empty list means "sync everything".
+/// Decide whether `mb` matches any entry in the user's configured
+/// mailbox list. An empty list means "sync everything".
 ///
 /// `INBOX` is treated as a magic alias for the JMAP inbox role -- this
 /// is the IMAP convention and matches what most users expect when they
 /// see "INBOX" in a config file. Other entries match by name, exactly
 /// or case-insensitively depending on `case_insensitive`.
+///
+/// The match walks the `parent_id` chain: a config entry that names
+/// the mailbox itself or any of its ancestors includes the mailbox.
+/// So `mailboxes = ["[Airmail]"]` picks up `[Airmail]` itself plus
+/// every descendant under it, matching the "select this folder and
+/// its subfolders" intuition users get from mbsync's pattern
+/// directives. To exclude a specific descendant the user would need
+/// a finer filter (not yet supported); today it's all-or-none per
+/// subtree.
+///
+/// Cycle in the parent chain (forged by a malicious server) breaks
+/// the walk and returns `false`. The cycle is also caught with a
+/// clearer error inside `maildir_ops::layout::resolve_folder_path`,
+/// which runs immediately after this filter.
 pub fn is_mailbox_synced(
     config_entries: &[String],
     mb: &MailboxObject,
+    by_id: &HashMap<JmapMailboxId, &MailboxObject>,
     case_insensitive: bool,
 ) -> bool {
     if config_entries.is_empty() {
         return true;
     }
-    for entry in config_entries {
-        if entry == "INBOX" && mb.role.as_deref() == Some("inbox") {
-            return true;
+    let mut seen: HashSet<JmapMailboxId> = HashSet::new();
+    let mut cur: &MailboxObject = mb;
+    loop {
+        if !seen.insert(cur.id.clone()) {
+            return false;
         }
-        let matches_name = if case_insensitive {
-            entry.eq_ignore_ascii_case(&mb.name)
-        } else {
-            entry == &mb.name
-        };
-        if matches_name {
-            return true;
+        for entry in config_entries {
+            if entry == "INBOX" && cur.role.as_deref() == Some("inbox") {
+                return true;
+            }
+            let matches_name = if case_insensitive {
+                entry.eq_ignore_ascii_case(&cur.name)
+            } else {
+                entry == &cur.name
+            };
+            if matches_name {
+                return true;
+            }
+        }
+        match &cur.parent_id {
+            None => return false,
+            Some(pid) => match by_id.get(pid) {
+                Some(parent) => cur = *parent,
+                None => return false,
+            },
         }
     }
-    false
 }
 
 /// Fetch all mailboxes from the server using the convenience helper.
@@ -197,24 +226,55 @@ mod tests {
         }
     }
 
+    fn mb_child(id: &str, name: &str, parent: &str, role: Option<&str>) -> MailboxObject {
+        MailboxObject {
+            id: JmapMailboxId::from(id),
+            name: name.to_string(),
+            parent_id: Some(JmapMailboxId::from(parent)),
+            role: role.map(str::to_string),
+            sort_order: 0,
+            total_emails: 0,
+            unread_emails: 0,
+        }
+    }
+
+    /// For single-mailbox tests where the parent chain doesn't matter
+    /// (no `parent_id` set, so the walk terminates immediately).
+    fn empty_index() -> HashMap<JmapMailboxId, &'static MailboxObject> {
+        HashMap::new()
+    }
+
+    fn build_index(mbs: &[MailboxObject]) -> HashMap<JmapMailboxId, &MailboxObject> {
+        mbs.iter().map(|m| (m.id.clone(), m)).collect()
+    }
+
     #[test]
     fn empty_config_syncs_everything() {
-        assert!(is_mailbox_synced(&[], &mb("Inbox", Some("inbox")), false));
-        assert!(is_mailbox_synced(&[], &mb("Random", None), false));
+        let idx = empty_index();
+        assert!(is_mailbox_synced(
+            &[],
+            &mb("Inbox", Some("inbox")),
+            &idx,
+            false
+        ));
+        assert!(is_mailbox_synced(&[], &mb("Random", None), &idx, false));
     }
 
     #[test]
     fn inbox_alias_matches_inbox_role() {
         let entries = vec!["INBOX".to_string()];
+        let idx = empty_index();
         assert!(is_mailbox_synced(
             &entries,
             &mb("Inbox", Some("inbox")),
+            &idx,
             false
         ));
         // Even if the server localized the name:
         assert!(is_mailbox_synced(
             &entries,
             &mb("Indbakke", Some("inbox")),
+            &idx,
             false
         ));
     }
@@ -222,25 +282,35 @@ mod tests {
     #[test]
     fn inbox_alias_does_not_match_non_inbox_role() {
         let entries = vec!["INBOX".to_string()];
+        let idx = empty_index();
         assert!(!is_mailbox_synced(
             &entries,
             &mb("Inbox", Some("archive")),
+            &idx,
             false
         ));
-        assert!(!is_mailbox_synced(&entries, &mb("Inbox", None), false));
+        assert!(!is_mailbox_synced(
+            &entries,
+            &mb("Inbox", None),
+            &idx,
+            false
+        ));
     }
 
     #[test]
     fn exact_name_match_is_case_sensitive_by_default() {
         let entries = vec!["Archive".to_string()];
+        let idx = empty_index();
         assert!(is_mailbox_synced(
             &entries,
             &mb("Archive", Some("archive")),
+            &idx,
             false
         ));
         assert!(!is_mailbox_synced(
             &entries,
             &mb("archive", Some("archive")),
+            &idx,
             false
         ));
     }
@@ -248,14 +318,17 @@ mod tests {
     #[test]
     fn case_insensitive_flag_loosens_name_match() {
         let entries = vec!["archive".to_string()];
+        let idx = empty_index();
         assert!(is_mailbox_synced(
             &entries,
             &mb("Archive", Some("archive")),
+            &idx,
             true
         ));
         assert!(!is_mailbox_synced(
             &entries,
             &mb("Archive", Some("archive")),
+            &idx,
             false
         ));
     }
@@ -263,16 +336,97 @@ mod tests {
     #[test]
     fn unmatched_entry_does_not_sync() {
         let entries = vec!["Sent".to_string(), "Drafts".to_string()];
+        let idx = empty_index();
         assert!(!is_mailbox_synced(
             &entries,
             &mb("Spam", Some("junk")),
+            &idx,
             false
         ));
         assert!(!is_mailbox_synced(
             &entries,
             &mb("Spam", Some("junk")),
+            &idx,
             true
         ));
+    }
+
+    /// `mailboxes = ["[Airmail]"]` matches `[Airmail]/Sent` because
+    /// the walk finds the parent in the index. This is the core
+    /// "select a folder and its subfolders" semantic.
+    #[test]
+    fn parent_match_includes_descendants() {
+        let entries = vec!["[Airmail]".to_string()];
+        let mbs = vec![
+            MailboxObject {
+                id: JmapMailboxId::from("p"),
+                name: "[Airmail]".to_string(),
+                parent_id: None,
+                role: None,
+                sort_order: 0,
+                total_emails: 0,
+                unread_emails: 0,
+            },
+            mb_child("c", "Sent", "p", None),
+        ];
+        let idx = build_index(&mbs);
+        assert!(is_mailbox_synced(&entries, &mbs[1], &idx, false));
+    }
+
+    /// INBOX alias matches at any depth, so a child of the inbox is
+    /// included by `mailboxes = ["INBOX"]` even though only its parent
+    /// has the inbox role.
+    #[test]
+    fn inbox_alias_matches_via_ancestor() {
+        let entries = vec!["INBOX".to_string()];
+        let mbs = vec![
+            MailboxObject {
+                id: JmapMailboxId::from("i"),
+                name: "Indbakke".to_string(),
+                parent_id: None,
+                role: Some("inbox".to_string()),
+                sort_order: 0,
+                total_emails: 0,
+                unread_emails: 0,
+            },
+            mb_child("c", "Receipts", "i", None),
+        ];
+        let idx = build_index(&mbs);
+        assert!(is_mailbox_synced(&entries, &mbs[1], &idx, false));
+    }
+
+    /// A descendant whose ancestors don't match any config entry
+    /// stays excluded -- the parent walk doesn't accidentally sweep
+    /// in unrelated folders.
+    #[test]
+    fn descendant_with_no_matching_ancestor_does_not_sync() {
+        let entries = vec!["Archive".to_string()];
+        let mbs = vec![
+            MailboxObject {
+                id: JmapMailboxId::from("p"),
+                name: "[Airmail]".to_string(),
+                parent_id: None,
+                role: None,
+                sort_order: 0,
+                total_emails: 0,
+                unread_emails: 0,
+            },
+            mb_child("c", "Sent", "p", None),
+        ];
+        let idx = build_index(&mbs);
+        assert!(!is_mailbox_synced(&entries, &mbs[1], &idx, false));
+    }
+
+    /// A cycle in the parent chain (forged by a malicious server)
+    /// terminates the walk and returns `false`. Defense-in-depth
+    /// against an infinite loop here -- `resolve_folder_path` will
+    /// reject the same input with a clearer error immediately after.
+    #[test]
+    fn parent_chain_cycle_does_not_loop() {
+        let entries = vec!["Anything".to_string()];
+        let mbs = vec![mb_child("a", "A", "b", None), mb_child("b", "B", "a", None)];
+        let idx = build_index(&mbs);
+        assert!(!is_mailbox_synced(&entries, &mbs[0], &idx, false));
     }
 
     #[test]

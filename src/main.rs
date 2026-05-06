@@ -202,12 +202,18 @@ async fn cmd_mailboxes(cli: &Cli) -> Result<()> {
 
     let mailboxes = jmapsync::jmap::mailbox::get_all(&client).await?;
 
+    // Index by id so `is_mailbox_synced` can walk the parent chain --
+    // a config entry naming a parent includes its descendants.
+    let by_id: std::collections::HashMap<_, _> =
+        mailboxes.iter().map(|mb| (mb.id.clone(), mb)).collect();
+
     println!("{:<40} {:>8} {:>8}  Role", "Name", "Total", "Unread");
     println!("{}", "-".repeat(70));
     for mb in &mailboxes {
         let synced = if jmapsync::jmap::mailbox::is_mailbox_synced(
             &config.sync.mailboxes,
             mb,
+            &by_id,
             config.sync.case_insensitive_match,
         ) {
             "*"

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use jmap_client::client::Client;
 use rusqlite::Connection;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -9,9 +9,10 @@ use crate::config::Config;
 use crate::ids::{JmapAccountId, JmapEmailId, JmapMailboxId};
 use crate::jmap::{
     email as jmap_email, limits, mailbox as jmap_mailbox, session,
-    types::{EmailObject, SessionInfo},
+    types::{EmailObject, MailboxObject, SessionInfo},
 };
 use crate::maildir_ops::dedupe::{LocalEntry, LocalIndex};
+use crate::maildir_ops::layout::resolve_folder_path;
 use crate::maildir_ops::{dedupe, scan, store};
 use crate::state::queries;
 use crate::sync::execute::Executor;
@@ -222,27 +223,41 @@ impl<'a> SyncEngine<'a> {
     pub async fn resolve_mailboxes(&self) -> Result<Vec<(JmapMailboxId, String)>> {
         let remote_mailboxes = jmap_mailbox::get_all(&self.client).await?;
 
+        // Index by id so the filter and the folder-path resolver can
+        // walk the parent chain.
+        let by_id: HashMap<JmapMailboxId, &MailboxObject> = remote_mailboxes
+            .iter()
+            .map(|mb| (mb.id.clone(), mb))
+            .collect();
+
+        let name_cap = limits::max_size_mailbox_name(&self.client);
         let mut synced = Vec::new();
 
         for mb in &remote_mailboxes {
-            // Use the literal "INBOX" for the inbox role to match the mbsync
-            // convention (and the magic alias accepted in [sync].mailboxes), so
-            // pre-provisioned and sync-created folders agree regardless of the
-            // server's display name (e.g. "Inbox", "Indbakke").
-            let folder_name: String = if mb.role.as_deref() == Some("inbox") {
-                "INBOX".to_string()
-            } else {
-                mb.name.clone()
-            };
-
-            // If mailboxes filter is set, only sync those
+            // Parent-aware filter: a config entry naming any ancestor
+            // (or the mailbox itself) includes this mailbox. So
+            // `mailboxes = ["[Airmail]"]` syncs `[Airmail]` plus every
+            // descendant. Empty filter means "sync everything".
             if !jmap_mailbox::is_mailbox_synced(
                 &self.config.sync.mailboxes,
                 mb,
+                &by_id,
                 self.config.sync.case_insensitive_match,
             ) {
                 continue;
             }
+
+            // Translate the JMAP hierarchy to a single on-disk folder
+            // name under the user-chosen layout. Defaults preserve the
+            // pre-hierarchy behavior: Flat with `.` produces the leaf
+            // name unchanged for depth-1 mailboxes.
+            let folder_name = resolve_folder_path(
+                mb,
+                &by_id,
+                self.config.sync.folder_layout,
+                self.config.sync.hierarchy_separator,
+                name_cap,
+            )?;
 
             // Store in DB
             queries::upsert_mailbox(
