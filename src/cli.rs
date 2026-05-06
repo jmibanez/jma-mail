@@ -4,7 +4,7 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(
     name = "jmapsync",
-    version,
+    version = env!("JMAPSYNC_VERSION"),
     about = "Bidirectional JMAP-to-Maildir email sync"
 )]
 pub struct Cli {
