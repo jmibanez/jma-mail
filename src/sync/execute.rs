@@ -52,15 +52,6 @@ impl<'a> Executor<'a> {
     /// jmap_email_id see the binding. Server-side mutations come last so
     /// pull-side state is settled before we report it back.
     pub async fn execute(&self, plan: SyncPlan) -> Result<SyncOutcome> {
-        let mut concurrency =
-            limits::concurrent_requests(self.client, self.config.sync.download_concurrency);
-        if concurrency != self.config.sync.download_concurrency {
-            info!(
-                "Clamped download concurrency from {} to {} per server maxConcurrentRequests",
-                self.config.sync.download_concurrency, concurrency
-            );
-        }
-
         let SyncPlan {
             actions,
             new_email_state,
@@ -104,7 +95,7 @@ impl<'a> Executor<'a> {
         }
 
         adopt_messages(self.conn, unconditional_adopts)?;
-        let downloaded = self.run_downloads(downloads, &mut concurrency).await?;
+        let downloaded = self.run_downloads(downloads).await?;
         self.update_local_flags(local_flags)?;
         self.move_local_messages(local_moves)?;
         self.delete_local_messages(local_deletes)?;
@@ -531,20 +522,30 @@ impl<'a> Executor<'a> {
 
     /// Run all DownloadMessage actions concurrently with the rate-limit
     /// halving behavior the old pull path had.
-    async fn run_downloads(
-        &self,
-        actions: Vec<SyncAction>,
-        concurrency: &mut usize,
-    ) -> Result<usize> {
+    async fn run_downloads(&self, actions: Vec<SyncAction>) -> Result<usize> {
         if actions.is_empty() {
             return Ok(0);
         }
+
+        // Server-cap-aware download concurrency. The clamp is logged
+        // here rather than at the top of `execute` so quiet "advance
+        // the cursor only" cycles (empty plan, no downloads) don't
+        // emit an info line that has no workload to describe.
+        let mut concurrency =
+            limits::concurrent_requests(self.client, self.config.sync.download_concurrency);
+        if concurrency != self.config.sync.download_concurrency {
+            info!(
+                "Clamped download concurrency from {} to {} per server maxConcurrentRequests",
+                self.config.sync.download_concurrency, concurrency
+            );
+        }
+
         let mut downloaded = 0usize;
         let mut pending = actions;
         let client = self.client;
 
         while !pending.is_empty() {
-            let n = (*concurrency).max(1);
+            let n = concurrency.max(1);
             let futures = pending.iter().enumerate().map(|(i, action)| {
                 let blob_id = match action {
                     SyncAction::DownloadMessage { jmap_blob_id, .. } => jmap_blob_id.clone(),
@@ -642,7 +643,7 @@ impl<'a> Executor<'a> {
                         "Hit JMAP rate limit; lowering download concurrency from {} to {}",
                         n, new
                     );
-                    *concurrency = new;
+                    concurrency = new;
                 } else {
                     warn!(
                         "Hit JMAP rate limit at minimum concurrency ({}); backing off and retrying",

@@ -182,12 +182,25 @@ impl<'a> SyncEngine<'a> {
             return Ok(SyncOutcome::default());
         }
 
-        if plan.is_empty() {
-            info!("Already in sync");
-            return Ok(SyncOutcome::default());
+        // An empty plan still has to flow through the executor so the
+        // cursor write at the tail of `execute` runs. Without that,
+        // the next `Email/changes` call replays the same "no-op for
+        // us" updates -- a self-induced echo from a recent push, a
+        // server-side change to a field we don't model, or anything
+        // else that produced no plan action -- and we'd loop forever
+        // re-fetching them. The per-phase methods inside `execute`
+        // are all empty-vec no-ops, so this costs nothing user-
+        // visible beyond the cursor advance.
+        //
+        // Snapshot before `into_filtered`: empty here means reconcile
+        // produced nothing, not "everything got filtered out by
+        // pull-only/push-only" -- those still need the regular log.
+        let already_in_sync = plan.is_empty();
+        if already_in_sync {
+            debug!("Plan is empty; running executor to advance the cursor only");
+        } else {
+            debug!("Plan to execute {}", plan);
         }
-
-        debug!("Plan to execute {}", plan);
 
         // Phase 4: filter by direction; warn on every dropped non-adoption
         // action so the user sees that pull-only / push-only suppressed
@@ -211,7 +224,9 @@ impl<'a> SyncEngine<'a> {
             );
         }
 
-        if used_initial_path {
+        if already_in_sync {
+            info!("Already in sync");
+        } else if used_initial_path {
             info!("Initial sync complete ({} downloaded)", outcome.downloaded);
         } else {
             info!("Sync complete ({} downloaded)", outcome.downloaded);
