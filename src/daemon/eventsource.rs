@@ -7,10 +7,8 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use super::runner::SyncTrigger;
+use super::{RECONNECT_INITIAL_BACKOFF, RECONNECT_MAX_BACKOFF};
 use crate::ids::JmapAccountId;
-
-const RECONNECT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(60);
 
 /// Outcome of a single SSE connection attempt.
 enum ConnectOutcome {
