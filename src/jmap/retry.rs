@@ -69,11 +69,25 @@ pub fn is_transient_error(err: &anyhow::Error) -> bool {
 
 fn is_transient_jmap_error(e: &JmapError) -> bool {
     match e {
-        // Connection-level failures from reqwest. Stick to the two
-        // unambiguously-transient classifiers; `is_request()` is a
-        // catch-all that also covers redirect-policy rejections and
-        // body-stream errors which are not safe to blanket-retry.
-        JmapError::Transport(req) => req.is_timeout() || req.is_connect(),
+        // Connection-level failures from reqwest. We retry on:
+        //
+        // - `is_timeout()` -- the request never completed in time; a
+        //   retry is safe because the server didn't ack.
+        // - `is_connect()` -- we never even reached the server.
+        // - Specific `std::io::Error` kinds in the source chain that
+        //   signal the underlying TCP connection died mid-request:
+        //   ConnectionReset, ConnectionAborted, BrokenPipe,
+        //   UnexpectedEof. These are the resume-from-sleep / NIC-reset
+        //   symptoms `is_connect()` misses because the original
+        //   connect happened earlier through reqwest's pool; a retry
+        //   forces a fresh connection.
+        //
+        // Deliberately NOT using `is_request()` as a catch-all: it
+        // also covers redirect-policy rejections and body-stream
+        // protocol errors that aren't safe to blanket-retry.
+        JmapError::Transport(req) => {
+            req.is_timeout() || req.is_connect() || transport_source_is_dead_connection(req)
+        }
         // RFC 7807 problem+json body — server gave us a structured status.
         JmapError::Problem(p) => p.status().is_some_and(is_transient_status_u32),
         // Plain HTTP failure where the body wasn't problem+json.
@@ -102,6 +116,35 @@ fn is_transient_jmap_error(e: &JmapError) -> bool {
         // won't help.
         _ => false,
     }
+}
+
+/// Walk the source chain of an error looking for a `std::io::Error`
+/// whose kind says the underlying connection went away. These are
+/// the kinds that show up after suspend/resume or a NIC reset, where
+/// reqwest's pool handed out a connection the OS hadn't yet noticed
+/// was dead and the first I/O on it failed. The next attempt will
+/// open a fresh connection and succeed.
+///
+/// Public-shape (`&dyn Error`) so the unit tests below can drive it
+/// with synthesized chains; the call site in
+/// `is_transient_jmap_error` passes the `reqwest::Error` directly,
+/// relying on its `Error::source` impl.
+fn transport_source_is_dead_connection(err: &(dyn std::error::Error + 'static)) -> bool {
+    use std::io::ErrorKind;
+    let mut source = err.source();
+    while let Some(s) = source {
+        if let Some(io_err) = s.downcast_ref::<std::io::Error>() {
+            return matches!(
+                io_err.kind(),
+                ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::UnexpectedEof
+            );
+        }
+        source = s.source();
+    }
+    false
 }
 
 fn is_transient_status_u32(code: u32) -> bool {
@@ -201,6 +244,81 @@ mod tests {
 
     fn method_err(t: MethodErrorType) -> JmapError {
         JmapError::Method(MethodError { p_type: t })
+    }
+
+    /// One-link wrapper used to synthesize an error source chain in
+    /// the dead-connection tests. `reqwest::Error` is opaque so we
+    /// drive `transport_source_is_dead_connection` directly with
+    /// these stubs to pin the io-kind classifier without standing up
+    /// a real HTTP failure.
+    #[derive(Debug)]
+    struct WrappedErr(std::io::Error);
+
+    impl std::fmt::Display for WrappedErr {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "wrapped: {}", self.0)
+        }
+    }
+
+    impl std::error::Error for WrappedErr {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    // -- Dead-connection io-kind classifier --
+
+    #[test]
+    fn dead_connection_classifies_connection_reset_as_transient() {
+        let inner = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "peer reset");
+        let wrapped = WrappedErr(inner);
+        assert!(transport_source_is_dead_connection(&wrapped));
+    }
+
+    #[test]
+    fn dead_connection_classifies_broken_pipe_as_transient() {
+        let inner = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "EPIPE");
+        let wrapped = WrappedErr(inner);
+        assert!(transport_source_is_dead_connection(&wrapped));
+    }
+
+    #[test]
+    fn dead_connection_classifies_unexpected_eof_as_transient() {
+        let inner = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "short read");
+        let wrapped = WrappedErr(inner);
+        assert!(transport_source_is_dead_connection(&wrapped));
+    }
+
+    #[test]
+    fn dead_connection_classifies_connection_aborted_as_transient() {
+        let inner = std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "ECONNABORTED");
+        let wrapped = WrappedErr(inner);
+        assert!(transport_source_is_dead_connection(&wrapped));
+    }
+
+    /// An io::Error of an unrelated kind (e.g. a permission denied
+    /// while reading a config file in some hypothetical chain) must
+    /// not be misclassified as a dead connection.
+    #[test]
+    fn dead_connection_ignores_unrelated_io_kind() {
+        let inner = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "EACCES");
+        let wrapped = WrappedErr(inner);
+        assert!(!transport_source_is_dead_connection(&wrapped));
+    }
+
+    /// An error whose source chain holds nothing implementing
+    /// `Error` (terminal node) is not a dead connection by default.
+    #[test]
+    fn dead_connection_returns_false_when_chain_has_no_io_error() {
+        #[derive(Debug)]
+        struct Plain;
+        impl std::fmt::Display for Plain {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "plain")
+            }
+        }
+        impl std::error::Error for Plain {}
+        assert!(!transport_source_is_dead_connection(&Plain));
     }
 
     // -- Substring fallback path (no typed source in the chain) --
