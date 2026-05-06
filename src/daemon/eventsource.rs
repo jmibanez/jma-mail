@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use super::runner::SyncTrigger;
-use super::{RECONNECT_INITIAL_BACKOFF, RECONNECT_MAX_BACKOFF};
+use super::{PING_WATCHDOG_SLACK, RECONNECT_INITIAL_BACKOFF, RECONNECT_MAX_BACKOFF};
 use crate::ids::JmapAccountId;
 
 /// Outcome of a single SSE connection attempt.
@@ -71,9 +71,27 @@ pub async fn listen(
 }
 
 /// One SSE connection attempt: open the stream, dispatch events, and
-/// return when the stream ends or the trigger channel closes. Resets
-/// `*backoff` to the initial value once the connection opens so a flaky
-/// link that recovers doesn't stay stuck at the cap.
+/// return when the stream ends or the trigger channel closes.
+///
+/// Two recovery mechanisms layered into this loop:
+///
+/// 1. **Backoff reset on first message.** `*backoff` resets to the
+///    initial value once we receive any `Event::Message` (state or
+///    server-side ping), not on `Event::Open`. A server that accepts
+///    the connection but never pings would otherwise let us reset to
+///    the floor on every reconnect and we'd hammer it at the minimum
+///    interval; tying the reset to actual data flow makes silent-
+///    server scenarios escalate.
+///
+/// 2. **Ping watchdog.** `es.next()` is wrapped in a
+///    `ping_interval + PING_WATCHDOG_SLACK` timeout. The JMAP server
+///    is contractually pinging on that interval (via the `?ping=N`
+///    query param below); if no event of any kind shows up within the
+///    window we treat the stream as silently dead -- common after a
+///    laptop wakes from sleep or a NAT entry expires -- and bail to
+///    the outer reconnect loop. Independent of the daemon-level
+///    reconnect path in `runner::run`, which keys off `engine.run`
+///    transient errors instead.
 async fn connect_and_listen(
     event_source_url: &str,
     auth_token: &str,
@@ -97,13 +115,28 @@ async fn connect_and_listen(
 
     let mut es = EventSource::new(request)?;
 
-    while let Some(event) = es.next().await {
-        match event {
+    let watchdog = Duration::from_secs(ping_interval) + PING_WATCHDOG_SLACK;
+
+    loop {
+        let next = match tokio::time::timeout(watchdog, es.next()).await {
+            Ok(Some(event)) => event,
+            Ok(None) => return Ok(ConnectOutcome::StreamEnded),
+            Err(_) => {
+                warn!(
+                    "No SSE event in {:?} (ping={}s + {:?} slack); reconnecting",
+                    watchdog, ping_interval, PING_WATCHDOG_SLACK
+                );
+                return Ok(ConnectOutcome::StreamEnded);
+            }
+        };
+
+        match next {
             Ok(Event::Open) => {
                 info!("SSE connection opened");
-                *backoff = RECONNECT_INITIAL_BACKOFF;
             }
             Ok(Event::Message(msg)) => {
+                *backoff = RECONNECT_INITIAL_BACKOFF;
+
                 debug!("SSE event: type={}, data={}", msg.event, msg.data);
 
                 if msg.event != "state" {
@@ -144,8 +177,6 @@ async fn connect_and_listen(
             }
         }
     }
-
-    Ok(ConnectOutcome::StreamEnded)
 }
 
 /// Decide whether a StateChange event represents a real advance for an
