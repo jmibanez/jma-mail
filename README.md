@@ -127,6 +127,7 @@ Commands:
   watch      Daemon mode: watch for push events + local changes, sync continuously
   init       Initialize config file and local maildir structure
   mailboxes  List remote mailboxes and their local mapping
+  auth       Manage account credentials and the JMAP discovery cache
   help       Print this message or the help of the given subcommand(s)
 
 Options:
@@ -196,6 +197,15 @@ Name                                        Total   Unread  Role
 
 ```
 
+### auth : Manage account credentials and the JMAP discovery cache
+
+`auth` is a small set of administrative subcommands for the OS keychain entries and the JMAP discovery cache. All three actions take `--account <email>`, which scopes them to a specific account by its `[account].email`. The `auth` subcommands don't read the config file, so a typo in `--account` isn't caught here -- the next sync run will report "no token for ..." instead.
+
+  * `auth set-token --account <email>` -- Read a bearer token from stdin and store it in the OS keychain (macOS Keychain, Linux Secret Service, Windows Credential Manager) under that email. On a TTY you get a hidden prompt; piped input (`pbpaste | jmapsync auth set-token --account foo@example.com`) is read raw. See [Authentication and Account `[account]`](#authentication-and-account-account) above for how the stored entry feeds into sync.
+  * `auth clear-token --account <email>` -- Remove the bearer token for that email from the OS keychain. Idempotent; clearing a non-existent entry is a no-op.
+  * `auth rediscover --account <email>` -- Clear the cached JMAP session URL for this account's email domain and re-run autodiscovery (DNS SRV `_jmap._tcp.<domain>`, then `/.well-known/jmap`), printing the result. Use this when your provider changes their session endpoint. If `[account].session_url` is set explicitly in the config, sync bypasses the discovery cache anyway -- `rediscover` still updates the cache, but the new value only takes effect once you remove the override; the command warns you about this.
+
+`auth` does not take the maildir or state-DB locks, so it can run alongside a `watch` daemon on the same account. Token rotations land in the keychain immediately; the running daemon will pick the new token up on its next reconnect (see [watch](#watch--push-email-and-continuous-sync)).
 
 ## Copyright, License
 
