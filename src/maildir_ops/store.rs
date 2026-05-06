@@ -48,3 +48,31 @@ pub fn move_message(from: &Maildir, to: &Maildir, id: &str) -> Result<()> {
     debug!("Moved message {} to {:?}", id, to.path());
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins the upstream invariant that `Maildir::create_dirs()`
+    /// cascades through missing intermediate parents (it calls
+    /// `fs::create_dir_all` internally for `cur`/`new`/`tmp`). The
+    /// `Fs` folder layout relies on this: a nested mailbox like
+    /// `[Airmail]/Sent` materialises as
+    /// `<root>/[Airmail]/Sent/{cur,new,tmp}` without `ensure_maildir`
+    /// doing any parent scaffolding of its own. If this test goes red
+    /// after a `maildir` crate bump or an `ensure_maildir` refactor,
+    /// the `Fs` layout is silently broken.
+    #[test]
+    fn ensure_maildir_creates_nested_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("A").join("B").join("C");
+        ensure_maildir(&nested).expect("nested ensure_maildir should succeed");
+        for sub in ["cur", "new", "tmp"] {
+            assert!(
+                nested.join(sub).is_dir(),
+                "{} should exist after ensure_maildir",
+                nested.join(sub).display()
+            );
+        }
+    }
+}
