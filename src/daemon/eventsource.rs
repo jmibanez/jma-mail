@@ -24,6 +24,15 @@ enum ConnectOutcome {
 /// causes a no-op sync loop.
 const TRACKED_TYPES: &[&str] = &["Email", "Mailbox"];
 
+/// Spec-mandated upper bound on a server's allowed maximum ping
+/// interval (RFC 8620 §7.3: "servers MUST NOT have ... a maximum
+/// allowed value less than 300"). Used as the watchdog's initial
+/// budget before the server tells us its actual interval, so a server
+/// that clamps our requested value upward (Fastmail can hand us back
+/// 300s when we ask for 60s) doesn't trip the watchdog before its
+/// first ping arrives.
+const SPEC_MAX_PING_INTERVAL_SECS: u64 = 300;
+
 /// Listen to JMAP EventSource (SSE) for state changes and send triggers.
 ///
 /// `initial_states` seeds the dedup cache from the state DB so the first
@@ -84,14 +93,20 @@ pub async fn listen(
 ///    server scenarios escalate.
 ///
 /// 2. **Ping watchdog.** `es.next()` is wrapped in a
-///    `ping_interval + PING_WATCHDOG_SLACK` timeout. The JMAP server
-///    is contractually pinging on that interval (via the `?ping=N`
-///    query param below); if no event of any kind shows up within the
-///    window we treat the stream as silently dead -- common after a
-///    laptop wakes from sleep or a NAT entry expires -- and bail to
-///    the outer reconnect loop. Independent of the daemon-level
-///    reconnect path in `runner::run`, which keys off `engine.run`
-///    transient errors instead.
+///    `interval + PING_WATCHDOG_SLACK` timeout. Per RFC 8620 §7.3 the
+///    server MAY clamp our requested `ping=N` -- Fastmail e.g. seems
+///    to hand back 300s for a 60s request -- and the only spec-blessed
+///    way to learn the actual interval is the `interval` field on the
+///    server's ping event payload. Until that first ping arrives we
+///    budget the spec-mandated maximum (`SPEC_MAX_PING_INTERVAL_SECS`)
+///    so we don't false-fire in the request-vs-actual gap, and we
+///    re-negotiate on every subsequent ping in case the server moves.
+///    If no event of any kind shows up within the current window we
+///    treat the stream as silently dead -- common after a laptop
+///    wakes from sleep or a NAT entry expires -- and bail to the
+///    outer reconnect loop. Independent of the daemon-level reconnect
+///    path in `runner::run`, which keys off `engine.run` transient
+///    errors instead.
 async fn connect_and_listen(
     event_source_url: &str,
     auth_token: &str,
@@ -115,17 +130,15 @@ async fn connect_and_listen(
 
     let mut es = EventSource::new(request)?;
 
-    let watchdog = Duration::from_secs(ping_interval) + PING_WATCHDOG_SLACK;
+    let mut watchdog = Duration::from_secs(SPEC_MAX_PING_INTERVAL_SECS) + PING_WATCHDOG_SLACK;
+    let mut watchdog_negotiated = false;
 
     loop {
         let next = match tokio::time::timeout(watchdog, es.next()).await {
             Ok(Some(event)) => event,
             Ok(None) => return Ok(ConnectOutcome::StreamEnded),
             Err(_) => {
-                warn!(
-                    "No SSE event in {:?} (ping={}s + {:?} slack); reconnecting",
-                    watchdog, ping_interval, PING_WATCHDOG_SLACK
-                );
+                warn!("No SSE event in {:?}; reconnecting", watchdog);
                 return Ok(ConnectOutcome::StreamEnded);
             }
         };
@@ -138,6 +151,30 @@ async fn connect_and_listen(
                 *backoff = RECONNECT_INITIAL_BACKOFF;
 
                 debug!("SSE event: type={}, data={}", msg.event, msg.data);
+
+                if msg.event == "ping" {
+                    match parse_ping_interval(&msg.data) {
+                        Some(interval) => {
+                            let new_watchdog = Duration::from_secs(interval) + PING_WATCHDOG_SLACK;
+                            if !watchdog_negotiated {
+                                info!(
+                                    "Server-negotiated SSE ping interval: {}s (watchdog {:?})",
+                                    interval, new_watchdog
+                                );
+                                watchdog_negotiated = true;
+                            }
+                            watchdog = new_watchdog;
+                        }
+                        None => {
+                            warn!(
+                                "Ping event missing/invalid `interval`; \
+                                 keeping watchdog at {:?}",
+                                watchdog
+                            );
+                        }
+                    }
+                    continue;
+                }
 
                 if msg.event != "state" {
                     continue;
@@ -177,6 +214,25 @@ async fn connect_and_listen(
             }
         }
     }
+}
+
+/// Pull the `interval` (in seconds) out of a server-emitted ping
+/// event payload per RFC 8620 §7.3:
+///
+/// > The data for the ping event MUST be a JSON object containing
+/// > an "interval" property, the value (type "UnsignedInt") being
+/// > the interval in seconds the server is using to send pings.
+///
+/// Returns `None` for any payload that isn't valid JSON, has a
+/// missing/non-integer `interval`, or reports `interval: 0` (which
+/// would shrink the watchdog to bare slack and false-fire on every
+/// subsequent event -- spec mandates servers honor a minimum of 30,
+/// so 0 is buggy-server territory). The caller keeps the previous
+/// watchdog value in any of these cases.
+fn parse_ping_interval(data: &str) -> Option<u64> {
+    let value: serde_json::Value = serde_json::from_str(data).ok()?;
+    let interval = value.get("interval")?.as_u64()?;
+    (interval > 0).then_some(interval)
 }
 
 /// Decide whether a StateChange event represents a real advance for an
@@ -292,5 +348,34 @@ mod tests {
         let mut last = HashMap::new();
         let data = make_event("other-acct", &[("Email", "J1")]);
         assert!(decide_trigger(&data, "acct", &mut last).is_err());
+    }
+
+    #[test]
+    fn parse_ping_interval_extracts_seconds() {
+        let data = r#"{"@type":"Ping","interval":300}"#;
+        assert_eq!(parse_ping_interval(data), Some(300));
+    }
+
+    #[test]
+    fn parse_ping_interval_returns_none_for_missing_field() {
+        let data = r#"{"@type":"Ping"}"#;
+        assert_eq!(parse_ping_interval(data), None);
+    }
+
+    #[test]
+    fn parse_ping_interval_returns_none_for_non_integer() {
+        let data = r#"{"@type":"Ping","interval":"300"}"#;
+        assert_eq!(parse_ping_interval(data), None);
+    }
+
+    #[test]
+    fn parse_ping_interval_returns_none_for_invalid_json() {
+        assert_eq!(parse_ping_interval("not json"), None);
+    }
+
+    #[test]
+    fn parse_ping_interval_returns_none_for_zero() {
+        let data = r#"{"@type":"Ping","interval":0}"#;
+        assert_eq!(parse_ping_interval(data), None);
     }
 }

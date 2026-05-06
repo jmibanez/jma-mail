@@ -1,4 +1,5 @@
-//! Integration test for the SSE listener's ping-interval watchdog.
+//! Integration test for the SSE listener's ping-interval watchdog
+//! and the server-negotiated interval that drives it.
 //!
 //! Wiremock can't do streaming responses, so we stand up a tiny TCP
 //! server that:
@@ -6,18 +7,27 @@
 //! - Accepts a TCP connection.
 //! - Drains the request line/headers (consumes the buffer; doesn't
 //!   parse).
-//! - Replies with valid SSE response headers and a single SSE comment
-//!   line (`: connected`) so the response is well-formed.
+//! - Replies with valid SSE response headers and a single ping event
+//!   carrying `{"interval": 2}` -- the spec-blessed channel for
+//!   telling clients the actual interval the server is using
+//!   (RFC 8620 §7.3).
 //! - Holds the socket open and goes silent.
 //!
-//! Without the watchdog, `reqwest_eventsource` would happily await
-//! bytes that never arrive and the listener would never surface the
-//! dead stream. With the watchdog, `es.next()` times out after
-//! `ping_interval + PING_WATCHDOG_SLACK` and the outer reconnect loop
-//! opens a fresh connection -- which we observe by counting `accept`
-//! calls on the test server. Pre-watchdog code: 1 connection (and
-//! the listener hangs forever). Post-watchdog: at least 2 within the
-//! test window.
+//! The listener should parse the ping payload, narrow its watchdog
+//! to `interval + PING_WATCHDOG_SLACK` (= 7s), time out on the
+//! ensuing silence, and reconnect via the outer backoff loop. We
+//! observe the reconnect by counting `accept` calls on the test
+//! server.
+//!
+//! Discriminator behaviour:
+//!
+//! - **Pre-watchdog code** (before commit 6fef921): listener hangs
+//!   forever on `es.next()`; count stays at 1.
+//! - **Pre-negotiation code** (6fef921..HEAD~1): watchdog sized from
+//!   the *requested* `ping_interval` (60 here), so it doesn't fire
+//!   within the 12 s test window; count stays at 1.
+//! - **Current code**: watchdog negotiates down to 7 s on the first
+//!   ping event; reconnects at ~8 s; count >= 2 by t=12 s.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -62,7 +72,9 @@ async fn spawn_silent_sse_server() -> (String, Arc<AtomicUsize>) {
                              Cache-Control: no-cache\r\n\
                              Connection: keep-alive\r\n\
                              \r\n\
-                             : connected\n\n";
+                             event: ping\n\
+                             data: {\"@type\":\"Ping\",\"interval\":2}\n\
+                             \n";
                 let _ = stream.write_all(resp).await;
                 let _ = stream.flush().await;
 
@@ -82,11 +94,16 @@ async fn ping_watchdog_reconnects_against_silent_server() {
     let (tx, _rx) = mpsc::channel::<SyncTrigger>(32);
     let account_id = JmapAccountId::from("acct");
 
-    // ping_interval = 2s, watchdog slack = 5s -> the listener should
-    // bail at ~7s after each Open, sleep its 1s initial backoff, and
-    // reconnect at ~8s. We wait 12s -- 4s of margin past the second
-    // accept -- which keeps the test cheap on CI without flaking.
-    let listen_future = eventsource::listen(&url, "test-token", &account_id, 2, HashMap::new(), tx);
+    // Request a 60 s ping interval (matching the default config).
+    // The server's first event hands back `interval: 2`, so the
+    // listener should narrow its watchdog to 2 + 5 = 7 s, time out
+    // on the ensuing silence, sleep 1 s of initial backoff, and
+    // reconnect at ~8 s. We wait 12 s -- 4 s of margin past the
+    // second accept -- which keeps the test cheap on CI without
+    // flaking. Pre-negotiation code would size the watchdog from
+    // the requested 60 and never fire in this window.
+    let listen_future =
+        eventsource::listen(&url, "test-token", &account_id, 60, HashMap::new(), tx);
 
     let driver_future = async {
         tokio::time::sleep(Duration::from_secs(12)).await;
@@ -100,8 +117,9 @@ async fn ping_watchdog_reconnects_against_silent_server() {
 
     assert!(
         count >= 2,
-        "expected listener to reconnect at least once after ping watchdog fired \
-         (got {} connection(s); pre-watchdog code would stick at 1)",
+        "expected listener to reconnect after watchdog fired against the \
+         server-negotiated 2 s ping interval (got {} connection(s); \
+         pre-negotiation code would stick at 1 for the full 60 s window)",
         count
     );
 }
