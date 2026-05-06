@@ -78,11 +78,17 @@ pub enum ConflictStrategy {
     LocalWins,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 pub struct StateConfig {
-    /// Path to SQLite state database
-    #[serde(default = "default_db_path")]
-    pub db_path: String,
+    /// Path to SQLite state database. When unset, the DB lives at
+    /// `<maildir_path>/.jmapsync.db` so its lifetime tracks the
+    /// maildir it describes -- moving, copying, or deleting the
+    /// maildir keeps state and data in sync, and multiple accounts
+    /// each get their own DB without coordinating a separate path.
+    /// Set this to override the default (e.g. to keep state on a
+    /// local-only path when the maildir lives on a synced volume).
+    #[serde(default)]
+    pub db_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -101,10 +107,6 @@ pub struct WatchConfig {
     /// (multiple events coalesce into one). Only fires in `watch` mode.
     #[serde(default)]
     pub post_arrival_command: Option<String>,
-}
-
-fn default_db_path() -> String {
-    "~/.local/share/jmapsync/state.db".to_string()
 }
 
 fn default_debounce_secs() -> u64 {
@@ -133,14 +135,6 @@ fn default_retry_initial_backoff_ms() -> u64 {
 
 fn default_retry_max_backoff_ms() -> u64 {
     8_000
-}
-
-impl Default for StateConfig {
-    fn default() -> Self {
-        Self {
-            db_path: default_db_path(),
-        }
-    }
 }
 
 impl Default for WatchConfig {
@@ -211,9 +205,14 @@ impl Config {
         expand_tilde(Path::new(&self.sync.maildir_path))
     }
 
-    /// Resolved state DB path with ~ expanded.
+    /// Resolved state DB path. Returns the explicit `[state].db_path`
+    /// override (with `~` expanded) if set, otherwise the default
+    /// `<maildir_path>/.jmapsync.db` next to the maildir it describes.
     pub fn db_path(&self) -> PathBuf {
-        expand_tilde(Path::new(&self.state.db_path))
+        match self.state.db_path.as_deref() {
+            Some(p) => expand_tilde(Path::new(p)),
+            None => self.maildir_path().join(".jmapsync.db"),
+        }
     }
 }
 
@@ -322,8 +321,12 @@ retry_initial_backoff_ms = 500
 retry_max_backoff_ms = 8000
 
 [state]
-# Path to SQLite state database
-db_path = "~/.local/share/jmapsync/state.db"
+# Path to SQLite state database. By default this is
+# `<sync.maildir_path>/.jmapsync.db` -- a hidden file at the maildir
+# root, so state and data move together. Uncomment and set this only
+# to override that default (e.g. to keep state on a local-only path
+# when the maildir lives on a synced or networked volume).
+# db_path = "~/.local/share/jmapsync/state.db"
 
 [watch]
 # Debounce interval for local filesystem events (seconds)

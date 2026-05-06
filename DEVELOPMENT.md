@@ -182,6 +182,8 @@ The lock keys on the maildir root, not the state DB, because the maildir is the 
 
 The maildir lock alone doesn't cover this, because two processes can hold *different* maildir locks while sharing a state DB -- which is exactly the topology the multi-account refactor produces (per-account daemon drivers, each with their own maildir, all pointing at one widened-PK DB).
 
+Note that with the maildir-relative default for `[state].db_path`, the state DB lives at `<maildir_root>/.jmapsync.db` and the maildir lock structurally covers what the DB lock guards -- any process that could open this DB must already hold the maildir lock by construction. The DB lock is only load-bearing when `[state].db_path` is set explicitly to a path outside the maildir, where two configs can share a DB while owning different maildirs. Today both locks are taken unconditionally regardless of topology; gating the DB lock on config shape is a candidate simplification but not a current one.
+
 **Lock-acquisition order: maildir lock first, then state DB lock**, consistently across every mutating call site (see `acquire_mutator_locks` in `src/main.rs`). Consistent order is what prevents deadlock between two contending pairs. Both locks are held for process lifetime; the kernel releases them when the fds close at process exit.
 
 ### State DB write coherence

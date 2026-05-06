@@ -348,7 +348,7 @@ fn build_test_config(server_uri: &str, maildir_root: &Path, db_path: &Path) -> C
             retry_max_backoff_ms: 8_000,
         },
         state: StateConfig {
-            db_path: db_path.to_string_lossy().into_owned(),
+            db_path: Some(db_path.to_string_lossy().into_owned()),
         },
         watch: WatchConfig {
             debounce_secs: 1,

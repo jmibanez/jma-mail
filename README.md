@@ -40,18 +40,18 @@ Note this also applies to the names of the mailboxes in `[sync].mailboxes` (see 
 
 ## How jmapsync Tracks State
 
-`jmapsync` tracks state between your local Maildirs and the upstream JMAP server on an SQLite database in `[state].db_path` (by default in `~/.local/share/jmapsync/state.db`). State is intentionally disposable: you should be able to delete its state and rerun a `jmapsync pull` to reconverge.
+`jmapsync` tracks state between your local Maildirs and the upstream JMAP server on an SQLite database. By default the database lives at `<sync.maildir_path>/.jmapsync.db` -- a hidden file at the maildir root, so state and data move together when you copy or relocate the maildir, and multiple accounts each get their own DB without sharing a path. Set `[state].db_path` to override (for example, to keep state on a local-only path when the maildir lives on a synced or networked volume). State is intentionally disposable: you should be able to delete its state and rerun a `jmapsync pull` to reconverge.
 
-If you delete `state.db` and run `jmapsync pull`, `jmapsync` will re-walk the server. It parses the `Message-ID` of each existing local message and "adopts" messages if they exist on the server, instead of re-downloading them. If you previously killed `jmapsync` in the middle of a previous initial `pull` and then deleted `state.db`, `jmapsync` does The Right Thing and continues where it left off (i.e. it doesn't redownload previously downloaded messages).
+If you delete the state DB and run `jmapsync pull`, `jmapsync` will re-walk the server. It parses the `Message-ID` of each existing local message and "adopts" messages if they exist on the server, instead of re-downloading them. If you previously killed `jmapsync` in the middle of a previous initial `pull` and then deleted the state DB, `jmapsync` does The Right Thing and continues where it left off (i.e. it doesn't redownload previously downloaded messages).
 
-So what's stored in `state.db`?
+So what's stored in the state DB?
 
   * A bidirectional `message_map`, mapping between a JMAP email and its local maildir file. `jmapsync` stores the name of the local Maildir file and its corresponding `message_id` as a fast lookup cache
   * A mapping between JMAP mailbox IDs and local Maildir folder names in `mailbox_map`, including role and parent
   * `jmap_state` containing per-entity sync cursors so `jmapsync` only needs to ask for changes since the last sync
   * And `local_state`, which is a snapshot of the local state (flags, size, mtime) so any local filesystem changes are quickly detected
 
-None of `state.db`'s contents are required to do a `pull`.
+None of the state DB's contents are required to do a `pull`.
 
 ### Breaking Changes
 
@@ -62,7 +62,7 @@ If there are any changes that break state tracking, as mentioned above you can s
 Mutating commands (`sync`, `pull`, `push`, `watch`) take **two** exclusive OS-level advisory locks before doing any work:
 
 1. `<maildir_root>/.jmapsync.lock` -- guards the maildir against concurrent mutation by any other jmapsync process pointed at the same maildir, even if their state DB paths differ.
-2. `<db_path>.lock` (e.g. `~/.local/share/jmapsync/state.db.lock`) -- guards the state DB against the schema-mismatch unlink/recreate path racing a concurrent process that opened the same DB.
+2. `<db_path>.lock` (e.g. `<maildir_root>/.jmapsync.db.lock`) -- guards the state DB against the schema-mismatch unlink/recreate path racing a concurrent process that opened the same DB.
 
 If another instance already holds either lock, the second invocation fails fast with a message naming the holder's PID. The two locks cover different topologies: same maildir / different DB (lock 1 catches it), and same DB / different maildir (lock 2 catches it). The locks are always acquired in the same order -- maildir first, then state DB -- so two contending processes can't deadlock.
 
@@ -101,7 +101,7 @@ This section configures which Maildirs `jmapsync` will sync to, and how it syncs
   
 ### State `[state]`
 
-This section only has one key, `db_path`, which tells `jmapsync` where to persist its state.
+This section only has one key, `db_path`, which tells `jmapsync` where to persist its state. Leave it unset to use the default (`<sync.maildir_path>/.jmapsync.db`); set it to override -- e.g. when the maildir lives on a synced or networked volume and you want the SQLite files on a local-only path.
 
 ### Push Email Config `[watch]`
 

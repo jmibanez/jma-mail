@@ -173,13 +173,10 @@ email = "$ACCOUNT_EMAIL"
 maildir_path = "$BENCH_DIR/maildir"
 mailboxes = []
 download_concurrency = 8
-
-[state]
-db_path = "$BENCH_DIR/state.db"
 EOF
 
 reset_state() {
-    rm -f state.db state.db-wal state.db-shm
+    rm -f maildir/.jmapsync.db maildir/.jmapsync.db-wal maildir/.jmapsync.db-shm
 }
 
 run() {

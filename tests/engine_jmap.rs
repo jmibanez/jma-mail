@@ -368,7 +368,7 @@ fn test_config(
             retry_max_backoff_ms: 1,
         },
         state: StateConfig {
-            db_path: ":memory:".to_string(),
+            db_path: Some(":memory:".to_string()),
         },
         watch: WatchConfig::default(),
     }
