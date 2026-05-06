@@ -132,6 +132,7 @@ async fn connect_and_listen(
 
     let mut watchdog = Duration::from_secs(SPEC_MAX_PING_INTERVAL_SECS) + PING_WATCHDOG_SLACK;
     let mut watchdog_negotiated = false;
+    let mut parse_failure_logged = false;
 
     loop {
         let next = match tokio::time::timeout(watchdog, es.next()).await {
@@ -166,11 +167,19 @@ async fn connect_and_listen(
                             watchdog = new_watchdog;
                         }
                         None => {
-                            warn!(
-                                "Ping event missing/invalid `interval`; \
-                                 keeping watchdog at {:?}",
-                                watchdog
-                            );
+                            // Once per connection. The flag lives on
+                            // this stack frame, so reconnecting
+                            // resets it: a server that starts
+                            // behaving will surface its first valid
+                            // interval via the success arm above.
+                            if !parse_failure_logged {
+                                warn!(
+                                    "Ping event missing/invalid `interval`; \
+                                     keeping watchdog at {:?}",
+                                    watchdog
+                                );
+                                parse_failure_logged = true;
+                            }
                         }
                     }
                     continue;
