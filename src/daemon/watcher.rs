@@ -7,6 +7,23 @@ use tracing::{debug, info, warn};
 
 use super::runner::SyncTrigger;
 
+/// Whether a notify event path should drive a sync trigger. We only
+/// care about events on actual maildir message files, which by
+/// convention live in `<folder>/cur/` (delivered+seen) or
+/// `<folder>/new/` (delivered, awaiting first read). Everything else
+/// inside the watched root is noise: `<folder>/tmp/` is mid-delivery
+/// scratch, and the maildir root itself can hold sidecar files
+/// jmapsync writes (`.jmapsync.db` and its `-wal` / `-shm` siblings
+/// in WAL mode, `.jmapsync.lock`, etc.) that shouldn't kick a sync.
+/// Read-only commands like `mailboxes` and `status` open the state DB
+/// to consult the discovery cache, which by itself touches the WAL
+/// and SHM siblings -- without this filter, running them alongside
+/// `watch` would spuriously fire `LocalChange` triggers.
+fn is_maildir_message_path(path: &Path) -> bool {
+    let s = path.to_string_lossy();
+    s.contains("/cur/") || s.contains("/new/")
+}
+
 /// Watch local maildir directories for filesystem changes.
 pub async fn watch(
     maildir_root: &Path,
@@ -24,7 +41,7 @@ pub async fn watch(
                 Ok(events) => {
                     let relevant = events.iter().any(|e| {
                         matches!(e.kind, DebouncedEventKind::Any)
-                            && !e.path.to_string_lossy().contains("/tmp/")
+                            && is_maildir_message_path(&e.path)
                     });
                     if relevant {
                         let _ = notify_tx.blocking_send(());
@@ -53,4 +70,71 @@ pub async fn watch(
 
     info!("Filesystem watcher ended");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn fires_on_cur_message() {
+        let p = PathBuf::from("/home/u/Mail/INBOX/cur/1700000000.M1.host:2,S");
+        assert!(is_maildir_message_path(&p));
+    }
+
+    #[test]
+    fn fires_on_new_message() {
+        let p = PathBuf::from("/home/u/Mail/INBOX/new/1700000000.M1.host");
+        assert!(is_maildir_message_path(&p));
+    }
+
+    #[test]
+    fn skips_tmp_message() {
+        let p = PathBuf::from("/home/u/Mail/INBOX/tmp/1700000000.M1.host");
+        assert!(!is_maildir_message_path(&p));
+    }
+
+    #[test]
+    fn skips_state_db_and_wal_sidecars() {
+        for name in [".jmapsync.db", ".jmapsync.db-wal", ".jmapsync.db-shm"] {
+            let p = PathBuf::from(format!("/home/u/Mail/{}", name));
+            assert!(
+                !is_maildir_message_path(&p),
+                "{} should not fire a trigger",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn skips_lock_files() {
+        for name in [".jmapsync.lock", ".jmapsync.db.lock"] {
+            let p = PathBuf::from(format!("/home/u/Mail/{}", name));
+            assert!(
+                !is_maildir_message_path(&p),
+                "{} should not fire a trigger",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn fires_on_nested_maildir_plus_plus_folder() {
+        // Maildir++ uses `.foldername` directories for nested
+        // folders; the `/cur/` substring check still picks up
+        // messages there.
+        let p = PathBuf::from("/home/u/Mail/INBOX/.archive/cur/1700000000.M1.host:2,S");
+        assert!(is_maildir_message_path(&p));
+    }
+
+    #[test]
+    fn skips_folder_directory_itself() {
+        // The `cur` directory at the folder root, no trailing slash.
+        // A folder being created (e.g. by sync provisioning a new
+        // mailbox) shouldn't fire on the directory event alone --
+        // any actual message inside will.
+        let p = PathBuf::from("/home/u/Mail/INBOX/cur");
+        assert!(!is_maildir_message_path(&p));
+    }
 }
