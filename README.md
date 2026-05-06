@@ -109,7 +109,7 @@ This section only has one key, `db_path`, which tells `jmapsync` where to persis
 
   * `post_arrival_command`: A shell command that `jmapsync` will invoke when it observes new mail. If you use a mail indexer such as `mu` or `notmuch`, put the indexing command here -- e.g. set this to `notmuch new` for `notmuch`.
   * `debounce_secs`: How long in seconds to coalesce filesystem events together. A smaller value means `jmapsync` will more readily sync any local changes, at the cost of chattier updates. A larger value means `jmapsync` will wait approximately that long and batch all local changes in that timeframe.
-  * `ping_interval`: How often will the upstream send a ping to `jmapsync`. Tweak this if you observe buffering proxies along your connection that delay delivery of notifications.
+  * `ping_interval`: How often (in seconds) to request the server send heartbeat pings on the EventSource (SSE) stream. Per RFC 8620 section 7.3 the server is allowed to clamp this value; some providers (Fastmail, notably) use a longer interval than requested. The actual interval the server uses drives the daemon's stream watchdog -- see `watch` below.
 
 ## Commands and Options
 
@@ -153,6 +153,24 @@ Options:
 ### sync : Bi-Directional Sync
 
 `sync` is generally the command you want, and is equivalent to running `mbsync -a` or `mbsync` against a specific channel. By default, if you run `jmapsync` without any subcommands it is equivalent to running `jmapsync sync`.
+
+### watch : Push email and continuous sync
+
+`watch` is the daemon mode: it does an initial bidirectional sync, then stays running and re-syncs whenever it sees a change on either side. Useful as a long-running process under launchd, systemd-user, or a tmux pane. `Ctrl-C` (or any `SIGTERM`/`SIGINT`) exits.
+
+Two trigger sources feed it:
+
+  * **JMAP EventSource (SSE).** A long-running HTTPS connection to your server's push endpoint. The server pushes a `state` event whenever an entity (Email, Mailbox) advances; `jmapsync` runs a sync cycle in response. This is what gives you push email.
+  * **Filesystem watcher.** Watches the maildir root via the OS's native filesystem-events API (`inotify` on Linux, `FSEvents` on macOS). Local edits (a message marked read by your MUA, a move between folders, a delete) trigger a sync cycle so changes propagate upstream. Events are debounced via `[watch].debounce_secs` to coalesce bursts.
+
+After every cycle that downloaded new mail, the optional `[watch].post_arrival_command` shell command runs (use this to kick off `mu index`, `notmuch new`, etc.).
+
+#### Reconnect on failure
+
+The daemon recovers from two classes of failure on its own:
+
+  * **Persistent JMAP transport errors.** If a sync cycle exhausts its in-call retry budget against a 5xx storm or sustained connectivity loss, the daemon rebuilds the JMAP session (re-resolving the bearer token from the keychain on the way) and continues. Reconnect attempts grow exponentially up to 60 seconds between tries; backoff resets on the first successful sync after recovery. Hard errors (e.g. a 401 from a rotated bearer token) propagate so the daemon dies loudly rather than spinning -- if you see this, fix the credential and restart.
+  * **Silently-dead SSE streams.** The daemon expects regular events on the EventSource: state changes when there's activity, periodic pings otherwise. If no event of any kind arrives within the negotiated ping interval plus 5 seconds of slack, the stream is treated as dead -- the usual failure mode after a laptop wakes from sleep, a NAT entry expires, or a proxy times the connection out without closing it -- and the daemon reconnects. Per RFC 8620 section 7.3 the server picks the actual ping interval (it MAY clamp our requested `[watch].ping_interval` upward) and reports it on each ping event; that reported value is what the watchdog uses. Until the first ping arrives, the watchdog budgets the spec-mandated maximum of 300 seconds, so a slow first ping won't cause a spurious reconnect.
 
 ### mailboxes : Status info
 
