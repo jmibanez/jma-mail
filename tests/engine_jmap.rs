@@ -25,6 +25,7 @@ use jmapsync::config::{
     AccountConfig, Config, ConflictStrategy, StateConfig, SyncConfig, WatchConfig,
 };
 use jmapsync::ids::{JmapEmailId, JmapMailboxId};
+use jmapsync::maildir_ops::layout::FolderLayout;
 use jmapsync::state::{db, queries};
 use jmapsync::sync::engine::SyncEngine;
 use rusqlite::Connection;
@@ -366,6 +367,8 @@ fn test_config(
             retry_max_attempts: 1,
             retry_initial_backoff_ms: 1,
             retry_max_backoff_ms: 1,
+            folder_layout: FolderLayout::Fs,
+            hierarchy_separator: '/',
         },
         state: StateConfig {
             db_path: Some(":memory:".to_string()),

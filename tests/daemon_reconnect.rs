@@ -46,6 +46,7 @@ use jmapsync::config::{
     AccountConfig, Config, ConflictStrategy, StateConfig, SyncConfig, WatchConfig,
 };
 use jmapsync::daemon;
+use jmapsync::maildir_ops::layout::FolderLayout;
 use jmapsync::state::{db, queries};
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path, path_regex};
@@ -346,6 +347,8 @@ fn build_test_config(server_uri: &str, maildir_root: &Path, db_path: &Path) -> C
             retry_max_attempts: 5,
             retry_initial_backoff_ms: 500,
             retry_max_backoff_ms: 8_000,
+            folder_layout: FolderLayout::Fs,
+            hierarchy_separator: '/',
         },
         state: StateConfig {
             db_path: Some(db_path.to_string_lossy().into_owned()),
