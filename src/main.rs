@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
+use std::collections::BTreeSet;
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
 
@@ -377,8 +378,6 @@ fn ago_phrase(sqlite_ts: &str, now: &chrono::DateTime<chrono::Utc>) -> Result<St
 }
 
 fn print_maildir_drift(conn: &rusqlite::Connection, maildir_root: &std::path::Path) -> Result<()> {
-    use std::collections::BTreeSet;
-
     println!("Maildir vs DB drift (under {}):", maildir_root.display());
 
     let known: BTreeSet<String> = jmapsync::state::queries::list_known_maildir_folders(conn)?
@@ -390,35 +389,86 @@ fn print_maildir_drift(conn: &rusqlite::Connection, maildir_root: &std::path::Pa
         return Ok(());
     }
 
-    let on_disk: BTreeSet<String> = match std::fs::read_dir(maildir_root) {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-            .filter_map(|e| {
-                let n = e.file_name().to_string_lossy().into_owned();
-                // Skip hidden entries: covers `.jmapsync.db*`, lock
-                // files, and anything else that isn't a synced folder.
-                if n.starts_with('.') { None } else { Some(n) }
-            })
-            .collect(),
-        Err(e) => {
-            println!("  Failed to read maildir root: {e}");
-            return Ok(());
-        }
-    };
-
     if known.is_empty() {
         println!("  No mailbox map yet -- DB has no record of synced folders.");
         return Ok(());
     }
 
+    // Walk recursively to find every directory that looks like a
+    // maildir (has `cur/` underneath). This is the only shape that
+    // works across all three folder layouts:
+    //   - Flat:      <root>/foo.bar/cur                (depth 1)
+    //   - MaildirPP: <root>/.foo.bar/cur               (depth 1, leading dot)
+    //   - Fs:        <root>/foo/bar/cur                (depth N>=1)
+    let on_disk = find_maildir_folders(maildir_root);
+
     let only_disk: Vec<&str> = on_disk.difference(&known).map(String::as_str).collect();
-    let only_db: Vec<&str> = known.difference(&on_disk).map(String::as_str).collect();
+    // For "in DB not on disk", trust the per-folder existence check
+    // rather than set-difference: it's layout-independent (a stored
+    // `maildir_folder` of `parent/child` joins onto the root with the
+    // FS separator, regardless of whether the *layout* uses `/` or
+    // `.`) and avoids being fooled by a recursive walk that missed
+    // something.
+    let only_db: Vec<&str> = known
+        .iter()
+        .filter(|f| !maildir_root.join(f).join("cur").is_dir())
+        .map(String::as_str)
+        .collect();
 
     print_drift_line("  Folders on disk not in DB: ", &only_disk);
     print_drift_line("  Folders in DB not on disk: ", &only_db);
 
     Ok(())
+}
+
+/// Walk `root` recursively and return every relative path whose
+/// directory contains a `cur/` subdirectory. That's our "is this a
+/// maildir?" marker -- works under any folder layout and matches
+/// what `ensure_maildir` actually creates.
+///
+/// Skips jmapsync's own state markers (`.jmapsync.*`), the maildir
+/// internals (`cur`/`new`/`tmp` -- we don't recurse into them, since
+/// any directory that *contains* one of those is itself a maildir
+/// already). Read errors at any level are silently dropped: this is
+/// a diagnostic command, and a partial drift report is more useful
+/// than no report.
+fn find_maildir_folders(root: &std::path::Path) -> BTreeSet<String> {
+    let mut found = BTreeSet::new();
+    walk_for_maildirs(root, root, &mut found);
+    found
+}
+
+fn walk_for_maildirs(root: &std::path::Path, dir: &std::path::Path, found: &mut BTreeSet<String>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(_) => return,
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        // `DirEntry::file_type()` doesn't traverse symlinks, so a
+        // symlink pointing at a directory has `is_dir() == false` here
+        // and gets filtered out before recursion -- no symlink loops.
+        // Side effect: a real maildir tree behind a symlink at the
+        // root won't show up in the drift report, which is acceptable
+        // for a diagnostic.
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with(".jmapsync.") {
+            continue;
+        }
+        if name_str == "cur" || name_str == "new" || name_str == "tmp" {
+            continue;
+        }
+        let path = entry.path();
+        if path.join("cur").is_dir()
+            && let Ok(rel) = path.strip_prefix(root)
+        {
+            found.insert(rel.to_string_lossy().into_owned());
+        }
+        walk_for_maildirs(root, &path, found);
+    }
 }
 
 fn print_drift_line(prefix: &str, items: &[&str]) {
@@ -508,4 +558,108 @@ fn load_config(cli: &Cli) -> Result<Config> {
         max_backoff: Duration::from_millis(config.sync.retry_max_backoff_ms),
     });
     Ok(config)
+}
+
+#[cfg(test)]
+mod drift_tests {
+    use super::*;
+
+    /// Build a fake maildir at `<root>/<folder>` with the cur/new/tmp
+    /// triplet that `find_maildir_folders` keys on.
+    fn touch_maildir(root: &std::path::Path, folder: &str) {
+        let path = root.join(folder);
+        for sub in ["cur", "new", "tmp"] {
+            std::fs::create_dir_all(path.join(sub)).unwrap();
+        }
+    }
+
+    #[test]
+    fn finds_flat_layout_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        touch_maildir(dir.path(), "INBOX");
+        touch_maildir(dir.path(), "Archive");
+        touch_maildir(dir.path(), "[Airmail].Sent");
+
+        let found = find_maildir_folders(dir.path());
+
+        let expected: BTreeSet<String> = ["INBOX", "Archive", "[Airmail].Sent"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(found, expected);
+    }
+
+    /// Pins the bug fix: the prior `starts_with('.')` filter dropped
+    /// every Maildir++ folder. The recursive walk lets dotted folders
+    /// through while still skipping our own `.jmapsync.*` markers.
+    #[test]
+    fn finds_maildir_pp_layout_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        touch_maildir(dir.path(), ".INBOX");
+        touch_maildir(dir.path(), ".Archive");
+        touch_maildir(dir.path(), ".[Airmail].Sent");
+
+        let found = find_maildir_folders(dir.path());
+
+        let expected: BTreeSet<String> = [".INBOX", ".Archive", ".[Airmail].Sent"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(found, expected);
+    }
+
+    /// Pins the bug fix: the prior top-level-only walk missed every
+    /// nested Fs mailbox at depth >= 2. The recursive walk records
+    /// each maildir at whatever depth it lives.
+    #[test]
+    fn finds_fs_layout_nested_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        touch_maildir(dir.path(), "INBOX");
+        touch_maildir(dir.path(), "[Airmail]");
+        touch_maildir(dir.path(), "[Airmail]/Sent");
+        touch_maildir(dir.path(), "[Airmail]/Drafts");
+
+        let found = find_maildir_folders(dir.path());
+
+        let expected: BTreeSet<String> =
+            ["INBOX", "[Airmail]", "[Airmail]/Sent", "[Airmail]/Drafts"]
+                .into_iter()
+                .map(String::from)
+                .collect();
+        assert_eq!(found, expected);
+    }
+
+    /// `.jmapsync.db`, `.jmapsync.lock`, etc. live at the maildir root
+    /// alongside synced folders. They must not be reported as drift.
+    #[test]
+    fn skips_jmapsync_state_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        touch_maildir(dir.path(), "INBOX");
+        // Mimic the on-disk shape of jmapsync's own state files.
+        std::fs::File::create(dir.path().join(".jmapsync.db")).unwrap();
+        std::fs::File::create(dir.path().join(".jmapsync.lock")).unwrap();
+        // Also a `.jmapsync.foo` directory, just to confirm the filter
+        // matches by prefix not by extension.
+        std::fs::create_dir_all(dir.path().join(".jmapsync.cache").join("cur")).unwrap();
+
+        let found = find_maildir_folders(dir.path());
+
+        let expected: BTreeSet<String> = ["INBOX"].into_iter().map(String::from).collect();
+        assert_eq!(found, expected);
+    }
+
+    /// A directory without `cur/` is just a regular directory, not a
+    /// maildir. Don't claim it.
+    #[test]
+    fn ignores_directories_without_cur() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("notes")).unwrap();
+        std::fs::create_dir_all(dir.path().join("staging")).unwrap();
+        touch_maildir(dir.path(), "INBOX");
+
+        let found = find_maildir_folders(dir.path());
+
+        let expected: BTreeSet<String> = ["INBOX"].into_iter().map(String::from).collect();
+        assert_eq!(found, expected);
+    }
 }
