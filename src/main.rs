@@ -202,12 +202,16 @@ async fn cmd_mailboxes(cli: &Cli) -> Result<()> {
 
     let mailboxes = jmapsync::jmap::mailbox::get_all(&client).await?;
 
-    // Index by id so `is_mailbox_synced` can walk the parent chain --
-    // a config entry naming a parent includes its descendants.
+    // Index by id so `is_mailbox_synced` can walk the parent chain
+    // and `resolve_folder_path` can compute the on-disk name.
     let by_id: std::collections::HashMap<_, _> =
         mailboxes.iter().map(|mb| (mb.id.clone(), mb)).collect();
+    let name_cap = jmapsync::jmap::limits::max_size_mailbox_name(&client);
 
-    println!("{:<40} {:>8} {:>8}  Role", "Name", "Total", "Unread");
+    println!(
+        "{:<40} {:>8} {:>8}  Role",
+        "On-disk name", "Total", "Unread"
+    );
     println!("{}", "-".repeat(70));
     for mb in &mailboxes {
         let synced = if jmapsync::jmap::mailbox::is_mailbox_synced(
@@ -220,10 +224,32 @@ async fn cmd_mailboxes(cli: &Cli) -> Result<()> {
         } else {
             " "
         };
+        // Show the on-disk path under the user's configured layout, so
+        // the listing matches what jmapsync would actually create.
+        // Resolution can fail several ways (separator collision in a
+        // segment, joined path over the server's name cap, parent
+        // chain cycle, unknown parent_id); whichever it is, the user
+        // would hit the same error on a real sync attempt -- mark the
+        // row visibly *and* surface the reason via `warn!` so the
+        // user has both the at-a-glance signal in the table and the
+        // specific cause in the log output.
+        let display_name = match jmapsync::maildir_ops::layout::resolve_folder_path(
+            mb,
+            &by_id,
+            config.sync.folder_layout,
+            config.sync.hierarchy_separator,
+            name_cap,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("mailbox {} resolution failed: {:#}", mb.id, e);
+                format!("{} (unresolved)", mb.name)
+            }
+        };
         println!(
             "{} {:<38} {:>8} {:>8}  {}",
             synced,
-            mb.name,
+            display_name,
             mb.total_emails,
             mb.unread_emails,
             mb.role.as_deref().unwrap_or("")

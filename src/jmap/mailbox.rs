@@ -65,6 +65,41 @@ fn validate_mailbox_name(name: &str, cap: usize) -> Result<()> {
     }
 }
 
+/// JMAP-side hierarchy path for `mb`, root-first segments joined with
+/// `/`. Used for log lines and other diagnostic output where we want
+/// to show how the *server* sees the mailbox tree, distinct from
+/// whatever flattened on-disk shape the maildir layout chooses. A
+/// cycle in the parent chain or an unknown `parent_id` truncates the
+/// walk; we render whatever ancestors we did manage to resolve. This
+/// is intentionally separate from `maildir_ops::layout::resolve_folder_path`
+/// even though the algorithms overlap: that helper owns the
+/// layout-aware on-disk path, this one owns the protocol-side
+/// display. They diverge if a user picks a layout other than `Fs` or
+/// configures a non-`/` separator.
+fn jmap_hierarchy_path(
+    mb: &MailboxObject,
+    by_id: &HashMap<&JmapMailboxId, &MailboxObject>,
+) -> String {
+    let mut chain: Vec<&str> = Vec::new();
+    let mut seen: HashSet<&JmapMailboxId> = HashSet::new();
+    let mut cur: &MailboxObject = mb;
+    loop {
+        if !seen.insert(&cur.id) {
+            break;
+        }
+        chain.push(&cur.name);
+        match &cur.parent_id {
+            None => break,
+            Some(pid) => match by_id.get(pid) {
+                Some(parent) => cur = *parent,
+                None => break,
+            },
+        }
+    }
+    chain.reverse();
+    chain.join("/")
+}
+
 /// Decide whether `mb` matches any entry in the user's configured
 /// mailbox list. An empty list means "sync everything".
 ///
@@ -183,10 +218,25 @@ pub async fn get_all(client: &Client) -> Result<Vec<MailboxObject>> {
                 let total_emails = mb.total_emails() as u64;
                 let unread_emails = mb.unread_emails() as u64;
 
-                debug!(
-                    "Mailbox: {} (id={}, role={:?}, total={}, unread={})",
-                    name, id, role_str, total_emails, unread_emails
-                );
+                // Per-row debug fires eagerly inside the closure so an
+                // operator running with --debug to diagnose a validation
+                // failure still sees the rows processed before the bad
+                // one. The hierarchy-aware second pass below adds tree
+                // context but only fires on a successful batch.
+                match parent_id {
+                    Some(ref actual_parent_id) => {
+                        debug!(
+                            "Child Mailbox (parent {}): {} (id={}, role={:?}, total={}, unread={})",
+                            actual_parent_id, name, id, role_str, total_emails, unread_emails
+                        );
+                    }
+                    None => {
+                        debug!(
+                            "Mailbox: {} (id={}, role={:?}, total={}, unread={})",
+                            name, id, role_str, total_emails, unread_emails
+                        );
+                    }
+                };
 
                 Ok(MailboxObject {
                     id,
@@ -199,6 +249,21 @@ pub async fn get_all(client: &Client) -> Result<Vec<MailboxObject>> {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+
+        // Hierarchy-aware second pass: now that we have the whole list,
+        // resolve each mailbox's `parent_id` references and log the
+        // JMAP-side ancestry path. Separate from the per-row debug
+        // above because the closure can't see siblings; both fire on a
+        // successful batch.
+        let by_id: HashMap<&JmapMailboxId, &MailboxObject> =
+            mailboxes.iter().map(|m| (&m.id, m)).collect();
+        for mb in &mailboxes {
+            debug!(
+                "Mailbox tree path: {} (id={})",
+                jmap_hierarchy_path(mb, &by_id),
+                mb.id
+            );
+        }
 
         Ok((mailboxes, state))
     })
