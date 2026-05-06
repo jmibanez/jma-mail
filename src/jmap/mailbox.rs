@@ -6,6 +6,7 @@ use tracing::{debug, info};
 
 use crate::ids::JmapMailboxId;
 use crate::jmap::limits;
+use crate::jmap::retry::with_retry;
 use crate::jmap::types::MailboxObject;
 
 /// Validate a mailbox name received from the JMAP server before it is
@@ -108,66 +109,71 @@ pub fn is_mailbox_synced(
 /// get refactor, not raising a hardcoded constant.
 pub async fn get_all(client: &Client) -> Result<Vec<MailboxObject>> {
     let name_cap = limits::max_size_mailbox_name(client);
-    let mut request = client.build();
-    let get_request = request
-        .get_mailbox()
-        .account_id(client.default_account_id());
-    get_request.properties([
-        mailbox::Property::Id,
-        mailbox::Property::Name,
-        mailbox::Property::ParentId,
-        mailbox::Property::Role,
-        mailbox::Property::SortOrder,
-        mailbox::Property::TotalEmails,
-        mailbox::Property::UnreadEmails,
-    ]);
+    let (mailboxes, state) = with_retry("Mailbox/get", || async {
+        let mut request = client.build();
+        let get_request = request
+            .get_mailbox()
+            .account_id(client.default_account_id());
+        get_request.properties([
+            mailbox::Property::Id,
+            mailbox::Property::Name,
+            mailbox::Property::ParentId,
+            mailbox::Property::Role,
+            mailbox::Property::SortOrder,
+            mailbox::Property::TotalEmails,
+            mailbox::Property::UnreadEmails,
+        ]);
 
-    let response = request.send().await.context("Failed to fetch mailboxes")?;
+        let response = request.send().await.context("Failed to fetch mailboxes")?;
 
-    let mailbox_response = response
-        .unwrap_method_responses()
-        .pop()
-        .context("No response for mailbox get")?;
+        let mailbox_response = response
+            .unwrap_method_responses()
+            .pop()
+            .context("No response for mailbox get")?;
 
-    let get_response = mailbox_response
-        .unwrap_get_mailbox()
-        .context("Failed to parse mailbox response")?;
+        let get_response = mailbox_response
+            .unwrap_get_mailbox()
+            .context("Failed to parse mailbox response")?;
 
-    let state = get_response.state().to_string();
-    let mailboxes: Vec<MailboxObject> = get_response
-        .list()
-        .iter()
-        .map(|mb| -> Result<MailboxObject> {
-            let id = JmapMailboxId::from(mb.id().unwrap_or_default());
-            let name = mb.name().unwrap_or("(unnamed)").to_string();
-            validate_mailbox_name(&name, name_cap)
-                .with_context(|| format!("rejecting mailbox id={}", id))?;
-            let parent_id = mb.parent_id().map(JmapMailboxId::from);
-            let role = mb.role();
-            let role_str = match role {
-                jmap_client::mailbox::Role::None => None,
-                other => Some(format!("{:?}", other).to_lowercase()),
-            };
-            let sort_order = mb.sort_order();
-            let total_emails = mb.total_emails() as u64;
-            let unread_emails = mb.unread_emails() as u64;
+        let state = get_response.state().to_string();
+        let mailboxes: Vec<MailboxObject> = get_response
+            .list()
+            .iter()
+            .map(|mb| -> Result<MailboxObject> {
+                let id = JmapMailboxId::from(mb.id().unwrap_or_default());
+                let name = mb.name().unwrap_or("(unnamed)").to_string();
+                validate_mailbox_name(&name, name_cap)
+                    .with_context(|| format!("rejecting mailbox id={}", id))?;
+                let parent_id = mb.parent_id().map(JmapMailboxId::from);
+                let role = mb.role();
+                let role_str = match role {
+                    jmap_client::mailbox::Role::None => None,
+                    other => Some(format!("{:?}", other).to_lowercase()),
+                };
+                let sort_order = mb.sort_order();
+                let total_emails = mb.total_emails() as u64;
+                let unread_emails = mb.unread_emails() as u64;
 
-            debug!(
-                "Mailbox: {} (id={}, role={:?}, total={}, unread={})",
-                name, id, role_str, total_emails, unread_emails
-            );
+                debug!(
+                    "Mailbox: {} (id={}, role={:?}, total={}, unread={})",
+                    name, id, role_str, total_emails, unread_emails
+                );
 
-            Ok(MailboxObject {
-                id,
-                name,
-                parent_id,
-                role: role_str,
-                sort_order,
-                total_emails,
-                unread_emails,
+                Ok(MailboxObject {
+                    id,
+                    name,
+                    parent_id,
+                    role: role_str,
+                    sort_order,
+                    total_emails,
+                    unread_emails,
+                })
             })
-        })
-        .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok((mailboxes, state))
+    })
+    .await?;
 
     info!("Fetched {} mailboxes (state: {})", mailboxes.len(), state);
 
