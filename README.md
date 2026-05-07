@@ -1,4 +1,4 @@
-# jma -- JM's Mail Agent
+# jma -- Sync JMAP mailboxes to local Maildirs
 
 `jma` (the binary; crate name `jma-mail`) is JM's Mail Agent: it syncs your local Maildir mailboxes with a [JMAP](https://jmap.io) mail server such as Fastmail, like [`isync`/`mbsync`](https://isync.sourceforge.io/mbsync.html) but for JMAP instead of IMAP.
 
@@ -236,6 +236,12 @@ The JMAP account ID is shown raw rather than mapped to an email -- mapping back 
   * `auth rediscover --account <email>` -- Clear the cached JMAP session URL for this account's email domain and re-run autodiscovery (DNS SRV `_jmap._tcp.<domain>`, then `/.well-known/jmap`), printing the result. Use this when your provider changes their session endpoint. If `[account].session_url` is set explicitly in the config, sync bypasses the discovery cache anyway -- `rediscover` still updates the cache, but the new value only takes effect once you remove the override; the command warns you about this.
 
 `auth` does not take the maildir or state-DB locks, so it can run alongside a `watch` daemon on the same account. Token rotations land in the keychain immediately; the running daemon will pick the new token up on its next reconnect (see [watch](#watch--push-email-and-continuous-sync)).
+
+## A short note on this project's name
+
+Originally, I named this project `jmapsync` -- short, descriptive, and evocative of the original inspiration for it, [`isync`/`mbsync`](https://isync.sourceforge.io/mbsync.html). However, I found out a bit later that there is already [an existing project called `jmapsync`](https://codeberg.org/derat/jmapsync) that basically does the same thing, although this project does have a different featureset. So, might as well rename. 
+
+You can honestly think of `jma` as either meaning "JMAP Mail Agent" or "JM's Mail Agent". Either works :)
 
 ## Copyright, License
 
