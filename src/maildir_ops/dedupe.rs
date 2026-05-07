@@ -113,8 +113,9 @@ where
         on_kept(&folder, &msgid, &keep.maildir_id);
 
         for dup in iter {
-            // Same Message-ID, same folder — delete this newer copy via the
-            // maildir API so any maildir-level bookkeeping is honored.
+            // Same Message-ID, same folder -- delete this newer copy
+            // via the maildir API so any maildir-level bookkeeping is
+            // honored.
             let md = store::ensure_maildir(&maildir_root.join(&folder))?;
             if let Err(e) = store::delete_message(&md, dup.maildir_id.as_ref()) {
                 warn!(
@@ -198,5 +199,77 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].folder, "INBOX");
         assert_eq!(entries[0].maildir_id.as_ref(), unique);
+    }
+
+    /// Suffix-bearing new/ files (the shape jma writes when delivering
+    /// an unseen message with server-set flags like F) must dedupe
+    /// correctly: the canonical id (sans `:2,<flags>`) surfaces on
+    /// `on_kept`, and a duplicate in new/ gets deleted on disk. Pre-
+    /// fix this regressed because (a) `entry.id()` returns the full
+    /// filename for new/ entries so the kept id leaked the suffix, and
+    /// (b) the maildir crate's id-keyed `delete` couldn't find the
+    /// canonical id in new/ -- duplicates would be detected but
+    /// deletion would silently fail.
+    #[test]
+    fn dedupe_handles_suffix_bearing_new_files() {
+        let tmp = TempDir::new().unwrap();
+        let inbox_path = tmp.path().join("INBOX");
+        let _inbox = ensure_maildir(&inbox_path).unwrap();
+
+        let body = "Message-ID: <a@x>\r\n\r\nbody\r\n";
+
+        // Older copy in cur/ (the legitimate one), newer duplicate in
+        // new/ with a `:2,F` suffix (the shape we now write on
+        // delivery).
+        let kept_unique = "1700000000.M1.host";
+        let dup_unique = "1700000005.M2.host";
+        let kept_filename = format!("{kept_unique}:2,S");
+        let dup_filename = format!("{dup_unique}:2,F");
+        fs::write(inbox_path.join("cur").join(&kept_filename), body).unwrap();
+        fs::write(inbox_path.join("new").join(&dup_filename), body).unwrap();
+
+        // Pin both sides of the ordering relation explicitly so the
+        // test doesn't rely on ambient mtime granularity (and survives
+        // a future edit that removes one of the two adjustments).
+        let now = SystemTime::now();
+        let kept_mtime = now - std::time::Duration::from_secs(60);
+        fs::File::open(inbox_path.join("cur").join(&kept_filename))
+            .and_then(|f| f.set_modified(kept_mtime))
+            .unwrap();
+        fs::File::open(inbox_path.join("new").join(&dup_filename))
+            .and_then(|f| f.set_modified(now))
+            .unwrap();
+
+        let folders = vec!["INBOX".to_string()];
+        let mut index = LocalIndex::default();
+        dedupe(tmp.path(), &folders, |folder, msgid, mid| {
+            index
+                .by_message_id
+                .entry(msgid.clone())
+                .or_default()
+                .push(LocalEntry {
+                    folder: folder.to_string(),
+                    maildir_id: mid.clone(),
+                });
+        })
+        .unwrap();
+
+        // Duplicate file is gone from disk.
+        assert!(
+            !inbox_path.join("new").join(&dup_filename).exists(),
+            "duplicate new/ file must have been removed"
+        );
+        assert!(
+            inbox_path.join("cur").join(&kept_filename).exists(),
+            "kept cur/ file must still exist"
+        );
+
+        // on_kept saw the canonical id, not the suffix-bearing form.
+        let entries = index
+            .by_message_id
+            .get(&MessageId::from("a@x"))
+            .expect("kept file should be indexed");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].maildir_id.as_ref(), kept_unique);
     }
 }
