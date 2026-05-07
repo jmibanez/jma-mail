@@ -127,43 +127,20 @@ pub fn scan_folder(
         }
     }
 
-    // Scan new/ directory (messages not yet seen)
+    // Walk new/ for presence only -- we never emit a LocalChange for
+    // a file there. Premise: jma (as the MDA) is the only writer to
+    // new/, and MUAs only ever promote new/ -> cur/. Anything we
+    // delivered to new/ is already tracked in the DB at write time;
+    // any later MUA promotion shows up through the cur/ scan as
+    // either a NewMessage (post-DB-wipe rescue) or a FlagsChanged.
+    // Files left in new/ by external MDAs likewise surface once the
+    // MUA promotes them. The only reason to walk new/ here is to
+    // count those files as seen so the deletion-detection loop below
+    // doesn't fire DeletedMessage (and an inevitable DestroyRemote)
+    // against an undelivered-but-pending message.
     for entry in maildir.list_new() {
         let entry = entry?;
-        let maildir_id = MaildirId::from(entry.id());
-
-        seen_ids.push(maildir_id.clone());
-
-        // Same logic as the cur/ loop: emit NewMessage when the id is
-        // unknown OR known-but-in-a-different-folder (id-preserving
-        // cross-folder rename into new/). Files in new/ have no
-        // ":2,<flags>" suffix per maildir convention.
-        let cross_folder = known_state
-            .get(&maildir_id)
-            .is_some_and(|(known_folder, _)| known_folder != folder_name);
-        if !known_state.contains_key(&maildir_id) || cross_folder {
-            if cross_folder {
-                debug!(
-                    "Cross-folder rename into new/: {} -> {}",
-                    maildir_id, folder_name
-                );
-            } else {
-                debug!("New message in new/: {}", maildir_id);
-            }
-            let path = entry.path().to_path_buf();
-            let Some(message_id) = require_message_id(&maildir_id, &path)? else {
-                continue;
-            };
-            let size_bytes = stat_size(&path);
-            changes.push(LocalChange::NewMessage {
-                maildir_id,
-                folder: folder_name.to_string(),
-                flags: String::new(),
-                path,
-                message_id,
-                size_bytes,
-            });
-        }
+        seen_ids.push(MaildirId::from(entry.id()));
     }
 
     // Detect deletions: entries in known_state for this folder that we didn't see
@@ -402,39 +379,89 @@ mod tests {
         }
     }
 
-    /// Cross-folder move into new/ (MUA stages the file in the
-    /// destination's new/ rather than cur/). Same fix path: emit
-    /// NewMessage so reconcile pairs it with the source DeletedMessage.
+    /// Pins the load-bearing premise: an *unknown* file in new/ must
+    /// not produce a `LocalChange::NewMessage`. Pre-simplification scan
+    /// would have emitted one (the "rescue" path); the new contract
+    /// says new/ is jma's own delivery zone, anything we wrote there
+    /// is already in the DB, and anything an external MDA wrote we
+    /// pick up post-promotion via the cur/ scan. If this test goes
+    /// red, scan has regressed to emitting NewMessage from new/ --
+    /// which would loop on every fresh download (deliver to new/ ->
+    /// scan -> NewMessage -> reconcile sees a local-only message ->
+    /// upload duplicate to server).
     #[test]
-    fn cross_folder_id_preserving_move_into_new_emits_new() {
+    fn unknown_file_in_new_emits_no_change() {
         let tmp = TempDir::new().unwrap();
-        let spam_path = tmp.path().join("Spam");
-        let spam = ensure_maildir(&spam_path).unwrap();
+        let inbox_path = tmp.path().join("INBOX");
+        let inbox = ensure_maildir(&inbox_path).unwrap();
 
         let unique = "1700000000.M1.host";
-        // new/ filenames have no :2, suffix.
         let body = "Message-ID: <a@x>\r\n\r\nbody\r\n";
-        write_message(&spam_path, "new", unique, body);
+        write_message(&inbox_path, "new", unique, body);
 
+        let known = HashMap::new();
+        let (changes, seen) = scan_folder(&inbox, "INBOX", &known).unwrap();
+
+        assert!(
+            changes.is_empty(),
+            "unknown new/ file must not surface as a LocalChange, got {:?}",
+            changes
+        );
+        let seen_strs: Vec<&str> = seen.iter().map(|m| m.as_ref()).collect();
+        assert_eq!(seen_strs, vec![unique], "seen_ids contents");
+    }
+
+    /// Files sitting in new/ -- whether bare (`<unique>`) or
+    /// suffix-bearing (`<unique>:2,<flags>`, the shape jma writes when
+    /// delivering an unseen message with server-set flags) -- must NOT
+    /// produce any LocalChange. They're tracked in the DB at delivery
+    /// time and only become "real" changes once an MUA promotes them
+    /// to cur/. Equally important, both shapes must register as seen
+    /// so the deletion-detection loop doesn't fire DeletedMessage
+    /// against an undelivered-but-pending file (which would cascade
+    /// into a DestroyRemote and silently delete the message
+    /// server-side).
+    #[test]
+    fn new_files_emit_no_change_but_count_as_seen() {
+        let tmp = TempDir::new().unwrap();
+        let inbox_path = tmp.path().join("INBOX");
+        let inbox = ensure_maildir(&inbox_path).unwrap();
+
+        let bare = "1700000000.M1.host";
+        let suffixed_unique = "1700000001.M2.host";
+        let suffixed = format!("{suffixed_unique}:2,F");
+        let body = "Message-ID: <a@x>\r\n\r\nbody\r\n";
+        write_message(&inbox_path, "new", bare, body);
+        write_message(&inbox_path, "new", &suffixed, body);
+
+        // Both ids are known to the DB (delivery-time tracking). If
+        // scan failed to count either as seen, the deletion loop would
+        // emit DeletedMessage for the missing one.
         let mut known = HashMap::new();
-        known.insert(unique.into(), ("INBOX".to_string(), "".to_string()));
+        known.insert(bare.into(), ("INBOX".to_string(), "".to_string()));
+        known.insert(
+            suffixed_unique.into(),
+            ("INBOX".to_string(), "F".to_string()),
+        );
 
-        let (changes, _seen) = scan_folder(&spam, "Spam", &known).unwrap();
+        let (changes, seen) = scan_folder(&inbox, "INBOX", &known).unwrap();
 
-        assert_eq!(changes.len(), 1);
-        match &changes[0] {
-            LocalChange::NewMessage {
-                maildir_id,
-                folder,
-                message_id,
-                ..
-            } => {
-                assert_eq!(maildir_id.as_ref(), unique);
-                assert_eq!(folder, "Spam");
-                assert_eq!(message_id.as_ref(), "a@x");
-            }
-            other => panic!("expected NewMessage on new/ scan, got {:?}", other),
-        }
+        assert!(
+            changes.is_empty(),
+            "new/ must not emit LocalChange events, got {:?}",
+            changes
+        );
+        let seen_strs: Vec<&str> = seen.iter().map(|m| m.as_ref()).collect();
+        assert!(
+            seen_strs.contains(&bare),
+            "bare new/ file must be in seen_ids, got {:?}",
+            seen_strs
+        );
+        assert!(
+            seen_strs.contains(&suffixed_unique),
+            "suffixed new/ file must surface its canonical id (without :2,) in seen_ids, got {:?}",
+            seen_strs
+        );
     }
 
     /// A file with no Message-ID header (RFC 5322 says it SHOULD be
