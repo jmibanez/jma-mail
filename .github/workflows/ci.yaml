@@ -3,8 +3,12 @@ name: CI build
 on:
   push:
     branches: [ "mainline" ]
+    paths-ignore:
+      - '*.md'
   pull_request:
     branches: [ "mainline" ]
+    paths-ignore:
+      - '*.md'
 
 env:
   CARGO_TERM_COLOR: always
