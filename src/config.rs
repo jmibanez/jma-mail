@@ -21,7 +21,7 @@ pub struct AccountConfig {
     /// the `/.well-known/jmap` HTTPS endpoint.
     pub email: String,
     /// API token. Lowest-priority fallback after the OS keychain
-    /// (`jmapsync auth set-token --account <email>`). Kept supported
+    /// (`jma auth set-token --account <email>`). Kept supported
     /// indefinitely for headless servers and CI where the keychain
     /// isn't available.
     pub token: Option<String>,
@@ -100,7 +100,7 @@ pub enum ConflictStrategy {
 #[derive(Debug, Deserialize, Default)]
 pub struct StateConfig {
     /// Path to SQLite state database. When unset, the DB lives at
-    /// `<maildir_path>/.jmapsync.db` so its lifetime tracks the
+    /// `<maildir_path>/.jma.db` so its lifetime tracks the
     /// maildir it describes -- moving, copying, or deleting the
     /// maildir keeps state and data in sync, and multiple accounts
     /// each get their own DB without coordinating a separate path.
@@ -174,7 +174,7 @@ impl AccountConfig {
     /// Resolve the bearer token. Order of precedence:
     ///
     /// 1. OS keychain entry for this account's email
-    ///    (`jmapsync auth set-token --account <email>`) -- preferred
+    ///    (`jma auth set-token --account <email>`) -- preferred
     ///    interactive path; the token never lives on disk in the
     ///    clear, and per-email scoping keeps multi-account configs
     ///    from sharing or overwriting each other's credentials.
@@ -188,7 +188,7 @@ impl AccountConfig {
             return Ok(t.to_string());
         }
         Err(anyhow::anyhow!(
-            "no API token for {}: run `jmapsync auth set-token --account {}` to store one \
+            "no API token for {}: run `jma auth set-token --account {}` to store one \
              in your OS keychain, or set `token` under that account in the config file",
             self.email,
             self.email,
@@ -230,11 +230,11 @@ impl Config {
 
     /// Resolved state DB path. Returns the explicit `[state].db_path`
     /// override (with `~` expanded) if set, otherwise the default
-    /// `<maildir_path>/.jmapsync.db` next to the maildir it describes.
+    /// `<maildir_path>/.jma.db` next to the maildir it describes.
     pub fn db_path(&self) -> PathBuf {
         match self.state.db_path.as_deref() {
             Some(p) => expand_tilde(Path::new(p)),
-            None => self.maildir_path().join(".jmapsync.db"),
+            None => self.maildir_path().join(".jma.db"),
         }
     }
 }
@@ -264,7 +264,7 @@ pub fn check_token_perms(path: &Path, token: Option<&str>) -> Option<String> {
             return Some(format!(
                 "config file {} is readable by group or others and contains a non-empty token; \
                  refusing to use it. Run `chmod 600 {}` (or move the token to your OS \
-                 keychain via `jmapsync auth set-token --account <email>`).",
+                 keychain via `jma auth set-token --account <email>`).",
                 path.display(),
                 path.display()
             ));
@@ -300,7 +300,7 @@ email = "you@example.com"
 #   https://www.fastmail.com/settings/security/tokens
 #
 # Two ways to provide it, in priority order:
-#   1. OS keychain -- run `jmapsync auth set-token --account <email>`
+#   1. OS keychain -- run `jma auth set-token --account <email>`
 #      to store the token under this account's email in the macOS
 #      Keychain / Linux Secret Service / Windows Credential Manager.
 #      Recommended for interactive use; per-account scoping keeps
@@ -358,11 +358,11 @@ retry_max_backoff_ms = 8000
 
 [state]
 # Path to SQLite state database. By default this is
-# `<sync.maildir_path>/.jmapsync.db` -- a hidden file at the maildir
+# `<sync.maildir_path>/.jma.db` -- a hidden file at the maildir
 # root, so state and data move together. Uncomment and set this only
 # to override that default (e.g. to keep state on a local-only path
 # when the maildir lives on a synced or networked volume).
-# db_path = "~/.local/share/jmapsync/state.db"
+# db_path = "~/.local/share/jma/state.db"
 
 [watch]
 # Debounce interval for local filesystem events (seconds)

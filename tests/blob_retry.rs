@@ -10,9 +10,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use jma_mail::ids::JmapBlobId;
+use jma_mail::jmap::email::download_blob;
 use jmap_client::client::{Client, Credentials};
-use jmapsync::ids::JmapBlobId;
-use jmapsync::jmap::email::download_blob;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -62,12 +62,12 @@ fn session_doc(server_uri: &str) -> serde_json::Value {
 
 /// Init `tracing` once per process so retry warn! lines hit the test
 /// writer (visible under `--nocapture`). Honors `RUST_LOG` if set,
-/// otherwise defaults to `jmapsync=debug`. `try_init` swallows the
+/// otherwise defaults to `jma_mail=debug`. `try_init` swallows the
 /// "already-initialized" error if a sibling test got here first.
 fn init_tracing() {
     use tracing_subscriber::EnvFilter;
     let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("jmapsync=debug"));
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("jma_mail=debug"));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_test_writer()

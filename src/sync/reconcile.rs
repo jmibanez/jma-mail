@@ -274,7 +274,7 @@ fn emit_detected_moves(moves: &[DetectedMove], plan: &mut SyncPlan) {
                 jmap_email_id: m.jmap_email_id.clone(),
                 message_id: m.message_id.clone(),
             },
-            // jmapsync's DB binds each email to exactly one mailbox,
+            // jma's DB binds each email to exactly one mailbox,
             // so the target set after the move is just the destination.
             // If the email also lives in unsynced JMAP mailboxes (e.g.
             // server-side label rules), this full-replacement strips
@@ -358,7 +358,7 @@ fn process_remote_emails(
             .cloned();
 
         // Unknown JMAP id and no Message-ID: refuse to ingest.
-        // jmapsync's idempotency invariant requires Message-ID as the
+        // jma's idempotency invariant requires Message-ID as the
         // adopt anchor across state-DB wipes; downloading without one
         // means the next state-DB wipe would re-download the same
         // bytes as a fresh local file (dup on disk) instead of
@@ -369,7 +369,7 @@ fn process_remote_emails(
         let Some(local_msg_id) = local_msg_id else {
             error!(
                 "Skipping remote email {} (folder {}): no Message-ID in Email/get response. \
-                 jmapsync requires Message-ID to anchor idempotency across state-DB wipes; \
+                 jma requires Message-ID to anchor idempotency across state-DB wipes; \
                  the server returned an RFC-violating email and we won't ingest it.",
                 email.id, target_folder
             );

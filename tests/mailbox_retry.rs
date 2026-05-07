@@ -11,8 +11,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use jma_mail::jmap::mailbox::get_all;
 use jmap_client::client::{Client, Credentials};
-use jmapsync::jmap::mailbox::get_all;
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -65,7 +65,7 @@ fn session_doc(server_uri: &str) -> Value {
 fn init_tracing() {
     use tracing_subscriber::EnvFilter;
     let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("jmapsync=debug"));
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("jma_mail=debug"));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_test_writer()

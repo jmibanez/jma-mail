@@ -13,8 +13,8 @@ use super::runner::SyncTrigger;
 /// `<folder>/new/` (delivered, awaiting first read). Everything else
 /// inside the watched root is noise: `<folder>/tmp/` is mid-delivery
 /// scratch, and the maildir root itself can hold sidecar files
-/// jmapsync writes (`.jmapsync.db` and its `-wal` / `-shm` siblings
-/// in WAL mode, `.jmapsync.lock`, etc.) that shouldn't kick a sync.
+/// jma writes (`.jma.db` and its `-wal` / `-shm` siblings
+/// in WAL mode, `.jma.lock`, etc.) that shouldn't kick a sync.
 /// Read-only commands like `mailboxes` and `status` open the state DB
 /// to consult the discovery cache, which by itself touches the WAL
 /// and SHM siblings -- without this filter, running them alongside
@@ -97,7 +97,7 @@ mod tests {
 
     #[test]
     fn skips_state_db_and_wal_sidecars() {
-        for name in [".jmapsync.db", ".jmapsync.db-wal", ".jmapsync.db-shm"] {
+        for name in [".jma.db", ".jma.db-wal", ".jma.db-shm"] {
             let p = PathBuf::from(format!("/home/u/Mail/{}", name));
             assert!(
                 !is_maildir_message_path(&p),
@@ -109,7 +109,7 @@ mod tests {
 
     #[test]
     fn skips_lock_files() {
-        for name in [".jmapsync.lock", ".jmapsync.db.lock"] {
+        for name in [".jma.lock", ".jma.db.lock"] {
             let p = PathBuf::from(format!("/home/u/Mail/{}", name));
             assert!(
                 !is_maildir_message_path(&p),

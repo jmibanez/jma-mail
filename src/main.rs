@@ -5,14 +5,14 @@ use std::time::Duration;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use jmapsync::cli::{AuthAction, Cli, Command};
-use jmapsync::config::{self, Config};
-use jmapsync::daemon;
-use jmapsync::jmap::retry::{self, RetryConfig};
-use jmapsync::jmap::session;
-use jmapsync::maildir_ops;
-use jmapsync::state;
-use jmapsync::sync::engine::SyncEngine;
+use jma_mail::cli::{AuthAction, Cli, Command};
+use jma_mail::config::{self, Config};
+use jma_mail::daemon;
+use jma_mail::jmap::retry::{self, RetryConfig};
+use jma_mail::jmap::session;
+use jma_mail::maildir_ops;
+use jma_mail::state;
+use jma_mail::sync::engine::SyncEngine;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -21,9 +21,9 @@ async fn main() -> Result<()> {
     // Set up logging
     let filter = match (cli.quiet, cli.verbose) {
         (true, _) => "error",
-        (_, 0) => "jmapsync=info",
-        (_, 1) => "jmapsync=debug",
-        (_, 2) => "jmapsync=debug,jmap_client=debug",
+        (_, 0) => "jma_mail=info",
+        (_, 1) => "jma_mail=debug",
+        (_, 2) => "jma_mail=debug,jmap_client=debug",
         (_, _) => "trace",
     };
     tracing_subscriber::fmt()
@@ -34,7 +34,7 @@ async fn main() -> Result<()> {
 
     let command = cli.command.clone().unwrap_or(Command::Sync);
 
-    info!("Running version {}", env!("JMAPSYNC_VERSION"));
+    info!("Running version {}", env!("JMA_VERSION"));
 
     match command {
         Command::Init => cmd_init(&cli).await,
@@ -63,11 +63,11 @@ async fn cmd_auth(cli: &Cli, action: AuthAction, email: String) -> Result<()> {
                     .context("Failed to read token from stdin")?;
                 s.trim_end_matches(['\n', '\r']).to_string()
             };
-            jmapsync::auth::set_bearer_token(&email, &token)?;
+            jma_mail::auth::set_bearer_token(&email, &token)?;
             println!("Bearer token saved to keychain for {}.", email);
         }
         AuthAction::ClearToken => {
-            jmapsync::auth::clear_bearer_token(&email)?;
+            jma_mail::auth::clear_bearer_token(&email)?;
             println!("Bearer token cleared from keychain for {}.", email);
         }
         AuthAction::Rediscover => {
@@ -87,11 +87,11 @@ async fn cmd_auth(cli: &Cli, action: AuthAction, email: String) -> Result<()> {
             // in-progress sync/watch.
             let conn = state::db::open(&db_path)?;
 
-            let prev = jmapsync::state::queries::get_cached_session_url(&conn, domain)?;
-            jmapsync::state::queries::clear_cached_session_url(&conn, domain)?;
+            let prev = jma_mail::state::queries::get_cached_session_url(&conn, domain)?;
+            jma_mail::state::queries::clear_cached_session_url(&conn, domain)?;
 
-            let new_url = jmapsync::jmap::discovery::discover(domain).await?;
-            jmapsync::state::queries::set_cached_session_url(&conn, domain, &new_url)?;
+            let new_url = jma_mail::jmap::discovery::discover(domain).await?;
+            jma_mail::state::queries::set_cached_session_url(&conn, domain, &new_url)?;
 
             match prev.as_deref() {
                 Some(p) if p == new_url => {
@@ -184,7 +184,7 @@ fn provision_maildirs(config: &Config) -> Result<()> {
         };
 
         if should_create {
-            jmapsync::maildir_ops::store::ensure_maildir(&path)?;
+            jma_mail::maildir_ops::store::ensure_maildir(&path)?;
             println!("Provisioned maildir: {}", path.display());
         } else {
             println!("Skipping non-empty maildir: {}", path.display());
@@ -204,13 +204,13 @@ async fn cmd_mailboxes(cli: &Cli) -> Result<()> {
     let conn = state::db::open(&db_path)?;
     let client = session::connect(&config.account, &conn).await?;
 
-    let mailboxes = jmapsync::jmap::mailbox::get_all(&client).await?;
+    let mailboxes = jma_mail::jmap::mailbox::get_all(&client).await?;
 
     // Index by id so `is_mailbox_synced` can walk the parent chain
     // and `resolve_folder_path` can compute the on-disk name.
     let by_id: std::collections::HashMap<_, _> =
         mailboxes.iter().map(|mb| (mb.id.clone(), mb)).collect();
-    let name_cap = jmapsync::jmap::limits::max_size_mailbox_name(&client);
+    let name_cap = jma_mail::jmap::limits::max_size_mailbox_name(&client);
 
     println!(
         "{:<40} {:>8} {:>8}  Role",
@@ -218,7 +218,7 @@ async fn cmd_mailboxes(cli: &Cli) -> Result<()> {
     );
     println!("{}", "-".repeat(70));
     for mb in &mailboxes {
-        let synced = if jmapsync::jmap::mailbox::is_mailbox_synced(
+        let synced = if jma_mail::jmap::mailbox::is_mailbox_synced(
             &config.sync.mailboxes,
             mb,
             &by_id,
@@ -229,7 +229,7 @@ async fn cmd_mailboxes(cli: &Cli) -> Result<()> {
             " "
         };
         // Show the on-disk path under the user's configured layout, so
-        // the listing matches what jmapsync would actually create.
+        // the listing matches what jma would actually create.
         // Resolution can fail several ways (separator collision in a
         // segment, joined path over the server's name cap, parent
         // chain cycle, unknown parent_id); whichever it is, the user
@@ -237,7 +237,7 @@ async fn cmd_mailboxes(cli: &Cli) -> Result<()> {
         // row visibly *and* surface the reason via `warn!` so the
         // user has both the at-a-glance signal in the table and the
         // specific cause in the log output.
-        let display_name = match jmapsync::maildir_ops::layout::resolve_folder_path(
+        let display_name = match jma_mail::maildir_ops::layout::resolve_folder_path(
             mb,
             &by_id,
             config.sync.folder_layout,
@@ -309,13 +309,13 @@ fn print_db_metadata(db_path: &std::path::Path, conn: &rusqlite::Connection) -> 
 fn print_account_cursors(conn: &rusqlite::Connection) -> Result<()> {
     use std::collections::BTreeMap;
 
-    let rows = jmapsync::state::queries::list_jmap_state_rows(conn)?;
+    let rows = jma_mail::state::queries::list_jmap_state_rows(conn)?;
     if rows.is_empty() {
-        println!("No JMAP state yet -- run `jmapsync sync` to bootstrap.");
+        println!("No JMAP state yet -- run `jma sync` to bootstrap.");
         return Ok(());
     }
 
-    let mut by_account: BTreeMap<String, Vec<jmapsync::state::queries::JmapStateRow>> =
+    let mut by_account: BTreeMap<String, Vec<jma_mail::state::queries::JmapStateRow>> =
         BTreeMap::new();
     for row in rows {
         by_account
@@ -383,7 +383,7 @@ fn ago_phrase(sqlite_ts: &str, now: &chrono::DateTime<chrono::Utc>) -> Result<St
 fn print_maildir_drift(conn: &rusqlite::Connection, maildir_root: &std::path::Path) -> Result<()> {
     println!("Maildir vs DB drift (under {}):", maildir_root.display());
 
-    let known: BTreeSet<String> = jmapsync::state::queries::list_known_maildir_folders(conn)?
+    let known: BTreeSet<String> = jma_mail::state::queries::list_known_maildir_folders(conn)?
         .into_iter()
         .collect();
 
@@ -429,7 +429,7 @@ fn print_maildir_drift(conn: &rusqlite::Connection, maildir_root: &std::path::Pa
 /// maildir?" marker -- works under any folder layout and matches
 /// what `ensure_maildir` actually creates.
 ///
-/// Skips jmapsync's own state markers (`.jmapsync.*`), the maildir
+/// Skips jma's own state markers (`.jma.*`), the maildir
 /// internals (`cur`/`new`/`tmp` -- we don't recurse into them, since
 /// any directory that *contains* one of those is itself a maildir
 /// already). Read errors at any level are silently dropped: this is
@@ -458,7 +458,7 @@ fn walk_for_maildirs(root: &std::path::Path, dir: &std::path::Path, found: &mut 
         }
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        if name_str.starts_with(".jmapsync.") {
+        if name_str.starts_with(".jma.") {
             continue;
         }
         if name_str == "cur" || name_str == "new" || name_str == "tmp" {
@@ -594,7 +594,7 @@ mod drift_tests {
 
     /// Pins the bug fix: the prior `starts_with('.')` filter dropped
     /// every Maildir++ folder. The recursive walk lets dotted folders
-    /// through while still skipping our own `.jmapsync.*` markers.
+    /// through while still skipping our own `.jma.*` markers.
     #[test]
     fn finds_maildir_pp_layout_folders() {
         let dir = tempfile::tempdir().unwrap();
@@ -632,18 +632,18 @@ mod drift_tests {
         assert_eq!(found, expected);
     }
 
-    /// `.jmapsync.db`, `.jmapsync.lock`, etc. live at the maildir root
+    /// `.jma.db`, `.jma.lock`, etc. live at the maildir root
     /// alongside synced folders. They must not be reported as drift.
     #[test]
-    fn skips_jmapsync_state_markers() {
+    fn skips_jma_state_markers() {
         let dir = tempfile::tempdir().unwrap();
         touch_maildir(dir.path(), "INBOX");
-        // Mimic the on-disk shape of jmapsync's own state files.
-        std::fs::File::create(dir.path().join(".jmapsync.db")).unwrap();
-        std::fs::File::create(dir.path().join(".jmapsync.lock")).unwrap();
-        // Also a `.jmapsync.foo` directory, just to confirm the filter
+        // Mimic the on-disk shape of jma's own state files.
+        std::fs::File::create(dir.path().join(".jma.db")).unwrap();
+        std::fs::File::create(dir.path().join(".jma.lock")).unwrap();
+        // Also a `.jma.foo` directory, just to confirm the filter
         // matches by prefix not by extension.
-        std::fs::create_dir_all(dir.path().join(".jmapsync.cache").join("cur")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".jma.cache").join("cur")).unwrap();
 
         let found = find_maildir_folders(dir.path());
 

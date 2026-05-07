@@ -7,7 +7,7 @@
 //!   - Linux: `dbus-secret-service-keyring-store`
 //!   - Windows: `windows-native-keyring-store`
 //!
-//! Service name `jmapsync-bearer`, user is the account's email.
+//! Service name `jma-bearer`, user is the account's email.
 //! Per-account scoping means a multi-account config keeps each
 //! provider's token isolated; rotating one doesn't touch the
 //! others.
@@ -23,7 +23,7 @@ use keyring_core::{Entry, Error};
 use std::sync::OnceLock;
 use tracing::debug;
 
-const SERVICE: &str = "jmapsync-bearer";
+const SERVICE: &str = "jma-bearer";
 
 /// Memoised result of registering the platform credential store as
 /// keyring-core's default. The error is stringified because

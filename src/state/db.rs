@@ -81,8 +81,8 @@ pub fn open(path: &Path) -> Result<Connection> {
 
     if let Some(stale) = stale_schema_version(path)? {
         anyhow::bail!(
-            "State DB at {} is schema version {}, but this jmapsync expects {}. \
-             Run `jmapsync sync` (or pull/push/watch) to recreate the DB \
+            "State DB at {} is schema version {}, but this jma expects {}. \
+             Run `jma sync` (or pull/push/watch) to recreate the DB \
              automatically -- existing local files are rebound by Message-ID, \
              so nothing re-downloads.",
             path.display(),
@@ -102,7 +102,7 @@ pub fn open(path: &Path) -> Result<Connection> {
 /// existing local files without re-downloading.
 ///
 /// Caller must hold the state DB lock from `acquire_lock` before
-/// calling this. Otherwise a concurrent jmapsync sharing this state DB
+/// calling this. Otherwise a concurrent jma sharing this state DB
 /// (e.g. a misconfigured second config pointing at the same `db_path`,
 /// or -- once the multi-account refactor lands -- a sibling per-account
 /// driver against the shared DB) could be midway through a cycle when
@@ -308,7 +308,7 @@ pub fn acquire_lock(db_path: &Path) -> Result<()> {
                 .map(|p| format!("pid {}", p))
                 .unwrap_or_else(|| "unknown pid".to_string());
             Err(anyhow::anyhow!(
-                "another jmapsync is using this state DB ({} at {})",
+                "another jma is using this state DB ({} at {})",
                 holder,
                 lock_path.display()
             ))
@@ -329,8 +329,8 @@ mod tests {
 
     #[test]
     fn lock_path_appends_lock_suffix() {
-        let p = lock_path_for(Path::new("/var/lib/jmapsync/state.db"));
-        assert_eq!(p, Path::new("/var/lib/jmapsync/state.db.lock"));
+        let p = lock_path_for(Path::new("/var/lib/jma/state.db"));
+        assert_eq!(p, Path::new("/var/lib/jma/state.db.lock"));
     }
 
     #[test]
@@ -358,7 +358,7 @@ mod tests {
         let err = acquire_lock(&db).expect_err("second acquire should fail");
         let msg = format!("{}", err);
         assert!(
-            msg.contains("another jmapsync is using this state DB"),
+            msg.contains("another jma is using this state DB"),
             "got: {msg}"
         );
         assert!(
@@ -495,7 +495,7 @@ mod tests {
             "expected version in message, got: {msg}"
         );
         assert!(
-            msg.contains("jmapsync sync"),
+            msg.contains("jma sync"),
             "expected actionable command in message, got: {msg}"
         );
     }

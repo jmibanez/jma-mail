@@ -1,5 +1,5 @@
 //! Newtype wrappers for the various string IDs that flow through
-//! jmapsync.
+//! jma.
 //!
 //! Without these, an opaque server `Email.id`, a maildir basename,
 //! and a parsed RFC 5322 `Message-ID` are all the same `String` type

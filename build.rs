@@ -7,7 +7,7 @@ fn main() {
     let cargo_version = env::var("CARGO_PKG_VERSION").unwrap();
     rerun_on_git_state();
     let version = compute_version(&cargo_version).unwrap_or_else(|| cargo_version.clone());
-    println!("cargo:rustc-env=JMAPSYNC_VERSION={version}");
+    println!("cargo:rustc-env=JMA_VERSION={version}");
 }
 
 fn rerun_on_git_state() {

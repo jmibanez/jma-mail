@@ -5,14 +5,14 @@ use std::path::{Path, PathBuf};
 use tracing::info;
 
 /// Path of the advisory lock file paired with a given maildir root
-/// (`<root>/.jmapsync.lock`). Exposed for diagnostics; not normally
+/// (`<root>/.jma.lock`). Exposed for diagnostics; not normally
 /// needed by callers.
 pub fn lock_path_for(maildir_root: &Path) -> PathBuf {
-    maildir_root.join(".jmapsync.lock")
+    maildir_root.join(".jma.lock")
 }
 
-/// Acquire an exclusive advisory lock on `<maildir_root>/.jmapsync.lock`
-/// so that at most one mutating jmapsync command (sync/pull/push/watch)
+/// Acquire an exclusive advisory lock on `<maildir_root>/.jma.lock`
+/// so that at most one mutating jma command (sync/pull/push/watch)
 /// touches a given maildir at a time. The lock is keyed on the maildir
 /// because the maildir is the cross-process shared mutation surface:
 /// two configs pointing at different state DBs but the same maildir
@@ -33,7 +33,7 @@ pub fn lock_path_for(maildir_root: &Path) -> PathBuf {
 pub fn acquire_lock(maildir_root: &Path) -> Result<()> {
     if !maildir_root.exists() {
         anyhow::bail!(
-            "Maildir root does not exist: {}. Run `jmapsync init` first, or fix the \
+            "Maildir root does not exist: {}. Run `jma init` first, or fix the \
              [sync].maildir_path in your config.",
             maildir_root.display()
         );
@@ -70,7 +70,7 @@ pub fn acquire_lock(maildir_root: &Path) -> Result<()> {
                 .map(|p| format!("pid {}", p))
                 .unwrap_or_else(|| "unknown pid".to_string());
             Err(anyhow::anyhow!(
-                "another jmapsync is running ({} at {})",
+                "another jma is running ({} at {})",
                 holder,
                 lock_path.display()
             ))
@@ -92,7 +92,7 @@ mod tests {
     #[test]
     fn lock_path_is_dotfile_at_maildir_root() {
         let p = lock_path_for(Path::new("/home/user/Mail/foo"));
-        assert_eq!(p, Path::new("/home/user/Mail/foo/.jmapsync.lock"));
+        assert_eq!(p, Path::new("/home/user/Mail/foo/.jma.lock"));
     }
 
     #[test]
@@ -111,7 +111,7 @@ mod tests {
 
         let err = acquire_lock(dir.path()).expect_err("second acquire should fail");
         let msg = format!("{}", err);
-        assert!(msg.contains("another jmapsync is running"), "got: {msg}");
+        assert!(msg.contains("another jma is running"), "got: {msg}");
         assert!(
             msg.contains(&format!("pid {}", std::process::id())),
             "expected our pid in message, got: {msg}"

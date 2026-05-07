@@ -206,7 +206,7 @@ fn require_message_id(maildir_id: &MaildirId, path: &Path) -> Result<Option<Mess
         None => {
             error!(
                 "Skipping {} ({}): no Message-ID header. \
-                 jmapsync requires Message-ID to anchor idempotency; \
+                 jma requires Message-ID to anchor idempotency; \
                  fix the file or remove it.",
                 maildir_id,
                 path.display()
@@ -438,7 +438,7 @@ mod tests {
     }
 
     /// A file with no Message-ID header (RFC 5322 says it SHOULD be
-    /// present, but isn't a hard MUST) must NOT be ingested: jmapsync
+    /// present, but isn't a hard MUST) must NOT be ingested: jma
     /// anchors idempotency on Message-ID, and emitting NewMessage
     /// without one would either drop the message at reconcile or
     /// produce a server-side duplicate after a state DB wipe. Scan

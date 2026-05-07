@@ -1,8 +1,12 @@
 [package]
-name = "jmapsync"
+name = "jma-mail"
 version = "0.1.0"
 edition = "2024"
-description = "Bidirectional JMAP-to-Maildir email sync for Fastmail"
+description = "JM's Mail Agent: bidirectional JMAP-to-Maildir email sync for Fastmail"
+
+[[bin]]
+name = "jma"
+path = "src/main.rs"
 
 [dependencies]
 # JMAP client

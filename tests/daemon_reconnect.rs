@@ -42,12 +42,12 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use jmapsync::config::{
+use jma_mail::config::{
     AccountConfig, Config, ConflictStrategy, StateConfig, SyncConfig, WatchConfig,
 };
-use jmapsync::daemon;
-use jmapsync::maildir_ops::layout::FolderLayout;
-use jmapsync::state::{db, queries};
+use jma_mail::daemon;
+use jma_mail::maildir_ops::layout::FolderLayout;
+use jma_mail::state::{db, queries};
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};

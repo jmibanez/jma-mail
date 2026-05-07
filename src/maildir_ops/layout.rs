@@ -4,7 +4,7 @@
 //! `cur`/`new`/`tmp` subdirectories and nothing else. There's no
 //! native concept of a folder hierarchy. Different tools have invented
 //! different conventions for laying a hierarchical mailbox tree onto a
-//! maildir root, and this module is where jmapsync picks one.
+//! maildir root, and this module is where jma picks one.
 //!
 //! `FolderLayout` enumerates the three conventions worth supporting;
 //! `resolve_folder_path` walks an upstream mailbox's parent chain and
@@ -42,7 +42,7 @@ use crate::jmap::types::MailboxObject;
 ///   The spec forbids names starting with `.` (would produce `..`)
 ///   so segments are validated against that.
 ///
-///   INBOX placement under this layout is a deliberate jmapsync
+///   INBOX placement under this layout is a deliberate jma
 ///   convention, not a spec-derived one. Sam Varshavchik's Maildir++
 ///   spec (README.maildirquota.html in Courier) doesn't address
 ///   INBOX -- INBOX is an IMAP/JMAP concept, and Maildir++ only
@@ -66,7 +66,7 @@ use crate::jmap::types::MailboxObject;
 ///   named `cur`/`new`/`tmp` collides with maildir internals -- so
 ///   segments equal to those names are rejected here. Leading-dot
 ///   segments are also rejected to avoid colliding with our own
-///   `.jmapsync.lock` / `.jmapsync.db` markers at the root.
+///   `.jma.lock` / `.jma.db` markers at the root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum FolderLayout {
@@ -124,7 +124,7 @@ fn validate_segment_for_layout(name: &str, layout: FolderLayout, separator: char
             if name.starts_with('.') {
                 anyhow::bail!(
                     "FS layout forbids segments starting with '.' \
-                     (collide with hidden files / jmapsync state markers): {:?}",
+                     (collide with hidden files / jma state markers): {:?}",
                     name
                 );
             }
@@ -153,7 +153,7 @@ fn validate_segment_for_layout(name: &str, layout: FolderLayout, separator: char
 /// under `Flat` and `MaildirPP`, where the whole flattened path
 /// becomes a single directory entry subject to the filesystem's
 /// `NAME_MAX`. Pass the filesystem cap (255 on every filesystem
-/// jmapsync will plausibly run on); upstream is responsible for
+/// jma will plausibly run on); upstream is responsible for
 /// segment-level caps. `Fs` joins with `/` so each segment is its
 /// own directory entry; the joined result has no additional cap and
 /// `joined_name_cap` is ignored.

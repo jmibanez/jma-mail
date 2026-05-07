@@ -297,7 +297,7 @@ impl EmailSetOutcome {
 /// correctly rejects `mailboxIds/{id}: false`. Full replacement
 /// sidesteps the issue at the cost of stripping any out-of-band
 /// mailbox memberships not in the target set — acceptable for
-/// jmapsync's single-mailbox-per-email model.
+/// jma's single-mailbox-per-email model.
 pub async fn set_email_batch(client: &Client, ops: &[EmailSetOp]) -> Result<EmailSetOutcome> {
     if ops.is_empty() {
         return Ok(EmailSetOutcome::default());

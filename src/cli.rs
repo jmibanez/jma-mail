@@ -3,9 +3,9 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
-    name = "jmapsync",
-    version = env!("JMAPSYNC_VERSION"),
-    about = "Bidirectional JMAP-to-Maildir email sync"
+    name = "jma",
+    version = env!("JMA_VERSION"),
+    about = "JM's Mail Agent: bidirectional JMAP-to-Maildir email sync"
 )]
 pub struct Cli {
     /// Config file path
@@ -13,7 +13,7 @@ pub struct Cli {
         short,
         long,
         global = true,
-        default_value = "~/.config/jmapsync/config.toml"
+        default_value = "~/.config/jma/config.toml"
     )]
     pub config: PathBuf,
 

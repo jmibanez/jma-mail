@@ -148,7 +148,7 @@ pub enum SyncAction {
         /// for `mailboxIds/{id}` (its patch map is typed `bool`), and
         /// servers like Fastmail correctly reject `false` for a
         /// `Id[Boolean]` set-membership map. Computed at planning
-        /// time; for jmapsync's single-mailbox-per-email DB model
+        /// time; for jma's single-mailbox-per-email DB model
         /// this is just `[to_mailbox_id]`.
         target_mailbox_ids: Vec<JmapMailboxId>,
         /// Folder names of the source / destination mailboxes,

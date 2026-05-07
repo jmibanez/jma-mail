@@ -1367,27 +1367,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
-name = "jmap-client"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3357aac1ef357587e09f44262f351f7773120fb695e281b34628ef9d84028038"
-dependencies = [
- "ahash",
- "async-stream",
- "base64",
- "chrono",
- "futures-util",
- "maybe-async",
- "parking_lot",
- "reqwest 0.13.2",
- "rustls",
- "rustls-pki-types",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "jmapsync"
+name = "jma-mail"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1421,6 +1401,26 @@ dependencies = [
  "uuid",
  "windows-native-keyring-store",
  "wiremock",
+]
+
+[[package]]
+name = "jmap-client"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3357aac1ef357587e09f44262f351f7773120fb695e281b34628ef9d84028038"
+dependencies = [
+ "ahash",
+ "async-stream",
+ "base64",
+ "chrono",
+ "futures-util",
+ "maybe-async",
+ "parking_lot",
+ "reqwest 0.13.2",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

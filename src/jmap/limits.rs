@@ -3,7 +3,7 @@
 //! The JMAP server is a trust boundary: it can advertise any value it
 //! likes in its session capabilities (RFC 8620 §2). Every accessor in
 //! this module combines the server's value with a separate ceiling
-//! representing what jmapsync is willing to attempt regardless. The
+//! representing what jma is willing to attempt regardless. The
 //! effective limit is always the smaller of the two:
 //! `min(server_value, our_ceiling)`. The server can only **lower**
 //! what we'd otherwise do; it can never raise it. When the server

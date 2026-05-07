@@ -34,9 +34,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use jmapsync::daemon::eventsource;
-use jmapsync::daemon::runner::SyncTrigger;
-use jmapsync::ids::JmapAccountId;
+use jma_mail::daemon::eventsource;
+use jma_mail::daemon::runner::SyncTrigger;
+use jma_mail::ids::JmapAccountId;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;

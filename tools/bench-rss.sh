@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Compare peak RSS and wall-clock between two jmapsync builds across
+# Compare peak RSS and wall-clock between two jma builds across
 # the four cells of an A/B benchmark:
 #
 #   * BEFORE binary, fresh state DB (initial sync)
@@ -21,7 +21,7 @@
 #
 # The script builds each binary by checking out the target commit
 # and running `cargo build --release`, then copies the artifact to
-# `$BENCH_DIR/jmapsync-<full-sha>`. Subsequent runs reuse the cached
+# `$BENCH_DIR/jma-<full-sha>`. Subsequent runs reuse the cached
 # binary if it's already present; delete the file to force a rebuild.
 # The user's working ref is restored at the end (and on interrupt /
 # build failure via an EXIT trap), but the script refuses to start
@@ -30,8 +30,8 @@
 # Environment overrides:
 #   BENCH_DIR  Scratch dir for cached binaries, maildir copy, state
 #              DB, logs.
-#              Default: /tmp/jmapsync-bench
-#   SUBCMD     jmapsync subcommand to benchmark.
+#              Default: /tmp/jma-bench
+#   SUBCMD     jma subcommand to benchmark.
 #              Default: pull
 #
 # Setup of the maildir + config is idempotent: the maildir is
@@ -39,8 +39,8 @@
 # to force a fresh setup (will also drop cached binaries).
 #
 # Auth flows through the existing keychain entry under
-# `jmapsync-bearer`/`default`; the script does not manage tokens.
-# Run `jmapsync auth set-token` first if needed.
+# `jma-bearer`/`default`; the script does not manage tokens.
+# Run `jma auth set-token` first if needed.
 
 set -euo pipefail
 
@@ -63,12 +63,12 @@ AFTER_REF="$2"
 MAILDIR_SOURCE="$3"
 ACCOUNT_EMAIL="$4"
 
-BENCH_DIR="${BENCH_DIR:-/tmp/jmapsync-bench}"
+BENCH_DIR="${BENCH_DIR:-/tmp/jma-bench}"
 SUBCMD="${SUBCMD:-pull}"
 
 # Must be inside a git checkout to resolve commits and switch refs.
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
-    echo "not inside a git repository; run from the jmapsync checkout" >&2
+    echo "not inside a git repository; run from the jma checkout" >&2
     exit 1
 }
 cd "$REPO_ROOT"
@@ -125,17 +125,17 @@ mkdir -p "$BENCH_DIR"
 # Returns success if the cached file is present (rebuilds when not).
 build_for() {
     local sha="$1"
-    local target="$BENCH_DIR/jmapsync-$sha"
+    local target="$BENCH_DIR/jma-$sha"
 
     if [[ -x "$target" ]]; then
-        echo "  cached: jmapsync-${sha:0:8} -> $target"
+        echo "  cached: jma-${sha:0:8} -> $target"
         return 0
     fi
 
-    echo "  building jmapsync-${sha:0:8} ..."
+    echo "  building jma-${sha:0:8} ..."
     git checkout --quiet "$sha"
     CC=/usr/bin/cc cargo build --release
-    cp "$REPO_ROOT/target/release/jmapsync" "$target"
+    cp "$REPO_ROOT/target/release/jma" "$target"
     chmod +x "$target"
     echo "  built: $target"
 }
@@ -150,8 +150,8 @@ echo
 # original commit, not at AFTER's tree.
 restore_ref
 
-BEFORE_BIN="$BENCH_DIR/jmapsync-$BEFORE_SHA"
-AFTER_BIN="$BENCH_DIR/jmapsync-$AFTER_SHA"
+BEFORE_BIN="$BENCH_DIR/jma-$BEFORE_SHA"
+AFTER_BIN="$BENCH_DIR/jma-$AFTER_SHA"
 
 # --- maildir / config setup (unchanged from the run-only script) ---
 
@@ -176,7 +176,7 @@ download_concurrency = 8
 EOF
 
 reset_state() {
-    rm -f maildir/.jmapsync.db maildir/.jmapsync.db-wal maildir/.jmapsync.db-shm
+    rm -f maildir/.jma.db maildir/.jma.db-wal maildir/.jma.db-shm
 }
 
 run() {

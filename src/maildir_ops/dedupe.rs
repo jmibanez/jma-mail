@@ -44,7 +44,7 @@ pub struct LocalIndex {
 /// Walk every synced maildir folder, parse Message-IDs out of each file, and
 /// dedupe **within each folder**: when several files in the same folder share
 /// a Message-ID, delete the newest by mtime (the most recently introduced
-/// copy is, by construction, the duplicate jmapsync wrote on top of an
+/// copy is, by construction, the duplicate jma wrote on top of an
 /// existing file). Cross-folder copies of the same Message-ID are preserved
 /// — a user copying a message into another mailbox is a distinct instance.
 ///
@@ -77,7 +77,7 @@ where
                 None => {
                     error!(
                         "Skipping {} ({}): no Message-ID header. \
-                         jmapsync requires Message-ID to anchor idempotency; \
+                         jma requires Message-ID to anchor idempotency; \
                          fix the file or remove it.",
                         maildir_id,
                         path.display()

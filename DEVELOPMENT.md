@@ -1,12 +1,12 @@
 # DEVELOPMENT.md
 
-A working tour of `jmapsync`'s internals, for those who want to work on the codebase. Skim the first three sections to get oriented; the later sections drill into `src/sync/` (the only part of the codebase with non-trivial logic).
+A working tour of `jma`'s internals, for those who want to work on the codebase. Skim the first three sections to get oriented; the later sections drill into `src/sync/` (the only part of the codebase with non-trivial logic).
 
 ## What this is
 
-`jmapsync` is a Rust CLI that bidirectionally syncs email between a JMAP server (targeting Fastmail) and a local Maildir -- like `mbsync`/`isync` but speaking JMAP. Single binary, async (tokio), state in SQLite.
+`jma` (binary; crate name `jma-mail`) is a Rust CLI that bidirectionally syncs email between a JMAP server (targeting Fastmail) and a local Maildir -- like `mbsync`/`isync` but speaking JMAP. Single binary, async (tokio), state in SQLite.
 
-Currently, `jmapsync` only supports **API token (Bearer)** auth. OAuth might be implemented in the future, but that would somehow entail saving an OAuth API private key; for now API tokens work. Tokens are resolved per-account: the OS keychain (entry keyed on the account's email, set via `jmapsync auth set-token --account <email>`) wins over the in-file `[[accounts]].token` fallback.
+Currently, `jma` only supports **API token (Bearer)** auth. OAuth might be implemented in the future, but that would somehow entail saving an OAuth API private key; for now API tokens work. Tokens are resolved per-account: the OS keychain (entry keyed on the account's email, set via `jma auth set-token --account <email>`) wins over the in-file `[[accounts]].token` fallback.
 
 See [README.md](README.md) for more info on subcommands and flags.
 
@@ -144,7 +144,7 @@ Two distinct identifiers anchor the system:
 
 The state DB is **disposable**. Nuking `state.db` and re-running must converge on the existing maildir without re-downloading or duplicating files. That property is enforced by:
 
-1. `maildir_ops::dedupe::dedupe` runs at the start of every sync cycle. It walks each synced folder, groups files by Message-ID (parsed from headers in `maildir_ops::headers`), and **deletes the newest by mtime** within each group. Newer copies are presumed to be jmapsync-introduced duplicates from a prior aborted run. Fires an `on_kept` callback once per surviving file; `SyncEngine::run` uses that callback to build a `LocalIndex` keyed on Message-ID.
+1. `maildir_ops::dedupe::dedupe` runs at the start of every sync cycle. It walks each synced folder, groups files by Message-ID (parsed from headers in `maildir_ops::headers`), and **deletes the newest by mtime** within each group. Newer copies are presumed to be jma-introduced duplicates from a prior aborted run. Fires an `on_kept` callback once per surviving file; `SyncEngine::run` uses that callback to build a `LocalIndex` keyed on Message-ID.
 
 2. `reconcile` consults `message_map` (by JMAP id) -> `LocalIndex` (by Message-ID) before emitting a `DownloadMessage`. The Message-ID lookup is what saves us after a DB wipe: a known server email whose Message-ID we already have on disk is adopted into `message_map` rather than re-downloaded.
 
@@ -159,8 +159,8 @@ There is no in-place migration system. Whenever the SQLite schema or the invaria
 On open, the binary compares the on-disk version against `SCHEMA_VERSION`:
 
 - **Match** -- proceed.
-- **Mismatch** under a mutating command (`sync`, `pull`, `push`, `watch`) -- `open_or_recreate` `warn!`s and unlinks `state.db` plus its `-wal` and `-shm` siblings, then recreates an empty schema. The mutating command holds the state DB lock at this point, so no concurrent jmapsync sharing this DB (same config, or — once the multi-account refactor lands — sibling per-account drivers against a shared DB) can race with the unlink. The disposability invariant is what makes this safe: the maildir + JMAP server are the source of truth, and the dedupe pass plus Message-ID-anchored adoption rebind every existing local file without re-downloading bytes.
-- **Mismatch** under a read-only command (`status`, `mailboxes`, `auth rediscover`) -- `open` refuses with an actionable error pointing the user at `jmapsync sync`. Read-only paths don't hold the state DB lock and so can't safely nuke; deferring to the next mutating run keeps the locking invariant intact.
+- **Mismatch** under a mutating command (`sync`, `pull`, `push`, `watch`) -- `open_or_recreate` `warn!`s and unlinks `state.db` plus its `-wal` and `-shm` siblings, then recreates an empty schema. The mutating command holds the state DB lock at this point, so no concurrent jma sharing this DB (same config, or — once the multi-account refactor lands — sibling per-account drivers against a shared DB) can race with the unlink. The disposability invariant is what makes this safe: the maildir + JMAP server are the source of truth, and the dedupe pass plus Message-ID-anchored adoption rebind every existing local file without re-downloading bytes.
+- **Mismatch** under a read-only command (`status`, `mailboxes`, `auth rediscover`) -- `open` refuses with an actionable error pointing the user at `jma sync`. Read-only paths don't hold the state DB lock and so can't safely nuke; deferring to the next mutating run keeps the locking invariant intact.
 
 Both directions of mismatch (older binary, newer DB; or newer binary, older DB) take the same auto-nuke path. Disposability cuts both ways. A pre-versioning DB (`user_version = 0` with populated tables) is treated as stale.
 
@@ -172,7 +172,7 @@ Two distinct surfaces need protection from concurrent mutation, plus write-coher
 
 ### Maildir mutual exclusion
 
-`maildir_ops::lock::acquire_lock` takes a `flock`-backed advisory lock on `<maildir_root>/.jmapsync.lock`. Mutating jmapsync invocations (`sync`, `pull`, `push`, `watch`) against the same maildir can't both run; the second fails with the first's PID in the error message. Read-only commands (`status`, `mailboxes`) and maildir-less commands (`init`, `auth`) skip this.
+`maildir_ops::lock::acquire_lock` takes a `flock`-backed advisory lock on `<maildir_root>/.jma.lock`. Mutating jma invocations (`sync`, `pull`, `push`, `watch`) against the same maildir can't both run; the second fails with the first's PID in the error message. Read-only commands (`status`, `mailboxes`) and maildir-less commands (`init`, `auth`) skip this.
 
 The lock keys on the maildir root, not the state DB, because the maildir is the shared mutation surface across processes. Two configs pointing at *different* state DBs but the *same* maildir would otherwise race -- both could write the same Message-ID under different filenames and clobber each other. Per-account-Maildir-root is the universal convention across mbsync, OfflineIMAP, getmail, etc., so this serializes exactly what needs serializing without artificially preventing legitimate multi-account setups (different accounts -> different roots -> different locks).
 
@@ -182,7 +182,7 @@ The lock keys on the maildir root, not the state DB, because the maildir is the 
 
 The maildir lock alone doesn't cover this, because two processes can hold *different* maildir locks while sharing a state DB -- which is exactly the topology the multi-account refactor produces (per-account daemon drivers, each with their own maildir, all pointing at one widened-PK DB).
 
-Note that with the maildir-relative default for `[state].db_path`, the state DB lives at `<maildir_root>/.jmapsync.db` and the maildir lock structurally covers what the DB lock guards -- any process that could open this DB must already hold the maildir lock by construction. The DB lock is only load-bearing when `[state].db_path` is set explicitly to a path outside the maildir, where two configs can share a DB while owning different maildirs. Today both locks are taken unconditionally regardless of topology; gating the DB lock on config shape is a candidate simplification but not a current one.
+Note that with the maildir-relative default for `[state].db_path`, the state DB lives at `<maildir_root>/.jma.db` and the maildir lock structurally covers what the DB lock guards -- any process that could open this DB must already hold the maildir lock by construction. The DB lock is only load-bearing when `[state].db_path` is set explicitly to a path outside the maildir, where two configs can share a DB while owning different maildirs. Today both locks are taken unconditionally regardless of topology; gating the DB lock on config shape is a candidate simplification but not a current one.
 
 **Lock-acquisition order: maildir lock first, then state DB lock**, consistently across every mutating call site (see `acquire_mutator_locks` in `src/main.rs`). Consistent order is what prevents deadlock between two contending pairs. Both locks are held for process lifetime; the kernel releases them when the fds close at process exit.
 

@@ -21,13 +21,13 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use jmapsync::config::{
+use jma_mail::config::{
     AccountConfig, Config, ConflictStrategy, StateConfig, SyncConfig, WatchConfig,
 };
-use jmapsync::ids::{JmapEmailId, JmapMailboxId};
-use jmapsync::maildir_ops::layout::FolderLayout;
-use jmapsync::state::{db, queries};
-use jmapsync::sync::engine::SyncEngine;
+use jma_mail::ids::{JmapEmailId, JmapMailboxId};
+use jma_mail::maildir_ops::layout::FolderLayout;
+use jma_mail::state::{db, queries};
+use jma_mail::sync::engine::SyncEngine;
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path, path_regex};
