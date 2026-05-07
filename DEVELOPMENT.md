@@ -6,7 +6,7 @@ A working tour of `jma`'s internals, for those who want to work on the codebase.
 
 `jma` (binary; crate name `jma-mail`) is a Rust CLI that bidirectionally syncs email between a JMAP server (targeting Fastmail) and a local Maildir -- like `mbsync`/`isync` but speaking JMAP. Single binary, async (tokio), state in SQLite.
 
-Currently, `jma` only supports **API token (Bearer)** auth. OAuth might be implemented in the future, but that would somehow entail saving an OAuth API private key; for now API tokens work. Tokens are resolved per-account: the OS keychain (entry keyed on the account's email, set via `jma auth set-token --account <email>`) wins over the in-file `[account].token` fallback.
+Currently, `jma` only supports **API token (Bearer)** auth. OAuth might be implemented in the future, but that would somehow entail saving an OAuth API private key; for now API tokens work. Tokens are resolved per-account: the OS keychain (entry keyed on the account's email, set via `jma auth set-token --account <email>`) wins over the in-file `[account].token` fallback. `src/auth.rs` wraps `keyring-core` with the platform-native backend (Keychain on macOS, Secret Service on Linux, Credential Manager on Windows).
 
 See [README.md](README.md) for more info on subcommands and flags.
 
@@ -28,15 +28,21 @@ CC=/usr/bin/cc cargo test --lib maildir_ops::headers::tests::parses_folded_value
 
 ## Source layout
 
-- `src/main.rs` -- CLI entry point and subcommand dispatch.
+- `src/main.rs` -- subcommand dispatch and lock acquisition.
+- `src/cli.rs` -- clap definitions for subcommands and global flags.
 - `src/config.rs` -- TOML config schema and template.
-- `src/jmap/` -- JMAP client wrapper. `session.rs` opens the   connection, `email.rs` is the per-method veneer over `jmap-client`, `mailbox.rs` handles `Mailbox/get`, `retry.rs` classifies errors as transient vs hard, `types.rs` holds the internal `EmailObject` shape.
-- `src/maildir_ops/` -- anything that touches the filesystem. `store.rs` wraps `maildirpp` for read/write, `flags.rs` translates between maildir suffix flags and JMAP keywords, `scan.rs` walks a folder and emits `LocalChange`s, `dedupe.rs` does the Message-ID-based duplicate sweep, `headers.rs` parses `Message-ID` out of a maildir file.
+- `src/auth.rs` -- bearer-token storage in the OS keychain (per-email scoping; platform backends behind `keyring-core`).
+- `src/ids.rs` -- newtype wrappers for the various string IDs (see [ID newtypes](#id-newtypes)).
+- `src/jmap/` -- JMAP client wrapper. `session.rs` opens the connection, `discovery.rs` resolves the session URL via DNS SRV / well-known per RFC 8620 section 2.2, `limits.rs` clamps every server-advertised cap against a hardcoded ceiling (so a hostile or buggy server can't induce DoS via absurd values), `email.rs` is the per-method veneer over `jmap-client`, `mailbox.rs` handles `Mailbox/get`, `retry.rs` classifies errors as transient vs hard, `types.rs` holds the internal `EmailObject` shape.
+- `src/maildir_ops/` -- anything that touches the filesystem. `store.rs` wraps the `maildir` crate for read/write, `flags.rs` translates between maildir suffix flags and JMAP keywords, `scan.rs` walks a folder and emits `LocalChange`s, `dedupe.rs` does the Message-ID-based duplicate sweep, `headers.rs` parses `Message-ID` out of a maildir file, `layout.rs` resolves a JMAP mailbox tree onto a single on-disk folder name under the configured `FolderLayout`, `lock.rs` takes the per-maildir advisory lock.
 - `src/state/` -- SQLite. Schema in `db.rs::SCHEMA`. Tables:
   - `jmap_state` -- per-entity sync cursor (one row per `(account, entity)` like `("acct", "Email")`).
   - `message_map` -- JMAP<->maildir binding, indexed on `maildir_id`, `message_id`, `mailbox_id`.
   - `mailbox_map` -- server mailbox metadata.
-  - `local_state` -- filesystem snapshot for change detection. All access goes through `queries.rs`. Don't `prepare` ad-hoc SQL elsewhere; if you need a new query, add it there.
+  - `local_state` -- filesystem snapshot for change detection.
+  - `jmap_discovery` -- cached session URL keyed on the account's email domain; populated by `session::connect` after autodiscovery, cleared and rediscovered on a structural connect failure.
+
+  All access goes through `queries.rs`. Don't `prepare` ad-hoc SQL elsewhere; if you need a new query, add it there.
 - `src/sync/` -- orchestration. See [Sync internals](#sync-internals) below.
 - `src/daemon/` -- `watch` mode. `runner.rs` runs an initial sync then concurrently spawns `eventsource.rs` (SSE listener on the JMAP `eventSourceUrl` from the session) and `watcher.rs` (filesystem `notify` with debouncing). Both feed a `tokio::sync::mpsc` channel of `SyncTrigger`s; the main loop drains and re-runs `SyncEngine::sync` per trigger. `hook.rs` runs `post_arrival_command` after sync cycles that downloaded mail, coalescing overlapping triggers.
 
@@ -92,7 +98,7 @@ The sync pipeline moves a small set of internal types between phases. Each one l
 **Maildir-side types** (`src/maildir_ops/`). What `scan` and `dedupe` produce for `reconcile` to chew on.
 
 - `LocalChange` (enum) -- one of:
-  - `NewMessage { maildir_id, folder, flags, path, message_id }` -- a file appeared that wasn't in `local_state`. `message_id` is non-`Option`: `scan::scan_folder` refuses to construct a `NewMessage` for a file without a parseable Message-ID header (it `error!`s and skips the file), so reconcile never has to defend against the missing-anchor case.
+  - `NewMessage { maildir_id, folder, flags, path, message_id, size_bytes }` -- a file appeared that wasn't in `local_state`. `message_id` is non-`Option`: `scan::scan_folder` refuses to construct a `NewMessage` for a file without a parseable Message-ID header (it `error!`s and skips the file), so reconcile never has to defend against the missing-anchor case. `size_bytes` is the on-disk size captured at scan time, used by reconcile to refuse oversized uploads at plan time without doing its own I/O.
   - `FlagsChanged { maildir_id, folder, old_flags, new_flags }` -- the maildir filename suffix changed.
   - `DeletedMessage { maildir_id, folder }` -- a `local_state` row has no corresponding file on disk.
 - `LocalEntry` -- `{ folder, maildir_id }`. One on-disk file's location.
@@ -176,6 +182,11 @@ The `jmap-client` crate is convenient but a few server behaviors need explicit h
 - **`Email/changes` since `"0"` is not a bootstrap.** Fastmail (and the spec) allows the server to refuse with `cannotCalculateChanges`. Use `jmap::email::get_current_state` (`Email/get` with empty ids) to read the current state after an initial pull instead. Detect this error via `jmap::email::is_cannot_calculate_changes`, which walks the anyhow chain and downcasts to the typed `jmap_client::Error::Method(MethodErrorType::CannotCalculateChanges)` -- never substring-match Display strings, since a `.context(...)` wrapper at any layer breaks that. Recovery: write the empty string to `jmap_state`, which `queries::get_jmap_state` filters back to `None`, which routes to the initial-pull branch on the next cycle.
 - **Maildir stores bare LF; `Email/import` rejects bare newlines.** `jmap::email::import_email` calls `normalize_crlf` before handing bytes to `email_import`. Don't normalize at maildir read time -- keep on-disk format native so other MUAs work.
 - **`mailbox_id(id, bool)` patches can't remove memberships.** `jmap-client` 0.4.1 types its `mailboxIds` patch map as `bool`, so the only values it can emit are `true` and `false`. Per RFC 8621 §4.1.1 `mailboxIds` is `Id[Boolean]` whose values are always `true`, and per RFC 8620 §5.3 a key is removed by patching its value to `null` -- which the typed-`bool` map cannot serialize. Strict servers (Fastmail) reject the `false`-valued patch as `notUpdated`. For moves, use the full-replacement `mailboxIds(...)` setter instead, which sends the entire target set in one go.
+- **Session URL resolution disables redirects.** `session::connect` resolves the URL via explicit `[account].session_url` override, then the `jmap_discovery` cache, then RFC 8620 section 2.2 autodiscovery (DNS SRV `_jmap._tcp.<domain>`, fallback `https://<domain>/.well-known/jmap`). The well-known probe runs with `redirect::Policy::none()`: per RFC 8620 section 2.1 the canonical session resource requires an authenticated GET, and following a 30x would land us there unauthenticated and get a 401. On a structural connect failure against a cached URL we clear the cache row and rediscover.
+
+### Server-cap clamping
+
+The JMAP server is a trust boundary: per RFC 8620 section 2 it can advertise any value it likes for its session capabilities, including absurd ones. A hostile or ill-configured upstream could otherwise force us to bundle megabytes of metadata into a single `Email/get` response, OOM us with a too-large upload, or escape the maildir tree with an oversized mailbox name. Every server-advertised limit therefore goes through `src/jmap/limits.rs`, which `min`'s the value against a hardcoded ceiling (`MAX_SET_BATCH_SIZE`, `MAX_GET_BATCH_SIZE`, `MAX_UPLOAD_FILE_SIZE`, `MAX_MAILBOX_NAME_LEN`) or, for the concurrency knobs, against the user-configured value. The server can only **lower** what we'd otherwise do; it can never raise it. Direct reads of `client.session().core_capabilities()...` elsewhere are a smell -- if you find yourself reaching for one, add or extend an accessor in `limits.rs` and route through it.
 
 ## Sync internals
 
@@ -203,11 +214,11 @@ planning; phase 5 is the only place we mutate anything.
    - `known_by_maildir: HashMap<maildir_id, MessageRecord>` -- 1:1, since each on-disk file maps to one `message_map` row.
    - `known_by_message_id: HashMap<message_id, Vec<MessageRecord>>` -- 1:N, since the same RFC 5322 Message-ID can appear in multiple folders.
 
-   `reconcile::reconcile` consumes all of the above plus the configured `ConflictStrategy` and returns a `SyncPlan`.
+   `reconcile::reconcile` consumes these plus the dedupe pass's `LocalIndex`, the `[(jmap_id, folder_name)]` mailbox list from phase 1, the configured `ConflictStrategy`, and the effective `maxSizeUpload` cap (used to refuse oversized local files at plan time). The full input set is bundled as `ReconcileInput` in `src/sync/reconcile.rs`. Returns a `SyncPlan`.
 
 4. **Filter by direction.** `SyncPlan::into_filtered(direction)` splits the plan into `(kept, dropped)`. `AdoptLocalMessage` is always kept regardless of direction (see [documentation on `plan.rs`, next](#plan-rs--the-action-vocabulary)). Dropped actions are logged so a `pull` or `push` user sees what was suppressed.
 
-5. **Execute.** `Executor::execute` walks the plan in a fixed order (adopt -> download -> local-flags -> local-move -> local-delete -> upload -> remote-set), then persists `new_email_state` into `jmap_state`.
+5. **Execute.** `Executor::execute` walks the plan in a fixed bucket order, performs the JMAP / filesystem / DB writes, and ratchets the JMAP cursor at the tail. See [`execute.rs`](#executers--performing-the-side-effects) for the full bucket order, load-bearing dependencies, and the chain-validation step that decides whether the cursor advances.
 
 ### `plan.rs` -- the action vocabulary
 
@@ -330,15 +341,17 @@ After remote-side actions are settled, walk `local_changes` again:
 Execute is the only place that mutates anything. It buckets the plan by variant, then drains buckets in a fixed order:
 
 ```
-adopt -> download -> local-flags -> local-move -> local-delete ->
-upload -> remote-keywords -> remote-move -> remote-destroy
+adopt (unconditional) -> download -> local-flags -> local-move ->
+local-delete -> upload -> remote-set (keywords + moves + destroys, batched)
+-> adopt (move-paired)
 ```
 
 This ordering is load-bearing in a few places:
 
-- **Adopt before everything.** Subsequent actions (`UpdateLocalFlags`, `MoveLocal`) may reference the maildir_id / jmap_email_id being bound; they only succeed if `message_map` already has the row.
+- **Adopt before everything (mostly).** Unconditional adopts -- those that bind a maildir file to a server email without an associated remote-side move -- run first, because subsequent actions (`UpdateLocalFlags`, `MoveLocal`) may reference the maildir_id / jmap_email_id being bound and only succeed if `message_map` already has the row.
+- **Move-paired adopts run last, after the remote-set batch.** When `AdoptLocalMessage` carries an `old_maildir_id` it is the DB half of a cross-folder local move whose JMAP half was emitted as a `MoveRemote`. Committing the adopt up front would advance the DB to the destination folder; if the paired `MoveRemote` then fails per-id inside `apply_remote_set`, the next reconcile cycle would see a divergence (server still in source, DB in destination) and emit a backwards `MoveLocal` that undoes the user's move. Deferring until after `apply_remote_set` lets `apply_move_pair_adopts` consult the call's `failed_updates` set and skip the adopt for any move-pair the server rejected.
 - **Pull side before push side.** We want the local DB to settle to its post-pull state before we tell the server about local changes -- both because the conflict resolution in reconcile assumed the pull would land first, and because failed pushes leave the DB in a state where the next cycle can still see the original local changes.
-- **Remote-set last and batched.** `apply_remote_set` collapses every `UpdateRemoteKeywords`, `MoveRemote`, and `DestroyRemote` into a single `Email/set` call (JMAP allows arbitrary `update` and `destroy` entries in one method call). This minimises round trips and keeps the per-id failure handling uniform: the call returns `failed_updates` and `failed_destroys` sets, and we mirror successes into the DB while skipping the failures.
+- **Remote-set batched.** `apply_remote_set` collapses every `UpdateRemoteKeywords`, `MoveRemote`, and `DestroyRemote` into a single `Email/set` call (JMAP allows arbitrary `update` and `destroy` entries in one method call). This minimises round trips and keeps the per-id failure handling uniform: the call returns `failed_updates` and `failed_destroys` sets, and we mirror successes into the DB while skipping the failures.
 
 #### Per-handler responsibilities
 
@@ -359,21 +372,17 @@ A handful of handler-specific notes:
 - `upload_messages` -- extracts flags from the on-disk filename rather than trusting the action payload, because the maildir filename is the single source of truth for flag state. Catches `alreadyExists` and warns rather than failing the cycle: hitting this means reconcile's adoption guard didn't fire (typically a race with another writer between scan and import), and bailing on a single bad message shouldn't kill the run.
 - `apply_remote_set` -- see above. Per-id failures are silently skipped from the DB-mirror pass so the local DB never claims the server is in a state it isn't.
 
-#### Download concurrency and rate-limit halving
+#### Download and upload concurrency
 
-`run_downloads` is the only handler that fans out concurrently:
+Both `run_downloads` and `upload_messages` fan out via `buffer_unordered`, capped at the effective per-handler concurrency from `limits::` (`config.sync.{download,upload}_concurrency` clamped to the server's `maxConcurrentRequests` / `maxConcurrentUpload`). DB writes happen serially after the stream drains, since `rusqlite::Connection` isn't `Send` and can't cross await points inside the parallel futures. Each successful `Email/import` also contributes its `oldState` / `newState` pair to the cursor ratchet (see [State persistence](#state-persistence)); `Email/blob` is a pure data fetch so downloads don't.
 
-- Configured concurrency (`config.sync.download_concurrency`) is clamped at startup to the server's advertised `maxConcurrentRequests` (Fastmail: 10).
-- Each pass spawns up to `n` concurrent `Email/blob` downloads via `buffer_unordered`.
-- If any download returns a transient error (rate limit, 5xx), succeeded entries are committed, failed entries stay in `pending`, concurrency is halved, the loop sleeps 500ms and retries.
-- On a hard error from any download, the cycle returns the error after committing whatever did succeed.
-- If a pass returns no successes and no rate-limit, we bail with "stream stalled" rather than looping forever.
-
-The halving is one-way per cycle; it doesn't ratchet back up on success. This is intentional -- a flaky link that hit the cap once is likely to hit it again, and the next cycle starts fresh from the configured value anyway.
+Downloads get a rate-limit halving loop: a transient failure within a pass commits the successes, halves concurrency, sleeps 500ms, and retries the unfinished entries; the halving is one-way per cycle, since a link that hit the cap once is likely to hit it again, and the next cycle resets from the configured value. A hard error short-circuits after committing whatever did succeed; a pass with no progress and no transient signal bails with "stream stalled" rather than spinning. Uploads don't halve -- they drain the stream regardless, and the first observed error becomes the cycle's hard error.
 
 #### State persistence
 
 After every handler returns, `execute` writes `new_email_state` (if present) into `jmap_state`. This is the only place the JMAP cursor advances -- if any handler returned an error, we never reach this write and the next cycle re-runs `Email/changes` from the prior cursor. The DB writes that *did* happen before the error are kept, which is fine because they're all idempotent against a re-run.
+
+The cursor we write is not unconditionally `new_email_state`. Per RFC 8620 section 7.1, every state-advancing call (`Email/import`, `Email/set`) returns its own `oldState` / `newState` pair, and a cursor can only legitimately move along a chain whose edges are all present. `execute` collects each call's pair into a chain map keyed on `oldState`, then walks forward from the cursor reconcile produced. If every edge is consumed in a single contiguous walk, no third-party write landed between our calls and we ratchet the cursor to the walk's end; if any edge is missing or unreachable, we leave the cursor alone and let the next cycle's `Email/changes` resume from the unmoved point.
 
 ### Adding a new SyncAction
 
@@ -391,3 +400,13 @@ Things to avoid:
 - Don't write to a maildir outside `execute` (or `dedupe`'s deletion of duplicates). Every other writer would skip the Message-ID check that anchors the idempotency model.
 - Don't add an `Email/set` call outside `apply_remote_set` -- keep remote mutations batched.
 - Don't advance `jmap_state` from anywhere except the tail of `Executor::execute`.
+
+## Local Maildir layout
+
+A maildir is classically a single flat `cur` / `new` / `tmp` triplet, with no native concept of a folder hierarchy, so different MUAs have invented different conventions for projecting one onto the on-disk shape. jma supports three, picked via `[sync].folder_layout`:
+
+- **`Flat`** -- mbsync's `Flatten=<sep>` convention. Parent/child becomes `<root>/parent.child/{cur,new,tmp}` with a user-chosen `[sync].hierarchy_separator` (default `.`).
+- **`MaildirPP`** -- the Courier/Dovecot Maildir++ convention: every synced folder is prefixed with a single `.` at the root, so a child `Sent` of parent `[Airmail]` becomes `<root>/.[Airmail].Sent/`.
+- **`Fs`** -- Dovecot's `LAYOUT=fs`. Hierarchy materialises as a recursive directory tree: `<root>/parent/child/{cur,new,tmp}`.
+
+The translation lives in `maildir_ops::layout::resolve_folder_path`. `mailbox_map.maildir_folder` and every downstream `maildir_folder` string (in `LocalChange`, `MessageRecord`, etc.) is the post-resolution name -- callers don't see the JMAP hierarchy directly. The `INBOX` magic alias documented in [Identifiers](#identifiers) is applied at the same point: regardless of the configured layout, the inbox-role mailbox lands in a folder named `INBOX` (or `.INBOX` under MaildirPP) so other tools handed the maildir get the conventional name rather than the locale-specific JMAP display string.
