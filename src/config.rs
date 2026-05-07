@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use regex::Regex;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -12,6 +13,13 @@ pub struct Config {
     pub state: StateConfig,
     #[serde(default)]
     pub watch: WatchConfig,
+
+    #[serde(default)]
+    pub rename_rules: Vec<MaildirRenameRule>,
+
+    /// Compiled rename rules; shouldn't be deserialized
+    #[serde(skip)]
+    pub compiled_rename_rules: Vec<CompiledRenameRule>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,6 +95,54 @@ pub struct SyncConfig {
     /// Once reached, all subsequent retries wait this long.
     #[serde(default = "default_retry_max_backoff_ms")]
     pub retry_max_backoff_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum MaildirRenameRule {
+    MapDirectly {
+        source_folder_path: String,
+        renamed_name: String,
+    },
+    Pattern {
+        source_folder_pattern: String,
+        rename_pattern: String,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub enum CompiledRenameRule {
+    MapDirectly {
+        source_folder_path: String,
+        renamed_name: String,
+    },
+    Pattern {
+        source_folder_pattern: Regex,
+        rename_pattern: String,
+    },
+}
+
+impl CompiledRenameRule {
+    pub fn compile_from_maildir_rename_rule(
+        rename_rule: &MaildirRenameRule,
+    ) -> Result<Self, anyhow::Error> {
+        match rename_rule {
+            MaildirRenameRule::MapDirectly {
+                source_folder_path,
+                renamed_name,
+            } => Ok(CompiledRenameRule::MapDirectly {
+                source_folder_path: source_folder_path.clone(),
+                renamed_name: renamed_name.clone(),
+            }),
+            MaildirRenameRule::Pattern {
+                source_folder_pattern,
+                rename_pattern,
+            } => Ok(CompiledRenameRule::Pattern {
+                source_folder_pattern: Regex::new(source_folder_pattern)?,
+                rename_pattern: rename_pattern.clone(),
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Default, Clone, Copy)]
@@ -216,10 +272,12 @@ impl Config {
         let path = expand_tilde(path);
         let contents = std::fs::read_to_string(&path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
-        let config: Config = toml::from_str(&contents).context("Failed to parse config file")?;
+        let mut config: Config =
+            toml::from_str(&contents).context("Failed to parse config file")?;
         if let Some(msg) = check_token_perms(&path, config.account.token.as_deref()) {
             return Err(anyhow::anyhow!(msg));
         }
+        config.compiled_rename_rules = compile_maildir_rename_rules(&config.rename_rules)?;
         Ok(config)
     }
 
@@ -289,6 +347,19 @@ pub fn expand_tilde(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+/// Compile all maildir rename rules. Compilation involves compiling
+/// regular expressions in MaildirRenameRule::Pattern rules into
+/// regex::Regex; ::MapDirectly rules are just copied over. As a side
+/// effect, invalid rules error out and give a diagnostic to the user.
+pub fn compile_maildir_rename_rules(
+    rename_rules: &[MaildirRenameRule],
+) -> Result<Vec<CompiledRenameRule>, anyhow::Error> {
+    rename_rules
+        .iter()
+        .map(CompiledRenameRule::compile_from_maildir_rename_rule)
+        .collect()
+}
+
 /// Generate a default config file template.
 pub fn default_config_template() -> &'static str {
     r#"[account]
@@ -355,6 +426,28 @@ upload_concurrency = 8
 retry_max_attempts = 5
 retry_initial_backoff_ms = 500
 retry_max_backoff_ms = 8000
+
+# If you want to change how your mailboxes are mapped to your Maildirs,
+# add one or more of these [[rename_rules]] tables
+#
+# For renaming literally, use type = "map-directly"
+# [[rename_rules]]
+# type = "map-directly"
+# source_folder_path = "[Gmail]/Sent"
+# renamed_name = "GmailSent"
+#
+# If you want to match against a regular expression, use type = "pattern"
+# [[rename_rules]]
+# type = "pattern"
+# source_folder_pattern = "\\[Gmail\\]/(.*)"
+# rename_pattern = "Gmail.\\1"
+#
+# To make it easier to type regular expression, use single quotes in the patterns
+# [[rename_rules]]
+# type = "pattern"
+# source_folder_pattern = '\[Gmail\]/(.*)'
+# rename_pattern = 'Gmail.\1'
+#
 
 [state]
 # Path to SQLite state database. By default this is
@@ -472,5 +565,23 @@ mod tests {
         let p = dir.path().join("config.toml");
         write_with_mode(&p, 0o644);
         assert!(check_token_perms(&p, None).is_none());
+    }
+
+    #[test]
+    fn compile_maildir_rename_rules_permits_valid_regex() {
+        let rules = vec![MaildirRenameRule::Pattern {
+            source_folder_pattern: r"[Gmail]\.(.*)".to_string(),
+            rename_pattern: r"Gmail.\1".to_string(),
+        }];
+        assert!(compile_maildir_rename_rules(&rules).is_ok());
+    }
+
+    #[test]
+    fn compile_maildir_rename_rules_error_on_invalid_regex() {
+        let rules = vec![MaildirRenameRule::Pattern {
+            source_folder_pattern: r"[Gmail].(".to_string(),
+            rename_pattern: r"Gmail.\1".to_string(),
+        }];
+        assert!(compile_maildir_rename_rules(&rules).is_err());
     }
 }

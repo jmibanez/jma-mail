@@ -358,6 +358,7 @@ fn build_test_config(server_uri: &str, maildir_root: &Path, db_path: &Path) -> C
             ping_interval: 60,
             post_arrival_command: None,
         },
+        rename_rules: Vec::default(),
     }
 }
 

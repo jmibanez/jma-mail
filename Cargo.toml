@@ -101,6 +101,9 @@ keyring-core = "1"
 # Hidden TTY prompt for `auth set-token`
 rpassword = "7"
 
+# Regex for pattern-based maildir rename rules
+regex = "1.12"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { version = "1", features = ["keychain"] }
 

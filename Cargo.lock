@@ -1386,6 +1386,7 @@ dependencies = [
  "notify",
  "notify-debouncer-mini",
  "rand 0.9.4",
+ "regex",
  "reqwest 0.12.28",
  "reqwest-eventsource",
  "rpassword",

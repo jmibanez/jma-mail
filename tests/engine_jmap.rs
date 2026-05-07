@@ -374,6 +374,7 @@ fn test_config(
             db_path: Some(":memory:".to_string()),
         },
         watch: WatchConfig::default(),
+        rename_rules: Vec::default(),
     }
 }
 
