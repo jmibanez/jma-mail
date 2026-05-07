@@ -6,7 +6,7 @@ A working tour of `jma`'s internals, for those who want to work on the codebase.
 
 `jma` (binary; crate name `jma-mail`) is a Rust CLI that bidirectionally syncs email between a JMAP server (targeting Fastmail) and a local Maildir -- like `mbsync`/`isync` but speaking JMAP. Single binary, async (tokio), state in SQLite.
 
-Currently, `jma` only supports **API token (Bearer)** auth. OAuth might be implemented in the future, but that would somehow entail saving an OAuth API private key; for now API tokens work. Tokens are resolved per-account: the OS keychain (entry keyed on the account's email, set via `jma auth set-token --account <email>`) wins over the in-file `[[accounts]].token` fallback.
+Currently, `jma` only supports **API token (Bearer)** auth. OAuth might be implemented in the future, but that would somehow entail saving an OAuth API private key; for now API tokens work. Tokens are resolved per-account: the OS keychain (entry keyed on the account's email, set via `jma auth set-token --account <email>`) wins over the in-file `[account].token` fallback.
 
 See [README.md](README.md) for more info on subcommands and flags.
 
