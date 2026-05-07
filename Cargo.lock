@@ -1382,7 +1382,7 @@ dependencies = [
  "jmap-client",
  "keyring-core",
  "maildir",
- "mailparse",
+ "mailparse 0.14.1",
  "notify",
  "notify-debouncer-mini",
  "rand 0.9.4",
@@ -1632,11 +1632,10 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 [[package]]
 name = "maildir"
 version = "0.6.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "879a6ae6743ab8219fdee64a569094485bfe18434e82b78b27fac5cce09e1437"
+source = "git+https://github.com/jmibanez/maildir?rev=0d6509aefe4d91f1864ad62e003092030c3afeae#0d6509aefe4d91f1864ad62e003092030c3afeae"
 dependencies = [
  "gethostname",
- "mailparse",
+ "mailparse 0.15.0",
 ]
 
 [[package]]
@@ -1644,6 +1643,17 @@ name = "mailparse"
 version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2d096594926cab442e054e047eb8c1402f7d5b2272573b97ba68aa40629f9757"
+dependencies = [
+ "charset",
+ "data-encoding",
+ "quoted_printable",
+]
+
+[[package]]
+name = "mailparse"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3da03d5980411a724e8aaf7b61a7b5e386ec55a7fb49ee3d0ff79efc7e5e7c7e"
 dependencies = [
  "charset",
  "data-encoding",
