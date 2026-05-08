@@ -734,6 +734,17 @@ fn walk_chain(cursor: Option<String>, edges: &HashMap<String, String>) -> Option
         if let Some(next) = edges.get(c) {
             current = Some(next.clone());
             walked += 1;
+            // Server is a trust boundary: a cycle would otherwise
+            // wedge this loop forever. The two shapes that reach us
+            // are a multi-edge cycle (e.g. S0->S1, S1->S0) and a
+            // self-loop (S0->S0), the latter being what
+            // EmailSetOutcome::merge produces when it happily
+            // coalesces a server state cycle back to the initial
+            // state. A valid forward chain visits each edge at most
+            // once, so any walk past `edges.len()` is a cycle.
+            if walked > edges.len() {
+                break;
+            }
         } else {
             break;
         }
@@ -1119,5 +1130,33 @@ mod tests {
     fn walk_chain_none_cursor_with_non_empty_edges_stays_none() {
         let edges = edges_from(&[("S0", "S1")]);
         assert_eq!(walk_chain(None, &edges), None);
+    }
+
+    /// Hostile/buggy server returning state edges that form a cycle
+    /// (S0 -> S1 -> S0) must not wedge the walk. Treat as
+    /// chain-not-intact: cursor passes through unchanged so the
+    /// next cycle's Email/changes catches up.
+    #[test]
+    fn walk_chain_cyclic_edges_do_not_wedge() {
+        let edges = edges_from(&[("S0", "S1"), ("S1", "S0")]);
+        assert_eq!(walk_chain(Some("S0".into()), &edges).as_deref(), Some("S0"));
+    }
+
+    /// Self-loop edge (S0 -> S0) -- the shape EmailSetOutcome::merge
+    /// emits when it coalesces a server state cycle back to the
+    /// initial state -- must also terminate.
+    #[test]
+    fn walk_chain_self_loop_does_not_wedge() {
+        let edges = edges_from(&[("S0", "S0")]);
+        assert_eq!(walk_chain(Some("S0".into()), &edges).as_deref(), Some("S0"));
+    }
+
+    /// Larger cycle (S0 -> S1 -> S2 -> S0) terminates with the
+    /// cursor preserved. The guard's bound is independent of cycle
+    /// length, so this is belt-and-braces alongside the 2-cycle case.
+    #[test]
+    fn walk_chain_three_cycle_does_not_wedge() {
+        let edges = edges_from(&[("S0", "S1"), ("S1", "S2"), ("S2", "S0")]);
+        assert_eq!(walk_chain(Some("S0".into()), &edges).as_deref(), Some("S0"));
     }
 }
