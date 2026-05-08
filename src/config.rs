@@ -3,7 +3,7 @@ use regex::Regex;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct Config {
     pub account: AccountConfig,
     pub sync: SyncConfig,
@@ -20,7 +20,7 @@ pub struct Config {
     pub compiled_rename_rules: Vec<CompiledRenameRule>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct AccountConfig {
     /// Email address for the account. The domain is used to discover
     /// the JMAP session URL via DNS SRV (`_jmap._tcp.<domain>`) and
@@ -88,7 +88,7 @@ pub enum FolderLayout {
     MaildirPP,
     Fs,
 }
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct SyncConfig {
     /// Root directory for local maildir storage
     pub maildir_path: String,
