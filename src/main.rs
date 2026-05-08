@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
+use jma_mail::maildir_ops::layout::FolderLayoutDefinition;
 use std::collections::BTreeSet;
 use std::time::Duration;
 use tracing::info;
@@ -217,6 +218,7 @@ async fn cmd_mailboxes(cli: &Cli) -> Result<()> {
         "On-disk name", "Total", "Unread"
     );
     println!("{}", "-".repeat(70));
+    let layout_definition = FolderLayoutDefinition::from_config(&config, name_cap);
     for mb in &mailboxes {
         let synced = if jma_mail::jmap::mailbox::is_mailbox_synced(
             &config.sync.mailboxes,
@@ -240,9 +242,7 @@ async fn cmd_mailboxes(cli: &Cli) -> Result<()> {
         let display_name = match jma_mail::maildir_ops::layout::resolve_folder_path(
             mb,
             &by_id,
-            config.sync.folder_layout,
-            config.sync.hierarchy_separator,
-            name_cap,
+            &layout_definition,
         ) {
             Ok(p) => p,
             Err(e) => {

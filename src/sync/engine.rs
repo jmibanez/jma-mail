@@ -12,7 +12,7 @@ use crate::jmap::{
     types::{EmailObject, MailboxObject, SessionInfo},
 };
 use crate::maildir_ops::dedupe::{LocalEntry, LocalIndex};
-use crate::maildir_ops::layout::resolve_folder_path;
+use crate::maildir_ops::layout::{FolderLayoutDefinition, resolve_folder_path};
 use crate::maildir_ops::{dedupe, scan, store};
 use crate::state::queries;
 use crate::sync::execute::Executor;
@@ -247,6 +247,7 @@ impl<'a> SyncEngine<'a> {
 
         let name_cap = limits::max_size_mailbox_name(&self.client);
         let mut synced = Vec::new();
+        let layout_definition = FolderLayoutDefinition::from_config(self.config, name_cap);
 
         for mb in &remote_mailboxes {
             // Parent-aware filter: a config entry naming any ancestor
@@ -266,13 +267,7 @@ impl<'a> SyncEngine<'a> {
             // name under the user-chosen layout. Defaults preserve the
             // pre-hierarchy behavior: Flat with `.` produces the leaf
             // name unchanged for depth-1 mailboxes.
-            let folder_name = resolve_folder_path(
-                mb,
-                &by_id,
-                self.config.sync.folder_layout,
-                self.config.sync.hierarchy_separator,
-                name_cap,
-            )?;
+            let folder_name = resolve_folder_path(mb, &by_id, &layout_definition)?;
 
             // Store in DB
             queries::upsert_mailbox(

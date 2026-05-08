@@ -26,9 +26,25 @@
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 
-use crate::config::FolderLayout;
+use crate::config::{Config, FolderLayout};
 use crate::ids::JmapMailboxId;
 use crate::jmap::types::MailboxObject;
+
+pub struct FolderLayoutDefinition {
+    layout: FolderLayout,
+    separator: char,
+    joined_name_cap: usize,
+}
+
+impl FolderLayoutDefinition {
+    pub fn from_config(config: &Config, name_cap: usize) -> Self {
+        FolderLayoutDefinition {
+            layout: config.sync.folder_layout,
+            separator: config.sync.hierarchy_separator,
+            joined_name_cap: name_cap,
+        }
+    }
+}
 
 /// Per-layout segment rules. Each layout has its own forbidden
 /// segment shapes that only matter once a segment is spliced into the
@@ -110,9 +126,7 @@ fn validate_segment_for_layout(name: &str, layout: FolderLayout, separator: char
 pub fn resolve_folder_path(
     mb: &MailboxObject,
     by_id: &HashMap<JmapMailboxId, &MailboxObject>,
-    layout: FolderLayout,
-    separator: char,
-    joined_name_cap: usize,
+    layout: &FolderLayoutDefinition,
 ) -> Result<String> {
     let mut chain: Vec<&MailboxObject> = Vec::new();
     let mut seen: HashSet<JmapMailboxId> = HashSet::new();
@@ -140,25 +154,25 @@ pub fn resolve_folder_path(
             } else {
                 m.name.clone()
             };
-            validate_segment_for_layout(&raw, layout, separator)
+            validate_segment_for_layout(&raw, layout.layout, layout.separator)
                 .with_context(|| format!("rejecting mailbox id={}", m.id))?;
             Ok(raw)
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let sep_str = separator.to_string();
-    let result = match layout {
+    let sep_str = layout.separator.to_string();
+    let result = match layout.layout {
         FolderLayout::Flat => segments.join(&sep_str),
         FolderLayout::MaildirPP => format!(".{}", segments.join(&sep_str)),
         FolderLayout::Fs => segments.join("/"),
     };
 
-    if matches!(layout, FolderLayout::Flat | FolderLayout::MaildirPP)
-        && result.len() > joined_name_cap
+    if matches!(layout.layout, FolderLayout::Flat | FolderLayout::MaildirPP)
+        && result.len() > layout.joined_name_cap
     {
         anyhow::bail!(
             "flattened folder path exceeds {} bytes ({} bytes): {:?}",
-            joined_name_cap,
+            layout.joined_name_cap,
             result.len(),
             result
         );
@@ -195,7 +209,12 @@ mod tests {
         sep: char,
     ) -> Result<String> {
         let idx = build_index(all);
-        resolve_folder_path(target, &idx, layout, sep, MAX_MAILBOX_NAME_LEN)
+        let layout_definition = FolderLayoutDefinition {
+            layout,
+            separator: sep,
+            joined_name_cap: MAX_MAILBOX_NAME_LEN,
+        };
+        resolve_folder_path(target, &idx, &layout_definition)
     }
 
     /// One row of the resolution table: an input mailbox tree, a
