@@ -26,7 +26,7 @@
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 
-use crate::config::{Config, FolderLayout};
+use crate::config::{CompiledRenameRule, Config, FolderLayout};
 use crate::ids::JmapMailboxId;
 use crate::jmap::types::MailboxObject;
 
@@ -34,6 +34,7 @@ pub struct FolderLayoutDefinition {
     layout: FolderLayout,
     separator: char,
     joined_name_cap: usize,
+    rename_rules: Vec<CompiledRenameRule>,
 }
 
 impl FolderLayoutDefinition {
@@ -42,6 +43,7 @@ impl FolderLayoutDefinition {
             layout: config.sync.folder_layout,
             separator: config.sync.hierarchy_separator,
             joined_name_cap: name_cap,
+            rename_rules: config.compiled_rename_rules.clone(),
         }
     }
 }
@@ -161,6 +163,20 @@ pub fn resolve_folder_path(
         .collect::<Result<Vec<_>>>()?;
 
     let sep_str = layout.separator.to_string();
+
+    if let Some(match_result) = maybe_match_rename_rules(&segments, &layout.rename_rules) {
+        if match_result.len() > layout.joined_name_cap {
+            anyhow::bail!(
+                "folder path from rule exceeds {} bytes ({} bytes): {:?}",
+                layout.joined_name_cap,
+                match_result.len(),
+                match_result
+            );
+        }
+
+        return Ok(match_result);
+    }
+
     let result = match layout.layout {
         FolderLayout::Flat => segments.join(&sep_str),
         FolderLayout::MaildirPP => format!(".{}", segments.join(&sep_str)),
@@ -181,10 +197,41 @@ pub fn resolve_folder_path(
     Ok(result)
 }
 
+fn maybe_match_rename_rules(segments: &[String], rules: &[CompiledRenameRule]) -> Option<String> {
+    let maildir_as_path = segments.join("/");
+    for rule in rules.iter() {
+        match rule {
+            CompiledRenameRule::MapDirectly {
+                source_folder_path,
+                renamed_name,
+            } => {
+                if maildir_as_path == *source_folder_path {
+                    return Some(renamed_name.clone());
+                }
+            }
+            CompiledRenameRule::Pattern {
+                source_folder_pattern,
+                rename_pattern,
+            } => {
+                if source_folder_pattern.is_match(&maildir_as_path) {
+                    return Some(
+                        source_folder_pattern
+                            .replace_all(&maildir_as_path, rename_pattern)
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::jmap::limits::MAX_MAILBOX_NAME_LEN;
+    use regex::Regex;
 
     fn mb_full(id: &str, name: &str, parent: Option<&str>, role: Option<&str>) -> MailboxObject {
         MailboxObject {
@@ -213,6 +260,7 @@ mod tests {
             layout,
             separator: sep,
             joined_name_cap: MAX_MAILBOX_NAME_LEN,
+            rename_rules: Vec::default(),
         };
         resolve_folder_path(target, &idx, &layout_definition)
     }
@@ -346,6 +394,91 @@ mod tests {
                 assert_eq!(got, expected, "[{}] under {:?}", case.label, layout);
             }
         }
+    }
+
+    #[test]
+    fn resolve_folder_using_direct_mapping_skips_normal_resolution() {
+        let mbs: Vec<MailboxObject> = [("p", "Foo", None, None), ("c", "Bar", Some("p"), None)]
+            .iter()
+            .map(|(id, name, parent, role)| mb_full(id, name, *parent, *role))
+            .collect();
+        let target = mbs.iter().find(|m| m.id.as_ref() == "c").unwrap();
+        let idx = build_index(&mbs);
+        let match_rule = CompiledRenameRule::MapDirectly {
+            source_folder_path: "Foo/Bar".to_string(),
+            renamed_name: "Foo::Bar".to_string(),
+        };
+
+        let layout_definition = FolderLayoutDefinition {
+            layout: FolderLayout::Fs,
+            separator: '.',
+            joined_name_cap: MAX_MAILBOX_NAME_LEN,
+            rename_rules: vec![match_rule],
+        };
+        let got = resolve_folder_path(target, &idx, &layout_definition);
+        assert!(got.is_ok());
+        assert_eq!(got.unwrap(), "Foo::Bar");
+    }
+
+    #[test]
+    fn resolve_folder_using_pattern_mapping_skips_normal_resolution() {
+        let mbs: Vec<MailboxObject> = [("p", "Foo", None, None), ("c", "Bar", Some("p"), None)]
+            .iter()
+            .map(|(id, name, parent, role)| mb_full(id, name, *parent, *role))
+            .collect();
+        let target = mbs.iter().find(|m| m.id.as_ref() == "c").unwrap();
+        let idx = build_index(&mbs);
+        let match_rule = CompiledRenameRule::Pattern {
+            source_folder_pattern: Regex::new(r"(.*)o/Bar").unwrap(),
+            rename_pattern: "Foo::Foo".to_string(),
+        };
+
+        let layout_definition = FolderLayoutDefinition {
+            layout: FolderLayout::Fs,
+            separator: '.',
+            joined_name_cap: MAX_MAILBOX_NAME_LEN,
+            rename_rules: vec![match_rule],
+        };
+        let got = resolve_folder_path(target, &idx, &layout_definition);
+        assert!(got.is_ok());
+        assert_eq!(got.unwrap(), "Foo::Foo");
+    }
+
+    #[test]
+    fn resolve_folder_using_rules_first_one_wins() {
+        let mbs: Vec<MailboxObject> = [("p", "Foo", None, None), ("c", "Bar", Some("p"), None)]
+            .iter()
+            .map(|(id, name, parent, role)| mb_full(id, name, *parent, *role))
+            .collect();
+        let target = mbs.iter().find(|m| m.id.as_ref() == "c").unwrap();
+        let idx = build_index(&mbs);
+        let pattern_match_rule = CompiledRenameRule::Pattern {
+            source_folder_pattern: Regex::new(r"(.*)o/Bar").unwrap(),
+            rename_pattern: "Foo::Foo".to_string(),
+        };
+        let direct_match_rule = CompiledRenameRule::MapDirectly {
+            source_folder_path: "Foo/Bar".to_string(),
+            renamed_name: "Foo::Bar".to_string(),
+        };
+        let layout_definition_pattern_first = FolderLayoutDefinition {
+            layout: FolderLayout::Fs,
+            separator: '.',
+            joined_name_cap: MAX_MAILBOX_NAME_LEN,
+            rename_rules: vec![pattern_match_rule.clone(), direct_match_rule.clone()],
+        };
+        let layout_definition_pattern_last = FolderLayoutDefinition {
+            layout: FolderLayout::Fs,
+            separator: '.',
+            joined_name_cap: MAX_MAILBOX_NAME_LEN,
+            rename_rules: vec![direct_match_rule.clone(), pattern_match_rule.clone()],
+        };
+        let got = resolve_folder_path(target, &idx, &layout_definition_pattern_first);
+        assert!(got.is_ok());
+        assert_eq!(got.unwrap(), "Foo::Foo");
+
+        let got = resolve_folder_path(target, &idx, &layout_definition_pattern_last);
+        assert!(got.is_ok());
+        assert_eq!(got.unwrap(), "Foo::Bar");
     }
 
     #[test]
