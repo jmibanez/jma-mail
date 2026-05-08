@@ -38,6 +38,8 @@ cargo install --git https://github.com/jmibanez/jma-mail
 
 Note this also applies to the names of the mailboxes in `[sync].mailboxes` (see below), so if your mailbox is e.g. named `Posteingang` it will be synced locally as `INBOX`.
 
+If you want finer-grained control over how specific folders are mapped to on-disk names -- for example, to flatten Gmail's `[Gmail]/Sent` to a tidier `GmailSent` -- see [Maildir rename rules](#maildir-rename-rules-rename_rules).
+
 ## How jma Tracks State
 
 `jma` tracks state between your local Maildirs and the upstream JMAP server on an SQLite database. By default the database lives at `<sync.maildir_path>/.jma.db` -- a hidden file at the maildir root, so state and data move together when you copy or relocate the maildir, and multiple accounts each get their own DB without sharing a path. Set `[state].db_path` to override (for example, to keep state on a local-only path when the maildir lives on a synced or networked volume). State is intentionally disposable: you should be able to delete its state and rerun a `jma pull` to reconverge.
@@ -110,6 +112,35 @@ This section only has one key, `db_path`, which tells `jma` where to persist its
   * `post_arrival_command`: A shell command that `jma` will invoke when it observes new mail. If you use a mail indexer such as `mu` or `notmuch`, put the indexing command here -- e.g. set this to `notmuch new` for `notmuch`.
   * `debounce_secs`: How long in seconds to coalesce filesystem events together. A smaller value means `jma` will more readily sync any local changes, at the cost of chattier updates. A larger value means `jma` will wait approximately that long and batch all local changes in that timeframe.
   * `ping_interval`: How often (in seconds) to request the server send heartbeat pings on the EventSource (SSE) stream. Per RFC 8620 section 7.3 the server is allowed to clamp this value; some providers (Fastmail, notably) use a longer interval than requested. The actual interval the server uses drives the daemon's stream watchdog -- see `watch` below.
+
+### Maildir rename rules `[[rename_rules]]`
+
+By default `jma` projects each JMAP folder onto disk using `[sync].folder_layout` and `[sync].hierarchy_separator`. If you want certain folders to land under different on-disk names -- to flatten Gmail's `[Gmail]/Sent` to a tidier `GmailSent`, or to reshape a whole subtree -- add one or more `[[rename_rules]]` tables. Two kinds:
+
+  * **Direct mapping.** Match an exact folder path; replace it with a literal name.
+
+    ```toml
+    [[rename_rules]]
+    type = "map-directly"
+    source_folder_path = "[Gmail]/Sent"
+    renamed_name = "GmailSent"
+    ```
+
+  * **Pattern mapping.** Match a [Rust `regex`](https://docs.rs/regex)-syntax expression against the folder path; produce the new name via capture-group substitution. TOML literal strings (single quotes) avoid having to backslash-escape.
+
+    ```toml
+    [[rename_rules]]
+    type = "pattern"
+    source_folder_pattern = '\[Gmail\]/(.*)'
+    rename_pattern = 'Gmail.\1'
+    ```
+
+A few things to know:
+
+  * **Rules match against the canonical `parent/child` path with `/` separators**, regardless of `[sync].hierarchy_separator`. So a parent `[Gmail]` with a child `Sent` is matched as `[Gmail]/Sent` even if your hierarchy separator is `.`.
+  * **First match wins.** Rules are evaluated in the order they appear in the config; the first that matches a folder path is used.
+  * **The rule output is the final on-disk folder name.** When a rule fires, the layout's separator-joining is skipped -- the rule's right-hand side is what lands on disk. By design: a single rule can expand a flat JMAP name into a subtree (e.g. `foo.bar.baz` to `foo/bar/baz`) or collapse one the other way.
+  * **Pattern regexes are validated at config load.** A typo in `source_folder_pattern` is reported when `jma` starts, not on the first sync.
 
 ## Commands and Options
 
