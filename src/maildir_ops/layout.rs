@@ -114,18 +114,6 @@ pub fn resolve_folder_path(
     separator: char,
     joined_name_cap: usize,
 ) -> Result<String> {
-    // Fs joins with `/` and ignores `separator`, so the collision
-    // check only applies to layouts that splice the separator into
-    // the on-disk name.
-    if matches!(layout, FolderLayout::Flat | FolderLayout::MaildirPP)
-        && (separator == '/' || separator == '\\' || separator == '\0')
-    {
-        anyhow::bail!(
-            "hierarchy separator {:?} would collide with filesystem path syntax",
-            separator
-        );
-    }
-
     let mut chain: Vec<&MailboxObject> = Vec::new();
     let mut seen: HashSet<JmapMailboxId> = HashSet::new();
     let mut cur: &MailboxObject = mb;
@@ -434,20 +422,5 @@ mod tests {
         let mbs = vec![mb_full("m", ".hidden", None, None)];
         let err = resolve(&mbs[0], &mbs, FolderLayout::Fs, '.').unwrap_err();
         assert!(format!("{:#}", err).contains("FS layout"), "got: {err:#}");
-    }
-
-    /// Even before walking the chain, a separator that would itself
-    /// inject a path component is refused. The per-segment validation
-    /// cannot catch this on its own: a separator of `/` produces an
-    /// escaping joined path even when no segment contains `/`, so the
-    /// upfront check is the only defense for the bad-config case.
-    #[test]
-    fn resolve_rejects_separator_that_collides_with_path_syntax() {
-        let mbs = vec![mb_full("m", "foo", None, None)];
-        for bad in ['/', '\\', '\0'] {
-            let err = resolve(&mbs[0], &mbs, FolderLayout::Flat, bad).unwrap_err();
-            let msg = format!("{}", err);
-            assert!(msg.contains("collide"), "for {bad:?}: got {msg}");
-        }
     }
 }

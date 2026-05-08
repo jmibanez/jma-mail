@@ -324,6 +324,8 @@ impl Config {
         if let Some(msg) = check_token_perms(&path, config.account.token.as_deref()) {
             return Err(anyhow::anyhow!(msg));
         }
+
+        check_valid_layout_rule(&config.sync.folder_layout, config.sync.hierarchy_separator)?;
         config.compiled_rename_rules = compile_maildir_rename_rules(&config.rename_rules)?;
         Ok(config)
     }
@@ -392,6 +394,27 @@ pub fn expand_tilde(path: &Path) -> PathBuf {
         return home.join(&s[2..]);
     }
     path.to_path_buf()
+}
+
+/// Check whether the layout type and hierarchy separator is valid.
+/// For instance, if the user specifies layout = "flat" but a
+/// hierarchy_separator = "/" on macOS, we error out since that
+/// clashes with the system path separator and will create
+/// subdirectories
+pub fn check_valid_layout_rule(layout: &FolderLayout, separator: char) -> Result<()> {
+    // Fs joins with `/` and ignores `separator`, so the collision
+    // check only applies to layouts that splice the separator into
+    // the on-disk name.
+    if matches!(layout, FolderLayout::Flat | FolderLayout::MaildirPP)
+        && (separator == '/' || separator == '\\' || separator == '\0')
+    {
+        anyhow::bail!(
+            "hierarchy separator {:?} would collide with filesystem path syntax",
+            separator
+        );
+    }
+
+    Ok(())
 }
 
 /// Compile all maildir rename rules. Compilation involves compiling
@@ -630,5 +653,18 @@ mod tests {
             rename_pattern: r"Gmail.\1".to_string(),
         }];
         assert!(compile_maildir_rename_rules(&rules).is_err());
+    }
+
+    /// A separator that would itself inject a path component is
+    /// refused at config load time.
+    #[test]
+    fn check_valid_layout_rule_rejects_separator_that_collides_with_path_syntax() {
+        for layout in [FolderLayout::Flat, FolderLayout::MaildirPP] {
+            for bad in ['/', '\\', '\0'] {
+                let err = check_valid_layout_rule(&layout, bad).unwrap_err();
+                let msg = format!("{}", err);
+                assert!(msg.contains("collide"), "for {bad:?}: got {msg}");
+            }
+        }
     }
 }
