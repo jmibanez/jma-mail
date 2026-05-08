@@ -22,9 +22,9 @@ async fn main() -> Result<()> {
     // Set up logging
     let filter = match (cli.quiet, cli.verbose) {
         (true, _) => "error",
-        (_, 0) => "jma_mail=info",
-        (_, 1) => "jma_mail=debug",
-        (_, 2) => "jma_mail=debug,jmap_client=debug",
+        (_, 0) => "jma_mail=info,jma=info",
+        (_, 1) => "jma_mail=debug,jma=debug",
+        (_, 2) => "jma_mail=debug,jma=debug,jmap_client=debug",
         (_, _) => "trace",
     };
     tracing_subscriber::fmt()
