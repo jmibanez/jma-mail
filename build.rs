@@ -15,10 +15,10 @@ fn rerun_on_git_state() {
         return;
     }
     println!("cargo:rerun-if-changed=.git/HEAD");
-    if let Ok(head) = fs::read_to_string(".git/HEAD") {
-        if let Some(ref_path) = head.strip_prefix("ref: ").map(str::trim) {
-            println!("cargo:rerun-if-changed=.git/{ref_path}");
-        }
+    if let Ok(head) = fs::read_to_string(".git/HEAD")
+        && let Some(ref_path) = head.strip_prefix("ref: ").map(str::trim)
+    {
+        println!("cargo:rerun-if-changed=.git/{ref_path}");
     }
     println!("cargo:rerun-if-changed=.git/packed-refs");
 }
