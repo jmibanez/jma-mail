@@ -53,11 +53,11 @@ So what's stored in the state DB?
   * `jmap_state` containing per-entity sync cursors so `jma` only needs to ask for changes since the last sync
   * And `local_state`, which is a snapshot of the local state (flags, size, mtime) so any local filesystem changes are quickly detected
 
-None of the state DB's contents are required to do a `pull`.
+None of the state DB's contents are required to do a `sync`, `push`, or `pull`.
 
 ### Breaking Changes
 
-If there are any changes that break state tracking, as mentioned above you can simply delete the state DB and re-run `jma`.
+If there are any changes that break state tracking, as mentioned above you can simply delete the state DB and re-run `jma`. For most cases, `jma` marks its SQLite state database with a schema version -- if there's a mismatch, it will automatically nuke the state DB and do a full sync to catch up.
 
 ### Concurrency: One Mutator at a Time
 
