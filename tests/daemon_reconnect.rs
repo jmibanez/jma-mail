@@ -42,11 +42,11 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use jma_mail::config::FolderLayout;
 use jma_mail::config::{
     AccountConfig, Config, ConflictStrategy, StateConfig, SyncConfig, WatchConfig,
 };
 use jma_mail::daemon;
-use jma_mail::maildir_ops::layout::FolderLayout;
 use jma_mail::state::{db, queries};
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path, path_regex};

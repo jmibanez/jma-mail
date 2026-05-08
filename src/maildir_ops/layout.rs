@@ -24,61 +24,11 @@
 //! into a single directory entry.
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 
+use crate::config::FolderLayout;
 use crate::ids::JmapMailboxId;
 use crate::jmap::types::MailboxObject;
-
-/// On-disk layout convention for a hierarchical mailbox tree.
-///
-/// - `Flat` -- mbsync's `Flatten=<sep>` convention. `parent/child`
-///   becomes `<root>/parent.child/{cur,new,tmp}` with a user-chosen
-///   separator (default `.`).
-/// - `MaildirPP` -- the Courier/Dovecot convention defined in Sam
-///   Varshavchik's Maildir++ extension. Flat shape: every synced
-///   folder is prefixed with a single `.` at the root, so a parent
-///   `[Airmail]` with child `Sent` becomes `<root>/.[Airmail].Sent/`.
-///   The spec forbids names starting with `.` (would produce `..`)
-///   so segments are validated against that.
-///
-///   INBOX placement under this layout is a deliberate jma
-///   convention, not a spec-derived one. Sam Varshavchik's Maildir++
-///   spec (README.maildirquota.html in Courier) doesn't address
-///   INBOX -- INBOX is an IMAP/JMAP concept, and Maildir++ only
-///   defines the dot-prefix folder convention. Dovecot's Maildir
-///   docs likewise don't address INBOX placement under the default
-///   layout (the documented "Without `DIRNAME`, INBOX will be stored
-///   at `~/Maildir/{new,cur,tmp}/`" line is in the section scoped to
-///   `LAYOUT=fs`, not Maildir++). With no authority to defer to we
-///   pick the simple thing: under our `MaildirPP` layout INBOX maps
-///   to `<root>/.INBOX/` just like every other folder. The
-///   alternative -- INBOX as the maildir root, the way Courier and
-///   Dovecot deployments commonly behave in practice -- would
-///   require the rest of the pipeline to accept an empty
-///   `maildir_folder` string (the SQL schema's `NOT NULL` on
-///   `mailbox_map.maildir_folder`, every `<root>.join(folder)` call,
-///   every `get_messages_by_folder` query), which is more than a
-///   layout helper should drag along.
-/// - `Fs` -- Dovecot's `LAYOUT=fs` convention. Hierarchy is materialised
-///   as a recursive directory tree: `<root>/parent/child/{cur,new,tmp}`.
-///   The Dovecot docs flag the obvious risk -- a mailbox literally
-///   named `cur`/`new`/`tmp` collides with maildir internals -- so
-///   segments equal to those names are rejected here. Leading-dot
-///   segments are also rejected to avoid colliding with our own
-///   `.jma.lock` / `.jma.db` markers at the root.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum FolderLayout {
-    #[default]
-    Flat,
-    /// `maildir++` is the spelling users see in Dovecot/Courier docs;
-    /// keep the config key matching that rather than serde's
-    /// kebab-case fallback (`maildir-pp`).
-    #[serde(rename = "maildir++")]
-    MaildirPP,
-    Fs,
-}
 
 /// Per-layout segment rules. Each layout has its own forbidden
 /// segment shapes that only matter once a segment is spliced into the
