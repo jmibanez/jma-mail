@@ -2,6 +2,7 @@ use anyhow::Result;
 use jmap_client::client::Client;
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -18,6 +19,19 @@ use crate::state::queries;
 use crate::sync::execute::Executor;
 use crate::sync::plan::{SyncAction, SyncDirection};
 use crate::sync::reconcile::{self, MessageRecordIndex, ReconcileInput};
+
+/// How the local-side scan should be carried out for one cycle.
+/// `Full` walks every synced folder; `Paths(...)` classifies only
+/// the `(folder, maildir_id)` groups the supplied event paths
+/// touched. The daemon picks `Paths` for `LocalChange` triggers
+/// (where the watcher hands us the authoritative change set) and
+/// `Full` for everything else (Initial, RemoteChange, CLI one-shots,
+/// post-disconnect catch-up).
+#[derive(Debug, Clone)]
+pub enum ScanScope {
+    Full,
+    Paths(Vec<PathBuf>),
+}
 
 /// Outcome of one sync iteration -- enough for the daemon loop to know
 /// whether to fire the post-arrival hook and to flag a degraded cycle.
@@ -92,7 +106,7 @@ impl<'a> SyncEngine<'a> {
     ) -> Result<SyncOutcome> {
         Self::connect(conn, config)
             .await?
-            .run(dry_run, SyncDirection::Both)
+            .run(dry_run, SyncDirection::Both, ScanScope::Full)
             .await
     }
 
@@ -101,7 +115,7 @@ impl<'a> SyncEngine<'a> {
     pub async fn pull_only(conn: &'a Connection, config: &'a Config) -> Result<SyncOutcome> {
         Self::connect(conn, config)
             .await?
-            .run(false, SyncDirection::PullOnly)
+            .run(false, SyncDirection::PullOnly, ScanScope::Full)
             .await
     }
 
@@ -110,16 +124,22 @@ impl<'a> SyncEngine<'a> {
     pub async fn push_only(conn: &'a Connection, config: &'a Config) -> Result<()> {
         Self::connect(conn, config)
             .await?
-            .run(false, SyncDirection::PushOnly)
+            .run(false, SyncDirection::PushOnly, ScanScope::Full)
             .await?;
         Ok(())
     }
 
     /// Single orchestration path. `direction` selects which side(s) of
-    /// the plan execute; adoption always runs. Public so the daemon
-    /// can drive its long-lived engine across triggers without
-    /// reconnecting.
-    pub async fn run(&self, dry_run: bool, direction: SyncDirection) -> Result<SyncOutcome> {
+    /// the plan execute; adoption always runs. `scan_scope` selects
+    /// between a full per-folder walk and a path-driven scan keyed off
+    /// fsevents. Public so the daemon can drive its long-lived engine
+    /// across triggers without reconnecting.
+    pub async fn run(
+        &self,
+        dry_run: bool,
+        direction: SyncDirection,
+        scan_scope: ScanScope,
+    ) -> Result<SyncOutcome> {
         let mailboxes = self.resolve_mailboxes().await?;
         let maildir_root = self.config.maildir_path();
 
@@ -154,15 +174,38 @@ impl<'a> SyncEngine<'a> {
             })?;
         }
 
-        // Phase 1: scan local changes.
-        let mut all_local_changes = Vec::new();
-        for (_, folder_name) in &mailboxes {
-            let maildir_path = maildir_root.join(folder_name);
-            let maildir = store::ensure_maildir(&maildir_path)?;
-            let known_state = queries::get_local_state_for_folder(self.conn, folder_name)?;
-            let (changes, _seen) = scan::scan_folder(&maildir, folder_name, &known_state)?;
-            all_local_changes.extend(changes);
-        }
+        // Phase 1: scan local changes. `Full` walks every synced
+        // folder; `Paths` classifies only the (folder, maildir_id)
+        // groups touched by the supplied event paths -- the daemon's
+        // common case, where the watcher already told us exactly
+        // which files moved.
+        let all_local_changes = match &scan_scope {
+            ScanScope::Full => {
+                let mut changes = Vec::new();
+                for (_, folder_name) in &mailboxes {
+                    let maildir_path = maildir_root.join(folder_name);
+                    let maildir = store::ensure_maildir(&maildir_path)?;
+                    let known_state = queries::get_local_state_for_folder(self.conn, folder_name)?;
+                    let (folder_changes, _seen) =
+                        scan::scan_folder(&maildir, folder_name, &known_state)?;
+                    changes.extend(folder_changes);
+                }
+                changes
+            }
+            ScanScope::Paths(paths) => {
+                let mut known_states = HashMap::new();
+                for (_, folder_name) in &mailboxes {
+                    // Make sure the maildir on disk exists, matching
+                    // the side-effect the Full path used to provide;
+                    // some downstream code assumes the directory tree
+                    // is in place.
+                    store::ensure_maildir(&maildir_root.join(folder_name))?;
+                    let state = queries::get_local_state_for_folder(self.conn, folder_name)?;
+                    known_states.insert(folder_name.clone(), state);
+                }
+                scan::scan_paths(&maildir_root, paths, &known_states)?
+            }
+        };
 
         // Phase 2: collect remote changes.
         let (remote_emails, remote_destroyed, new_state, used_initial_path) =

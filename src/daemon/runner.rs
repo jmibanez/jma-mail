@@ -11,7 +11,7 @@ use super::{RECONNECT_INITIAL_BACKOFF, RECONNECT_MAX_BACKOFF};
 use crate::config::Config;
 use crate::jmap::retry::is_transient_error;
 use crate::state::queries;
-use crate::sync::engine::SyncEngine;
+use crate::sync::engine::{ScanScope, SyncEngine};
 use crate::sync::plan::SyncDirection;
 
 /// What triggered a sync cycle. `LocalChange` carries the FS event
@@ -133,7 +133,10 @@ pub async fn run(conn: &Connection, config: &Config) -> Result<()> {
     // Email/changes.
     let mut engine = connect_with_backoff(conn, config).await?;
     info!("Running initial sync before entering watch mode");
-    match engine.run(false, SyncDirection::Both).await {
+    match engine
+        .run(false, SyncDirection::Both, ScanScope::Full)
+        .await
+    {
         Ok(outcome) => {
             if outcome.downloaded > 0 {
                 hook.trigger().await;
@@ -278,7 +281,19 @@ async fn session<'a>(
         } else {
             info!("Sync triggered by {}", trigger);
         }
-        match engine.run(false, SyncDirection::Both).await {
+        // LocalChange triggers carry the FS event paths from the
+        // coalesced batch; route them through ScanScope::Paths so the
+        // engine classifies only the (folder, maildir_id) groups those
+        // paths touched. RemoteChange and Initial fall back to a full
+        // per-folder walk -- RemoteChange has no local hint, Initial
+        // happens once at startup, and a coalesced batch promoted to
+        // either of those by the dominance order also drops to the
+        // safe O(N) shape (see coalesce_triggers).
+        let scope = match &trigger {
+            SyncTrigger::LocalChange(paths) => ScanScope::Paths(paths.clone()),
+            SyncTrigger::RemoteChange | SyncTrigger::Initial => ScanScope::Full,
+        };
+        match engine.run(false, SyncDirection::Both, scope).await {
             Ok(outcome) => {
                 // A successful cycle means the link is healthy --
                 // reset the outer backoff so the next disconnect
