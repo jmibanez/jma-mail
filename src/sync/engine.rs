@@ -19,6 +19,7 @@ use crate::state::queries;
 use crate::sync::execute::Executor;
 use crate::sync::plan::{SyncAction, SyncDirection};
 use crate::sync::reconcile::{self, MessageRecordIndex, ReconcileInput};
+use crate::sync::self_writes::SelfWriteCache;
 
 /// How the local-side scan should be carried out for one cycle.
 /// `Full` walks every synced folder; `Paths(...)` classifies only
@@ -69,6 +70,12 @@ pub struct SyncEngine<'a> {
     conn: &'a Connection,
     config: &'a Config,
     account_id: JmapAccountId,
+    /// Cache of paths jma has just written, shared with the
+    /// daemon's filesystem watcher so it can drop self-echo
+    /// fsevents without firing a sync cycle. None for one-shot CLI
+    /// commands -- they don't run a watcher and have no consumer
+    /// for the cache.
+    self_writes: Option<Arc<SelfWriteCache>>,
 }
 
 impl<'a> SyncEngine<'a> {
@@ -86,7 +93,18 @@ impl<'a> SyncEngine<'a> {
             conn,
             config,
             account_id,
+            self_writes: None,
         })
+    }
+
+    /// Attach a self-write cache so that the daemon's executor
+    /// records every disk-mutating store operation it performs and
+    /// the watcher can drop self-echo fsevents that would otherwise
+    /// drive no-op sync cycles. CLI one-shots leave this unset --
+    /// they don't run a watcher and the cache would just be a
+    /// memory leak across the call.
+    pub fn set_self_writes(&mut self, cache: Arc<SelfWriteCache>) {
+        self.self_writes = Some(cache);
     }
 
     /// Snapshot the JMAP session metadata the daemon needs for SSE
@@ -268,7 +286,12 @@ impl<'a> SyncEngine<'a> {
         );
 
         // Phase 5: execute.
-        let executor = Executor::new(&self.client, self.conn, self.config);
+        let executor = Executor::new(
+            &self.client,
+            self.conn,
+            self.config,
+            self.self_writes.clone(),
+        );
         let mut outcome = executor.execute(filtered).await?;
         outcome.already_in_sync = already_in_sync;
 

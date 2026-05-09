@@ -405,12 +405,13 @@ Things to avoid:
 
 ### Trigger pipeline
 
-`watch` mode receives change signals from two sources and funnels them into one sync cycle at a time. There are three layers between a kernel FS event and `engine.run`, and they each smooth a different slice of the noise:
+`watch` mode receives change signals from two sources and funnels them into one sync cycle at a time. There are three layers between a kernel FS event and `engine.run`, and they each smooth a different slice of the noise; a self-write cache rides alongside layer 1 to suppress fsevents echoes of jma's own disk writes:
 
 ```
-FS kernel events -> notify-debouncer-mini -> mpsc trigger channel -> coalescing window -> engine.run
-                    ([watch].debounce_secs)                          ([watch].coalesce_window_ms)
-SSE state events --------------------------/
+FS kernel events -> notify-debouncer-mini -> [self-write cache] -> mpsc trigger channel -> coalescing window -> engine.run
+                    ([watch].debounce_secs)  ([watch].self_write_                          ([watch].coalesce_
+                                              ttl_secs)                                     window_ms)
+SSE state events ---------------------------------------------------/
 ```
 
 **Layer 1: per-path debouncing** (`notify-debouncer-mini`, configured via `[watch].debounce_secs`, default 2s). The crate keeps one global wakeup timer plus a per-path event map. When the timer fires, every path whose `update.elapsed() >= timeout` is drained and emitted in the same batch; surviving paths re-arm a fresh deadline off the youngest survivor. With `batch_mode = true` (the crate default), an arriving event never shortens an existing deadline, so paths batch together against the deadline that was set by the *first* event of the current burst rather than each path setting its own. Practical consequence: a flurry of writes against the same file collapses into one emit; writes against different paths usually emit together but can land in adjacent ticks (see below).
@@ -418,6 +419,19 @@ SSE state events --------------------------/
 **Layer 2: trigger-loop coalescing** (`runner.rs`, configured via `[watch].coalesce_window_ms`, default 500ms). After the first `SyncTrigger` arrives on the mpsc channel, the loop holds open a small window before starting the cycle. Each subsequent trigger resets the window. The cycle runs only once the channel is quiet for the full window. This layer also decides the trigger shape via dominance: `Initial` beats `RemoteChange` beats `LocalChange`, and `LocalChange` paths concatenate.
 
 The two layers exist because they smooth different things. `debounce_secs` smooths each filesystem path's event stream; `coalesce_window_ms` smooths *across* paths and across signal sources (FS + SSE). Neither subsumes the other: layer 1 on its own cannot merge two debouncer batches that fire on adjacent ticks, nor can it merge an FS batch with an SSE state event; layer 2 on its own would see one mpsc send per kernel event and have to dedupe everything that the per-path crate already collapses.
+
+#### Self-write cache
+
+`SelfWriteCache` (`src/sync/self_writes.rs`) sits between the per-path debouncer and the mpsc trigger channel and exists to drop fsevents echoes of jma's own disk writes. Two suppression layers do this together:
+
+- The watcher's all-live-new filter (no cache involved) catches the simplest case: a batch whose every path is a live `new/` file. Per `scan_paths`' contract those events are seen-only -- jma's delivery already updated the DB -- so the trigger never reaches the runner.
+- The cache catches the harder case: an MUA promotes `new/<id>:2,F` to `cur/<id>:2,F` preserving flags. Both source and destination paths arrive in the same batch, the all-live-new filter keeps the batch (a `cur/` path is present), and the runner would otherwise wake, run a path-driven scan, classify as no-op, and pay the `Email/changes` round-trip on the way out. Each delivery records two cache entries: the actually-delivered path, and (for `new/` deliveries) the predicted same-flag `cur/` path the MUA might rename to. When the watcher sees a batch whose every path matches a non-expired cache entry, it drops the batch and evicts those entries.
+
+The path-exact key matters: a flag-changing promotion (e.g. MUA adds `S` on read, producing `cur/<id>:2,FS`) won't match the predicted `cur/<id>:2,F` entry, so the batch falls through to a real cycle that pushes the new flag to the server. Eviction-on-match matters too: once an entry has caught the echo it was predicted for, a *subsequent* event on the same path within the TTL has to fall through (e.g. an MUA renames the just-promoted `cur/` file to add `S`).
+
+TTL defaults to `2 * (debounce_secs + coalesce_window_ms)` rounded to the nearest second (5s under default knobs), with a 1s floor. The 2x multiple is wide enough for a push-aware MUA to notice the `new/` delivery and promote within the next debounce cycle. Polling MUAs (Gnus's nnmaildir, others on a manual-fetch schedule) may need to override `[watch].self_write_ttl_secs` upward; setting it to 0 effectively disables the cache and is useful when debugging a self-suppression report.
+
+Limitation: a user deletion of a freshly jma-delivered file *within* the TTL window will be silently swallowed (the watcher matches the cache entry and drops the batch). The next full scan -- Initial, RemoteChange, or a manual sync -- catches the drift, so the deletion eventually propagates. This is the price of the cache; the alternative (no cache) means every same-flag promotion costs an `Email/changes` round-trip.
 
 #### The split-batch corner case
 
@@ -433,10 +447,11 @@ The latency floor from a first FS event to the start of the cycle is `debounce_s
 
 #### Tuning expectations
 
-Both knobs are advanced/debug-only and intentionally undocumented in the user-facing README. Defaults handle the common case. Reasonable reasons to override:
+All three knobs are advanced/debug-only and intentionally undocumented in the user-facing README. Defaults handle the common case. Reasonable reasons to override:
 
 - `debounce_secs`: an MUA whose write flurries genuinely span more than 2s, or load-shedding when the watcher fires too aggressively.
 - `coalesce_window_ms`: chasing a split-batch report that survives the default 500ms (raise it), or shaving latency off a non-production diagnostic run (lower it; tests can set it to 0 to disable the wait entirely).
+- `self_write_ttl_secs`: an MUA whose `new/`->`cur/` promotion latency consistently exceeds the derived default (raise to suppress promotion echoes), or debugging the self-suppression behavior (set to 0 to bypass the cache entirely).
 
 If you find yourself wanting to recommend a tuning change to a user, the right move is usually to investigate whether the default actually broke or whether something upstream (an MUA bug, a non-atomic move, fsevents drops) is the real cause.
 

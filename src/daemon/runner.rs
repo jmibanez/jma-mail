@@ -3,6 +3,7 @@ use rusqlite::Connection;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -13,6 +14,7 @@ use crate::jmap::retry::is_transient_error;
 use crate::state::queries;
 use crate::sync::engine::{ScanScope, SyncEngine};
 use crate::sync::plan::SyncDirection;
+use crate::sync::self_writes::SelfWriteCache;
 
 /// What triggered a sync cycle. `LocalChange` carries the FS event
 /// paths that drove the watcher so the runner can surface them when
@@ -95,13 +97,29 @@ pub async fn run(conn: &Connection, config: &Config) -> Result<()> {
         info!("Post-arrival hook configured");
     }
 
+    // Shared between the executor (records every disk write it
+    // performs) and the watcher (drops fsevents batches whose every
+    // path matches a recent self-write). Catches the new/->cur/
+    // MUA-promotion-with-same-flags echo that the watcher's
+    // all-live-new filter alone can't suppress -- the cur/ path on
+    // that promotion forces the batch through, and the cache
+    // recognises it as the predicted promotion target.
+    //
+    // TTL is derived from the trigger pipeline knobs (default 5s
+    // when debounce_secs=2 and coalesce_window_ms=500); see
+    // `WatchConfig::effective_self_write_ttl` for the formula and
+    // the override path.
+    let self_writes = Arc::new(SelfWriteCache::new(config.watch.effective_self_write_ttl()));
+
     // FS watcher is independent of JMAP and survives reconnects --
     // spawn it once for the daemon's lifetime.
     let fs_tx = tx.clone();
     let fs_root = config.maildir_path();
     let debounce = config.watch.debounce_secs;
+    let fs_self_writes = self_writes.clone();
     let fs_handle = tokio::spawn(async move {
-        if let Err(e) = super::watcher::watch(&fs_root, debounce, fs_tx).await {
+        if let Err(e) = super::watcher::watch(&fs_root, debounce, fs_tx, Some(fs_self_writes)).await
+        {
             error!("Filesystem watcher error: {}", e);
         }
     });
@@ -114,7 +132,7 @@ pub async fn run(conn: &Connection, config: &Config) -> Result<()> {
     // the DB cursor is intact and the next regular trigger will
     // reconcile any events missed during the disconnect window via
     // Email/changes.
-    let mut engine = connect_with_backoff(conn, config).await?;
+    let mut engine = connect_with_backoff(conn, config, self_writes.clone()).await?;
     info!("Running initial sync before entering watch mode");
     match engine
         .run(false, SyncDirection::Both, ScanScope::Full)
@@ -155,7 +173,7 @@ pub async fn run(conn: &Connection, config: &Config) -> Result<()> {
                     e, backoff
                 );
                 tokio::time::sleep(backoff).await;
-                engine = connect_with_backoff(conn, config).await?;
+                engine = connect_with_backoff(conn, config, self_writes.clone()).await?;
                 backoff = (backoff * 2).min(RECONNECT_MAX_BACKOFF);
             }
             Err(e) => {
@@ -320,14 +338,23 @@ async fn session<'a>(
 /// token, 4xx from a malformed config) propagate immediately so the
 /// daemon dies loudly rather than burning CPU in a retry loop the user
 /// can't escape without intervention.
+///
+/// Threads the self-write cache through every successful connect
+/// (initial bootstrap and post-transport-error reconnects alike) so
+/// the reconnect path can't silently regress self-echo suppression
+/// by forgetting to call `engine.set_self_writes`.
 async fn connect_with_backoff<'a>(
     conn: &'a Connection,
     config: &'a Config,
+    self_writes: Arc<SelfWriteCache>,
 ) -> Result<SyncEngine<'a>> {
     let mut backoff = RECONNECT_INITIAL_BACKOFF;
     loop {
         match SyncEngine::connect(conn, config).await {
-            Ok(engine) => return Ok(engine),
+            Ok(mut engine) => {
+                engine.set_self_writes(self_writes);
+                return Ok(engine);
+            }
             Err(e) if is_transient_error(&e) => {
                 warn!("Connect failed ({:#}); retrying in {:?}", e, backoff);
                 tokio::time::sleep(backoff).await;

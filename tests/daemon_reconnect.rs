@@ -360,6 +360,7 @@ fn build_test_config(server_uri: &str, maildir_root: &Path, db_path: &Path) -> C
             // the production default would tax each trigger with a
             // 500ms wait.
             coalesce_window_ms: 0,
+            self_write_ttl_secs: None,
             post_arrival_command: None,
         },
         ..Default::default()

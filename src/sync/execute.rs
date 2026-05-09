@@ -4,6 +4,7 @@ use jmap_client::client::Client;
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -16,6 +17,7 @@ use crate::maildir_ops::{flags::keywords_to_flags, store};
 use crate::state::queries::{self, MessageRecord};
 use crate::sync::engine::SyncOutcome;
 use crate::sync::plan::{BoundId, LocalId, RemoteId, SyncAction, SyncPlan};
+use crate::sync::self_writes::SelfWriteCache;
 
 /// Bundles the immutable per-cycle state every execute helper threads
 /// through (client, DB connection, config, maildir root, account id).
@@ -29,10 +31,20 @@ pub struct Executor<'a> {
     config: &'a Config,
     maildir_root: PathBuf,
     account_id: JmapAccountId,
+    /// Optional self-write cache. Set by the daemon (and shared
+    /// with the watcher) so disk writes here suppress the
+    /// corresponding fsevents echoes; left None for one-shot CLI
+    /// commands that have no watcher to feed.
+    self_writes: Option<Arc<SelfWriteCache>>,
 }
 
 impl<'a> Executor<'a> {
-    pub fn new(client: &'a Client, conn: &'a Connection, config: &'a Config) -> Self {
+    pub fn new(
+        client: &'a Client,
+        conn: &'a Connection,
+        config: &'a Config,
+        self_writes: Option<Arc<SelfWriteCache>>,
+    ) -> Self {
         let account_id: JmapAccountId = client.default_account_id().into();
         let maildir_root = config.maildir_path();
         Self {
@@ -41,6 +53,7 @@ impl<'a> Executor<'a> {
             config,
             maildir_root,
             account_id,
+            self_writes,
         }
     }
 
@@ -646,6 +659,30 @@ impl<'a> Executor<'a> {
                     let maildir_path = self.maildir_root.join(maildir_folder);
                     let maildir = store::ensure_maildir(&maildir_path)?;
                     let mid = store::store_message(&maildir, blob, &flags)?;
+                    if let Some(cache) = &self.self_writes {
+                        // Suppress the fsevents echo of this delivery
+                        // and -- for new/ deliveries -- the same-flag
+                        // cur/ promotion an MUA may rename to next.
+                        // A flag-changing promotion (e.g. MUA adds S
+                        // on read) won't match the predicted path, so
+                        // it falls through to a real classify cycle.
+                        //
+                        // The flag string used here must byte-match
+                        // what the maildir crate writes. `keywords_to_flags`
+                        // already returns canonical (sorted, deduped)
+                        // output and the maildir crate writes it
+                        // verbatim into the suffix; if either side
+                        // ever diverges from canonical-sorted, this
+                        // prediction silently misses every delivery.
+                        let subdir = if flags.contains('S') { "cur" } else { "new" };
+                        let suffix = format!("{}:2,{}", mid.as_ref(), flags);
+                        let delivered = maildir_path.join(subdir).join(&suffix);
+                        let mut paths = vec![delivered];
+                        if subdir == "new" {
+                            paths.push(maildir_path.join("cur").join(&suffix));
+                        }
+                        cache.record(paths);
+                    }
                     info!("Downloaded new email {} -> {}/{}", id, maildir_folder, mid);
                     let keywords_json = serde_json::to_string(keywords)?;
                     // Per-iteration transaction: pair the message_map and

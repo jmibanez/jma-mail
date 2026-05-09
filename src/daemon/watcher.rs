@@ -1,11 +1,13 @@
 use anyhow::Result;
 use notify_debouncer_mini::{DebouncedEventKind, new_debouncer};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use super::runner::SyncTrigger;
+use crate::sync::self_writes::SelfWriteCache;
 
 /// Whether a notify event path should drive a sync trigger. We only
 /// care about events on actual maildir message files, which by
@@ -62,10 +64,16 @@ fn batch_might_emit_changes(paths: &[PathBuf]) -> bool {
 }
 
 /// Watch local maildir directories for filesystem changes.
+/// `self_writes`, when set, lets the watcher drop fsevents batches
+/// whose every path matches a recent jma write -- the
+/// new/->cur/ MUA-promotion-with-same-flags echo and similar.
+/// CLI commands don't run a watcher; the daemon always passes
+/// `Some(...)`.
 pub async fn watch(
     maildir_root: &Path,
     debounce_secs: u64,
     tx: mpsc::Sender<SyncTrigger>,
+    self_writes: Option<Arc<SelfWriteCache>>,
 ) -> Result<()> {
     info!("Watching maildir at {} for changes", maildir_root.display());
 
@@ -76,10 +84,6 @@ pub async fn watch(
         move |result: Result<Vec<notify_debouncer_mini::DebouncedEvent>, notify::Error>| {
             match result {
                 Ok(events) => {
-                    // Forward the relevant FS paths so the runner can
-                    // surface them when a `LocalChange` cycle ends up
-                    // doing nothing -- the path list is the only clue
-                    // to what wrote.
                     let paths: Vec<PathBuf> = events
                         .into_iter()
                         .filter(|e| {
@@ -91,14 +95,23 @@ pub async fn watch(
                     if paths.is_empty() {
                         return;
                     }
-                    if batch_might_emit_changes(&paths) {
-                        let _ = notify_tx.blocking_send(paths);
-                    } else {
+                    if !batch_might_emit_changes(&paths) {
                         debug!(
                             "Skipping all-live-new fsevents batch ({} path(s)); scan would emit nothing",
                             paths.len()
                         );
+                        return;
                     }
+                    if let Some(cache) = &self_writes
+                        && cache.matches_all(&paths)
+                    {
+                        debug!(
+                            "Skipping fsevents batch ({} path(s)); all paths matched recent self-writes",
+                            paths.len()
+                        );
+                        return;
+                    }
+                    let _ = notify_tx.blocking_send(paths);
                 }
                 Err(e) => {
                     warn!("Filesystem watcher error: {}", e);

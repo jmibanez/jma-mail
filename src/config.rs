@@ -236,6 +236,18 @@ pub struct WatchConfig {
     /// corner case).
     #[serde(default = "default_coalesce_window_ms")]
     pub coalesce_window_ms: u64,
+    /// Advanced/debug knob; not surfaced in the README. TTL for
+    /// entries in the daemon's self-write cache (see DEVELOPMENT.md
+    /// "Daemon internals -> Trigger pipeline" for the full
+    /// rationale). When unset, the effective TTL is derived from
+    /// `debounce_secs` and `coalesce_window_ms` -- see
+    /// `effective_self_write_ttl`. Override only when an MUA's
+    /// new/->cur/ promotion latency consistently exceeds the
+    /// derived default (raise) or when debugging
+    /// self-suppression (lower or 0 to effectively disable the
+    /// cache).
+    #[serde(default)]
+    pub self_write_ttl_secs: Option<u64>,
     /// Shell command to run (via `sh -c`) after a sync cycle that
     /// downloaded new messages. Useful for triggering a mail indexer
     /// (mu, notmuch, etc.) once new files land in the maildir. The
@@ -244,6 +256,27 @@ pub struct WatchConfig {
     /// (multiple events coalesce into one). Only fires in `watch` mode.
     #[serde(default)]
     pub post_arrival_command: Option<String>,
+}
+
+impl WatchConfig {
+    /// Effective TTL for the self-write cache. If
+    /// `self_write_ttl_secs` is set, use it verbatim (0 is a valid
+    /// "effectively disable the cache" value).
+    ///
+    /// Otherwise default to `2 * (debounce_secs + coalesce_window_ms)`
+    /// rounded to the nearest second, with a 1s floor. The 2x
+    /// multiple is wide enough to cover a push-aware MUA noticing
+    /// the new/ delivery and renaming it within the next debounce
+    /// cycle; polling MUAs (Gnus, others on a manual-fetch
+    /// schedule) may need to override upward.
+    pub fn effective_self_write_ttl(&self) -> std::time::Duration {
+        if let Some(secs) = self.self_write_ttl_secs {
+            return std::time::Duration::from_secs(secs);
+        }
+        let total_ms = self.debounce_secs * 1000 + self.coalesce_window_ms;
+        let secs = (total_ms * 2 + 500) / 1000;
+        std::time::Duration::from_secs(secs.max(1))
+    }
 }
 
 fn default_debounce_secs() -> u64 {
@@ -288,6 +321,7 @@ impl Default for WatchConfig {
             debounce_secs: default_debounce_secs(),
             ping_interval: default_ping_interval(),
             coalesce_window_ms: default_coalesce_window_ms(),
+            self_write_ttl_secs: None,
             post_arrival_command: None,
         }
     }
@@ -684,5 +718,51 @@ mod tests {
                 assert!(msg.contains("collide"), "for {bad:?}: got {msg}");
             }
         }
+    }
+
+    /// Default WatchConfig (debounce=2s, coalesce=500ms) yields a
+    /// derived self-write TTL of 5 seconds: 2 * (2000 + 500) ms,
+    /// rounded to the nearest second. Pins the formula so a future
+    /// tweak to either window doesn't silently shift the cache TTL
+    /// off the value the trigger pipeline assumes.
+    #[test]
+    fn effective_self_write_ttl_default_is_2x_pipeline_rounded() {
+        let cfg = WatchConfig::default();
+        assert_eq!(cfg.effective_self_write_ttl().as_secs(), 5);
+    }
+
+    /// Explicit override wins over the derived default. 0 is a
+    /// valid override (effectively disables the cache).
+    #[test]
+    fn effective_self_write_ttl_override_wins() {
+        let mut cfg = WatchConfig::default();
+        cfg.self_write_ttl_secs = Some(60);
+        assert_eq!(cfg.effective_self_write_ttl().as_secs(), 60);
+
+        cfg.self_write_ttl_secs = Some(0);
+        assert_eq!(cfg.effective_self_write_ttl().as_secs(), 0);
+    }
+
+    /// Bumping the trigger pipeline knobs shifts the derived TTL
+    /// in lockstep. Pins the rounding behavior at a non-trivial
+    /// boundary: debounce=3s, coalesce=700ms -> 2 * 3700 = 7400ms
+    /// -> 7s (nearest).
+    #[test]
+    fn effective_self_write_ttl_tracks_pipeline_widening() {
+        let mut cfg = WatchConfig::default();
+        cfg.debounce_secs = 3;
+        cfg.coalesce_window_ms = 700;
+        assert_eq!(cfg.effective_self_write_ttl().as_secs(), 7);
+    }
+
+    /// Pathologically small pipeline (sub-second derived TTL)
+    /// floors at 1s so a freshly-recorded entry can survive at
+    /// least one fsevents tick.
+    #[test]
+    fn effective_self_write_ttl_floors_at_one_second() {
+        let mut cfg = WatchConfig::default();
+        cfg.debounce_secs = 0;
+        cfg.coalesce_window_ms = 100;
+        assert_eq!(cfg.effective_self_write_ttl().as_secs(), 1);
     }
 }
