@@ -1025,6 +1025,40 @@ mod tests {
         }
     }
 
+    /// Missing new/ path with a DB anchor: the file was unlinked
+    /// from new/ before MUA promotion (user deleted the unread
+    /// message directly from new/, or the MDA cleaned it up).
+    /// scan_paths must emit `DeletedMessage` so the deletion
+    /// propagates upstream. Load-bearing for
+    /// `daemon::watcher::batch_might_emit_changes`'s "drop
+    /// all-live-new batches" optimization: that filter must keep
+    /// batches whose new/ paths have gone missing, otherwise this
+    /// DeletedMessage is silently swallowed.
+    #[test]
+    fn scan_paths_missing_new_path_emits_deleted_when_db_anchored() {
+        let tmp = TempDir::new().unwrap();
+        let inbox_path = tmp.path().join("INBOX");
+        let _inbox = ensure_maildir(&inbox_path).unwrap();
+        // INBOX/new/ is empty -- the file was removed.
+
+        let unique = "1700000000.M1.host";
+        let known = known_for("INBOX", &[(unique, "INBOX", "")]);
+        let event_paths = vec![inbox_path.join("new").join(unique)];
+
+        let changes = scan_paths(tmp.path(), &event_paths, &known).unwrap();
+        assert_eq!(changes.len(), 1);
+        match &changes[0] {
+            LocalChange::DeletedMessage { maildir_id, folder } => {
+                assert_eq!(maildir_id.as_ref(), unique);
+                assert_eq!(folder, "INBOX");
+            }
+            other => panic!(
+                "expected DeletedMessage for missing new/ path, got {:?}",
+                other
+            ),
+        }
+    }
+
     /// Live new/ event by itself: no change emitted. The MUA's
     /// eventual cur/ promotion is the trigger we care about. Pins
     /// the parity with scan_folder's new/ contract.
