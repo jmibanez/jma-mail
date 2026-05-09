@@ -35,6 +35,61 @@ impl fmt::Display for SyncTrigger {
     }
 }
 
+/// Window the trigger loop holds open after the first trigger
+/// arrives, waiting for additional triggers to coalesce into the
+/// same cycle. Each subsequent trigger resets the timer; the cycle
+/// runs only once the pipe goes quiet for the full window.
+///
+/// Reason: a multi-step MUA operation can fire two consecutive
+/// debouncer batches -- e.g. a cross-folder move whose source-delete
+/// and dest-create renames land in separate windows. Without
+/// coalescing, the source-delete cycle sees `DeletedMessage(src)`
+/// alone, reconcile can't pair it with the missing `NewMessage(dst)`,
+/// and the move degrades into `DestroyRemote` + later
+/// `UploadMessage` -- losing the JMAP id, thread, and keyword
+/// history. Holding open a small window catches the back-to-back
+/// case at the cost of a fixed sub-second latency on the first
+/// trigger.
+const COALESCE_WINDOW: Duration = Duration::from_millis(500);
+
+/// Combine a batch of triggers (the first plus everything absorbed
+/// during the coalescing window) into a single representative for
+/// one sync cycle. The split signature pins the non-empty
+/// precondition at the type level: there is always at least the
+/// initial trigger, which the trigger loop just received.
+///
+/// Dominance order, broadest first: `Initial` wins if present (it's
+/// a full bootstrap, not a per-trigger delta), then `RemoteChange`
+/// (we're looking at server-side state too), otherwise
+/// `LocalChange` carrying every path from every absorbed
+/// `LocalChange` trigger. The order matches "broader scan wins" --
+/// once we've decided we need a non-LocalChange shape, the
+/// LocalChange path set is irrelevant.
+///
+/// The path-drop on RemoteChange/Initial assumes those triggers
+/// always imply a full local scan. If a future cycle shape ever
+/// pairs RemoteChange with path-narrowed local work, this merge
+/// becomes lossy and needs revisiting.
+fn coalesce_triggers(first: SyncTrigger, rest: Vec<SyncTrigger>) -> SyncTrigger {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let mut has_initial = false;
+    let mut has_remote = false;
+    for t in std::iter::once(first).chain(rest) {
+        match t {
+            SyncTrigger::Initial => has_initial = true,
+            SyncTrigger::RemoteChange => has_remote = true,
+            SyncTrigger::LocalChange(p) => paths.extend(p),
+        }
+    }
+    if has_initial {
+        SyncTrigger::Initial
+    } else if has_remote {
+        SyncTrigger::RemoteChange
+    } else {
+        SyncTrigger::LocalChange(paths)
+    }
+}
+
 /// Why the inner `session` returned. The outer `run` uses this to
 /// decide whether to break the watch loop or rebuild the engine and
 /// start another session.
@@ -190,11 +245,39 @@ async fn session<'a>(
     // Trigger loop. Break out with the appropriate SessionExit so the
     // outer `run` can decide between shutdown and reconnect; abort the
     // SSE listener on the way out either way.
+    //
+    // Each iteration receives one trigger, then holds open a
+    // COALESCE_WINDOW for additional triggers before running the
+    // cycle. The window resets every time another trigger lands, so
+    // bursts collapse naturally and the cycle only starts once the
+    // pipe goes quiet.
     let exit = loop {
-        let Some(trigger) = rx.recv().await else {
+        let Some(first) = rx.recv().await else {
             break SessionExit::ChannelClosed;
         };
-        info!("Sync triggered by {}", trigger);
+        // Drain the pipe until COALESCE_WINDOW elapses without a new
+        // trigger. Channel-closed mid-drain (Ok(None)) just exits the
+        // inner loop with whatever we collected; the outer `rx.recv`
+        // on the next iteration will return None and break with
+        // ChannelClosed. Worth at most one extra cycle on the way out.
+        let mut rest: Vec<SyncTrigger> = Vec::new();
+        loop {
+            match tokio::time::timeout(COALESCE_WINDOW, rx.recv()).await {
+                Ok(Some(next)) => rest.push(next),
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+        let coalesced_count = 1 + rest.len();
+        let trigger = coalesce_triggers(first, rest);
+        if coalesced_count > 1 {
+            info!(
+                "Sync triggered by {} ({} triggers coalesced)",
+                trigger, coalesced_count
+            );
+        } else {
+            info!("Sync triggered by {}", trigger);
+        }
         match engine.run(false, SyncDirection::Both).await {
             Ok(outcome) => {
                 // A successful cycle means the link is healthy --
@@ -246,5 +329,75 @@ async fn connect_with_backoff<'a>(
             }
             Err(e) => return Err(e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A single trigger passes through unchanged; coalesce_triggers
+    /// is identity on a one-element batch. Pins the no-op case so a
+    /// future tweak to the dominance logic doesn't accidentally
+    /// rewrite single-trigger semantics.
+    #[test]
+    fn coalesce_single_local_change_is_identity() {
+        let p = PathBuf::from("/Mail/INBOX/cur/file:2,S");
+        let merged = coalesce_triggers(SyncTrigger::LocalChange(vec![p.clone()]), Vec::new());
+        match merged {
+            SyncTrigger::LocalChange(paths) => assert_eq!(paths, vec![p]),
+            other => panic!("expected LocalChange, got {:?}", other),
+        }
+    }
+
+    /// Multiple LocalChange triggers concatenate their path lists.
+    /// This is the path-driven scan's correctness lever: a
+    /// cross-folder move whose source-delete and dest-create renames
+    /// land in separate debouncer batches must end up in the same
+    /// path set so reconcile's move pre-pass can pair them.
+    #[test]
+    fn coalesce_merges_local_change_paths() {
+        let a = PathBuf::from("/Mail/INBOX/cur/a:2,");
+        let b = PathBuf::from("/Mail/Spam/cur/a:2,");
+        let merged = coalesce_triggers(
+            SyncTrigger::LocalChange(vec![a.clone()]),
+            vec![SyncTrigger::LocalChange(vec![b.clone()])],
+        );
+        match merged {
+            SyncTrigger::LocalChange(paths) => assert_eq!(paths, vec![a, b]),
+            other => panic!("expected merged LocalChange, got {:?}", other),
+        }
+    }
+
+    /// A RemoteChange in the batch dominates LocalChange: the merged
+    /// trigger surfaces as RemoteChange so the cycle does a full
+    /// scan (we have no way to narrow on a server-driven change). The
+    /// LocalChange paths are intentionally dropped -- once a full
+    /// scan is happening, the scan reads live FS state across every
+    /// folder and the path list adds no information.
+    #[test]
+    fn coalesce_remote_change_dominates_local() {
+        let p = PathBuf::from("/Mail/INBOX/cur/file:2,S");
+        let merged = coalesce_triggers(
+            SyncTrigger::LocalChange(vec![p]),
+            vec![SyncTrigger::RemoteChange],
+        );
+        assert!(matches!(merged, SyncTrigger::RemoteChange));
+    }
+
+    /// Initial dominates everything else: it's the bootstrap shape
+    /// and implies a full first-pass walk regardless of what else
+    /// arrived. Defensive coverage -- Initial is sent once at startup
+    /// outside the trigger loop and shouldn't appear in coalesced
+    /// batches in practice, but the dominance order needs to hold if
+    /// it ever does.
+    #[test]
+    fn coalesce_initial_dominates_remote_and_local() {
+        let p = PathBuf::from("/Mail/INBOX/cur/file:2,S");
+        let merged = coalesce_triggers(
+            SyncTrigger::LocalChange(vec![p]),
+            vec![SyncTrigger::RemoteChange, SyncTrigger::Initial],
+        );
+        assert!(matches!(merged, SyncTrigger::Initial));
     }
 }
