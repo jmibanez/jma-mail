@@ -44,7 +44,7 @@ CC=/usr/bin/cc cargo test --lib maildir_ops::headers::tests::parses_folded_value
 
   All access goes through `queries.rs`. Don't `prepare` ad-hoc SQL elsewhere; if you need a new query, add it there.
 - `src/sync/` -- orchestration. See [Sync internals](#sync-internals) below.
-- `src/daemon/` -- `watch` mode. `runner.rs` runs an initial sync then concurrently spawns `eventsource.rs` (SSE listener on the JMAP `eventSourceUrl` from the session) and `watcher.rs` (filesystem `notify` with debouncing). Both feed a `tokio::sync::mpsc` channel of `SyncTrigger`s; the main loop drains and re-runs `SyncEngine::sync` per trigger. `hook.rs` runs `post_arrival_command` after sync cycles that downloaded mail, coalescing overlapping triggers.
+- `src/daemon/` -- `watch` mode. `runner.rs` runs an initial sync then concurrently spawns `eventsource.rs` (SSE listener on the JMAP `eventSourceUrl` from the session) and `watcher.rs` (filesystem `notify` with debouncing). Both feed a `tokio::sync::mpsc` channel of `SyncTrigger`s; the trigger loop holds open a coalescing window after the first arrival to absorb back-to-back batches, then dispatches one `SyncEngine::run` per coalesced cycle (path-driven scan for `LocalChange`, full scan otherwise). See [Trigger pipeline](#trigger-pipeline) for the layering. `hook.rs` runs `post_arrival_command` after cycles that downloaded mail, coalescing overlapping triggers.
 
 ## Identifiers
 
@@ -400,6 +400,45 @@ Things to avoid:
 - Don't write to a maildir outside `execute` (or `dedupe`'s deletion of duplicates). Every other writer would skip the Message-ID check that anchors the idempotency model.
 - Don't add an `Email/set` call outside `apply_remote_set` -- keep remote mutations batched.
 - Don't advance `jmap_state` from anywhere except the tail of `Executor::execute`.
+
+## Daemon internals
+
+### Trigger pipeline
+
+`watch` mode receives change signals from two sources and funnels them into one sync cycle at a time. There are three layers between a kernel FS event and `engine.run`, and they each smooth a different slice of the noise:
+
+```
+FS kernel events -> notify-debouncer-mini -> mpsc trigger channel -> coalescing window -> engine.run
+                    ([watch].debounce_secs)                          ([watch].coalesce_window_ms)
+SSE state events --------------------------/
+```
+
+**Layer 1: per-path debouncing** (`notify-debouncer-mini`, configured via `[watch].debounce_secs`, default 2s). The crate keeps one global wakeup timer plus a per-path event map. When the timer fires, every path whose `update.elapsed() >= timeout` is drained and emitted in the same batch; surviving paths re-arm a fresh deadline off the youngest survivor. With `batch_mode = true` (the crate default), an arriving event never shortens an existing deadline, so paths batch together against the deadline that was set by the *first* event of the current burst rather than each path setting its own. Practical consequence: a flurry of writes against the same file collapses into one emit; writes against different paths usually emit together but can land in adjacent ticks (see below).
+
+**Layer 2: trigger-loop coalescing** (`runner.rs`, configured via `[watch].coalesce_window_ms`, default 500ms). After the first `SyncTrigger` arrives on the mpsc channel, the loop holds open a small window before starting the cycle. Each subsequent trigger resets the window. The cycle runs only once the channel is quiet for the full window. This layer also decides the trigger shape via dominance: `Initial` beats `RemoteChange` beats `LocalChange`, and `LocalChange` paths concatenate.
+
+The two layers exist because they smooth different things. `debounce_secs` smooths each filesystem path's event stream; `coalesce_window_ms` smooths *across* paths and across signal sources (FS + SSE). Neither subsumes the other: layer 1 on its own cannot merge two debouncer batches that fire on adjacent ticks, nor can it merge an FS batch with an SSE state event; layer 2 on its own would see one mpsc send per kernel event and have to dedupe everything that the per-path crate already collapses.
+
+#### The split-batch corner case
+
+Per-path debouncing means two events that fire microseconds apart on different paths can land in *different* emit batches. Concretely: a cross-folder rename produces a source-path event at t=0 and a destination-path event at t=0.001. The first event arms the global deadline at t=2.0. At t=2.0 the wakeup fires; the source path's `update.elapsed()` is exactly 2s so it emits, and on the way out of the drain the deadline is reset and re-armed at `dest.update + timeout` = t=2.001 (the source already drained, the dest is the only survivor). At t=2.001 the next wakeup fires and the dest emits. Two callback invocations, two mpsc sends, two `SyncTrigger`s.
+
+Without layer 2, those two triggers drive two separate cycles. Under `ScanScope::Paths` (the path-driven scan, which trusts the event stream as the change set), the source-cycle sees `DeletedMessage(src)` alone and reconcile cannot pair it with the missing `NewMessage(dst)`; the move degrades into `DestroyRemote` followed by a fresh `UploadMessage`, losing the JMAP id, thread, and keyword history of the original. This is what `coalesce_window_ms` exists to fix: 500ms is comfortably larger than the inter-tick gap, so both halves arrive in the same coalesced batch and `scan_paths` sees them in one call.
+
+Raising `debounce_secs` doesn't fix this -- the split is a per-path-timing artifact, not a window-too-narrow problem, so raising the value just relocates the same boundary and the inter-tick split can recur there. `coalesce_window_ms` is the layer that actually addresses it.
+
+#### Steady-state latency
+
+The latency floor from a first FS event to the start of the cycle is `debounce_secs + coalesce_window_ms` (~2.5s with defaults). Under `batch_mode = true` the debouncer's docstring caps per-event delay at 2x `debounce_secs`, so the worst-case floor with defaults is closer to ~4.5s. Continuous activity extends both windows further (each layer's timer resets on new input).
+
+#### Tuning expectations
+
+Both knobs are advanced/debug-only and intentionally undocumented in the user-facing README. Defaults handle the common case. Reasonable reasons to override:
+
+- `debounce_secs`: an MUA whose write flurries genuinely span more than 2s, or load-shedding when the watcher fires too aggressively.
+- `coalesce_window_ms`: chasing a split-batch report that survives the default 500ms (raise it), or shaving latency off a non-production diagnostic run (lower it; tests can set it to 0 to disable the wait entirely).
+
+If you find yourself wanting to recommend a tuning change to a user, the right move is usually to investigate whether the default actually broke or whether something upstream (an MUA bug, a non-atomic move, fsevents drops) is the real cause.
 
 ## Local Maildir layout
 

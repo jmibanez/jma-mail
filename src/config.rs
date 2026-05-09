@@ -215,7 +215,12 @@ pub struct StateConfig {
 
 #[derive(Debug, Deserialize)]
 pub struct WatchConfig {
-    /// Debounce interval for local filesystem events (seconds)
+    /// Advanced/debug knob; not surfaced in the README. Per-path
+    /// debounce interval for filesystem events. The underlying
+    /// `notify-debouncer-mini` emits a path's accumulated events
+    /// once that path has been quiet this long. See DEVELOPMENT.md
+    /// (Daemon internals -> Trigger pipeline) for the full layering
+    /// and tuning rationale.
     #[serde(default = "default_debounce_secs")]
     pub debounce_secs: u64,
     /// SSE ping interval (seconds)
@@ -543,8 +548,6 @@ retry_max_backoff_ms = 8000
 # db_path = "~/.local/share/jma/state.db"
 
 [watch]
-# Debounce interval for local filesystem events (seconds)
-debounce_secs = 2
 # SSE ping interval (seconds)
 ping_interval = 60
 # Command to run (via `sh -c`) after a watch-mode sync that downloaded
