@@ -221,6 +221,16 @@ pub struct WatchConfig {
     /// SSE ping interval (seconds)
     #[serde(default = "default_ping_interval")]
     pub ping_interval: u64,
+    /// Advanced/debug knob; not surfaced in the README. How long the
+    /// trigger loop waits after a sync trigger lands before starting
+    /// the cycle, absorbing any further triggers that arrive in the
+    /// window so back-to-back debouncer batches collapse into one
+    /// cycle. Each new trigger resets the timer. 500ms is enough for
+    /// the common case; only needs raising in odd situations (very
+    /// chatty MUA, high FS event latency, debugging a split-batch
+    /// corner case).
+    #[serde(default = "default_coalesce_window_ms")]
+    pub coalesce_window_ms: u64,
     /// Shell command to run (via `sh -c`) after a sync cycle that
     /// downloaded new messages. Useful for triggering a mail indexer
     /// (mu, notmuch, etc.) once new files land in the maildir. The
@@ -237,6 +247,10 @@ fn default_debounce_secs() -> u64 {
 
 fn default_ping_interval() -> u64 {
     60
+}
+
+fn default_coalesce_window_ms() -> u64 {
+    500
 }
 
 fn default_download_concurrency() -> usize {
@@ -268,6 +282,7 @@ impl Default for WatchConfig {
         Self {
             debounce_secs: default_debounce_secs(),
             ping_interval: default_ping_interval(),
+            coalesce_window_ms: default_coalesce_window_ms(),
             post_arrival_command: None,
         }
     }

@@ -35,23 +35,6 @@ impl fmt::Display for SyncTrigger {
     }
 }
 
-/// Window the trigger loop holds open after the first trigger
-/// arrives, waiting for additional triggers to coalesce into the
-/// same cycle. Each subsequent trigger resets the timer; the cycle
-/// runs only once the pipe goes quiet for the full window.
-///
-/// Reason: a multi-step MUA operation can fire two consecutive
-/// debouncer batches -- e.g. a cross-folder move whose source-delete
-/// and dest-create renames land in separate windows. Without
-/// coalescing, the source-delete cycle sees `DeletedMessage(src)`
-/// alone, reconcile can't pair it with the missing `NewMessage(dst)`,
-/// and the move degrades into `DestroyRemote` + later
-/// `UploadMessage` -- losing the JMAP id, thread, and keyword
-/// history. Holding open a small window catches the back-to-back
-/// case at the cost of a fixed sub-second latency on the first
-/// trigger.
-const COALESCE_WINDOW: Duration = Duration::from_millis(500);
-
 /// Combine a batch of triggers (the first plus everything absorbed
 /// during the coalescing window) into a single representative for
 /// one sync cycle. The split signature pins the non-empty
@@ -216,6 +199,13 @@ async fn session<'a>(
     };
     let account_id = session_info.account_id.clone();
     let ping_interval = config.watch.ping_interval;
+    // Coalescing window for the trigger loop: hold open after the
+    // first trigger to absorb back-to-back debouncer batches into one
+    // cycle. See `WatchConfig::coalesce_window_ms` for the rationale
+    // (cross-folder move halves must land in the same scan_paths
+    // call, otherwise reconcile can't pair source-delete with
+    // dest-create and the move degrades into destroy + reupload).
+    let coalesce_window = Duration::from_millis(config.watch.coalesce_window_ms);
 
     // Seed the SSE dedup cache from current DB state so the first
     // event after (re)connect isn't a guaranteed redundant trigger.
@@ -249,8 +239,8 @@ async fn session<'a>(
     // outer `run` can decide between shutdown and reconnect; abort the
     // SSE listener on the way out either way.
     //
-    // Each iteration receives one trigger, then holds open a
-    // COALESCE_WINDOW for additional triggers before running the
+    // Each iteration receives one trigger, then holds open the
+    // coalescing window for additional triggers before running the
     // cycle. The window resets every time another trigger lands, so
     // bursts collapse naturally and the cycle only starts once the
     // pipe goes quiet.
@@ -258,14 +248,15 @@ async fn session<'a>(
         let Some(first) = rx.recv().await else {
             break SessionExit::ChannelClosed;
         };
-        // Drain the pipe until COALESCE_WINDOW elapses without a new
-        // trigger. Channel-closed mid-drain (Ok(None)) just exits the
-        // inner loop with whatever we collected; the outer `rx.recv`
-        // on the next iteration will return None and break with
-        // ChannelClosed. Worth at most one extra cycle on the way out.
+        // Drain the pipe until the coalescing window elapses without
+        // a new trigger. Channel-closed mid-drain (Ok(None)) just
+        // exits the inner loop with whatever we collected; the outer
+        // `rx.recv` on the next iteration will return None and break
+        // with ChannelClosed. Worth at most one extra cycle on the
+        // way out.
         let mut rest: Vec<SyncTrigger> = Vec::new();
         loop {
-            match tokio::time::timeout(COALESCE_WINDOW, rx.recv()).await {
+            match tokio::time::timeout(coalesce_window, rx.recv()).await {
                 Ok(Some(next)) => rest.push(next),
                 Ok(None) => break,
                 Err(_) => break,

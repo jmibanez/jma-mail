@@ -356,6 +356,10 @@ fn build_test_config(server_uri: &str, maildir_root: &Path, db_path: &Path) -> C
         watch: WatchConfig {
             debounce_secs: 1,
             ping_interval: 60,
+            // Disable coalescing; this test doesn't exercise it and
+            // the production default would tax each trigger with a
+            // 500ms wait.
+            coalesce_window_ms: 0,
             post_arrival_command: None,
         },
         ..Default::default()
