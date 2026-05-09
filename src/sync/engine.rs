@@ -32,6 +32,12 @@ pub struct SyncOutcome {
     /// are self-healing -- the next cycle re-detects and re-attempts
     /// each rejected action -- so they stay below the `error!` bar.
     pub failed_remote_actions: usize,
+    /// True when reconcile produced an empty plan -- neither side had
+    /// work to do. The daemon uses this to flag spurious `LocalChange`
+    /// triggers (FS notification fired but nothing actually changed)
+    /// so the user can correlate the no-op cycle with the FS event
+    /// paths that drove it.
+    pub already_in_sync: bool,
 }
 
 /// Bundles the immutable state every engine helper threads through
@@ -177,9 +183,19 @@ impl<'a> SyncEngine<'a> {
             max_upload_size: limits::max_size_upload(&self.client),
         });
 
+        // Snapshot before `into_filtered`: empty here means reconcile
+        // produced nothing, not "everything got filtered out by
+        // pull-only/push-only" -- those still need the regular log.
+        // Computed before the dry-run branch so the field stays
+        // truthful for any caller that consumes the outcome.
+        let already_in_sync = plan.is_empty();
+
         if dry_run {
             print!("{}", plan);
-            return Ok(SyncOutcome::default());
+            return Ok(SyncOutcome {
+                already_in_sync,
+                ..Default::default()
+            });
         }
 
         // An empty plan still has to flow through the executor so the
@@ -191,11 +207,6 @@ impl<'a> SyncEngine<'a> {
         // re-fetching them. The per-phase methods inside `execute`
         // are all empty-vec no-ops, so this costs nothing user-
         // visible beyond the cursor advance.
-        //
-        // Snapshot before `into_filtered`: empty here means reconcile
-        // produced nothing, not "everything got filtered out by
-        // pull-only/push-only" -- those still need the regular log.
-        let already_in_sync = plan.is_empty();
         if already_in_sync {
             debug!("Plan is empty; running executor to advance the cursor only");
         } else {
@@ -215,7 +226,8 @@ impl<'a> SyncEngine<'a> {
 
         // Phase 5: execute.
         let executor = Executor::new(&self.client, self.conn, self.config);
-        let outcome = executor.execute(filtered).await?;
+        let mut outcome = executor.execute(filtered).await?;
+        outcome.already_in_sync = already_in_sync;
 
         if outcome.failed_remote_actions > 0 {
             warn!(

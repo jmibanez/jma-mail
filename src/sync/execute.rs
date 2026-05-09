@@ -148,6 +148,9 @@ impl<'a> Executor<'a> {
         Ok(SyncOutcome {
             downloaded,
             failed_remote_actions,
+            // Engine sets this from the unfiltered plan; executor
+            // doesn't have the visibility to compute it.
+            already_in_sync: false,
         })
     }
 

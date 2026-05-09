@@ -1,9 +1,11 @@
 use anyhow::Result;
 use rusqlite::Connection;
 use std::collections::HashMap;
+use std::fmt;
+use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::{RECONNECT_INITIAL_BACKOFF, RECONNECT_MAX_BACKOFF};
 use crate::config::Config;
@@ -12,12 +14,25 @@ use crate::state::queries;
 use crate::sync::engine::SyncEngine;
 use crate::sync::plan::SyncDirection;
 
-/// What triggered a sync cycle.
+/// What triggered a sync cycle. `LocalChange` carries the FS event
+/// paths that drove the watcher so the runner can surface them when
+/// the cycle ends up doing nothing -- diagnostic for spurious
+/// triggers, where the path list is the only clue to what wrote.
 #[derive(Debug, Clone)]
 pub enum SyncTrigger {
     RemoteChange,
-    LocalChange,
+    LocalChange(Vec<PathBuf>),
     Initial,
+}
+
+impl fmt::Display for SyncTrigger {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RemoteChange => f.write_str("RemoteChange"),
+            Self::LocalChange(paths) => write!(f, "LocalChange ({} FS event(s))", paths.len()),
+            Self::Initial => f.write_str("Initial"),
+        }
+    }
 }
 
 /// Why the inner `session` returned. The outer `run` uses this to
@@ -179,7 +194,7 @@ async fn session<'a>(
         let Some(trigger) = rx.recv().await else {
             break SessionExit::ChannelClosed;
         };
-        info!("Sync triggered by {:?}", trigger);
+        info!("Sync triggered by {}", trigger);
         match engine.run(false, SyncDirection::Both).await {
             Ok(outcome) => {
                 // A successful cycle means the link is healthy --
@@ -188,6 +203,16 @@ async fn session<'a>(
                 *backoff = RECONNECT_INITIAL_BACKOFF;
                 if outcome.downloaded > 0 {
                     hook.trigger().await;
+                }
+                if outcome.already_in_sync
+                    && let SyncTrigger::LocalChange(paths) = &trigger
+                {
+                    let formatted: Vec<String> =
+                        paths.iter().map(|p| p.display().to_string()).collect();
+                    debug!(
+                        "LocalChange trigger produced no work; FS event path(s): {}",
+                        formatted.join(", ")
+                    );
                 }
             }
             Err(e) if is_transient_error(&e) => {

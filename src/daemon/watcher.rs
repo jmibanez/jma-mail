@@ -1,6 +1,6 @@
 use anyhow::Result;
 use notify_debouncer_mini::{DebouncedEventKind, new_debouncer};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -32,19 +32,27 @@ pub async fn watch(
 ) -> Result<()> {
     info!("Watching maildir at {} for changes", maildir_root.display());
 
-    let (notify_tx, mut notify_rx) = tokio::sync::mpsc::channel(100);
+    let (notify_tx, mut notify_rx) = tokio::sync::mpsc::channel::<Vec<PathBuf>>(100);
 
     let mut debouncer = new_debouncer(
         Duration::from_secs(debounce_secs),
         move |result: Result<Vec<notify_debouncer_mini::DebouncedEvent>, notify::Error>| {
             match result {
                 Ok(events) => {
-                    let relevant = events.iter().any(|e| {
-                        matches!(e.kind, DebouncedEventKind::Any)
-                            && is_maildir_message_path(&e.path)
-                    });
-                    if relevant {
-                        let _ = notify_tx.blocking_send(());
+                    // Forward the relevant FS paths so the runner can
+                    // surface them when a `LocalChange` cycle ends up
+                    // doing nothing -- the path list is the only clue
+                    // to what wrote.
+                    let paths: Vec<PathBuf> = events
+                        .into_iter()
+                        .filter(|e| {
+                            matches!(e.kind, DebouncedEventKind::Any)
+                                && is_maildir_message_path(&e.path)
+                        })
+                        .map(|e| e.path)
+                        .collect();
+                    if !paths.is_empty() {
+                        let _ = notify_tx.blocking_send(paths);
                     }
                 }
                 Err(e) => {
@@ -60,9 +68,9 @@ pub async fn watch(
 
     info!("Filesystem watcher started");
 
-    while notify_rx.recv().await.is_some() {
-        debug!("Local filesystem change detected");
-        if tx.send(SyncTrigger::LocalChange).await.is_err() {
+    while let Some(paths) = notify_rx.recv().await {
+        debug!("Local filesystem change detected ({} path(s))", paths.len());
+        if tx.send(SyncTrigger::LocalChange(paths)).await.is_err() {
             info!("Sync channel closed, shutting down watcher");
             break;
         }
