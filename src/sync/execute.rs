@@ -604,37 +604,118 @@ impl<'a> Executor<'a> {
             );
         }
 
+        let total = actions.len();
+        // Up-front summary so the user sees that work is queued before
+        // any blob actually lands -- otherwise initial sync of a fresh
+        // server is silent for as long as the first download takes.
+        // Skip the one-message case: steady-state daemon cycles already
+        // log the per-message line below, and a single-message preamble
+        // is just noise.
+        if total > 1 {
+            info!("Downloading {} messages", total);
+        }
+
         let mut downloaded = 0usize;
         let mut pending = actions;
         let client = self.client;
 
         while !pending.is_empty() {
             let n = concurrency.max(1);
-            let futures = pending.iter().enumerate().map(|(i, action)| {
-                let blob_id = match action {
+            let batch = std::mem::take(&mut pending);
+            let futures = batch.into_iter().map(|action| {
+                let blob_id = match &action {
                     SyncAction::DownloadMessage { jmap_blob_id, .. } => jmap_blob_id.clone(),
                     _ => unreachable!("non-download in downloads bucket"),
                 };
                 async move {
                     let res = jmap_email::download_blob(client, &blob_id).await;
-                    (i, res)
+                    (action, res)
                 }
             });
             let mut stream = stream::iter(futures).buffer_unordered(n);
 
-            let mut succeeded: Vec<(usize, Vec<u8>)> = Vec::new();
             let mut rate_limited = false;
             let mut hard_error: Option<anyhow::Error> = None;
+            let mut to_retry: Vec<SyncAction> = Vec::new();
 
-            while let Some((i, result)) = stream.next().await {
+            // Store + log each blob as it lands, not after the whole
+            // stream drains, so per-message progress flows during the
+            // wait. Connection isn't Send, but the stream consumer
+            // runs on the spawning task -- the DB writes happen here,
+            // not inside the parallel download futures.
+            while let Some((action, result)) = stream.next().await {
                 match result {
-                    Ok(blob) => succeeded.push((i, blob)),
+                    Ok(blob) => {
+                        let SyncAction::DownloadMessage {
+                            id,
+                            jmap_blob_id,
+                            jmap_thread_id,
+                            mailbox_id,
+                            maildir_folder,
+                            keywords,
+                        } = &action
+                        else {
+                            unreachable!("non-download in downloads bucket");
+                        };
+                        let flags = keywords_to_flags(keywords);
+                        let maildir_path = self.maildir_root.join(maildir_folder);
+                        let maildir = store::ensure_maildir(&maildir_path)?;
+                        let mid = store::store_message(&maildir, &blob, &flags)?;
+                        if let Some(cache) = &self.self_writes {
+                            // Suppress the fsevents echo of this delivery
+                            // and -- for new/ deliveries -- the same-flag
+                            // cur/ promotion an MUA may rename to next.
+                            // A flag-changing promotion (e.g. MUA adds S
+                            // on read) won't match the predicted path, so
+                            // it falls through to a real classify cycle.
+                            //
+                            // The flag string used here must byte-match
+                            // what the maildir crate writes. `keywords_to_flags`
+                            // already returns canonical (sorted, deduped)
+                            // output and the maildir crate writes it
+                            // verbatim into the suffix; if either side
+                            // ever diverges from canonical-sorted, this
+                            // prediction silently misses every delivery.
+                            let subdir = if flags.contains('S') { "cur" } else { "new" };
+                            let suffix = format!("{}:2,{}", mid.as_ref(), flags);
+                            let delivered = maildir_path.join(subdir).join(&suffix);
+                            let mut paths = vec![delivered];
+                            if subdir == "new" {
+                                paths.push(maildir_path.join("cur").join(&suffix));
+                            }
+                            cache.record(paths);
+                        }
+                        info!("Downloaded new email {} -> {}/{}", id, maildir_folder, mid);
+                        let keywords_json = serde_json::to_string(keywords)?;
+                        // Per-iteration transaction: pair the message_map and
+                        // local_state upserts so the just-stored maildir file
+                        // doesn't end up bound in only one of the two tables.
+                        let txn = self.conn.unchecked_transaction()?;
+                        queries::upsert_message(
+                            &txn,
+                            &MessageRecord {
+                                jmap_email_id: id.jmap_email_id.clone(),
+                                jmap_blob_id: Some(jmap_blob_id.clone()),
+                                jmap_thread_id: Some(jmap_thread_id.clone()),
+                                mailbox_id: mailbox_id.clone(),
+                                maildir_id: Some(mid.clone()),
+                                maildir_folder: Some(maildir_folder.clone()),
+                                message_id: id.message_id.clone(),
+                                flags: flags.clone(),
+                                jmap_keywords: keywords_json,
+                            },
+                        )?;
+                        queries::upsert_local_state(&txn, &mid, maildir_folder, &flags, None)?;
+                        txn.commit()?;
+                        downloaded += 1;
+                    }
                     Err(e) => {
                         if is_transient_error(&e) {
                             rate_limited = true;
-                            if let SyncAction::DownloadMessage { id, .. } = &pending[i] {
+                            if let SyncAction::DownloadMessage { id, .. } = &action {
                                 debug!("Rate-limited downloading email {}: {}", id, e);
                             }
+                            to_retry.push(action);
                         } else if hard_error.is_none() {
                             hard_error = Some(e);
                         }
@@ -643,82 +724,11 @@ impl<'a> Executor<'a> {
             }
             drop(stream);
 
-            let succeeded_idx: HashSet<usize> = succeeded.iter().map(|(i, _)| *i).collect();
-
-            for (i, blob) in &succeeded {
-                if let SyncAction::DownloadMessage {
-                    id,
-                    jmap_blob_id,
-                    jmap_thread_id,
-                    mailbox_id,
-                    maildir_folder,
-                    keywords,
-                } = &pending[*i]
-                {
-                    let flags = keywords_to_flags(keywords);
-                    let maildir_path = self.maildir_root.join(maildir_folder);
-                    let maildir = store::ensure_maildir(&maildir_path)?;
-                    let mid = store::store_message(&maildir, blob, &flags)?;
-                    if let Some(cache) = &self.self_writes {
-                        // Suppress the fsevents echo of this delivery
-                        // and -- for new/ deliveries -- the same-flag
-                        // cur/ promotion an MUA may rename to next.
-                        // A flag-changing promotion (e.g. MUA adds S
-                        // on read) won't match the predicted path, so
-                        // it falls through to a real classify cycle.
-                        //
-                        // The flag string used here must byte-match
-                        // what the maildir crate writes. `keywords_to_flags`
-                        // already returns canonical (sorted, deduped)
-                        // output and the maildir crate writes it
-                        // verbatim into the suffix; if either side
-                        // ever diverges from canonical-sorted, this
-                        // prediction silently misses every delivery.
-                        let subdir = if flags.contains('S') { "cur" } else { "new" };
-                        let suffix = format!("{}:2,{}", mid.as_ref(), flags);
-                        let delivered = maildir_path.join(subdir).join(&suffix);
-                        let mut paths = vec![delivered];
-                        if subdir == "new" {
-                            paths.push(maildir_path.join("cur").join(&suffix));
-                        }
-                        cache.record(paths);
-                    }
-                    info!("Downloaded new email {} -> {}/{}", id, maildir_folder, mid);
-                    let keywords_json = serde_json::to_string(keywords)?;
-                    // Per-iteration transaction: pair the message_map and
-                    // local_state upserts so the just-stored maildir file
-                    // doesn't end up bound in only one of the two tables.
-                    let txn = self.conn.unchecked_transaction()?;
-                    queries::upsert_message(
-                        &txn,
-                        &MessageRecord {
-                            jmap_email_id: id.jmap_email_id.clone(),
-                            jmap_blob_id: Some(jmap_blob_id.clone()),
-                            jmap_thread_id: Some(jmap_thread_id.clone()),
-                            mailbox_id: mailbox_id.clone(),
-                            maildir_id: Some(mid.clone()),
-                            maildir_folder: Some(maildir_folder.clone()),
-                            message_id: id.message_id.clone(),
-                            flags: flags.clone(),
-                            jmap_keywords: keywords_json,
-                        },
-                    )?;
-                    queries::upsert_local_state(&txn, &mid, maildir_folder, &flags, None)?;
-                    txn.commit()?;
-                    downloaded += 1;
-                }
-            }
-
             if let Some(e) = hard_error {
                 return Err(e);
             }
 
-            pending = pending
-                .into_iter()
-                .enumerate()
-                .filter(|(i, _)| !succeeded_idx.contains(i))
-                .map(|(_, p)| p)
-                .collect();
+            pending = to_retry;
 
             if pending.is_empty() {
                 break;
