@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
@@ -18,6 +18,18 @@ use crate::state::queries::{self, MessageRecord};
 use crate::sync::engine::SyncOutcome;
 use crate::sync::plan::{BoundId, LocalId, RemoteId, SyncAction, SyncPlan};
 use crate::sync::self_writes::SelfWriteCache;
+
+/// Above this many queued downloads, demote the per-message `info!`
+/// line to `debug!` and switch to a periodic `info!` heartbeat. Keeps
+/// initial-sync logs scannable: a 50K-message first sync produces
+/// roughly one progress line per minute instead of 50K per-message
+/// lines, while small daemon-cycle batches stay verbose.
+const VERBOSE_DOWNLOAD_THRESHOLD: usize = 100;
+
+/// Wall-clock interval between progress heartbeats once per-message
+/// logging is suppressed. Short enough to feel live during a long
+/// initial sync without flooding the log.
+const DOWNLOAD_PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Bundles the immutable per-cycle state every execute helper threads
 /// through (client, DB connection, config, maildir root, account id).
@@ -614,6 +626,12 @@ impl<'a> Executor<'a> {
         if total > 1 {
             info!("Downloading {} messages", total);
         }
+        // Above the threshold, suppress per-message info and emit a
+        // periodic heartbeat instead. `last_progress` is reset on each
+        // heartbeat (and only advances when a store actually committed),
+        // so a rate-limited stall doesn't spam an unchanging percentage.
+        let verbose_per_message = total <= VERBOSE_DOWNLOAD_THRESHOLD;
+        let mut last_progress = Instant::now();
 
         let mut downloaded = 0usize;
         let mut pending = actions;
@@ -685,7 +703,6 @@ impl<'a> Executor<'a> {
                             }
                             cache.record(paths);
                         }
-                        info!("Downloaded new email {} -> {}/{}", id, maildir_folder, mid);
                         let keywords_json = serde_json::to_string(keywords)?;
                         // Per-iteration transaction: pair the message_map and
                         // local_state upserts so the just-stored maildir file
@@ -708,6 +725,16 @@ impl<'a> Executor<'a> {
                         queries::upsert_local_state(&txn, &mid, maildir_folder, &flags, None)?;
                         txn.commit()?;
                         downloaded += 1;
+                        if verbose_per_message {
+                            info!("Downloaded new email {} -> {}/{}", id, maildir_folder, mid);
+                        } else {
+                            debug!("Downloaded new email {} -> {}/{}", id, maildir_folder, mid);
+                            if last_progress.elapsed() >= DOWNLOAD_PROGRESS_INTERVAL {
+                                let pct = (downloaded * 100) / total;
+                                info!("Downloaded {}/{} ({}%) so far", downloaded, total, pct);
+                                last_progress = Instant::now();
+                            }
+                        }
                     }
                     Err(e) => {
                         if is_transient_error(&e) {
