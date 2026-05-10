@@ -1,4 +1,5 @@
 use anyhow::Result;
+use futures_util::stream::{self, StreamExt};
 use jmap_client::client::Client;
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
@@ -438,15 +439,35 @@ impl<'a> SyncEngine<'a> {
     ) -> Result<(Vec<EmailObject>, Vec<JmapEmailId>, String, bool)> {
         let mut all_ids: Vec<JmapEmailId> = Vec::new();
         let mut seen: HashSet<JmapEmailId> = HashSet::new();
-        for (mailbox_id, folder_name) in mailboxes {
-            let ids =
-                jmap_email::query_mailbox(&self.client, mailbox_id.as_ref(), folder_name).await?;
+
+        // Fan out per-mailbox Email/query in parallel. `query_mailbox`
+        // paginates internally (each page must wait for the previous
+        // within a single mailbox), but across mailboxes the queries
+        // are independent. Cap parallelism at the JMAP server's
+        // maxConcurrentRequests via the existing download_concurrency
+        // ceiling -- queries are ordinary JMAP requests and share that
+        // budget. Result order is non-deterministic with
+        // `buffer_unordered`; the downstream consumers
+        // (`batched_get` and the seen-set dedupe) are both
+        // order-agnostic.
+        let n = limits::concurrent_requests(&self.client, self.config.sync.download_concurrency);
+        let client = &self.client;
+        let futures = mailboxes
+            .iter()
+            .map(|(mailbox_id, folder_name)| async move {
+                jmap_email::query_mailbox(client, mailbox_id.as_ref(), folder_name).await
+            });
+        let mut stream = stream::iter(futures).buffer_unordered(n);
+
+        while let Some(result) = stream.next().await {
+            let ids = result?;
             for id in ids {
                 if seen.insert(id.clone()) {
                     all_ids.push(id);
                 }
             }
         }
+
         let emails = self.batched_get(&all_ids).await?;
         let state = jmap_email::get_current_state(&self.client).await?;
         Ok((emails, Vec::new(), state, true))
