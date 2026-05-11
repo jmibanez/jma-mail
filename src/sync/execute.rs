@@ -121,14 +121,15 @@ impl<'a> Executor<'a> {
 
         adopt_messages(self.conn, unconditional_adopts)?;
         let downloaded = self.run_downloads(downloads).await?;
-        self.update_local_flags(local_flags)?;
+        let local_flag_updates = self.update_local_flags(local_flags)?;
         self.move_local_messages(local_moves)?;
         self.delete_local_messages(local_deletes)?;
         let upload_results = self.upload_messages(uploads).await?;
         let uploaded = upload_results.uploaded;
-        let outcome = self
+        let (outcome, remote_keyword_updates) = self
             .apply_remote_set(remote_keywords, remote_moves, remote_destroys)
             .await?;
+        let flag_updates = local_flag_updates + remote_keyword_updates;
         apply_move_pair_adopts(self.conn, move_pair_adopts, &outcome.failed_updates)?;
         let failed_remote_actions = outcome.failed_updates.len() + outcome.failed_destroys.len();
 
@@ -174,6 +175,7 @@ impl<'a> Executor<'a> {
         Ok(SyncOutcome {
             downloaded,
             uploaded,
+            flag_updates,
             failed_remote_actions,
             // Engine sets this from the unfiltered plan; executor
             // doesn't have the visibility to compute it.
@@ -181,7 +183,12 @@ impl<'a> Executor<'a> {
         })
     }
 
-    fn update_local_flags(&self, actions: Vec<SyncAction>) -> Result<()> {
+    /// Returns the number of local flag updates the maildir + DB
+    /// accepted this cycle. Per-message `set_flags` failures are
+    /// logged at warn and skipped here; the count reflects only the
+    /// updates that actually landed.
+    fn update_local_flags(&self, actions: Vec<SyncAction>) -> Result<usize> {
+        let mut succeeded = 0usize;
         for action in actions {
             let SyncAction::UpdateLocalFlags {
                 id,
@@ -231,9 +238,10 @@ impl<'a> Executor<'a> {
             )?;
             queries::upsert_local_state(&txn, &maildir_id, &maildir_folder, &new_flags, None)?;
             txn.commit()?;
+            succeeded += 1;
             info!("Updated local flags for {}: '{}'", bound_for_log, new_flags);
         }
-        Ok(())
+        Ok(succeeded)
     }
 
     fn move_local_messages(&self, actions: Vec<SyncAction>) -> Result<()> {
@@ -463,12 +471,17 @@ impl<'a> Executor<'a> {
     /// moves, and destroys together. After the server confirms, we mirror
     /// each successful op into the local DB. Per-id failures are skipped
     /// so we don't drift the DB out of sync with the server.
+    /// Returns the JMAP-layer outcome plus the count of remote
+    /// keyword updates the server accepted -- the second tuple
+    /// element matches the semantics of `update_local_flags`'s return
+    /// (skips server-rejected ids), so summing the two gives the
+    /// total flag-update count for the cycle.
     async fn apply_remote_set(
         &self,
         keywords: Vec<SyncAction>,
         moves: Vec<SyncAction>,
         destroys: Vec<SyncAction>,
-    ) -> Result<jmap_email::EmailSetOutcome> {
+    ) -> Result<(jmap_email::EmailSetOutcome, usize)> {
         let mut ops: Vec<EmailSetOp> = Vec::new();
         for action in &keywords {
             if let SyncAction::UpdateRemoteKeywords { id, keywords } = action {
@@ -500,7 +513,7 @@ impl<'a> Executor<'a> {
         }
 
         if ops.is_empty() {
-            return Ok(jmap_email::EmailSetOutcome::default());
+            return Ok((jmap_email::EmailSetOutcome::default(), 0));
         }
 
         let outcome = jmap_email::set_email_batch(self.client, &ops).await?;
@@ -513,6 +526,7 @@ impl<'a> Executor<'a> {
         let txn = self.conn.unchecked_transaction()?;
 
         // Mirror keyword updates into the local DB.
+        let mut keyword_updates_succeeded = 0usize;
         for action in keywords {
             let SyncAction::UpdateRemoteKeywords { id, keywords } = action else {
                 continue;
@@ -542,6 +556,7 @@ impl<'a> Executor<'a> {
                     queries::upsert_local_state(&txn, &mid, &folder, &flags, None)?;
                 }
             }
+            keyword_updates_succeeded += 1;
             info!("Updated remote keywords for {}", id);
         }
 
@@ -598,7 +613,7 @@ impl<'a> Executor<'a> {
         }
 
         txn.commit()?;
-        Ok(outcome)
+        Ok((outcome, keyword_updates_succeeded))
     }
 
     /// Run all DownloadMessage actions concurrently with the rate-limit

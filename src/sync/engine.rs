@@ -45,6 +45,13 @@ pub struct SyncOutcome {
     /// the server rejected (or whose import returned an error) are
     /// excluded so the number matches what actually landed remotely.
     pub uploaded: usize,
+    /// Flag/keyword updates that landed this cycle, summed across
+    /// both directions: maildir flag changes mirrored from server
+    /// keyword diffs (`UpdateLocalFlags`) and server keyword pushes
+    /// from local flag diffs (`UpdateRemoteKeywords`). Skipped or
+    /// rejected updates are excluded so the count matches what
+    /// actually changed on at least one side.
+    pub flag_updates: usize,
     /// Per-id failures from the remote-side Email/set batch
     /// (notUpdated + notDestroyed). Each one is also logged at warn
     /// level with id and folder context; this count is the
@@ -312,15 +319,17 @@ impl<'a> SyncEngine<'a> {
             crate::notify!("Already in sync");
         } else if used_initial_path {
             crate::notify!(
-                "Initial sync complete ({} downloaded, {} uploaded)",
+                "Initial sync complete ({} downloaded, {} uploaded, {} flag updates)",
                 outcome.downloaded,
-                outcome.uploaded
+                outcome.uploaded,
+                outcome.flag_updates
             );
         } else {
             crate::notify!(
-                "Sync complete ({} downloaded, {} uploaded)",
+                "Sync complete ({} downloaded, {} uploaded, {} flag updates)",
                 outcome.downloaded,
-                outcome.uploaded
+                outcome.uploaded,
+                outcome.flag_updates
             );
         }
         Ok(outcome)
