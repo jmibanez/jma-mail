@@ -125,6 +125,7 @@ impl<'a> Executor<'a> {
         self.move_local_messages(local_moves)?;
         self.delete_local_messages(local_deletes)?;
         let upload_results = self.upload_messages(uploads).await?;
+        let uploaded = upload_results.uploaded;
         let outcome = self
             .apply_remote_set(remote_keywords, remote_moves, remote_destroys)
             .await?;
@@ -172,6 +173,7 @@ impl<'a> Executor<'a> {
 
         Ok(SyncOutcome {
             downloaded,
+            uploaded,
             failed_remote_actions,
             // Engine sets this from the unfiltered plan; executor
             // doesn't have the visibility to compute it.
@@ -327,6 +329,7 @@ impl<'a> Executor<'a> {
             return Ok(UploadResults {
                 chain_pairs: Vec::new(),
                 chain_intact: true,
+                uploaded: 0,
             });
         }
         let n = limits::upload_concurrency(self.client, self.config.sync.upload_concurrency);
@@ -442,12 +445,14 @@ impl<'a> Executor<'a> {
             info!("Uploaded local message {} -> {}", id.maildir_id, target);
         }
 
+        let uploaded = succeeded.len();
         if let Some(e) = hard_error {
             return Err(e);
         }
         Ok(UploadResults {
             chain_pairs,
             chain_intact,
+            uploaded,
         })
     }
 
@@ -975,6 +980,12 @@ enum UploadOutcome {
 struct UploadResults {
     chain_pairs: Vec<(String, String)>,
     chain_intact: bool,
+    /// Number of uploads the server accepted this cycle. Excludes
+    /// per-upload errors and `UploadOutcome::Skipped` (the import
+    /// helper's "server already had this Message-ID" branch), so the
+    /// count matches what actually landed remotely rather than what
+    /// the executor attempted.
+    uploaded: usize,
 }
 
 /// One upload's worth of work: read + import. Sync `std::fs::read`

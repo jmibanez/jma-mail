@@ -40,6 +40,11 @@ pub enum ScanScope {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SyncOutcome {
     pub downloaded: usize,
+    /// Local messages successfully pushed to the server via
+    /// Email/import this cycle. Counts only the successes; uploads
+    /// the server rejected (or whose import returned an error) are
+    /// excluded so the number matches what actually landed remotely.
+    pub uploaded: usize,
     /// Per-id failures from the remote-side Email/set batch
     /// (notUpdated + notDestroyed). Each one is also logged at warn
     /// level with id and folder context; this count is the
@@ -306,9 +311,17 @@ impl<'a> SyncEngine<'a> {
         if already_in_sync {
             crate::notify!("Already in sync");
         } else if used_initial_path {
-            crate::notify!("Initial sync complete ({} downloaded)", outcome.downloaded);
+            crate::notify!(
+                "Initial sync complete ({} downloaded, {} uploaded)",
+                outcome.downloaded,
+                outcome.uploaded
+            );
         } else {
-            crate::notify!("Sync complete ({} downloaded)", outcome.downloaded);
+            crate::notify!(
+                "Sync complete ({} downloaded, {} uploaded)",
+                outcome.downloaded,
+                outcome.uploaded
+            );
         }
         Ok(outcome)
     }
