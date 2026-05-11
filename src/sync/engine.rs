@@ -304,11 +304,11 @@ impl<'a> SyncEngine<'a> {
         }
 
         if already_in_sync {
-            info!("Already in sync");
+            crate::notify!("Already in sync");
         } else if used_initial_path {
-            info!("Initial sync complete ({} downloaded)", outcome.downloaded);
+            crate::notify!("Initial sync complete ({} downloaded)", outcome.downloaded);
         } else {
-            info!("Sync complete ({} downloaded)", outcome.downloaded);
+            crate::notify!("Sync complete ({} downloaded)", outcome.downloaded);
         }
         Ok(outcome)
     }
@@ -368,7 +368,7 @@ impl<'a> SyncEngine<'a> {
             synced.push((mb.id.clone(), folder_name));
         }
 
-        info!("Syncing {} mailboxes", synced.len());
+        crate::notify!("Syncing {} mailboxes", synced.len());
         Ok(synced)
     }
 

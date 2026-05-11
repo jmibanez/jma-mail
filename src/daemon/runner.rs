@@ -133,7 +133,7 @@ pub async fn run(conn: &Connection, config: &Config) -> Result<()> {
     // reconcile any events missed during the disconnect window via
     // Email/changes.
     let mut engine = connect_with_backoff(conn, config, self_writes.clone()).await?;
-    info!("Running initial sync before entering watch mode");
+    crate::notify!("Running initial sync before entering watch mode");
     match engine
         .run(false, SyncDirection::Both, ScanScope::Full)
         .await
@@ -152,7 +152,7 @@ pub async fn run(conn: &Connection, config: &Config) -> Result<()> {
         Err(e) => error!("Initial sync failed: {:#}", e),
     }
 
-    info!("Watch mode active. Press Ctrl+C to stop.");
+    crate::notify!("Watch mode active. Press Ctrl+C to stop.");
 
     // Watch loop. Each iteration runs a "session" (post-initial-sync
     // setup + drain triggers) until either the channel closes or
@@ -183,7 +183,7 @@ pub async fn run(conn: &Connection, config: &Config) -> Result<()> {
         }
     }
 
-    info!("Watch mode shutting down");
+    crate::notify!("Watch mode shutting down");
     fs_handle.abort();
     Ok(())
 }

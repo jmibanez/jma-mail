@@ -75,7 +75,7 @@ pub async fn watch(
     tx: mpsc::Sender<SyncTrigger>,
     self_writes: Option<Arc<SelfWriteCache>>,
 ) -> Result<()> {
-    info!("Watching maildir at {} for changes", maildir_root.display());
+    crate::notify!("Watching maildir at {} for changes", maildir_root.display());
 
     let (notify_tx, mut notify_rx) = tokio::sync::mpsc::channel::<Vec<PathBuf>>(100);
 

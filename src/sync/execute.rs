@@ -624,7 +624,7 @@ impl<'a> Executor<'a> {
         // log the per-message line below, and a single-message preamble
         // is just noise.
         if total > 1 {
-            info!("Downloading {} messages", total);
+            crate::notify!("Downloading {} messages", total);
         }
         // Above the threshold, suppress per-message info and emit a
         // periodic heartbeat instead. `last_progress` is reset on each
@@ -731,7 +731,12 @@ impl<'a> Executor<'a> {
                             debug!("Downloaded new email {} -> {}/{}", id, maildir_folder, mid);
                             if last_progress.elapsed() >= DOWNLOAD_PROGRESS_INTERVAL {
                                 let pct = (downloaded * 100) / total;
-                                info!("Downloaded {}/{} ({}%) so far", downloaded, total, pct);
+                                crate::notify!(
+                                    "Downloaded {}/{} ({}%) so far",
+                                    downloaded,
+                                    total,
+                                    pct
+                                );
                                 last_progress = Instant::now();
                             }
                         }
