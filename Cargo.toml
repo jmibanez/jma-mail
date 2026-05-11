@@ -124,3 +124,15 @@ tokio = { version = "1", features = ["full", "test-util"] }
 # In-process HTTP mock server for integration tests that exercise the
 # JMAP HTTP plumbing (e.g. retry behavior on 503).
 wiremock = "0.6"
+# Spawn an ephemeral Stalwart Mail container per E2E suite so we can
+# exercise the JMAP path against a real server instead of scripted
+# wiremock fixtures. Default `ring` TLS feature matches the rest of
+# our build; we don't need `http_wait` or `blocking`.
+testcontainers = "0.27"
+# Out-of-band seeding into the test Stalwart: APPEND synthetic
+# messages into the test account's INBOX without going through the
+# same JMAP path we're testing. A jmap-client breakage shouldn't
+# make seeding silently produce bad fixtures.
+async-imap = { version = "0.11", default-features = false, features = [
+    "runtime-tokio",
+] }
