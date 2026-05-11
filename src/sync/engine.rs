@@ -52,6 +52,16 @@ pub struct SyncOutcome {
     /// rejected updates are excluded so the count matches what
     /// actually changed on at least one side.
     pub flag_updates: usize,
+    /// Cross-folder moves that landed this cycle, summed across both
+    /// directions: server folder changes mirrored to local maildir
+    /// (`MoveLocal`) and local folder changes pushed to the server
+    /// (`MoveRemote`). Skipped or rejected moves are excluded.
+    pub moved: usize,
+    /// Deletions that landed this cycle, summed across both
+    /// directions: server destroys mirrored to local
+    /// (`DeleteLocal`) and local deletions pushed to the server
+    /// (`DestroyRemote`). Skipped or rejected destroys are excluded.
+    pub deleted: usize,
     /// Per-id failures from the remote-side Email/set batch
     /// (notUpdated + notDestroyed). Each one is also logged at warn
     /// level with id and folder context; this count is the
@@ -319,17 +329,21 @@ impl<'a> SyncEngine<'a> {
             crate::notify!("Already in sync");
         } else if used_initial_path {
             crate::notify!(
-                "Initial sync complete ({} downloaded, {} uploaded, {} flag updates)",
+                "Initial sync complete ({} downloaded, {} uploaded, {} flag updates, {} moved, {} deleted)",
                 outcome.downloaded,
                 outcome.uploaded,
-                outcome.flag_updates
+                outcome.flag_updates,
+                outcome.moved,
+                outcome.deleted
             );
         } else {
             crate::notify!(
-                "Sync complete ({} downloaded, {} uploaded, {} flag updates)",
+                "Sync complete ({} downloaded, {} uploaded, {} flag updates, {} moved, {} deleted)",
                 outcome.downloaded,
                 outcome.uploaded,
-                outcome.flag_updates
+                outcome.flag_updates,
+                outcome.moved,
+                outcome.deleted
             );
         }
         Ok(outcome)

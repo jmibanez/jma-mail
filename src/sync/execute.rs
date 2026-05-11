@@ -122,14 +122,16 @@ impl<'a> Executor<'a> {
         adopt_messages(self.conn, unconditional_adopts)?;
         let downloaded = self.run_downloads(downloads).await?;
         let local_flag_updates = self.update_local_flags(local_flags)?;
-        self.move_local_messages(local_moves)?;
-        self.delete_local_messages(local_deletes)?;
+        let local_moves_count = self.move_local_messages(local_moves)?;
+        let local_deletes_count = self.delete_local_messages(local_deletes)?;
         let upload_results = self.upload_messages(uploads).await?;
         let uploaded = upload_results.uploaded;
-        let (outcome, remote_keyword_updates) = self
+        let (outcome, remote_counts) = self
             .apply_remote_set(remote_keywords, remote_moves, remote_destroys)
             .await?;
-        let flag_updates = local_flag_updates + remote_keyword_updates;
+        let flag_updates = local_flag_updates + remote_counts.keyword_updates;
+        let moved = local_moves_count + remote_counts.moves;
+        let deleted = local_deletes_count + remote_counts.destroys;
         apply_move_pair_adopts(self.conn, move_pair_adopts, &outcome.failed_updates)?;
         let failed_remote_actions = outcome.failed_updates.len() + outcome.failed_destroys.len();
 
@@ -176,6 +178,8 @@ impl<'a> Executor<'a> {
             downloaded,
             uploaded,
             flag_updates,
+            moved,
+            deleted,
             failed_remote_actions,
             // Engine sets this from the unfiltered plan; executor
             // doesn't have the visibility to compute it.
@@ -244,7 +248,11 @@ impl<'a> Executor<'a> {
         Ok(succeeded)
     }
 
-    fn move_local_messages(&self, actions: Vec<SyncAction>) -> Result<()> {
+    /// Returns the number of cross-folder local moves that landed
+    /// (file moved + DB row updated). Per-message `store::move_message`
+    /// failures are logged at warn and skipped here.
+    fn move_local_messages(&self, actions: Vec<SyncAction>) -> Result<usize> {
+        let mut succeeded = 0usize;
         for action in actions {
             let SyncAction::MoveLocal {
                 id,
@@ -293,15 +301,22 @@ impl<'a> Executor<'a> {
             };
             queries::upsert_local_state(&txn, &maildir_id, &to_folder, &flags, None)?;
             txn.commit()?;
+            succeeded += 1;
             info!(
                 "Moved {} from {} to {}",
                 bound_for_log, from_folder, to_folder
             );
         }
-        Ok(())
+        Ok(succeeded)
     }
 
-    fn delete_local_messages(&self, actions: Vec<SyncAction>) -> Result<()> {
+    /// Returns the number of local deletions that landed (DB rows
+    /// removed). A `store::delete_message` failure for a file that
+    /// was already gone is normal -- logged at debug -- and the DB
+    /// cleanup still runs, so the count tracks "message gone from
+    /// local" rather than "file successfully unlinked."
+    fn delete_local_messages(&self, actions: Vec<SyncAction>) -> Result<usize> {
+        let mut succeeded = 0usize;
         for action in actions {
             let SyncAction::DeleteLocal { id, maildir_folder } = action else {
                 continue;
@@ -327,9 +342,10 @@ impl<'a> Executor<'a> {
             queries::delete_local_state(&txn, &maildir_id)?;
             queries::delete_message_by_jmap_id(&txn, &jmap_email_id)?;
             txn.commit()?;
+            succeeded += 1;
             info!("Deleted local copy of destroyed {}", bound_for_log);
         }
-        Ok(())
+        Ok(succeeded)
     }
 
     async fn upload_messages(&self, actions: Vec<SyncAction>) -> Result<UploadResults> {
@@ -471,17 +487,17 @@ impl<'a> Executor<'a> {
     /// moves, and destroys together. After the server confirms, we mirror
     /// each successful op into the local DB. Per-id failures are skipped
     /// so we don't drift the DB out of sync with the server.
-    /// Returns the JMAP-layer outcome plus the count of remote
-    /// keyword updates the server accepted -- the second tuple
-    /// element matches the semantics of `update_local_flags`'s return
-    /// (skips server-rejected ids), so summing the two gives the
-    /// total flag-update count for the cycle.
+    /// Returns the JMAP-layer outcome plus a per-category count of
+    /// remote operations the server accepted. Each count matches the
+    /// semantics of the local-side counter it pairs with (skips
+    /// server-rejected ids), so summing across directions gives the
+    /// total for the cycle.
     async fn apply_remote_set(
         &self,
         keywords: Vec<SyncAction>,
         moves: Vec<SyncAction>,
         destroys: Vec<SyncAction>,
-    ) -> Result<(jmap_email::EmailSetOutcome, usize)> {
+    ) -> Result<(jmap_email::EmailSetOutcome, ApplyRemoteSetCounts)> {
         let mut ops: Vec<EmailSetOp> = Vec::new();
         for action in &keywords {
             if let SyncAction::UpdateRemoteKeywords { id, keywords } = action {
@@ -513,7 +529,10 @@ impl<'a> Executor<'a> {
         }
 
         if ops.is_empty() {
-            return Ok((jmap_email::EmailSetOutcome::default(), 0));
+            return Ok((
+                jmap_email::EmailSetOutcome::default(),
+                ApplyRemoteSetCounts::default(),
+            ));
         }
 
         let outcome = jmap_email::set_email_batch(self.client, &ops).await?;
@@ -526,7 +545,7 @@ impl<'a> Executor<'a> {
         let txn = self.conn.unchecked_transaction()?;
 
         // Mirror keyword updates into the local DB.
-        let mut keyword_updates_succeeded = 0usize;
+        let mut counts = ApplyRemoteSetCounts::default();
         for action in keywords {
             let SyncAction::UpdateRemoteKeywords { id, keywords } = action else {
                 continue;
@@ -556,7 +575,7 @@ impl<'a> Executor<'a> {
                     queries::upsert_local_state(&txn, &mid, &folder, &flags, None)?;
                 }
             }
-            keyword_updates_succeeded += 1;
+            counts.keyword_updates += 1;
             info!("Updated remote keywords for {}", id);
         }
 
@@ -582,6 +601,7 @@ impl<'a> Executor<'a> {
                     id, from_folder, to_folder
                 );
             } else {
+                counts.moves += 1;
                 info!("Moved remote {} from {} to {}", id, from_folder, to_folder);
             }
         }
@@ -609,11 +629,12 @@ impl<'a> Executor<'a> {
                 queries::delete_local_state(&txn, mid)?;
             }
             queries::delete_message_by_jmap_id(&txn, &id.jmap_email_id)?;
+            counts.destroys += 1;
             info!("Destroyed remote {}", id);
         }
 
         txn.commit()?;
-        Ok((outcome, keyword_updates_succeeded))
+        Ok((outcome, counts))
     }
 
     /// Run all DownloadMessage actions concurrently with the rate-limit
@@ -982,6 +1003,19 @@ enum UploadOutcome {
         chain_new: Option<String>,
     },
     Skipped,
+}
+
+/// Per-category counts of remote operations the server accepted
+/// inside `apply_remote_set`. Each field is the remote-side
+/// counterpart of one local-side counter the executor computes
+/// elsewhere -- summed by `execute` into the matching `SyncOutcome`
+/// field. Server-rejected ids (the `outcome.failed_*` sets) are
+/// excluded so each count matches what actually changed remotely.
+#[derive(Debug, Default)]
+struct ApplyRemoteSetCounts {
+    keyword_updates: usize,
+    moves: usize,
+    destroys: usize,
 }
 
 /// Aggregated result of `upload_messages`. Carries the per-import
