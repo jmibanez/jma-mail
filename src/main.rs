@@ -22,10 +22,10 @@ async fn main() -> Result<()> {
     // Verbosity dial. At the default level the tracing filter sits
     // at warn -- info-level logs are suppressed, and milestone status
     // ("Sync complete", "Watch mode active") flows through `notify!`
-    // (cargo-style stdout text, independent of tracing). -v opens
-    // info for our crates, -vv opens debug for our crates, -vvv
-    // widens debug to every crate (notably hyper/tokio internals),
-    // -vvvv lifts to trace. -q clamps every channel to error.
+    // as plain stdout text, independent of tracing. -v opens info
+    // for our crates, -vv opens debug for our crates, -vvv widens
+    // debug to every crate (notably hyper/tokio internals), -vvvv
+    // lifts to trace. -q clamps every channel to error.
     let filter = match (cli.quiet, cli.verbose) {
         (true, _) => "error",
         (_, 0) => "jma_mail=warn,jma=warn",
@@ -34,10 +34,10 @@ async fn main() -> Result<()> {
         (_, 3) => "debug",
         (_, _) => "trace",
     };
-    // Tracing logs go to stderr so `notify!`'s cargo-style status
-    // text (stdout) stays parseable when the user redirects one and
-    // not the other. tracing_subscriber's default writer is stdout,
-    // hence the explicit override.
+    // Tracing logs go to stderr so `notify!`'s status text (stdout)
+    // stays parseable when the user redirects one and not the other.
+    // tracing_subscriber's default writer is stdout, hence the
+    // explicit override.
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter)),

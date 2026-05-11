@@ -17,9 +17,7 @@ pub struct Cli {
     )]
     pub config: PathBuf,
 
-    /// Increase logging verbosity. The default level emits only
-    /// cargo-style status text plus warnings; -v adds info, -vv adds
-    /// debug, -vvv widens debug to every crate, -vvvv lifts to trace.
+    /// Increase verbosity: -v info, -vv debug, -vvv all crates, -vvvv trace.
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
     pub verbose: u8,
 

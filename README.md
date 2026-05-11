@@ -163,7 +163,7 @@ Commands:
 
 Options:
   -c, --config <CONFIG>  Config file path [default: ~/.config/jma/config.toml]
-  -v, --verbose...       Increase logging verbosity (-v, -vv, -vvv)
+  -v, --verbose...       Increase verbosity: -v info, -vv debug, -vvv all crates, -vvvv trace
   -n, --dry-run          Show what would be done without making changes
   -q, --quiet            Suppress all output except errors
   -h, --help             Print help
@@ -185,6 +185,16 @@ Options:
 ### sync : Bi-Directional Sync
 
 `sync` is generally the command you want, and is equivalent to running `mbsync -a` or `mbsync` against a specific channel. By default, if you run `jma` without any subcommands it is equivalent to running `jma sync`.
+
+```console
+$ jma sync
+Running jma version 0.1.0
+Syncing 7 mailboxes
+Downloading 4 messages
+Sync complete (4 downloaded, 1 uploaded, 2 flag updates, 0 moved, 0 deleted)
+```
+
+The summary line tallies what landed this cycle, summed across both directions where applicable.
 
 ### watch : Push email and continuous sync
 
@@ -210,12 +220,9 @@ The daemon recovers from two classes of failure on its own:
 
 ```console
 $ jma mailboxes
-2026-04-28T07:09:08.040128Z  INFO jma_mail::jmap::session: Connecting to JMAP server at https://api.fastmail.com/jmap/session
-2026-04-28T07:09:08.781767Z  INFO jma_mail::jmap::session: JMAP session established for foo@example.com
-2026-04-28T07:09:09.473870Z  INFO jma_mail::jmap::mailbox: Fetched 8 mailboxes (state: J391861)
-Name                                        Total   Unread  Role
+On-disk name                                Total   Unread  Role
 ----------------------------------------------------------------------
-* Inbox                                       556        3  inbox
+* INBOX                                       556        3  inbox
 * Archive                                      71        0  archive
 * Drafts                                        8        0  drafts
 * Misc                                          3        0
