@@ -64,6 +64,12 @@ MAILDIR_SOURCE="$3"
 ACCOUNT_EMAIL="$4"
 
 BENCH_DIR="${BENCH_DIR:-/tmp/jma-bench}"
+# Expand a leading ~ in BENCH_DIR. Bash expands tilde in plain
+# `VAR=~/foo` assignments, but a quoted value (`VAR='~/foo'`) or
+# one inherited from a different shell context arrives literal,
+# and the script would then create a directory called `~` rather
+# than landing under $HOME.
+BENCH_DIR="${BENCH_DIR/#~/$HOME}"
 SUBCMD="${SUBCMD:-pull}"
 
 # Must be inside a git checkout to resolve commits and switch refs.
@@ -134,10 +140,26 @@ build_for() {
 
     echo "  building jma-${sha:0:8} ..."
     git checkout --quiet "$sha"
+
+    # The package/bin name has shifted across history (jmapsync ->
+    # jma-mail, with the bin variously named jma or jmapsync). Nuke
+    # top-level target/release/ executables first so that after the
+    # build, whatever single binary exists is unambiguously this
+    # commit's output -- otherwise a stale `target/release/jma` from
+    # a prior dev build would get copied into the BEFORE cache slot.
+    find "$REPO_ROOT/target/release" -maxdepth 1 -type f -perm +111 -delete 2>/dev/null || true
+
     CC=/usr/bin/cc cargo build --release
-    cp "$REPO_ROOT/target/release/jma" "$target"
+
+    local built
+    built=$(find "$REPO_ROOT/target/release" -maxdepth 1 -type f -perm +111 2>/dev/null | head -1)
+    if [[ -z "$built" ]]; then
+        echo "  no executable produced under target/release/" >&2
+        return 1
+    fi
+    cp "$built" "$target"
     chmod +x "$target"
-    echo "  built: $target"
+    echo "  built: $target (from $(basename "$built"))"
 }
 
 echo "=== build / cache ==="
@@ -173,10 +195,20 @@ email = "$ACCOUNT_EMAIL"
 maildir_path = "$BENCH_DIR/maildir"
 mailboxes = []
 download_concurrency = 8
+
+[state]
+db_path = "$BENCH_DIR/state.db"
 EOF
 
 reset_state() {
-    rm -f maildir/.jma.db maildir/.jma.db-wal maildir/.jma.db-shm
+    # State DB location is pinned via [state].db_path in config.toml
+    # above, so both binaries write to $BENCH_DIR/state.db regardless
+    # of their built-in default (pre-76eef97 defaulted to
+    # ~/.local/share/jmapsync/state.db, post-76eef97 to
+    # <maildir>/.jma.db). Clear the pinned location plus the maildir-
+    # level advisory lock that maildir_ops::lock writes at the
+    # maildir root post-rename.
+    rm -f state.db* maildir/.jma.lock
 }
 
 run() {
