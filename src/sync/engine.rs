@@ -248,6 +248,29 @@ impl<'a> SyncEngine<'a> {
             }
         };
 
+        // Path-scan short-circuit: a LocalChange-driven cycle whose
+        // scan classified nothing has no local work to send and no
+        // remote signal that anything moved (a server-side change
+        // arrives via RemoteChange, not LocalChange). Skip Phase 2
+        // (Email/changes per folder) and everything after. The
+        // Mailbox/get in `resolve_mailboxes` has already run by this
+        // point and is unavoidable -- the mailbox list drives the
+        // scan -- but suppressing the N x Email/changes round-trips
+        // is the bulk of the saving. Without this, every spurious
+        // fsevent that survives the watcher filter (an mbsync write
+        // missed by the self-write cache, Time Machine touching
+        // attributes, a backup tool brushing a real message) costs
+        // a full per-folder JMAP delta fetch. RemoteChange and
+        // Initial coalesce to Full scope (see `coalesce_triggers`)
+        // so they bypass this entirely and always fetch.
+        if matches!(scan_scope, ScanScope::Paths(_)) && all_local_changes.is_empty() {
+            debug!("Path-scan produced no local changes; skipping remote fetch");
+            return Ok(SyncOutcome {
+                already_in_sync: true,
+                ..Default::default()
+            });
+        }
+
         // Phase 2: collect remote changes.
         let (remote_emails, remote_destroyed, new_state, used_initial_path) =
             self.fetch_remote_state(&mailboxes).await?;
