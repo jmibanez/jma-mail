@@ -21,9 +21,34 @@ use crate::sync::self_writes::SelfWriteCache;
 /// to consult the discovery cache, which by itself touches the WAL
 /// and SHM siblings -- without this filter, running them alongside
 /// `watch` would spuriously fire `LocalChange` triggers.
+///
+/// The filename half of the check is an allowlist on shape rather
+/// than a denylist of known sidecar prefixes: the maildir spec
+/// requires the unique-name component to start with a unix
+/// timestamp, so the first character of any legitimate message
+/// filename is an ASCII digit. Anything else inside cur/ or new/ --
+/// dot-prefixed sidecars (.DS_Store, .#editor-swap, MUA locks),
+/// letter-prefixed drop-ins (README, notes.bak), backup-tool
+/// scratch (~tmp), future sidecar conventions we don't know about
+/// today -- fails the digit-prefix test and is dropped at the
+/// watcher. Filtering here avoids the downstream coalesce +
+/// scan_paths chain entirely for those events.
+///
+/// The maildir crate's MailEntries iterator does the same skip
+/// internally for its `.starts_with('.')` case but doesn't expose
+/// the predicate as a public function. Worth lifting upstream --
+/// exposing it would let downstream consumers skip the
+/// re-implementation -- but the spec invariant is short enough to
+/// inline for now.
 fn is_maildir_message_path(path: &Path) -> bool {
     let s = path.to_string_lossy();
-    s.contains("/cur/") || s.contains("/new/")
+    if !(s.contains("/cur/") || s.contains("/new/")) {
+        return false;
+    }
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.chars().next())
+        .is_some_and(|c| c.is_ascii_digit())
 }
 
 /// Whether a coalesced batch of relevant maildir paths can possibly
@@ -181,6 +206,33 @@ mod tests {
                 !is_maildir_message_path(&p),
                 "{} should not fire a trigger",
                 name
+            );
+        }
+    }
+
+    /// Anything whose filename doesn't start with an ASCII digit
+    /// fails the maildir-spec shape check. Pins the allowlist's
+    /// rejection surface across the categories that historically
+    /// slipped through: dot-prefixed sidecars (finder artefacts,
+    /// editor swap files, MUA locks), letter-prefixed drop-ins
+    /// (READMEs, notes), symbol-prefixed scratch (backup tmps).
+    /// A maildir message filename starts with a unix timestamp per
+    /// spec, so every legitimate path begins with a digit.
+    #[test]
+    fn rejects_non_maildir_filenames_in_cur_or_new() {
+        for path in [
+            "/home/u/Mail/INBOX/cur/.DS_Store",
+            "/home/u/Mail/INBOX/cur/.#emacs-swap",
+            "/home/u/Mail/INBOX/new/.DS_Store",
+            "/home/u/Mail/INBOX/cur/README",
+            "/home/u/Mail/INBOX/cur/notes.bak",
+            "/home/u/Mail/INBOX/cur/~tmp-backup",
+        ] {
+            let p = PathBuf::from(path);
+            assert!(
+                !is_maildir_message_path(&p),
+                "{} should not fire a trigger",
+                path
             );
         }
     }
