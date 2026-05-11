@@ -41,22 +41,20 @@ pub enum Command {
     Pull,
     /// One-way sync: local -> server only
     Push,
-    /// Daemon mode: watch for push events + local changes, sync continuously
+    /// Daemon mode: continuous sync on server + local changes
     Watch,
     /// Initialize config file and local maildir structure
     Init,
     /// List remote mailboxes and their local mapping
     Mailboxes,
-    /// Show sync staleness, JMAP cursor health, and maildir-vs-DB drift.
-    /// Read-only; safe to run alongside an in-progress sync or watch.
+    /// Show sync staleness, cursor health, and maildir drift.
     Status,
     /// Manage account credentials and the JMAP discovery cache
     Auth {
         #[command(subcommand)]
         action: AuthAction,
 
-        /// Operate on the token for the account with this email
-        /// address. Required.
+        /// Account email to operate on
         #[arg(long, value_name = "EMAIL")]
         account: String,
     },
@@ -64,14 +62,10 @@ pub enum Command {
 
 #[derive(Subcommand, Clone)]
 pub enum AuthAction {
-    /// Read a bearer token from stdin (hidden prompt on a TTY,
-    /// raw read otherwise) and store it in the OS keychain
+    /// Read a bearer token from stdin and store in the OS keychain
     SetToken,
     /// Remove the bearer token from the OS keychain
     ClearToken,
-    /// Clear the cached JMAP session URL for this account's email
-    /// domain and run autodiscovery (DNS SRV, /.well-known/jmap)
-    /// again, printing the result. Use this when your provider
-    /// changes their session endpoint.
+    /// Re-run JMAP session URL autodiscovery
     Rediscover,
 }

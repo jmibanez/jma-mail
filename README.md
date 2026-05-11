@@ -154,10 +154,10 @@ Commands:
   sync       Run bidirectional sync (default if no command given)
   pull       One-way sync: server -> local only
   push       One-way sync: local -> server only
-  watch      Daemon mode: watch for push events + local changes, sync continuously
+  watch      Daemon mode: continuous sync on server + local changes
   init       Initialize config file and local maildir structure
   mailboxes  List remote mailboxes and their local mapping
-  status     Show sync staleness, JMAP cursor health, and maildir-vs-DB drift. Read-only; safe to run alongside an in-progress sync or watch
+  status     Show sync staleness, cursor health, and maildir drift
   auth       Manage account credentials and the JMAP discovery cache
   help       Print this message or the help of the given subcommand(s)
 
