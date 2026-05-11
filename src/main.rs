@@ -3,7 +3,6 @@ use clap::Parser;
 use jma_mail::maildir_ops::layout::FolderLayoutDefinition;
 use std::collections::BTreeSet;
 use std::time::Duration;
-use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use jma_mail::cli::{AuthAction, Cli, Command};
@@ -48,7 +47,7 @@ async fn main() -> Result<()> {
 
     let command = cli.command.clone().unwrap_or(Command::Sync);
 
-    info!("Running version {}", env!("JMA_VERSION"));
+    jma_mail::notify!("Running jma version {}", env!("JMA_VERSION"));
 
     match command {
         Command::Init => cmd_init(&cli).await,
