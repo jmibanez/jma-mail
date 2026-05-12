@@ -3,7 +3,7 @@ use futures_util::stream::{self, StreamExt};
 use jmap_client::client::Client;
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -192,60 +192,12 @@ impl<'a> Executor<'a> {
     /// logged at warn and skipped here; the count reflects only the
     /// updates that actually landed.
     fn update_local_flags(&self, actions: Vec<SyncAction>) -> Result<usize> {
-        let mut succeeded = 0usize;
-        for action in actions {
-            let SyncAction::UpdateLocalFlags {
-                id,
-                maildir_folder,
-                new_flags,
-                keywords,
-                jmap_blob_id,
-                jmap_thread_id,
-                mailbox_id,
-            } = action
-            else {
-                continue;
-            };
-            let bound_for_log = id.clone();
-            let BoundId {
-                maildir_id,
-                jmap_email_id,
-                message_id,
-            } = id;
-            let maildir_path = self.maildir_root.join(&maildir_folder);
-            let maildir = store::ensure_maildir(&maildir_path)?;
-            if let Err(e) = store::set_flags(&maildir, maildir_id.as_ref(), &new_flags) {
-                warn!(
-                    "Failed to set flags for {} in {}: {}",
-                    maildir_id, maildir_folder, e
-                );
-                continue;
-            }
-            let keywords_json = serde_json::to_string(&keywords)?;
-            // Per-iteration transaction: pair the two DB writes so this
-            // row's message_map and local_state never disagree on flags
-            // even if the second write fails.
-            let txn = self.conn.unchecked_transaction()?;
-            queries::upsert_message(
-                &txn,
-                &MessageRecord {
-                    jmap_email_id,
-                    jmap_blob_id: Some(jmap_blob_id),
-                    jmap_thread_id: Some(jmap_thread_id),
-                    mailbox_id,
-                    maildir_id: Some(maildir_id.clone()),
-                    maildir_folder: Some(maildir_folder.clone()),
-                    message_id,
-                    flags: new_flags.clone(),
-                    jmap_keywords: keywords_json,
-                },
-            )?;
-            queries::upsert_local_state(&txn, &maildir_id, &maildir_folder, &new_flags, None)?;
-            txn.commit()?;
-            succeeded += 1;
-            info!("Updated local flags for {}: '{}'", bound_for_log, new_flags);
-        }
-        Ok(succeeded)
+        apply_update_local_flags(
+            self.conn,
+            &self.maildir_root,
+            self.self_writes.as_deref(),
+            actions,
+        )
     }
 
     /// Returns the number of cross-folder local moves that landed
@@ -927,6 +879,100 @@ fn apply_move_pair_adopts(
     Ok(())
 }
 
+/// Apply the local-side flag updates from a reconcile plan.
+fn apply_update_local_flags(
+    conn: &Connection,
+    maildir_root: &Path,
+    self_writes: Option<&SelfWriteCache>,
+    actions: Vec<SyncAction>,
+) -> Result<usize> {
+    let mut succeeded = 0usize;
+    for action in actions {
+        let SyncAction::UpdateLocalFlags {
+            id,
+            maildir_folder,
+            new_flags,
+            keywords,
+            jmap_blob_id,
+            jmap_thread_id,
+            mailbox_id,
+        } = action
+        else {
+            continue;
+        };
+        let bound_for_log = id.clone();
+        let BoundId {
+            maildir_id,
+            jmap_email_id,
+            message_id,
+        } = id;
+        let maildir_path = maildir_root.join(&maildir_folder);
+        let maildir = store::ensure_maildir(&maildir_path)?;
+        // A `new/` file has never carried a `:2,<flags>` view that
+        // the maildir crate's `set_flags` can find. Reaching it from
+        // the JMAP side -- typically the server flipping `$seen` --
+        // is the canonical "client first observes this message"
+        // moment, so the executor promotes it from `new/` to `cur/`
+        // and attaches the new flag set as the info suffix in the
+        // same rename. Steady-state cur/ flag updates take the
+        // existing path.
+        let was_in_new = store::message_is_in_new(&maildir, maildir_id.as_ref());
+        let store_result = if was_in_new {
+            store::promote_to_cur_with_flags(&maildir, maildir_id.as_ref(), &new_flags)
+        } else {
+            store::set_flags(&maildir, maildir_id.as_ref(), &new_flags)
+        };
+        if let Err(e) = store_result {
+            warn!(
+                "Failed to set flags for {} in {}: {}",
+                maildir_id, maildir_folder, e
+            );
+            continue;
+        }
+        // Predict the post-rename cur/ filename and feed it to the
+        // self-write cache so the watcher drops the fsevents echo of
+        // our own rename instead of waking the daemon for a no-op
+        // cycle. `new_flags` is already canonical (sorted/deduped)
+        // out of `keywords_to_flags`, byte-matching what the maildir
+        // crate writes into the suffix. For a new/->cur/ promotion
+        // we also predict the cleared new/ side, mirroring the
+        // delivery path's prediction shape so MUAs that would have
+        // promoted the file independently are still suppressed.
+        if let Some(cache) = self_writes {
+            let suffix = format!("{}:2,{}", maildir_id.as_ref(), new_flags);
+            let mut paths = vec![maildir_path.join("cur").join(&suffix)];
+            if was_in_new {
+                paths.push(maildir_path.join("new").join(&suffix));
+            }
+            cache.record(paths);
+        }
+        let keywords_json = serde_json::to_string(&keywords)?;
+        // Per-iteration transaction: pair the two DB writes so this
+        // row's message_map and local_state never disagree on flags
+        // even if the second write fails.
+        let txn = conn.unchecked_transaction()?;
+        queries::upsert_message(
+            &txn,
+            &MessageRecord {
+                jmap_email_id,
+                jmap_blob_id: Some(jmap_blob_id),
+                jmap_thread_id: Some(jmap_thread_id),
+                mailbox_id,
+                maildir_id: Some(maildir_id.clone()),
+                maildir_folder: Some(maildir_folder.clone()),
+                message_id,
+                flags: new_flags.clone(),
+                jmap_keywords: keywords_json,
+            },
+        )?;
+        queries::upsert_local_state(&txn, &maildir_id, &maildir_folder, &new_flags, None)?;
+        txn.commit()?;
+        succeeded += 1;
+        info!("Updated local flags for {}: '{}'", bound_for_log, new_flags);
+    }
+    Ok(succeeded)
+}
+
 /// DB writes for a single AdoptLocalMessage. Shared between the
 /// up-front adopt phase and the post-remote-set move-pair phase so
 /// both go through the same row-shape and ordering.
@@ -1300,5 +1346,172 @@ mod tests {
     fn walk_chain_three_cycle_does_not_wedge() {
         let edges = edges_from(&[("S0", "S1"), ("S1", "S2"), ("S2", "S0")]);
         assert_eq!(walk_chain(Some("S0".into()), &edges).as_deref(), Some("S0"));
+    }
+
+    /// A message downloaded as unread lands in `new/` with no
+    /// `:2,...` suffix. When the server later marks it `$seen`,
+    /// reconcile emits `UpdateLocalFlags` and the executor must
+    /// promote the file from `new/<id>` to `cur/<id>:2,S`, not just
+    /// rename it in place: the `maildir` crate's `set_flags` only
+    /// searches `cur/`, so a naive call against a `new/` file
+    /// silently no-ops and the user's "mark read" gesture never
+    /// reaches disk. Pins the promotion step.
+    #[test]
+    fn update_local_flags_promotes_new_to_cur_when_message_becomes_seen() {
+        use crate::maildir_ops::store;
+        use std::collections::HashMap;
+
+        let temp = tempfile::tempdir().unwrap();
+        let maildir_root = temp.path();
+        let inbox = maildir_root.join("INBOX");
+        let maildir = store::ensure_maildir(&inbox).unwrap();
+        // Deliver the message as unseen-no-flags: lands in INBOX/new/.
+        let mid = store::store_message(&maildir, b"raw body", "").unwrap();
+        assert_eq!(
+            std::fs::read_dir(inbox.join("new")).unwrap().count(),
+            1,
+            "precondition: file must be in INBOX/new/ before the test fires"
+        );
+
+        let conn = db::open_in_memory().unwrap();
+        queries::upsert_message(
+            &conn,
+            &MessageRecord {
+                jmap_email_id: "E1".into(),
+                jmap_blob_id: Some("B1".into()),
+                jmap_thread_id: Some("T1".into()),
+                mailbox_id: "MB-INBOX".into(),
+                maildir_id: Some(mid.clone()),
+                maildir_folder: Some("INBOX".into()),
+                message_id: "a@x".into(),
+                flags: "".into(),
+                jmap_keywords: "{}".into(),
+            },
+        )
+        .unwrap();
+        queries::upsert_local_state(&conn, &mid, "INBOX", "", None).unwrap();
+
+        let mut keywords = HashMap::new();
+        keywords.insert("$seen".to_string(), true);
+        let action = SyncAction::UpdateLocalFlags {
+            id: BoundId {
+                maildir_id: mid.clone(),
+                jmap_email_id: "E1".into(),
+                message_id: "a@x".into(),
+            },
+            maildir_folder: "INBOX".into(),
+            new_flags: "S".into(),
+            keywords,
+            jmap_blob_id: "B1".into(),
+            jmap_thread_id: "T1".into(),
+            mailbox_id: "MB-INBOX".into(),
+        };
+
+        let count = apply_update_local_flags(&conn, maildir_root, None, vec![action]).unwrap();
+        assert_eq!(count, 1, "the flag update must report success");
+
+        // File-on-disk assertion -- the user-visible outcome.
+        let cur_entries: Vec<String> = std::fs::read_dir(inbox.join("cur"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            cur_entries.len(),
+            1,
+            "exactly one file should land in INBOX/cur/ after promotion"
+        );
+        assert!(
+            cur_entries[0].ends_with(":2,S"),
+            "promoted file must carry `:2,S` suffix (got {:?})",
+            cur_entries[0]
+        );
+        assert_eq!(
+            std::fs::read_dir(inbox.join("new")).unwrap().count(),
+            0,
+            "INBOX/new/ must be empty after the promotion to cur/"
+        );
+
+        // DB assertion -- message_map.flags reflects the new state.
+        let rec = queries::get_message_by_jmap_id(&conn, &JmapEmailId::from("E1"))
+            .unwrap()
+            .expect("E1 must still exist");
+        assert_eq!(
+            rec.flags, "S",
+            "message_map.flags must update alongside the file"
+        );
+    }
+
+    /// When the daemon is running with a self-write cache attached,
+    /// a new/->cur/ promotion driven by an `UpdateLocalFlags` action
+    /// must register both the cleared `new/<id>:2,<new_flags>` path
+    /// and the populated `cur/<id>:2,<new_flags>` path with the
+    /// cache, mirroring the download path's prediction shape. Without
+    /// this, the watcher's fsevents stream surfaces our own rename as
+    /// a phantom local change, the trigger loop wakes, and reconcile
+    /// pays an `Email/changes` round-trip per server-side `$seen`
+    /// flip.
+    #[test]
+    fn update_local_flags_records_self_writes_on_promote() {
+        use crate::maildir_ops::store;
+        use crate::sync::self_writes::SelfWriteCache;
+        use std::collections::HashMap;
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir().unwrap();
+        let maildir_root = temp.path();
+        let inbox = maildir_root.join("INBOX");
+        let maildir = store::ensure_maildir(&inbox).unwrap();
+        let mid = store::store_message(&maildir, b"raw body", "").unwrap();
+
+        let conn = db::open_in_memory().unwrap();
+        queries::upsert_message(
+            &conn,
+            &MessageRecord {
+                jmap_email_id: "E1".into(),
+                jmap_blob_id: Some("B1".into()),
+                jmap_thread_id: Some("T1".into()),
+                mailbox_id: "MB-INBOX".into(),
+                maildir_id: Some(mid.clone()),
+                maildir_folder: Some("INBOX".into()),
+                message_id: "a@x".into(),
+                flags: "".into(),
+                jmap_keywords: "{}".into(),
+            },
+        )
+        .unwrap();
+        queries::upsert_local_state(&conn, &mid, "INBOX", "", None).unwrap();
+
+        let mut keywords = HashMap::new();
+        keywords.insert("$seen".to_string(), true);
+        let action = SyncAction::UpdateLocalFlags {
+            id: BoundId {
+                maildir_id: mid.clone(),
+                jmap_email_id: "E1".into(),
+                message_id: "a@x".into(),
+            },
+            maildir_folder: "INBOX".into(),
+            new_flags: "S".into(),
+            keywords,
+            jmap_blob_id: "B1".into(),
+            jmap_thread_id: "T1".into(),
+            mailbox_id: "MB-INBOX".into(),
+        };
+
+        let cache = SelfWriteCache::new(Duration::from_secs(5));
+        let count = apply_update_local_flags(&conn, maildir_root, Some(&cache), vec![action])
+            .expect("apply_update_local_flags");
+        assert_eq!(count, 1);
+
+        // The watcher's fast path probes the cache against the batch
+        // it sees. For a new/->cur/ promotion the predicted paths are
+        // both sides of the rename, so the watcher's batch-of-two for
+        // our own rename matches cleanly and `matches_all` evicts.
+        let cur_path = inbox.join("cur").join(format!("{}:2,S", mid.as_ref()));
+        let new_path = inbox.join("new").join(format!("{}:2,S", mid.as_ref()));
+        assert!(
+            cache.matches_all(&[cur_path, new_path]),
+            "self-write cache must hold both sides of the new/->cur/ promotion"
+        );
     }
 }

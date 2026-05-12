@@ -63,12 +63,97 @@ pub fn delete_message(maildir: &Maildir, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Set flags on a message (replaces all existing flags).
+/// Set flags on a message (replaces all existing flags). Only
+/// applies to messages already in `cur/`; the maildir crate's
+/// underlying `set_flags` won't find a `new/` file. Callers that
+/// don't know which subdir the file lives in should dispatch via
+/// `message_is_in_new`, falling back to `promote_to_cur_with_flags`
+/// for new/-side files.
 pub fn set_flags(maildir: &Maildir, id: &str, flags: &str) -> Result<()> {
     maildir
         .set_flags(id, flags)
         .with_context(|| format!("Failed to set flags on message {}", id))?;
     debug!("Set flags '{}' on message {}", flags, id);
+    Ok(())
+}
+
+/// True if the message with this id currently lives in `new/`. Used
+/// by the sync executor to decide between `set_flags` (cur/-only
+/// rename) and `promote_to_cur_with_flags` (new/ -> cur/ promotion)
+/// when applying an `UpdateLocalFlags` action. Routed through the
+/// upstream `list_new()` iterator so any future fix to its
+/// suffix-aware id parsing carries through here automatically;
+/// hand-rolled filename matching would drift.
+pub fn message_is_in_new(maildir: &Maildir, id: &str) -> bool {
+    maildir
+        .list_new()
+        .any(|e| e.map(|entry| entry.id() == id).unwrap_or(false))
+}
+
+/// Promote a message from `new/` to `cur/`, attaching the given
+/// flag set as the `:2,<flags>` info suffix. Strict maildir says a
+/// file transitions through this rename when a client first observes
+/// it; jma drives the rename whenever the server reports a
+/// `new/`-side message has gained any JMAP keyword (typically
+/// `$seen`, the maildir-`S` analogue, but any non-empty flag set
+/// triggers the same promotion).
+///
+/// Distinct from `set_flags` because the underlying `maildir` crate
+/// won't search `new/`; the sync executor picks between the two
+/// based on `message_is_in_new`.
+///
+/// Refuses to clobber an existing cur/-side file at the destination
+/// path. That's an illegal-but-observed state (typically left over
+/// by a crash mid-promotion in a prior MUA or sync run): silently
+/// overwriting it would lose data, and `fs::rename` on POSIX is
+/// happy to do exactly that. Warn-and-skip in the caller is the
+/// right recovery -- the next cycle re-evaluates with both files
+/// visible to dedupe.
+///
+/// The `list_new` + `fs::rename` pair is TOCTOU with concurrent MUA
+/// promotions of the same id. An ENOENT during the rename surfaces
+/// as a context'd error and bubbles up cleanly through
+/// `apply_update_local_flags`'s warn-and-skip path; the next sync
+/// cycle catches up.
+pub fn promote_to_cur_with_flags(maildir: &Maildir, id: &str, flags: &str) -> Result<()> {
+    let entry = maildir
+        .list_new()
+        .find_map(|e| match e {
+            Ok(entry) if entry.id() == id => Some(Ok(entry)),
+            Ok(_) => None,
+            Err(e) => Some(Err(e)),
+        })
+        .transpose()
+        .with_context(|| format!("iterate new/ in {}", maildir.path().display()))?
+        .with_context(|| {
+            format!(
+                "Message {} not found in {}/new/",
+                id,
+                maildir.path().display()
+            )
+        })?;
+    let src = entry.path().clone();
+    let dest = maildir.path().join("cur").join(format!("{id}:2,{flags}"));
+    if dest.exists() {
+        return Err(anyhow::anyhow!(
+            "Refusing to promote {} to {}: destination already exists \
+             (illegal maildir state, likely a prior crash mid-promotion); \
+             dedupe pass will reconcile on the next cycle",
+            id,
+            dest.display()
+        ));
+    }
+    std::fs::rename(&src, &dest).with_context(|| {
+        format!(
+            "Failed to promote {} from new/ to cur/ at {}",
+            id,
+            dest.display()
+        )
+    })?;
+    debug!(
+        "Promoted message {} from new/ to cur/ with flags '{}'",
+        id, flags
+    );
     Ok(())
 }
 
