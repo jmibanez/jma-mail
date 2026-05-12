@@ -217,7 +217,7 @@ async fn wait_for_jmap(http: &HttpClient, session_url: &str) -> Result<()> {
     // TCP+HTTP-only shell. Probe the same URL jmap-client will hit:
     // the configured `session_url` itself (which is the session
     // resource on Stalwart) carrying the fixture bearer.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
         let probe = async {
             let r = http
@@ -245,7 +245,7 @@ async fn wait_for_jmap(http: &HttpClient, session_url: &str) -> Result<()> {
 }
 
 async fn wait_for_imap(port: u16) -> Result<()> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
         match TcpStream::connect(("127.0.0.1", port)).await {
             Ok(_) => return Ok(()),
