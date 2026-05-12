@@ -136,3 +136,10 @@ testcontainers = "0.27"
 async-imap = { version = "0.11", default-features = false, features = [
     "runtime-tokio",
 ] }
+# Synthetic corpus generation for the bench examples
+# (examples/gen-bench-maildir). Names, lorem-ipsum bodies, varied
+# subject lines; size distribution is driven by sentence/paragraph
+# range arguments so the bench can exercise non-uniform message
+# sizes. Dev-only because no production code path constructs fake
+# email content.
+fake = "4"
