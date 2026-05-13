@@ -1,8 +1,8 @@
 //! Shared fixture for end-to-end JMAP tests. Spawns a Stalwart Mail
 //! container pre-seeded from a checked-in fixture (config.json plus
-//! the SQLite settings DB), waits for JMAP and IMAP to come up, and
-//! returns a `JmapFixture` that tests can point a real
-//! `jma_mail::Config` at.
+//! the RocksDB data directory under `rocksdb/`), waits for JMAP and
+//! IMAP to come up, and returns a `JmapFixture` that tests can
+//! point a real `jma_mail::Config` at.
 //!
 //! We boot from a checked-in fixture because Stalwart v0.16's
 //! persisted config is a typed JSON blob with `@type` discriminators
@@ -41,6 +41,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use async_imap::Client as ImapClient;
+use include_dir::{Dir, include_dir};
 use reqwest::Client as HttpClient;
 use serde_json::Value;
 use std::time::Duration;
@@ -58,26 +59,52 @@ const ACCOUNT_EMAIL: &str = "admin@example.org";
 
 /// Wizard-generated admin password; only used for IMAP authentication
 /// when seeding the inbox. JMAP authentication for the system under
-/// test goes through `FIXTURE_BEARER` instead.
-const ACCOUNT_IMAP_PASSWORD: &str = "FuNI0rB6Bqn3XwEu"; // fixture-only; bound to the committed SQLite hash
+/// test goes through `FIXTURE_BEARER` instead. Bound to the password
+/// hash committed in tests/fixtures/stalwart/rocksdb/ (regenerate
+/// via tools/regen-stalwart-fixture.sh when changing).
+const ACCOUNT_IMAP_PASSWORD: &str = "QFe7eBz1vEO6EQQS"; // fixture-only
 
 /// Pre-minted Stalwart API key whose hash is persisted in the
 /// fixture DB. Stalwart accepts this as `Authorization: Bearer ...`
 /// for any JMAP call against the wizard admin's account, so
 /// jma-mail's standard Bearer flow works end-to-end without any
-/// auth-mode changes.
-const FIXTURE_BEARER: &str = "API_AAAAAQAAAAG8bLPzdkZoPVirWT08nsPm1TsreA"; // fixture-only; bound to the committed SQLite hash
+/// auth-mode changes. Bound to the API-key hash committed in
+/// tests/fixtures/stalwart/rocksdb/ (regenerate via
+/// tools/regen-stalwart-fixture.sh when changing).
+const FIXTURE_BEARER: &str = "API_AAAAAQAAAAFQG84N-GbiAB_AC27jqdsECoy8iw"; // fixture-only
 
 /// Path the Stalwart image's default `CMD` reads at boot. Mounting
 /// our fixture here is what tells the server to skip the bootstrap
 /// wizard and start in normal operation.
 const CONTAINER_CONFIG_PATH: &str = "/etc/stalwart/config.json";
 
-/// Where the wizard's `config.json` points (the SQLite settings
-/// store). All meaningful server state -- accounts, listeners,
-/// passwords, the minted API key hash -- lives in this file; the
-/// `config.json` above is just a 100-byte pointer to it.
-const CONTAINER_DB_PATH: &str = "/var/lib/stalwart/stalwart.db";
+/// Where Stalwart's `config.json` points (the data directory).
+/// RocksDB writes its CURRENT/MANIFEST/SST/blob files directly
+/// into this path -- there's no per-engine subdirectory. The
+/// local fixture lives at tests/fixtures/stalwart/rocksdb/ for
+/// human readability, but the contents get copied into this
+/// container path verbatim.
+const CONTAINER_DATA_DIR: &str = "/var/lib/stalwart";
+
+/// Compile-time embed of the wizard-generated RocksDB state. Each
+/// file at any depth becomes a separate with_copy_to call into
+/// CONTAINER_DATA_DIR at spawn time. The LOCK file (RocksDB's
+/// flock marker) is stripped at regen time and shouldn't appear
+/// here; the fresh container's RocksDB recreates it on open.
+static ROCKSDB_FIXTURE: Dir<'_> =
+    include_dir!("$CARGO_MANIFEST_DIR/tests/fixtures/stalwart/rocksdb");
+
+/// Recursively collect every file in an include_dir::Dir. The
+/// crate's Dir::files() returns top-level only, so we descend
+/// into subdirectories manually for fixtures that have a nested
+/// tree (the RocksDB blob store under blobfs/<XX>/<Y>/).
+fn collect_fixture_files<'a>(dir: &'a Dir<'a>) -> Vec<&'a include_dir::File<'a>> {
+    let mut out: Vec<&'a include_dir::File<'a>> = dir.files().collect();
+    for sub in dir.dirs() {
+        out.extend(collect_fixture_files(sub));
+    }
+    out
+}
 
 /// Container-side files end up owned by root after `with_copy_to`
 /// (testcontainers builds a tar with uid 0 entries). The Stalwart
@@ -124,12 +151,11 @@ impl SeedMessage {
 
 pub async fn spawn_stalwart() -> Result<JmapFixture> {
     // `with_copy_to` takes `Vec<u8>` (via `CopyDataSource::Data`), so
-    // each call clones the ~1.4 MB embedded DB onto the heap. The
+    // each call clones the embedded bytes onto the heap. The
     // alternative `CopyDataSource::File` variant wants a path on
     // disk, not a `&'static [u8]`, so there's no slice-borrowing
     // shortcut in testcontainers 0.27 -- the clone is the API.
     let config_bytes = include_bytes!("../fixtures/stalwart/config.json").to_vec();
-    let db_bytes = include_bytes!("../fixtures/stalwart/stalwart.db").to_vec();
 
     // Stalwart bakes the configured public hostname/port into the
     // discovery document's `apiUrl`, `downloadUrl`, etc., and the
@@ -147,17 +173,36 @@ pub async fn spawn_stalwart() -> Result<JmapFixture> {
     let imap_port = pick_free_port().await?;
     let public_url = format!("http://127.0.0.1:{http_port}");
 
-    let container = GenericImage::new(STALWART_IMAGE, STALWART_TAG)
+    let mut image = GenericImage::new(STALWART_IMAGE, STALWART_TAG)
         .with_mapped_port(http_port, 8080.tcp())
         .with_mapped_port(imap_port, 143.tcp())
         .with_copy_to(CONTAINER_CONFIG_PATH, config_bytes)
-        .with_copy_to(CONTAINER_DB_PATH, db_bytes)
         .with_env_var("STALWART_PUBLIC_URL", &public_url)
         .with_user(RUN_AS_USER)
-        .with_startup_timeout(Duration::from_secs(60))
-        .start()
-        .await
-        .context("start Stalwart container")?;
+        .with_startup_timeout(Duration::from_secs(60));
+
+    // Copy every file in the embedded RocksDB fixture into the
+    // container's data directory. The fixture has subdirectories
+    // (the blob-store's sharded blobfs/<XX>/<Y>/ tree); we descend
+    // recursively because include_dir's Dir::files() only walks
+    // the top level. file.path() returns the path relative to the
+    // include_dir root, so it already carries the subdirectory
+    // prefix and we just prefix CONTAINER_DATA_DIR. testcontainers'
+    // with_copy_to creates parent directories on the container
+    // side automatically, so we don't have to materialise empty
+    // dirs ourselves.
+    for file in collect_fixture_files(&ROCKSDB_FIXTURE) {
+        let rel = file.path().to_str().ok_or_else(|| {
+            anyhow!(
+                "RocksDB fixture entry has non-UTF8 path: {}",
+                file.path().display()
+            )
+        })?;
+        let container_path = format!("{CONTAINER_DATA_DIR}/{rel}");
+        image = image.with_copy_to(container_path, file.contents().to_vec());
+    }
+
+    let container = image.start().await.context("start Stalwart container")?;
 
     // `jmap-client::Client::connect` appends `/.well-known/jmap` to
     // whatever URL it's given, so `session_url` must be a path under

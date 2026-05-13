@@ -1,1 +1,1 @@
-{"@type":"Sqlite","path":"/var/lib/stalwart/stalwart.db","poolWorkers":null,"poolMaxConnections":10}
+{"@type":"RocksDb","path":"/var/lib/stalwart/","blobSize":1024,"bufferSize":536870912,"poolWorkers":null}

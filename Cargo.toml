@@ -143,3 +143,9 @@ async-imap = { version = "0.11", default-features = false, features = [
 # sizes. Dev-only because no production code path constructs fake
 # email content.
 fake = "4"
+# Embed the Stalwart test fixture's RocksDB data directory at
+# compile time. tests/common/mod.rs iterates the included files
+# and ships each one into the container at boot via with_copy_to,
+# the same pattern 69c455a used for the (single-file) SQLite
+# fixture. Dev-only; production code never touches this.
+include_dir = "0.7"
