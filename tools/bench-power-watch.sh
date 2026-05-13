@@ -69,22 +69,38 @@ set -euo pipefail
 
 usage() {
     cat >&2 <<EOF
-usage: $0 <before-commit> <after-commit> <maildir-source> <account-email>
+usage: $0 <before-commit> <after-commit>
+       $0 <before-commit> <after-commit> <maildir-source> <account-email>
 
-Set BENCH_DIR, WATCH_SECONDS, or SAMPLE_MS env vars to override
-defaults. See the comment block at the top of $0 for details.
+Two-arg form spins up a Stalwart testcontainer fixture; four-arg
+form runs against a real JMAP account. In testcontainer mode the
+watch cells run against a freshly-seeded server with the maildir
+warmed by an untimed pull (same warm-then-idle baseline as
+real-account mode).
+
+Set BENCH_DIR, WATCH_SECONDS, SAMPLE_MS, or STIMULUS_INTERVAL_S
+env vars to override defaults. Testcontainer mode also honours
+TESTCONTAINER_CORPUS_COUNT, TESTCONTAINER_CORPUS_FOLDERS,
+TESTCONTAINER_CORPUS_SEED, and TESTCONTAINER_NEW_PCT.
 EOF
     exit 1
 }
 
-if [[ $# -ne 4 ]]; then
+if [[ $# -ne 2 && $# -ne 4 ]]; then
     usage
 fi
 
 BEFORE_REF="$1"
 AFTER_REF="$2"
-MAILDIR_SOURCE="$3"
-ACCOUNT_EMAIL="$4"
+if [[ $# -eq 4 ]]; then
+    MAILDIR_SOURCE="$3"
+    ACCOUNT_EMAIL="$4"
+    TESTCONTAINER_MODE=0
+else
+    MAILDIR_SOURCE=""
+    ACCOUNT_EMAIL=""
+    TESTCONTAINER_MODE=1
+fi
 
 BENCH_DIR="${BENCH_DIR:-/tmp/jma-bench}"
 # Expand a leading ~ in BENCH_DIR. Bash expands tilde in plain
@@ -103,7 +119,7 @@ REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
 }
 cd "$REPO_ROOT"
 
-if [[ ! -d "$MAILDIR_SOURCE" ]]; then
+if (( TESTCONTAINER_MODE == 0 )) && [[ ! -d "$MAILDIR_SOURCE" ]]; then
     echo "maildir source not a directory: $MAILDIR_SOURCE" >&2
     exit 1
 fi
@@ -159,11 +175,21 @@ restore_ref() {
     fi
 }
 
+# Source the testcontainer helper unconditionally (functions and
+# defaults only; nothing fires until a function is called). Done
+# before any ref-switching cargo operations so the file is loaded
+# from the user's original tree.
+# shellcheck source=tools/_testcontainer.sh
+source "$REPO_ROOT/tools/_testcontainer.sh"
+
 cleanup() {
     # Best-effort kill of any stragglers we own; per-cell teardown
     # already handles the happy path, but if we crashed mid-cell
     # these PIDs tell us who to reap so we don't leak a daemon, a
     # touch loop, or a root-owned powermetrics across script exits.
+    # TESTCONTAINER_PID goes early so container teardown can overlap
+    # with the local-process kills below.
+    testcontainer_stop
     if [[ -n "${ACTIVE_STIM_PID:-}" ]]; then
         kill "$ACTIVE_STIM_PID" 2>/dev/null || true
         ACTIVE_STIM_PID=""
@@ -226,18 +252,55 @@ echo
 
 restore_ref
 
+# Testcontainer setup happens after restore_ref so the example
+# binaries we build live in the user's original tree (the bench-
+# server example was introduced post-69c455a and won't exist at
+# arbitrary BEFORE refs).
+if (( TESTCONTAINER_MODE )); then
+    echo "=== testcontainer setup ==="
+    testcontainer_build_helpers
+    testcontainer_start "$BENCH_DIR"
+    echo
+fi
+
 BEFORE_BIN="$BENCH_DIR/jma-$BEFORE_SHA"
 AFTER_BIN="$BENCH_DIR/jma-$AFTER_SHA"
 
 cd "$BENCH_DIR"
 
-if [[ ! -d maildir ]]; then
+if (( TESTCONTAINER_MODE )); then
+    # Testcontainer mode: maildir starts empty; the per-cell warm
+    # pull populates it from the seeded server before the watch
+    # window opens. Wipe any leftovers from a prior run.
+    rm -rf maildir
+    mkdir -p maildir
+elif [[ ! -d maildir ]]; then
     echo "=== copying $MAILDIR_SOURCE -> $BENCH_DIR/maildir ==="
     cp -R "$MAILDIR_SOURCE" maildir
     echo
 fi
 
-cat > config.toml <<EOF
+# Always (re-)write the config so a config-shape change in the
+# binaries doesn't require manual sync. In testcontainer mode we
+# also pin [account].token (the fixture bearer) and
+# [account].session_url (the container's advertised URL).
+if (( TESTCONTAINER_MODE )); then
+    cat > config.toml <<EOF
+[account]
+email = "$JMA_BENCH_ACCOUNT_EMAIL"
+token = "$JMA_BENCH_BEARER"
+session_url = "$JMA_BENCH_SESSION_URL"
+
+[sync]
+maildir_path = "$BENCH_DIR/maildir"
+mailboxes = []
+download_concurrency = 8
+
+[state]
+db_path = "$BENCH_DIR/state.db"
+EOF
+else
+    cat > config.toml <<EOF
 [account]
 email = "$ACCOUNT_EMAIL"
 
@@ -249,6 +312,15 @@ download_concurrency = 8
 [state]
 db_path = "$BENCH_DIR/state.db"
 EOF
+fi
+# jma's Config::load refuses to start when [account].token is set
+# in a config file with group/other perm bits (mode & 0o077 != 0;
+# see 808c151). In testcontainer mode the bearer is in
+# [account].token so this is hard-required; in real-account mode
+# the token lives in the keychain and the file has nothing
+# sensitive, but we chmod the same way regardless for
+# consistency.
+chmod 600 config.toml
 
 reset_state() {
     # State DB location is pinned via [state].db_path in config.toml
@@ -259,6 +331,14 @@ reset_state() {
     # level advisory lock that maildir_ops::lock writes at the
     # maildir root post-rename.
     rm -f state.db* maildir/.jma.lock
+    # In testcontainer mode the server is the source of truth, so
+    # also wipe the maildir between cells. The per-cell warm pull
+    # re-downloads from the server, giving each cell the same
+    # warm-then-idle baseline as the real-account mode.
+    if (( TESTCONTAINER_MODE )); then
+        rm -rf maildir
+        mkdir -p maildir
+    fi
 }
 
 sum_jma_energy() {

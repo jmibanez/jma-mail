@@ -32,6 +32,12 @@
 //! across tests -- per-test isolation is cheaper than debugging an
 //! order-dependent failure on the rare day one shows up.
 //!
+//! `examples/bench-server.rs` path-includes this module to spawn
+//! the same fixture for the bench scripts' testcontainer mode, so
+//! refactors of the public surface here (`spawn_stalwart`,
+//! `JmapFixture`, `seed_inbox`, `SeedMessage`) need to be checked
+//! against that consumer too.
+//!
 //! Seeding goes through IMAP APPEND (`seed_inbox`) rather than
 //! `Email/import` so a `jmap-client` breakage can't silently
 //! corrupt the seed corpus: a failure at seed time is structurally

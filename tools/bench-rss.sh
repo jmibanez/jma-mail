@@ -46,22 +46,46 @@ set -euo pipefail
 
 usage() {
     cat >&2 <<EOF
-usage: $0 <before-commit> <after-commit> <maildir-source> <account-email>
+usage: $0 <before-commit> <after-commit>
+       $0 <before-commit> <after-commit> <maildir-source> <account-email>
+
+Two-arg form spins up a Stalwart testcontainer fixture seeded from
+a synthetic corpus and runs both cells against it -- no live
+account or local maildir required. Four-arg form is the original
+behavior: copy the user-provided maildir into BENCH_DIR and sync
+against the real JMAP account.
+
+Note: BEFORE-initial cells differ semantically between modes. In
+four-arg mode the maildir starts pre-populated (from the source
+copy), so the cell measures a fresh-state-DB re-scan against an
+already-warm tree. In two-arg mode the maildir starts empty and
+the cell measures a true initial download from the seeded server.
+Within a mode BEFORE-vs-AFTER stays apples-to-apples; across modes
+the numbers aren't directly comparable.
 
 Set BENCH_DIR or SUBCMD env vars to override the scratch dir or
-subcommand. See the comment block at the top of $0 for details.
+subcommand. Testcontainer mode also honours TESTCONTAINER_CORPUS_COUNT,
+TESTCONTAINER_CORPUS_FOLDERS, TESTCONTAINER_CORPUS_SEED, and
+TESTCONTAINER_NEW_PCT to size the seed corpus.
 EOF
     exit 1
 }
 
-if [[ $# -ne 4 ]]; then
+if [[ $# -ne 2 && $# -ne 4 ]]; then
     usage
 fi
 
 BEFORE_REF="$1"
 AFTER_REF="$2"
-MAILDIR_SOURCE="$3"
-ACCOUNT_EMAIL="$4"
+if [[ $# -eq 4 ]]; then
+    MAILDIR_SOURCE="$3"
+    ACCOUNT_EMAIL="$4"
+    TESTCONTAINER_MODE=0
+else
+    MAILDIR_SOURCE=""
+    ACCOUNT_EMAIL=""
+    TESTCONTAINER_MODE=1
+fi
 
 BENCH_DIR="${BENCH_DIR:-/tmp/jma-bench}"
 # Expand a leading ~ in BENCH_DIR. Bash expands tilde in plain
@@ -79,7 +103,7 @@ REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
 }
 cd "$REPO_ROOT"
 
-if [[ ! -d "$MAILDIR_SOURCE" ]]; then
+if (( TESTCONTAINER_MODE == 0 )) && [[ ! -d "$MAILDIR_SOURCE" ]]; then
     echo "maildir source not a directory: $MAILDIR_SOURCE" >&2
     exit 1
 fi
@@ -123,7 +147,25 @@ restore_ref() {
         ORIG_REF=""
     fi
 }
-trap restore_ref EXIT INT TERM
+
+# Source the testcontainer helper unconditionally (it just defines
+# functions and default env vars; nothing fires until a function is
+# called). Done before any ref-switching cargo operations so the
+# file is loaded from the user's original tree -- BEFORE refs may
+# predate when this helper landed.
+# shellcheck source=tools/_testcontainer.sh
+source "$REPO_ROOT/tools/_testcontainer.sh"
+
+# Cleanup tears down the testcontainer fixture (no-op when one
+# wasn't started) and restores the user's ref. restore_ref is
+# still called directly mid-script after the build loop so cells
+# run on the user's original tree -- this trap is for crash /
+# interrupt paths and the final exit.
+cleanup() {
+    testcontainer_stop
+    restore_ref
+}
+trap cleanup EXIT INT TERM
 
 mkdir -p "$BENCH_DIR"
 
@@ -172,22 +214,59 @@ echo
 # original commit, not at AFTER's tree.
 restore_ref
 
+# Testcontainer setup happens after restore_ref so the example
+# binaries we build live in the user's original tree (the bench-
+# server example was introduced post-69c455a and won't exist at
+# arbitrary BEFORE refs).
+if (( TESTCONTAINER_MODE )); then
+    echo "=== testcontainer setup ==="
+    testcontainer_build_helpers
+    testcontainer_start "$BENCH_DIR"
+    echo
+fi
+
 BEFORE_BIN="$BENCH_DIR/jma-$BEFORE_SHA"
 AFTER_BIN="$BENCH_DIR/jma-$AFTER_SHA"
 
-# --- maildir / config setup (unchanged from the run-only script) ---
+# --- maildir / config setup ---
 
 cd "$BENCH_DIR"
 
-if [[ ! -d maildir ]]; then
+if (( TESTCONTAINER_MODE )); then
+    # Testcontainer mode: maildir always starts empty; jma pulls
+    # everything from the seeded server. Wiping any leftovers from
+    # a prior run ensures the BEFORE-initial cell measures a true
+    # initial download rather than a partial resync.
+    rm -rf maildir
+    mkdir -p maildir
+elif [[ ! -d maildir ]]; then
     echo "=== copying $MAILDIR_SOURCE -> $BENCH_DIR/maildir ==="
     cp -R "$MAILDIR_SOURCE" maildir
     echo
 fi
 
 # Always (re-)write the config so a config-shape change in the
-# binaries doesn't require manual sync.
-cat > config.toml <<EOF
+# binaries doesn't require manual sync. In testcontainer mode we
+# also pin [account].token (the fixture bearer) and
+# [account].session_url (the container's advertised URL) so jma
+# bypasses keychain + autodiscovery and hits the fixture directly.
+if (( TESTCONTAINER_MODE )); then
+    cat > config.toml <<EOF
+[account]
+email = "$JMA_BENCH_ACCOUNT_EMAIL"
+token = "$JMA_BENCH_BEARER"
+session_url = "$JMA_BENCH_SESSION_URL"
+
+[sync]
+maildir_path = "$BENCH_DIR/maildir"
+mailboxes = []
+download_concurrency = 8
+
+[state]
+db_path = "$BENCH_DIR/state.db"
+EOF
+else
+    cat > config.toml <<EOF
 [account]
 email = "$ACCOUNT_EMAIL"
 
@@ -199,6 +278,15 @@ download_concurrency = 8
 [state]
 db_path = "$BENCH_DIR/state.db"
 EOF
+fi
+# jma's Config::load refuses to start when [account].token is set
+# in a config file with group/other perm bits (mode & 0o077 != 0;
+# see 808c151). In testcontainer mode the bearer is in
+# [account].token so this is hard-required; in real-account mode
+# the token lives in the keychain and the file has nothing
+# sensitive, but we chmod the same way regardless for
+# consistency.
+chmod 600 config.toml
 
 reset_state() {
     # State DB location is pinned via [state].db_path in config.toml
@@ -209,6 +297,16 @@ reset_state() {
     # level advisory lock that maildir_ops::lock writes at the
     # maildir root post-rename.
     rm -f state.db* maildir/.jma.lock
+    # In testcontainer mode the maildir is never the source of
+    # truth (the server is), so reset_state also wipes the maildir
+    # between pairs so each "initial" cell measures a true initial
+    # download. In real-account mode the maildir copy from
+    # MAILDIR_SOURCE is the BEFORE state we want to preserve, so
+    # we leave it alone.
+    if (( TESTCONTAINER_MODE )); then
+        rm -rf maildir
+        mkdir -p maildir
+    fi
 }
 
 run() {
