@@ -1,5 +1,7 @@
 # jma -- Sync JMAP mailboxes to local Maildirs
 
+[![CI](https://github.com/jmibanez/jma-mail/actions/workflows/ci.yaml/badge.svg)](https://github.com/jmibanez/jma-mail/actions/workflows/ci.yaml)[![E2E](https://github.com/jmibanez/jma-mail/actions/workflows/e2e.yaml/badge.svg)](https://github.com/jmibanez/jma-mail/actions/workflows/e2e.yaml)
+
 `jma` (the binary; crate name `jma-mail`) is JM's Mail Agent: it syncs your local Maildir mailboxes with a [JMAP](https://jmap.io) mail server such as Fastmail, like [`isync`/`mbsync`](https://isync.sourceforge.io/mbsync.html) but for JMAP instead of IMAP.
 
 `jma` supports syncing a Maildir mailbox that was downloaded via `mbsync` or `offlineimap` -- point it to the directory containing your Maildir mailboxes and it should pick up where `mbsync` or `offlineimap` left off.
