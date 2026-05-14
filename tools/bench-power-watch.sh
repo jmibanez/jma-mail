@@ -56,6 +56,15 @@
 #                   to 0 to disable the stimulus and measure the
 #                   truly-idle daemon instead.
 #                   Default: 10
+#   BENCH_LOOP_COUNT
+#                   Number of rounds to run. Each round is one
+#                   BEFORE-watch / AFTER-watch pair interleaved
+#                   temporally so round-to-round noise affects each
+#                   cell equally. Per-round logs land at
+#                   power-<label>-r<round>.txt when this is >1; the
+#                   summary then reports mean/stddev/min/max of the
+#                   energy impact per cell across the rounds.
+#                   Default: 1
 #
 # Setup of the maildir + config is idempotent: the maildir is copied
 # and the config written only if missing. The state DB is wiped
@@ -82,7 +91,9 @@ warmed by an untimed pull (same warm-then-idle baseline as
 real-account mode).
 
 Set BENCH_DIR, WATCH_SECONDS, SAMPLE_MS, or STIMULUS_INTERVAL_S
-env vars to override defaults. Testcontainer mode also honours
+env vars to override defaults. BENCH_LOOP_COUNT=N runs N
+before/after-watch rounds and the summary reports mean/stddev/min/max
+of energy impact per cell. Testcontainer mode also honours
 TESTCONTAINER_CORPUS_COUNT, TESTCONTAINER_CORPUS_FOLDERS,
 TESTCONTAINER_CORPUS_SEED, and TESTCONTAINER_NEW_PCT.
 EOF
@@ -310,24 +321,50 @@ run_watch() {
     echo
 }
 
-run_watch before-watch "$BEFORE_BIN"
-run_watch after-watch  "$AFTER_BIN"
+# Two-cell round body: each round runs one BEFORE-watch and one
+# AFTER-watch with each cell's run_watch handling its own state
+# reset + warm pull internally. Interleaving across rounds keeps
+# round-to-round noise (background load, thermal drift) balanced
+# between BEFORE and AFTER.
+bench_run_round() {
+    local suffix="$1"
+    run_watch "before-watch${suffix}" "$BEFORE_BIN"
+    run_watch "after-watch${suffix}"  "$AFTER_BIN"
+}
 
-echo "=== summary ==="
-printf "  %-18s  %12s  %10s\n" "scenario" "watch window" "energy impact"
-printf "  %-18s  %12s  %10s\n" "--------" "------------" "-------------"
-for label in before-watch after-watch; do
-    pmlog="power-${label}.txt"
-    if [[ -f "$pmlog" ]]; then
-        energy_pair=$(sum_jma_energy "$pmlog")
-        energy=${energy_pair% *}
-        samples=${energy_pair##* }
-    else
-        energy="n/a"
-        samples="0"
-    fi
-    printf "  %-18s  %11ss  %13s\n" "$label" "$WATCH_SECONDS" "${energy:-n/a}"
-done
-echo
-echo "  (sample counts: see per-cell output above; energy is sum"
-echo "   of jma's Energy Impact column across all samples)"
+run_loop bench_run_round
+
+# Extractor for aggregate_cell. Energy lives in power-<label>-r<N>.txt;
+# sum_jma_energy emits "<energy> <samples>", we want just the first.
+extract_energy() { sum_jma_energy "$1" | awk '{print $1}'; }
+
+CELLS=(before-watch after-watch)
+
+if (( BENCH_LOOP_COUNT == 1 )); then
+    echo "=== summary ==="
+    printf "  %-18s  %12s  %10s\n" "scenario" "watch window" "energy impact"
+    printf "  %-18s  %12s  %10s\n" "--------" "------------" "-------------"
+    for label in "${CELLS[@]}"; do
+        pmlog="power-${label}.txt"
+        if [[ -f "$pmlog" ]]; then
+            energy=$(extract_energy "$pmlog" 2>/dev/null || echo "")
+        else
+            energy=""
+        fi
+        printf "  %-18s  %11ss  %13s\n" "$label" "$WATCH_SECONDS" "${energy:-n/a}"
+    done
+    echo
+    echo "  (sample counts: see per-cell output above; energy is sum"
+    echo "   of jma's Energy Impact column across all samples)"
+else
+    echo "=== summary: energy impact over $BENCH_LOOP_COUNT rounds (watch window: ${WATCH_SECONDS}s) ==="
+    printf "  %-18s  %10s  %10s  %10s  %10s\n" "scenario" "mean" "stddev" "min" "max"
+    printf "  %-18s  %10s  %10s  %10s  %10s\n" "--------" "----" "------" "---" "---"
+    for label in "${CELLS[@]}"; do
+        read -r mean sd min max <<< "$(aggregate_cell extract_energy "power-${label}" 1)"
+        printf "  %-18s  %10s  %10s  %10s  %10s\n" "$label" "$mean" "$sd" "$min" "$max"
+    done
+    echo
+    echo "  (per-round logs at power-<label>-r<N>.txt; energy is sum"
+    echo "   of jma's Energy Impact column across all samples in one cell)"
+fi

@@ -42,13 +42,22 @@
 # if the working tree has tracked uncommitted changes.
 #
 # Environment overrides:
-#   BENCH_DIR   Scratch dir for cached binaries, maildir copy, state
-#               DB, logs.
-#               Default: /tmp/jma-bench
-#   SUBCMD      jma subcommand to benchmark.
-#               Default: pull
-#   SAMPLE_MS   powermetrics sampling interval in milliseconds.
-#               Default: 1000
+#   BENCH_DIR         Scratch dir for cached binaries, maildir copy,
+#                     state DB, logs.
+#                     Default: /tmp/jma-bench
+#   SUBCMD            jma subcommand to benchmark.
+#                     Default: pull
+#   SAMPLE_MS         powermetrics sampling interval in milliseconds.
+#                     Default: 1000
+#   BENCH_LOOP_COUNT  Number of rounds to run. Each round is one full
+#                     quartet (BEFORE-initial, BEFORE-steady,
+#                     AFTER-initial, AFTER-steady), so round-to-round
+#                     noise affects each cell equally. Per-round logs
+#                     land at time-<label>-r<round>.txt and
+#                     power-<label>-r<round>.txt when this is >1; the
+#                     summary then reports mean/stddev/min/max per
+#                     cell for each metric.
+#                     Default: 1
 #
 # Setup of the maildir + config is idempotent: the maildir is
 # copied and the config written only if missing. Delete $BENCH_DIR
@@ -76,9 +85,11 @@ state-DB re-scan); within a mode BEFORE-vs-AFTER stays
 apples-to-apples.
 
 Set BENCH_DIR, SUBCMD, or SAMPLE_MS env vars to override the scratch
-dir, subcommand, or sampling interval. Testcontainer mode also
-honours TESTCONTAINER_CORPUS_COUNT, TESTCONTAINER_CORPUS_FOLDERS,
-TESTCONTAINER_CORPUS_SEED, and TESTCONTAINER_NEW_PCT.
+dir, subcommand, or sampling interval. BENCH_LOOP_COUNT=N runs N
+quartet rounds and the summary reports mean/stddev/min/max per cell.
+Testcontainer mode also honours TESTCONTAINER_CORPUS_COUNT,
+TESTCONTAINER_CORPUS_FOLDERS, TESTCONTAINER_CORPUS_SEED, and
+TESTCONTAINER_NEW_PCT.
 EOF
     exit 1
 }
@@ -248,31 +259,70 @@ run() {
     echo
 }
 
-# Pair 1: BEFORE binary, fresh state DB then steady state.
-reset_state
-run before-initial "$BEFORE_BIN"
-run before-steady  "$BEFORE_BIN"
+# Quartet-grouped round body. See bench-rss.sh for the rationale on
+# interleaving across rounds vs. running cells in pair-blocks.
+bench_run_round() {
+    local suffix="$1"
+    reset_state
+    run "before-initial${suffix}" "$BEFORE_BIN"
+    run "before-steady${suffix}"  "$BEFORE_BIN"
+    reset_state
+    run "after-initial${suffix}"  "$AFTER_BIN"
+    run "after-steady${suffix}"   "$AFTER_BIN"
+}
 
-# Pair 2: AFTER binary, fresh state DB then steady state.
-reset_state
-run after-initial  "$AFTER_BIN"
-run after-steady   "$AFTER_BIN"
+run_loop bench_run_round
 
-echo "=== summary ==="
-printf "  %-18s  %10s  %10s  %10s  %14s\n" "scenario" "wall" "user" "sys" "energy impact"
-printf "  %-18s  %10s  %10s  %10s  %14s\n" "--------" "----" "----" "---" "-------------"
-for label in before-initial before-steady after-initial after-steady; do
-    timelog="time-${label}.txt"
-    pmlog="power-${label}.txt"
-    real=$(awk '/real.*user.*sys/ {print $1; exit}' "$timelog" 2>/dev/null || echo "")
-    user=$(awk '/real.*user.*sys/ {print $3; exit}' "$timelog" 2>/dev/null || echo "")
-    sys=$(awk '/real.*user.*sys/ {print $5; exit}' "$timelog" 2>/dev/null || echo "")
-    if [[ -f "$pmlog" ]]; then
-        energy=$(sum_jma_energy "$pmlog")
-        energy=${energy% *}
-    else
-        energy="n/a"
-    fi
-    printf "  %-18s  %9ss  %9ss  %9ss  %14s\n" \
-        "$label" "${real:-n/a}" "${user:-n/a}" "${sys:-n/a}" "${energy:-n/a}"
-done
+# Extractors for aggregate_cell: read one value from one log file.
+# Wall / user / sys all come from the same `time -l` summary line.
+extract_wall()   { awk '/real.*user.*sys/ {print $1; exit}' "$1"; }
+extract_user()   { awk '/real.*user.*sys/ {print $3; exit}' "$1"; }
+extract_sys()    { awk '/real.*user.*sys/ {print $5; exit}' "$1"; }
+extract_energy() { sum_jma_energy "$1" | awk '{print $1}'; }
+
+CELLS=(before-initial before-steady after-initial after-steady)
+
+if (( BENCH_LOOP_COUNT == 1 )); then
+    # Single-round summary: same shape as before the loop landed.
+    echo "=== summary ==="
+    printf "  %-18s  %10s  %10s  %10s  %14s\n" "scenario" "wall" "user" "sys" "energy impact"
+    printf "  %-18s  %10s  %10s  %10s  %14s\n" "--------" "----" "----" "---" "-------------"
+    for label in "${CELLS[@]}"; do
+        timelog="time-${label}.txt"
+        pmlog="power-${label}.txt"
+        real=$(extract_wall "$timelog" 2>/dev/null || echo "")
+        user=$(extract_user "$timelog" 2>/dev/null || echo "")
+        sys=$(extract_sys  "$timelog" 2>/dev/null || echo "")
+        if [[ -f "$pmlog" ]]; then
+            energy=$(extract_energy "$pmlog" 2>/dev/null || echo "")
+        else
+            energy=""
+        fi
+        printf "  %-18s  %9ss  %9ss  %9ss  %14s\n" \
+            "$label" "${real:-n/a}" "${user:-n/a}" "${sys:-n/a}" "${energy:-n/a}"
+    done
+else
+    # Multi-round summary: one table per metric to keep each row
+    # narrow enough to read without wrapping. Each table reports
+    # mean / stddev / min / max for one metric across all four
+    # cells. Wall / user / sys live in time-<label>-r<N>.txt;
+    # energy lives in power-<label>-r<N>.txt.
+    print_aggregate_table() {
+        local title="$1"
+        local extractor="$2"
+        local prefix="$3"
+        local scale="$4"
+        echo "=== summary: $title over $BENCH_LOOP_COUNT rounds ==="
+        printf "  %-18s  %10s  %10s  %10s  %10s\n" "scenario" "mean" "stddev" "min" "max"
+        printf "  %-18s  %10s  %10s  %10s  %10s\n" "--------" "----" "------" "---" "---"
+        for label in "${CELLS[@]}"; do
+            read -r mean sd min max <<< "$(aggregate_cell "$extractor" "${prefix}-${label}" "$scale")"
+            printf "  %-18s  %10s  %10s  %10s  %10s\n" "$label" "$mean" "$sd" "$min" "$max"
+        done
+        echo
+    }
+    print_aggregate_table "wall clock (s)" extract_wall   time  1
+    print_aggregate_table "user CPU (s)"   extract_user   time  1
+    print_aggregate_table "sys CPU (s)"    extract_sys    time  1
+    print_aggregate_table "energy impact"  extract_energy power 1
+fi

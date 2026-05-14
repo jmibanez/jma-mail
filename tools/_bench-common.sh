@@ -22,6 +22,19 @@
 #   ORIG_REF         User's pre-script git ref (for restore_ref)
 #   JMA_BENCH_*      Testcontainer fixture coordinates (set by
 #                    _testcontainer.sh::testcontainer_start)
+#   BENCH_LOOP_COUNT Number of rounds to run (run_loop / aggregate_cell);
+#                    parsed and validated at source-time below
+
+# Number of bench rounds. Validated at source-time so a typo
+# doesn't manifest as a silently-skipped loop or a thousand-round
+# runaway. Each bench script wraps its cell driver in `run_loop`
+# below, which calls a per-script round body $BENCH_LOOP_COUNT
+# times.
+BENCH_LOOP_COUNT="${BENCH_LOOP_COUNT:-1}"
+if ! [[ "$BENCH_LOOP_COUNT" =~ ^[1-9][0-9]*$ ]]; then
+    echo "BENCH_LOOP_COUNT must be a positive integer; got: $BENCH_LOOP_COUNT" >&2
+    exit 1
+fi
 
 # Parse the 2-or-4 positional arg shape used by every bench script:
 #
@@ -221,6 +234,88 @@ reset_state() {
         rm -rf maildir
         mkdir -p maildir
     fi
+}
+
+# Run the caller's per-script round body $BENCH_LOOP_COUNT times.
+# The round-body fn (passed by name) receives the round's label
+# suffix as $1 -- empty for a single-round run so the per-cell
+# log files keep their original `log-<label>.txt` naming and the
+# script's existing N==1 summary path doesn't need to know about
+# rounds, or "-r<N>" for multi-round runs so each round's files
+# are independently preserved for later post-processing.
+#
+# The round body shape is per-script: bench-rss / bench-power do
+# the four-cell quartet (BEFORE-initial, BEFORE-steady, reset,
+# AFTER-initial, AFTER-steady) with reset_state between pairs;
+# bench-power-watch does two warm-then-watch cells with reset_state
+# inside each cell's run_watch. Both shapes slot into this loop
+# uniformly -- the loop only knows about rounds and labels, not
+# about cell semantics.
+run_loop() {
+    local round_fn="$1"
+    for ((round=1; round<=BENCH_LOOP_COUNT; round++)); do
+        local suffix=""
+        if (( BENCH_LOOP_COUNT > 1 )); then
+            echo "=== round $round / $BENCH_LOOP_COUNT ==="
+            suffix="-r${round}"
+        fi
+        "$round_fn" "$suffix"
+    done
+}
+
+# Compute mean / stddev / min / max of one metric across the N
+# per-round log files for one cell. Outputs four space-separated
+# numbers (mean stddev min max), or "n/a n/a n/a n/a" if no
+# per-round logs exist or no values extract cleanly.
+#
+# extractor_fn is a function name; it's invoked as
+#   <extractor_fn> <logfile>
+# and is expected to output a single number on stdout. The
+# function-pointer indirection lets each bench script extract its
+# own metrics (RSS / wall / CPU / energy) without this helper
+# growing per-script knowledge.
+#
+# log_prefix is the per-round logfile root: aggregate_cell looks
+# for "<log_prefix>-r<round>.txt" for each round in 1..N. scale
+# divides the extracted values (1 for already-scaled units like
+# seconds or energy impact; 1024*1024 to convert RSS bytes to MB).
+#
+# stddev uses Bessel's n-1 correction; with n=1 it collapses to 0.
+# Callers should branch on BENCH_LOOP_COUNT and use a single-read
+# summary path when N==1, since variance over one sample is
+# meaningless.
+aggregate_cell() {
+    local extractor_fn="$1"
+    local log_prefix="$2"
+    local scale="$3"
+    local values=()
+    for ((r=1; r<=BENCH_LOOP_COUNT; r++)); do
+        local log="${log_prefix}-r${r}.txt"
+        [[ -f "$log" ]] || continue
+        local v
+        v=$("$extractor_fn" "$log" 2>/dev/null)
+        [[ -n "$v" ]] && values+=("$v")
+    done
+    if (( ${#values[@]} == 0 )); then
+        echo "n/a n/a n/a n/a"
+        return
+    fi
+    printf '%s\n' "${values[@]}" | awk -v scale="$scale" '
+        BEGIN { min = ""; max = "" }
+        { v = $1 / scale; n++; s += v; ss += v*v
+          if (min == "" || v < min) min = v
+          if (max == "" || v > max) max = v }
+        END {
+            mean = s / n
+            if (n > 1) {
+                var = (ss - s*s/n) / (n - 1)
+                if (var < 0) var = 0
+                sd = sqrt(var)
+            } else {
+                sd = 0
+            }
+            printf "%.2f %.2f %.2f %.2f", mean, sd, min, max
+        }'
 }
 
 # Sum the Energy Impact column of every powermetrics task row whose

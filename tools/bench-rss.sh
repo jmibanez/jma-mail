@@ -28,11 +28,23 @@
 # if the working tree has tracked uncommitted changes.
 #
 # Environment overrides:
-#   BENCH_DIR  Scratch dir for cached binaries, maildir copy, state
-#              DB, logs.
-#              Default: /tmp/jma-bench
-#   SUBCMD     jma subcommand to benchmark.
-#              Default: pull
+#   BENCH_DIR         Scratch dir for cached binaries, maildir copy,
+#                     state DB, logs.
+#                     Default: /tmp/jma-bench
+#   SUBCMD            jma subcommand to benchmark.
+#                     Default: pull
+#   BENCH_LOOP_COUNT  Number of rounds to run. Each round is one full
+#                     quartet (BEFORE-initial, BEFORE-steady,
+#                     AFTER-initial, AFTER-steady), so binary code
+#                     paths are interleaved temporally and round-to-
+#                     round noise (thermal drift, background load,
+#                     page-cache state) affects each cell equally.
+#                     Per-round logs land at log-<label>-r<round>.txt
+#                     when this is >1; the summary table then reports
+#                     mean / stddev / min / max per cell across the
+#                     rounds. Stays apples-to-apples for the BEFORE-
+#                     vs-AFTER comparison within each round.
+#                     Default: 1
 #
 # Setup of the maildir + config is idempotent: the maildir is
 # copied and the config written only if missing. Delete $BENCH_DIR
@@ -71,9 +83,11 @@ Within a mode BEFORE-vs-AFTER stays apples-to-apples; across modes
 the numbers aren't directly comparable.
 
 Set BENCH_DIR or SUBCMD env vars to override the scratch dir or
-subcommand. Testcontainer mode also honours TESTCONTAINER_CORPUS_COUNT,
-TESTCONTAINER_CORPUS_FOLDERS, TESTCONTAINER_CORPUS_SEED, and
-TESTCONTAINER_NEW_PCT to size the seed corpus.
+subcommand. BENCH_LOOP_COUNT=N runs N quartet rounds and the summary
+reports mean/stddev/min/max per cell. Testcontainer mode also honours
+TESTCONTAINER_CORPUS_COUNT, TESTCONTAINER_CORPUS_FOLDERS,
+TESTCONTAINER_CORPUS_SEED, and TESTCONTAINER_NEW_PCT to size the seed
+corpus.
 EOF
     exit 1
 }
@@ -203,27 +217,64 @@ run() {
     echo
 }
 
-# Pair 1: BEFORE binary, fresh state DB then steady state.
-reset_state
-run before-initial "$BEFORE_BIN"
-run before-steady  "$BEFORE_BIN"
+# Quartet-grouped round body: each round runs all four cells back-
+# to-back so round-to-round noise (thermal drift, background load,
+# page-cache state) affects each cell equally. The BEFORE-vs-AFTER
+# delta within any single round stays apples-to-apples; multi-round
+# variance is what's left after that pairing.
+bench_run_round() {
+    local suffix="$1"
+    reset_state
+    run "before-initial${suffix}" "$BEFORE_BIN"
+    run "before-steady${suffix}"  "$BEFORE_BIN"
+    reset_state
+    run "after-initial${suffix}"  "$AFTER_BIN"
+    run "after-steady${suffix}"   "$AFTER_BIN"
+}
 
-# Pair 2: AFTER binary, fresh state DB then steady state.
-reset_state
-run after-initial  "$AFTER_BIN"
-run after-steady   "$AFTER_BIN"
+run_loop bench_run_round
 
-echo "=== summary ==="
-printf "  %-18s  %10s  %10s\n" "scenario" "peak RSS" "wall clock"
-printf "  %-18s  %10s  %10s\n" "--------" "--------" "----------"
-for label in before-initial before-steady after-initial after-steady; do
-    log="log-${label}.txt"
-    rss=$(awk '/maximum resident set size/ {print $1}' "$log" 2>/dev/null || echo "")
-    real=$(awk '/real/ {print $1; exit}' "$log" 2>/dev/null || echo "")
-    if [[ -n "$rss" ]]; then
-        rss_mb=$(awk -v b="$rss" 'BEGIN { printf "%.1f MB", b / 1024 / 1024 }')
-    else
-        rss_mb="(n/a)"
-    fi
-    printf "  %-18s  %10s  %9ss\n" "$label" "$rss_mb" "${real:-n/a}"
-done
+# Extractors for aggregate_cell: read one value from one log file.
+extract_rss()  { awk '/maximum resident set size/ {print $1; exit}' "$1"; }
+extract_wall() { awk '/real/ {print $1; exit}' "$1"; }
+
+CELLS=(before-initial before-steady after-initial after-steady)
+
+if (( BENCH_LOOP_COUNT == 1 )); then
+    # Single-round summary: same shape as before the loop landed.
+    # Reads the no-suffix log files emitted in single-round mode.
+    echo "=== summary ==="
+    printf "  %-18s  %10s  %10s\n" "scenario" "peak RSS" "wall clock"
+    printf "  %-18s  %10s  %10s\n" "--------" "--------" "----------"
+    for label in "${CELLS[@]}"; do
+        log="log-${label}.txt"
+        rss=$(extract_rss "$log" 2>/dev/null || echo "")
+        real=$(extract_wall "$log" 2>/dev/null || echo "")
+        if [[ -n "$rss" ]]; then
+            rss_mb=$(awk -v b="$rss" 'BEGIN { printf "%.1f MB", b / 1024 / 1024 }')
+        else
+            rss_mb="(n/a)"
+        fi
+        printf "  %-18s  %10s  %9ss\n" "$label" "$rss_mb" "${real:-n/a}"
+    done
+else
+    # Multi-round summary: per-cell mean / stddev / min / max. Two
+    # tables (RSS in MB, wall-clock in seconds) keep each row
+    # narrow enough to read in a terminal without wrapping.
+    rss_scale=$((1024 * 1024))
+    echo "=== summary: peak RSS over $BENCH_LOOP_COUNT rounds (MB) ==="
+    printf "  %-18s  %10s  %10s  %10s  %10s\n" "scenario" "mean" "stddev" "min" "max"
+    printf "  %-18s  %10s  %10s  %10s  %10s\n" "--------" "----" "------" "---" "---"
+    for label in "${CELLS[@]}"; do
+        read -r mean sd min max <<< "$(aggregate_cell extract_rss "log-${label}" "$rss_scale")"
+        printf "  %-18s  %10s  %10s  %10s  %10s\n" "$label" "$mean" "$sd" "$min" "$max"
+    done
+    echo
+    echo "=== summary: wall clock over $BENCH_LOOP_COUNT rounds (s) ==="
+    printf "  %-18s  %10s  %10s  %10s  %10s\n" "scenario" "mean" "stddev" "min" "max"
+    printf "  %-18s  %10s  %10s  %10s  %10s\n" "--------" "----" "------" "---" "---"
+    for label in "${CELLS[@]}"; do
+        read -r mean sd min max <<< "$(aggregate_cell extract_wall "log-${label}" 1)"
+        printf "  %-18s  %10s  %10s  %10s  %10s\n" "$label" "$mean" "$sd" "$min" "$max"
+    done
+fi
