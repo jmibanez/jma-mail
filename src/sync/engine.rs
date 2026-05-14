@@ -557,11 +557,25 @@ impl<'a> SyncEngine<'a> {
     }
 
     async fn batched_get(&self, ids: &[JmapEmailId]) -> Result<Vec<EmailObject>> {
-        let mut out: Vec<EmailObject> = Vec::new();
+        // Fan the Email/get chunks out through buffer_unordered with
+        // the same server-cap-aware ceiling the download stream uses.
+        // The chunks themselves are non-overlapping slices of `ids`,
+        // so the per-batch calls have no ordering or data dependency
+        // on each other; reconcile keys off email ID and is
+        // order-agnostic. On a fresh-server initial pull the metadata
+        // phase used to serialize N = ceil(total / chunk_size) Email/
+        // get round-trips back to back; this collapses that to
+        // ceil(N / concurrency) parallel rounds.
         let chunk_size = limits::max_objects_in_get(&self.client);
-        for chunk in ids.chunks(chunk_size) {
-            let batch = jmap_email::get_by_ids(&self.client, chunk).await?;
-            out.extend(batch);
+        let n = limits::concurrent_requests(&self.client, self.config.sync.download_concurrency);
+        let client = &self.client;
+        let futures = ids
+            .chunks(chunk_size)
+            .map(|chunk| async move { jmap_email::get_by_ids(client, chunk).await });
+        let mut stream = stream::iter(futures).buffer_unordered(n);
+        let mut out: Vec<EmailObject> = Vec::new();
+        while let Some(batch) = stream.next().await {
+            out.extend(batch?);
         }
         Ok(out)
     }

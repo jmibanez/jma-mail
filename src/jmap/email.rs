@@ -50,25 +50,41 @@ fn email_properties() -> Vec<email::Property> {
 
 /// Fetch emails by IDs using the request builder.
 pub async fn get_by_ids(client: &Client, ids: &[JmapEmailId]) -> Result<Vec<EmailObject>> {
-    with_retry("Email/get", || async {
-        let mut request = client.build();
-        let get_request = request.get_email().account_id(client.default_account_id());
-        get_request.ids(ids.iter().map(String::from));
-        get_request.properties(email_properties());
+    // Per-batch phase span so the profile layer can attribute each
+    // Email/get round-trip individually. Callers (`batched_get`) issue
+    // these in parallel via `buffer_unordered`, so spans overlap in
+    // real time; each span's wall_ms is one batch's start-to-finish
+    // duration rather than its CPU share. The aggregate JSON makes
+    // visible whether batch latency is uniform or whether a tail is
+    // dominating the parallel window.
+    let span = tracing::info_span!(
+        target: crate::profile::TARGET_PHASE,
+        "fetch.get_batch",
+        count = ids.len() as u64,
+    );
+    async move {
+        with_retry("Email/get", || async {
+            let mut request = client.build();
+            let get_request = request.get_email().account_id(client.default_account_id());
+            get_request.ids(ids.iter().map(String::from));
+            get_request.properties(email_properties());
 
-        let response = request.send().await.context("Failed to fetch emails")?;
+            let response = request.send().await.context("Failed to fetch emails")?;
 
-        let email_response = response
-            .unwrap_method_responses()
-            .pop()
-            .context("No response for email get")?;
+            let email_response = response
+                .unwrap_method_responses()
+                .pop()
+                .context("No response for email get")?;
 
-        let get_response = email_response
-            .unwrap_get_email()
-            .context("Failed to parse email response")?;
+            let get_response = email_response
+                .unwrap_get_email()
+                .context("Failed to parse email response")?;
 
-        Ok(get_response.list().iter().map(parse_email_object).collect())
-    })
+            Ok(get_response.list().iter().map(parse_email_object).collect())
+        })
+        .await
+    }
+    .instrument(span)
     .await
 }
 
