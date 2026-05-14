@@ -5,7 +5,7 @@ use jmap_client::core::error::MethodErrorType;
 use jmap_client::email;
 use std::collections::HashMap;
 use tracing::field::Empty;
-use tracing::{debug, info, instrument};
+use tracing::{Instrument, debug, info, instrument};
 
 use crate::ids::{JmapBlobId, JmapEmailId, JmapMailboxId, JmapThreadId, MessageId};
 use crate::jmap::limits;
@@ -27,6 +27,14 @@ pub fn is_cannot_calculate_changes(err: &anyhow::Error) -> bool {
     }
     false
 }
+
+/// Page size for `Email/query` pagination. JMAP defines no
+/// `maxObjectsInQuery` capability, so this is a pure client-side
+/// preference: the server may return any number of IDs up to this
+/// limit. `query_mailbox` advances its offset by the actual returned
+/// count and stops only on an empty response, so a server that
+/// silently clamps below this value still paginates correctly.
+const QUERY_PAGE_SIZE: usize = 1000;
 
 /// Properties we request for Email/get calls.
 fn email_properties() -> Vec<email::Property> {
@@ -72,64 +80,85 @@ pub async fn query_mailbox(
     mailbox_id: &str,
     folder_name: &str,
 ) -> Result<Vec<JmapEmailId>> {
-    let mut all_ids = Vec::new();
-    let mut position: usize = 0;
-    let page_size: usize = 100;
+    // Per-folder phase span so the profile layer can attribute query
+    // wall-clock back to a specific folder. With cross-folder fan-out
+    // in `initial_remote_state` these spans overlap in real time --
+    // each span's wall_ms is that folder's start-to-finish duration,
+    // not its share of CPU; the aggregate JSON shows which folder
+    // dominates the parallel window.
+    let span = tracing::info_span!(
+        target: crate::profile::TARGET_PHASE,
+        "fetch.query_folder",
+        folder = %folder_name,
+        count = Empty,
+    );
+    async move {
+        let mut all_ids = Vec::new();
+        let mut position: usize = 0;
 
-    loop {
-        let ids: Vec<JmapEmailId> = with_retry("Email/query", || async {
-            let mut request = client.build();
-            let query = request
-                .query_email()
-                .account_id(client.default_account_id());
-            query
-                .filter(email::query::Filter::in_mailbox(mailbox_id))
-                .position(position as i32)
-                .limit(page_size);
+        loop {
+            let ids: Vec<JmapEmailId> = with_retry("Email/query", || async {
+                let mut request = client.build();
+                let query = request
+                    .query_email()
+                    .account_id(client.default_account_id());
+                query
+                    .filter(email::query::Filter::in_mailbox(mailbox_id))
+                    .position(position as i32)
+                    .limit(QUERY_PAGE_SIZE);
 
-            let response = request.send().await.context("Failed to query emails")?;
+                let response = request.send().await.context("Failed to query emails")?;
 
-            let query_response = response
-                .unwrap_method_responses()
-                .pop()
-                .context("No response for email query")?;
+                let query_response = response
+                    .unwrap_method_responses()
+                    .pop()
+                    .context("No response for email query")?;
 
-            let result = query_response
-                .unwrap_query_email()
-                .context("Failed to parse email query response")?;
+                let result = query_response
+                    .unwrap_query_email()
+                    .context("Failed to parse email query response")?;
 
-            Ok(result
-                .ids()
-                .iter()
-                .map(|id| JmapEmailId::from(id.as_str()))
-                .collect())
-        })
-        .await?;
-        let count = ids.len();
-        all_ids.extend(ids);
+                Ok(result
+                    .ids()
+                    .iter()
+                    .map(|id| JmapEmailId::from(id.as_str()))
+                    .collect())
+            })
+            .await?;
+            let count = ids.len();
+            all_ids.extend(ids);
 
-        debug!(
-            "Queried {} page at position {}: got {} emails (total so far: {})",
-            folder_name,
-            position,
-            count,
-            all_ids.len()
-        );
+            debug!(
+                "Queried {} page at position {}: got {} emails (total so far: {})",
+                folder_name,
+                position,
+                count,
+                all_ids.len()
+            );
 
-        if count < page_size {
-            break;
+            if count == 0 {
+                break;
+            }
+
+            // JMAP allows the server to return any count up to the
+            // requested limit (there is no maxObjectsInQuery cap to
+            // negotiate against), so the cursor must advance by what
+            // was actually returned. The empty-page break above is
+            // the only end-of-list signal under that contract.
+            position += count;
         }
 
-        position += page_size;
+        info!(
+            "Queried {} email IDs from {} ({})",
+            all_ids.len(),
+            folder_name,
+            mailbox_id
+        );
+        tracing::Span::current().record("count", all_ids.len() as u64);
+        Ok(all_ids)
     }
-
-    info!(
-        "Queried {} email IDs from {} ({})",
-        all_ids.len(),
-        folder_name,
-        mailbox_id
-    );
-    Ok(all_ids)
+    .instrument(span)
+    .await
 }
 
 /// Fetch the current Email state by issuing Email/get with an empty id list.
