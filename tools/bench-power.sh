@@ -60,6 +60,9 @@
 
 set -euo pipefail
 
+# shellcheck source=tools/_bench-common.sh
+source "$(dirname "${BASH_SOURCE[0]}")/_bench-common.sh"
+
 usage() {
     cat >&2 <<EOF
 usage: $0 <before-commit> <after-commit>
@@ -80,21 +83,7 @@ EOF
     exit 1
 }
 
-if [[ $# -ne 2 && $# -ne 4 ]]; then
-    usage
-fi
-
-BEFORE_REF="$1"
-AFTER_REF="$2"
-if [[ $# -eq 4 ]]; then
-    MAILDIR_SOURCE="$3"
-    ACCOUNT_EMAIL="$4"
-    TESTCONTAINER_MODE=0
-else
-    MAILDIR_SOURCE=""
-    ACCOUNT_EMAIL=""
-    TESTCONTAINER_MODE=1
-fi
+parse_bench_args "$@" || usage
 
 BENCH_DIR="${BENCH_DIR:-/tmp/jma-bench}"
 # Expand a leading ~ in BENCH_DIR. Bash expands tilde in plain
@@ -123,33 +112,11 @@ if ! command -v powermetrics >/dev/null 2>&1; then
     exit 1
 fi
 
-# Resolve refs to full SHAs so cached binaries are unambiguous.
-resolve_sha() {
-    git rev-parse --verify "${1}^{commit}" 2>/dev/null || {
-        echo "cannot resolve commit ref: $1" >&2
-        exit 1
-    }
-}
-
 BEFORE_SHA=$(resolve_sha "$BEFORE_REF")
 AFTER_SHA=$(resolve_sha "$AFTER_REF")
+print_resolved_commits "$BEFORE_REF" "$BEFORE_SHA" "$AFTER_REF" "$AFTER_SHA"
 
-# Pretty subject for the resolved-commits printout.
-subject_of() {
-    git --no-pager log -1 --format=%s "$1"
-}
-
-echo "=== resolved commits ==="
-printf "  BEFORE: %s (%s) -- %s\n" "$BEFORE_REF" "${BEFORE_SHA:0:8}" "$(subject_of "$BEFORE_SHA")"
-printf "  AFTER:  %s (%s) -- %s\n" "$AFTER_REF"  "${AFTER_SHA:0:8}"  "$(subject_of "$AFTER_SHA")"
-echo
-
-# Refuse to run if tracked files are modified or staged. Untracked
-# files are fine -- they don't move under `git checkout`.
-if ! git diff --quiet || ! git diff --cached --quiet; then
-    echo "working tree has uncommitted tracked changes; commit or stash first" >&2
-    exit 1
-fi
+require_clean_worktree
 
 # Remember the user's current ref so the trap can restore it. If we
 # were on a branch, store the branch name; if detached, store the
@@ -172,13 +139,6 @@ fi
 SUDO_KEEPALIVE_PID=$!
 echo
 
-restore_ref() {
-    if [[ -n "${ORIG_REF:-}" ]]; then
-        ( cd "$REPO_ROOT" && git checkout --quiet "$ORIG_REF" ) || true
-        ORIG_REF=""
-    fi
-}
-
 # Source the testcontainer helper unconditionally (functions and
 # defaults only; nothing fires until a function is called). Done
 # before any ref-switching cargo operations so the file is loaded
@@ -197,41 +157,6 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 mkdir -p "$BENCH_DIR"
-
-# Build a binary for the given full SHA into the scratch cache.
-# Returns success if the cached file is present (rebuilds when not).
-build_for() {
-    local sha="$1"
-    local target="$BENCH_DIR/jma-$sha"
-
-    if [[ -x "$target" ]]; then
-        echo "  cached: jma-${sha:0:8} -> $target"
-        return 0
-    fi
-
-    echo "  building jma-${sha:0:8} ..."
-    git checkout --quiet "$sha"
-
-    # The package/bin name has shifted across history (jmapsync ->
-    # jma-mail, with the bin variously named jma or jmapsync). Nuke
-    # top-level target/release/ executables first so that after the
-    # build, whatever single binary exists is unambiguously this
-    # commit's output -- otherwise a stale `target/release/jma` from
-    # a prior dev build would get copied into the BEFORE cache slot.
-    find "$REPO_ROOT/target/release" -maxdepth 1 -type f -perm +111 -delete 2>/dev/null || true
-
-    CC=/usr/bin/cc cargo build --release
-
-    local built
-    built=$(find "$REPO_ROOT/target/release" -maxdepth 1 -type f -perm +111 2>/dev/null | head -1)
-    if [[ -z "$built" ]]; then
-        echo "  no executable produced under target/release/" >&2
-        return 1
-    fi
-    cp "$built" "$target"
-    chmod +x "$target"
-    echo "  built: $target (from $(basename "$built"))"
-}
 
 echo "=== build / cache ==="
 build_for "$BEFORE_SHA"
@@ -261,109 +186,8 @@ AFTER_BIN="$BENCH_DIR/jma-$AFTER_SHA"
 # --- maildir / config setup ---
 
 cd "$BENCH_DIR"
-
-if (( TESTCONTAINER_MODE )); then
-    # Testcontainer mode: maildir always starts empty; jma pulls
-    # everything from the seeded server. Wiping any leftovers from
-    # a prior run ensures BEFORE-initial measures a true initial
-    # download rather than a partial resync.
-    rm -rf maildir
-    mkdir -p maildir
-elif [[ ! -d maildir ]]; then
-    echo "=== copying $MAILDIR_SOURCE -> $BENCH_DIR/maildir ==="
-    cp -R "$MAILDIR_SOURCE" maildir
-    echo
-fi
-
-# Always (re-)write the config so a config-shape change in the
-# binaries doesn't require manual sync. In testcontainer mode we
-# also pin [account].token (the fixture bearer) and
-# [account].session_url (the container's advertised URL) so jma
-# bypasses keychain + autodiscovery and hits the fixture directly.
-if (( TESTCONTAINER_MODE )); then
-    cat > config.toml <<EOF
-[account]
-email = "$JMA_BENCH_ACCOUNT_EMAIL"
-token = "$JMA_BENCH_BEARER"
-session_url = "$JMA_BENCH_SESSION_URL"
-
-[sync]
-maildir_path = "$BENCH_DIR/maildir"
-mailboxes = []
-download_concurrency = 8
-
-[state]
-db_path = "$BENCH_DIR/state.db"
-EOF
-else
-    cat > config.toml <<EOF
-[account]
-email = "$ACCOUNT_EMAIL"
-
-[sync]
-maildir_path = "$BENCH_DIR/maildir"
-mailboxes = []
-download_concurrency = 8
-
-[state]
-db_path = "$BENCH_DIR/state.db"
-EOF
-fi
-# jma's Config::load refuses to start when [account].token is set
-# in a config file with group/other perm bits (mode & 0o077 != 0;
-# see 808c151). In testcontainer mode the bearer is in
-# [account].token so this is hard-required; in real-account mode
-# the token lives in the keychain and the file has nothing
-# sensitive, but we chmod the same way regardless for
-# consistency.
-chmod 600 config.toml
-
-reset_state() {
-    # State DB location is pinned via [state].db_path in config.toml
-    # above, so both binaries write to $BENCH_DIR/state.db regardless
-    # of their built-in default (pre-76eef97 defaulted to
-    # ~/.local/share/jmapsync/state.db, post-76eef97 to
-    # <maildir>/.jma.db). Clear the pinned location plus the maildir-
-    # level advisory lock that maildir_ops::lock writes at the
-    # maildir root post-rename.
-    rm -f state.db* maildir/.jma.lock
-    # In testcontainer mode the server is the source of truth, so
-    # also wipe the maildir between pairs so each "initial" cell
-    # measures a true initial download.
-    if (( TESTCONTAINER_MODE )); then
-        rm -rf maildir
-        mkdir -p maildir
-    fi
-}
-
-# Sum the Energy Impact column of every powermetrics task row whose
-# first field looks like our jma binary. The cached binaries are
-# named `jma-<full-sha>`, but the kernel's comm field truncates at
-# 16 chars (MAXCOMLEN), so powermetrics shows `jma-<short-sha>`.
-# Match `jma` exactly or `jma-...` by prefix.
-#
-# With `--samplers tasks --show-process-energy` the Energy Impact
-# value is the last numeric column of the row (the Deadlines and
-# Wakeups groups contain comma-glued tokens that don't parse as
-# pure numbers), so scan from the right for the first pure-numeric
-# token and accumulate.
-sum_jma_energy() {
-    local pmlog="$1"
-    awk '
-        $1 ~ /^jma(-|$)/ {
-            for (i = NF; i >= 1; i--) {
-                if ($i ~ /^[0-9]+(\.[0-9]+)?$/) {
-                    total += $i
-                    samples += 1
-                    break
-                }
-            }
-        }
-        END {
-            printf "%.2f %d", total + 0, samples + 0
-        }
-    ' "$pmlog"
-}
+setup_maildir
+write_bench_config
 
 run() {
     local label="$1"
