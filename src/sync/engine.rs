@@ -524,21 +524,23 @@ impl<'a> SyncEngine<'a> {
         let mut seen: HashSet<JmapEmailId> = HashSet::new();
 
         // Fan out per-mailbox Email/query in parallel. `query_mailbox`
-        // paginates internally (each page must wait for the previous
-        // within a single mailbox), but across mailboxes the queries
-        // are independent. Cap parallelism at the JMAP server's
-        // maxConcurrentRequests via the existing download_concurrency
-        // ceiling -- queries are ordinary JMAP requests and share that
-        // budget. Result order is non-deterministic with
-        // `buffer_unordered`; the downstream consumers
-        // (`batched_get` and the seen-set dedupe) are both
-        // order-agnostic.
+        // now also fans out within a mailbox (probe + parallel page
+        // fetch via `calculateTotal`), so the same `n` budget applies
+        // at two levels: up to `n` mailboxes in flight, each issuing
+        // up to `n` concurrent page requests. The product oversubscribes
+        // the server's `maxConcurrentRequests` in the worst case; in
+        // practice the inner fan-out is short-lived (a mailbox's page
+        // count is small relative to `n` for typical accounts) and
+        // jmap-client's transient-error retries cover the rest.
+        // Result order is non-deterministic with `buffer_unordered`;
+        // the downstream consumers (`batched_get` and the seen-set
+        // dedupe) are both order-agnostic.
         let n = limits::concurrent_requests(&self.client, self.config.sync.download_concurrency);
         let client = &self.client;
         let futures = mailboxes
             .iter()
             .map(|(mailbox_id, folder_name)| async move {
-                jmap_email::query_mailbox(client, mailbox_id.as_ref(), folder_name).await
+                jmap_email::query_mailbox(client, mailbox_id.as_ref(), folder_name, n).await
             });
         let mut stream = stream::iter(futures).buffer_unordered(n);
 

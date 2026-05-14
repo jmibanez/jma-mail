@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use futures_util::stream::{self, StreamExt};
 use jmap_client::Error as JmapError;
 use jmap_client::client::Client;
 use jmap_client::core::error::MethodErrorType;
@@ -88,20 +89,90 @@ pub async fn get_by_ids(client: &Client, ids: &[JmapEmailId]) -> Result<Vec<Emai
     .await
 }
 
-/// Query all email IDs in a mailbox, paginated. `folder_name` is used
-/// only for log readability — the JMAP request identifies the mailbox
-/// by `mailbox_id`.
+/// One `Email/query` round-trip at a specific offset. `with_total`
+/// asks the server to populate `total` in the response so the caller
+/// can plan the remaining pages up front; subsequent pages set it
+/// `false` to spare the server the count.
+async fn query_page(
+    client: &Client,
+    mailbox_id: &str,
+    folder_name: &str,
+    position: usize,
+    with_total: bool,
+) -> Result<(Vec<JmapEmailId>, Option<usize>)> {
+    let span = tracing::info_span!(
+        target: crate::profile::TARGET_PHASE,
+        "fetch.query_page",
+        folder = %folder_name,
+        position = position as u64,
+        count = Empty,
+    );
+    async move {
+        let (ids, total) = with_retry("Email/query", || async {
+            let mut request = client.build();
+            let query = request
+                .query_email()
+                .account_id(client.default_account_id());
+            query
+                .filter(email::query::Filter::in_mailbox(mailbox_id))
+                .position(position as i32)
+                .limit(QUERY_PAGE_SIZE);
+            if with_total {
+                query.calculate_total(true);
+            }
+
+            let response = request.send().await.context("Failed to query emails")?;
+
+            let query_response = response
+                .unwrap_method_responses()
+                .pop()
+                .context("No response for email query")?;
+
+            let result = query_response
+                .unwrap_query_email()
+                .context("Failed to parse email query response")?;
+
+            let ids: Vec<JmapEmailId> = result
+                .ids()
+                .iter()
+                .map(|id| JmapEmailId::from(id.as_str()))
+                .collect();
+            let total = result.total();
+            Ok((ids, total))
+        })
+        .await?;
+
+        tracing::Span::current().record("count", ids.len() as u64);
+        Ok((ids, total))
+    }
+    .instrument(span)
+    .await
+}
+
+/// Query all email IDs in a mailbox. `folder_name` is used only for
+/// log readability -- the JMAP request identifies the mailbox by
+/// `mailbox_id`. `concurrency` caps the within-mailbox page fan-out
+/// when the server reports `total` on the probe page; the caller is
+/// responsible for combining this with its own cross-mailbox budget.
+///
+/// The first page is issued with `calculateTotal: true`. If the
+/// server returns a total, the remaining page positions are computed
+/// up front and fanned out through `buffer_unordered`. If the server
+/// omits `total` (RFC 8620 section 5.5 makes it optional), the rest of the
+/// pages are walked serially using the empty-page end-of-list
+/// heuristic.
 pub async fn query_mailbox(
     client: &Client,
     mailbox_id: &str,
     folder_name: &str,
+    concurrency: usize,
 ) -> Result<Vec<JmapEmailId>> {
-    // Per-folder phase span so the profile layer can attribute query
-    // wall-clock back to a specific folder. With cross-folder fan-out
-    // in `initial_remote_state` these spans overlap in real time --
-    // each span's wall_ms is that folder's start-to-finish duration,
-    // not its share of CPU; the aggregate JSON shows which folder
-    // dominates the parallel window.
+    // Per-folder phase span so the profile layer can attribute total
+    // query wall-clock back to a specific folder. With cross-folder
+    // fan-out in `initial_remote_state` these spans overlap in real
+    // time -- each span's wall_ms is that folder's start-to-finish
+    // duration, not its share of CPU. The per-page `fetch.query_page`
+    // spans nested below cover individual round-trips.
     let span = tracing::info_span!(
         target: crate::profile::TARGET_PHASE,
         "fetch.query_folder",
@@ -109,59 +180,49 @@ pub async fn query_mailbox(
         count = Empty,
     );
     async move {
-        let mut all_ids = Vec::new();
-        let mut position: usize = 0;
+        let (first_ids, total) = query_page(client, mailbox_id, folder_name, 0, true).await?;
+        let first_count = first_ids.len();
+        let mut all_ids = first_ids;
 
-        loop {
-            let ids: Vec<JmapEmailId> = with_retry("Email/query", || async {
-                let mut request = client.build();
-                let query = request
-                    .query_email()
-                    .account_id(client.default_account_id());
-                query
-                    .filter(email::query::Filter::in_mailbox(mailbox_id))
-                    .position(position as i32)
-                    .limit(QUERY_PAGE_SIZE);
-
-                let response = request.send().await.context("Failed to query emails")?;
-
-                let query_response = response
-                    .unwrap_method_responses()
-                    .pop()
-                    .context("No response for email query")?;
-
-                let result = query_response
-                    .unwrap_query_email()
-                    .context("Failed to parse email query response")?;
-
-                Ok(result
-                    .ids()
-                    .iter()
-                    .map(|id| JmapEmailId::from(id.as_str()))
-                    .collect())
-            })
-            .await?;
-            let count = ids.len();
-            all_ids.extend(ids);
-
-            debug!(
-                "Queried {} page at position {}: got {} emails (total so far: {})",
-                folder_name,
-                position,
-                count,
-                all_ids.len()
-            );
-
-            if count == 0 {
-                break;
+        match total {
+            Some(total) if total > all_ids.len() => {
+                // Total known: build the remaining page positions and
+                // run them through `buffer_unordered`. The server may
+                // grow or shrink the result set between pages (new
+                // mail, deletions); short or empty pages near the end
+                // are harmless because callers dedupe by id and we
+                // never assume `total` is the final count.
+                let positions: Vec<usize> =
+                    (all_ids.len()..total).step_by(QUERY_PAGE_SIZE).collect();
+                let futures = positions.into_iter().map(|pos| async move {
+                    query_page(client, mailbox_id, folder_name, pos, false).await
+                });
+                let mut stream = stream::iter(futures).buffer_unordered(concurrency.max(1));
+                while let Some(result) = stream.next().await {
+                    let (ids, _) = result?;
+                    all_ids.extend(ids);
+                }
             }
-
-            // JMAP allows the server to return any count up to the
-            // requested limit (there is no maxObjectsInQuery cap to
-            // negotiate against), so the cursor must advance by what
-            // was actually returned. The empty-page break above is
-            // the only end-of-list signal under that contract.
-            position += count;
+            Some(_) => {
+                // First page already covered the full set.
+            }
+            None => {
+                // Server didn't report total. Fall back to serial
+                // pagination: advance by the actual returned count
+                // and stop on the first empty page (the only
+                // end-of-list signal we have without `total`).
+                let mut position = first_count;
+                loop {
+                    let (ids, _) =
+                        query_page(client, mailbox_id, folder_name, position, false).await?;
+                    let count = ids.len();
+                    all_ids.extend(ids);
+                    if count == 0 {
+                        break;
+                    }
+                    position += count;
+                }
+            }
         }
 
         info!(
@@ -169,6 +230,13 @@ pub async fn query_mailbox(
             all_ids.len(),
             folder_name,
             mailbox_id
+        );
+        debug!(
+            "Queried {}: first_page={}, total_reported={:?}, final={}",
+            folder_name,
+            first_count,
+            total,
+            all_ids.len()
         );
         tracing::Span::current().record("count", all_ids.len() as u64);
         Ok(all_ids)
