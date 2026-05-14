@@ -328,6 +328,7 @@ run_watch() {
 # between BEFORE and AFTER.
 bench_run_round() {
     local suffix="$1"
+    prewarm_server "$BEFORE_BIN" "$suffix"
     run_watch "before-watch${suffix}" "$BEFORE_BIN"
     run_watch "after-watch${suffix}"  "$AFTER_BIN"
 }

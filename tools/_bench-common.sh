@@ -318,6 +318,41 @@ aggregate_cell() {
         }'
 }
 
+# Untimed pre-warm pull against the testcontainer server so the
+# first measured *-initial cell of the round doesn't bear the full
+# cost of warming the server's OS page cache, RocksDB block cache,
+# and Stalwart's in-process caches. Without this the BEFORE-initial
+# cell pays that warming cost and AFTER-initial rides on its back --
+# a constant-sign bias that always favors AFTER and doesn't average
+# out across rounds (only round 1's first initial cell is ever
+# truly cold; every subsequent initial cell sees a warmer baseline).
+#
+# Real-account mode is a no-op: the live server's caching is opaque
+# and outside the script's control.
+#
+# Takes the binary to run the throwaway pull with (either BEFORE or
+# AFTER works since both see the same server) and the round suffix
+# for log naming. State is reset at the start of the function so the
+# pull works from a clean DB+maildir baseline; the bench-script round
+# body is expected to reset_state again afterwards before its first
+# measured cell. Warmup output lands at prewarm<suffix>.txt in
+# $BENCH_DIR for debugging.
+prewarm_server() {
+    (( TESTCONTAINER_MODE )) || return 0
+    local binary="$1"
+    local suffix="$2"
+    local warmlog="prewarm${suffix}.txt"
+    echo "=== prewarm${suffix} (untimed, warms server caches) ==="
+    reset_state
+    if "$binary" -c config.toml pull > "$warmlog" 2>&1; then
+        echo "  done -- see ${BENCH_DIR}/${warmlog}"
+    else
+        echo "  WARN: prewarm pull failed; proceeding anyway -- see ${BENCH_DIR}/${warmlog}" >&2
+        tail -5 "$warmlog" >&2 || true
+    fi
+    echo
+}
+
 # Sum the Energy Impact column of every powermetrics task row whose
 # first field looks like our jma binary. Used by bench-power and
 # bench-power-watch; declared in common so a future format change

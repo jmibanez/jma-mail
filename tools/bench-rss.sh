@@ -224,6 +224,7 @@ run() {
 # variance is what's left after that pairing.
 bench_run_round() {
     local suffix="$1"
+    prewarm_server "$BEFORE_BIN" "$suffix"
     reset_state
     run "before-initial${suffix}" "$BEFORE_BIN"
     run "before-steady${suffix}"  "$BEFORE_BIN"
