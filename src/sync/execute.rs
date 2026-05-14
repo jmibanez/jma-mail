@@ -31,6 +31,25 @@ const VERBOSE_DOWNLOAD_THRESHOLD: usize = 100;
 /// initial sync without flooding the log.
 const DOWNLOAD_PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Per-cycle download progress state. Shared between batches inside
+/// `download_messages` so the heartbeat clock and verbose-mode
+/// decision carry over the rate-limit-driven concurrency halving.
+struct DownloadProgress {
+    downloaded: usize,
+    total: usize,
+    verbose_per_message: bool,
+    last_progress: Instant,
+}
+
+/// Outcome of one parallel download batch. Drives the retry-with-
+/// halved-concurrency loop in `download_messages`: `to_retry` is
+/// whatever the batch couldn't land, and `rate_limited` decides
+/// whether to halve before the next pass.
+struct DownloadBatchOutcome {
+    to_retry: Vec<SyncAction>,
+    rate_limited: bool,
+}
+
 /// Bundles the immutable per-cycle state every execute helper threads
 /// through (client, DB connection, config, maildir root, account id).
 /// The struct lets us add another shared field without touching every
@@ -120,7 +139,7 @@ impl<'a> Executor<'a> {
         }
 
         adopt_messages(self.conn, unconditional_adopts)?;
-        let downloaded = self.run_downloads(downloads).await?;
+        let downloaded = self.download_messages(downloads).await?;
         let local_flag_updates = self.update_local_flags(local_flags)?;
         let local_moves_count = self.move_local_messages(local_moves)?;
         let local_deletes_count = self.delete_local_messages(local_deletes)?;
@@ -315,76 +334,30 @@ impl<'a> Executor<'a> {
                 self.config.sync.upload_concurrency, n
             );
         }
-        let pending = actions;
-
-        // Build one future per upload. Each future owns its UploadJob
-        // (via clone from the borrowed action), so the async block
-        // doesn't keep `pending` borrowed across awaits. The `i` from
-        // `enumerate` flows through into each completion so the post-
-        // stream DB pass can correlate with `pending[i]` even though
-        // `buffer_unordered` returns out of order. Same shape as
-        // `run_downloads`.
-        let client = self.client;
-        let futures = pending.iter().enumerate().map(|(i, action)| {
-            let SyncAction::UploadMessage {
-                id,
-                maildir_folder,
-                file_path,
-                mailbox_id,
-                flags,
-            } = action
-            else {
-                unreachable!("non-upload in uploads bucket");
-            };
-            let job = UploadJob {
-                id: id.clone(),
-                maildir_folder: maildir_folder.clone(),
-                file_path: file_path.clone(),
-                mailbox_id: mailbox_id.clone(),
-                flags: flags.clone(),
-            };
-            async move { (i, upload_one(client, job).await) }
-        });
-
-        // Errors don't abort the stream: we let in-flight futures drain
-        // so any work already on the wire either succeeds or fails on
-        // its own merits.
-        let mut stream = stream::iter(futures).buffer_unordered(n);
-
-        let mut succeeded: Vec<(usize, JmapEmailId)> = Vec::new();
-        let mut hard_error: Option<anyhow::Error> = None;
-        let mut chain_pairs: Vec<(String, String)> = Vec::new();
-        let mut chain_intact = true;
-
-        while let Some((i, result)) = stream.next().await {
-            match result {
-                Ok(UploadOutcome::Uploaded {
-                    email_id,
-                    chain_old,
-                    chain_new,
-                }) => {
-                    succeeded.push((i, email_id));
-                    match (chain_old, chain_new) {
-                        (Some(o), Some(n)) => chain_pairs.push((o, n)),
-                        _ => chain_intact = false,
-                    }
-                }
-                Ok(UploadOutcome::Skipped) => {}
-                Err(e) => {
-                    if hard_error.is_none() {
-                        hard_error = Some(e);
-                    }
-                }
-            }
+        let outcome = run_upload_stream(self.client, &actions, n).await;
+        self.commit_uploaded_messages(&actions, &outcome.succeeded)?;
+        let uploaded = outcome.succeeded.len();
+        if let Some(e) = outcome.hard_error {
+            return Err(e);
         }
-        drop(stream);
+        Ok(UploadResults {
+            chain_pairs: outcome.chain_pairs,
+            chain_intact: outcome.chain_intact,
+            uploaded,
+        })
+    }
 
-        // DB writes happen serially after the stream drains: rusqlite's
-        // Connection isn't Send, so it can't cross await points inside
-        // the parallel futures. Per-iteration transactions pair the
-        // message_map and local_state upserts so a mid-loop crash can't
-        // leave a row in only one table.
-        for (i, jmap_email_id) in &succeeded {
+    /// Mirror each successful upload into `message_map` + `local_state`.
+    /// rusqlite's Connection isn't Send, so this runs serially after
+    /// the parallel stream drains -- the DB writes can't sit inside
+    /// the futures. Per-iteration transactions pair the two upserts
+    /// so a mid-loop crash can't leave a row in only one table.
+    fn commit_uploaded_messages(
+        &self,
+        pending: &[SyncAction],
+        succeeded: &[(usize, JmapEmailId)],
+    ) -> Result<()> {
+        for (i, jmap_email_id) in succeeded {
             let SyncAction::UploadMessage {
                 id,
                 maildir_folder,
@@ -420,16 +393,7 @@ impl<'a> Executor<'a> {
             };
             info!("Uploaded local message {} -> {}", id.maildir_id, target);
         }
-
-        let uploaded = succeeded.len();
-        if let Some(e) = hard_error {
-            return Err(e);
-        }
-        Ok(UploadResults {
-            chain_pairs,
-            chain_intact,
-            uploaded,
-        })
+        Ok(())
     }
 
     /// Collapse all remote-side mutations onto a single Email/set call.
@@ -591,7 +555,7 @@ impl<'a> Executor<'a> {
 
     /// Run all DownloadMessage actions concurrently with the rate-limit
     /// halving behavior the old pull path had.
-    async fn run_downloads(&self, actions: Vec<SyncAction>) -> Result<usize> {
+    async fn download_messages(&self, actions: Vec<SyncAction>) -> Result<usize> {
         if actions.is_empty() {
             return Ok(0);
         }
@@ -623,143 +587,23 @@ impl<'a> Executor<'a> {
         // periodic heartbeat instead. `last_progress` is reset on each
         // heartbeat (and only advances when a store actually committed),
         // so a rate-limited stall doesn't spam an unchanging percentage.
-        let verbose_per_message = total <= VERBOSE_DOWNLOAD_THRESHOLD;
-        let mut last_progress = Instant::now();
+        let mut progress = DownloadProgress {
+            downloaded: 0,
+            total,
+            verbose_per_message: total <= VERBOSE_DOWNLOAD_THRESHOLD,
+            last_progress: Instant::now(),
+        };
 
-        let mut downloaded = 0usize;
         let mut pending = actions;
-        let client = self.client;
-
         while !pending.is_empty() {
             let n = concurrency.max(1);
             let batch = std::mem::take(&mut pending);
-            let futures = batch.into_iter().map(|action| {
-                let blob_id = match &action {
-                    SyncAction::DownloadMessage { jmap_blob_id, .. } => jmap_blob_id.clone(),
-                    _ => unreachable!("non-download in downloads bucket"),
-                };
-                async move {
-                    let res = jmap_email::download_blob(client, &blob_id).await;
-                    (action, res)
-                }
-            });
-            let mut stream = stream::iter(futures).buffer_unordered(n);
-
-            let mut rate_limited = false;
-            let mut hard_error: Option<anyhow::Error> = None;
-            let mut to_retry: Vec<SyncAction> = Vec::new();
-
-            // Store + log each blob as it lands, not after the whole
-            // stream drains, so per-message progress flows during the
-            // wait. Connection isn't Send, but the stream consumer
-            // runs on the spawning task -- the DB writes happen here,
-            // not inside the parallel download futures.
-            while let Some((action, result)) = stream.next().await {
-                match result {
-                    Ok(blob) => {
-                        let SyncAction::DownloadMessage {
-                            id,
-                            jmap_blob_id,
-                            jmap_thread_id,
-                            mailbox_id,
-                            maildir_folder,
-                            keywords,
-                        } = &action
-                        else {
-                            unreachable!("non-download in downloads bucket");
-                        };
-                        let flags = keywords_to_flags(keywords);
-                        let maildir_path = self.maildir_root.join(maildir_folder);
-                        let maildir = store::ensure_maildir(&maildir_path)?;
-                        let mid = store::store_message(&maildir, &blob, &flags)?;
-                        if let Some(cache) = &self.self_writes {
-                            // Suppress the fsevents echo of this delivery
-                            // and -- for new/ deliveries -- the same-flag
-                            // cur/ promotion an MUA may rename to next.
-                            // A flag-changing promotion (e.g. MUA adds S
-                            // on read) won't match the predicted path, so
-                            // it falls through to a real classify cycle.
-                            //
-                            // The flag string used here must byte-match
-                            // what the maildir crate writes. `keywords_to_flags`
-                            // already returns canonical (sorted, deduped)
-                            // output and the maildir crate writes it
-                            // verbatim into the suffix; if either side
-                            // ever diverges from canonical-sorted, this
-                            // prediction silently misses every delivery.
-                            let subdir = if flags.contains('S') { "cur" } else { "new" };
-                            let suffix = format!("{}:2,{}", mid.as_ref(), flags);
-                            let delivered = maildir_path.join(subdir).join(&suffix);
-                            let mut paths = vec![delivered];
-                            if subdir == "new" {
-                                paths.push(maildir_path.join("cur").join(&suffix));
-                            }
-                            cache.record(paths);
-                        }
-                        let keywords_json = serde_json::to_string(keywords)?;
-                        // Per-iteration transaction: pair the message_map and
-                        // local_state upserts so the just-stored maildir file
-                        // doesn't end up bound in only one of the two tables.
-                        let txn = self.conn.unchecked_transaction()?;
-                        queries::upsert_message(
-                            &txn,
-                            &MessageRecord {
-                                jmap_email_id: id.jmap_email_id.clone(),
-                                jmap_blob_id: Some(jmap_blob_id.clone()),
-                                jmap_thread_id: Some(jmap_thread_id.clone()),
-                                mailbox_id: mailbox_id.clone(),
-                                maildir_id: Some(mid.clone()),
-                                maildir_folder: Some(maildir_folder.clone()),
-                                message_id: id.message_id.clone(),
-                                flags: flags.clone(),
-                                jmap_keywords: keywords_json,
-                            },
-                        )?;
-                        queries::upsert_local_state(&txn, &mid, maildir_folder, &flags, None)?;
-                        txn.commit()?;
-                        downloaded += 1;
-                        if verbose_per_message {
-                            info!("Downloaded new email {} -> {}/{}", id, maildir_folder, mid);
-                        } else {
-                            debug!("Downloaded new email {} -> {}/{}", id, maildir_folder, mid);
-                            if last_progress.elapsed() >= DOWNLOAD_PROGRESS_INTERVAL {
-                                let pct = (downloaded * 100) / total;
-                                crate::notify!(
-                                    "Downloaded {}/{} ({}%) so far",
-                                    downloaded,
-                                    total,
-                                    pct
-                                );
-                                last_progress = Instant::now();
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        if is_transient_error(&e) {
-                            rate_limited = true;
-                            if let SyncAction::DownloadMessage { id, .. } = &action {
-                                debug!("Rate-limited downloading email {}: {}", id, e);
-                            }
-                            to_retry.push(action);
-                        } else if hard_error.is_none() {
-                            hard_error = Some(e);
-                        }
-                    }
-                }
-            }
-            drop(stream);
-
-            if let Some(e) = hard_error {
-                return Err(e);
-            }
-
-            pending = to_retry;
-
+            let outcome = self.download_batch(batch, n, &mut progress).await?;
+            pending = outcome.to_retry;
             if pending.is_empty() {
                 break;
             }
-
-            if rate_limited {
+            if outcome.rate_limited {
                 let new = (n / 2).max(1);
                 if new < n {
                     warn!(
@@ -782,7 +626,153 @@ impl<'a> Executor<'a> {
             }
         }
 
-        Ok(downloaded)
+        Ok(progress.downloaded)
+    }
+
+    /// Run one parallel download batch. Returns the actions that hit
+    /// a transient error and should be retried, plus a flag the caller
+    /// uses to decide whether to halve concurrency before the retry
+    /// pass. Hard errors abort the batch immediately.
+    ///
+    /// Connection isn't Send, so DB writes happen inline on the
+    /// spawning task as each blob lands -- not inside the parallel
+    /// futures. Per-message progress thus flows during the wait
+    /// instead of arriving in one burst after the stream drains.
+    async fn download_batch(
+        &self,
+        batch: Vec<SyncAction>,
+        concurrency: usize,
+        progress: &mut DownloadProgress,
+    ) -> Result<DownloadBatchOutcome> {
+        let client = self.client;
+        let futures = batch.into_iter().map(|action| {
+            let blob_id = match &action {
+                SyncAction::DownloadMessage { jmap_blob_id, .. } => jmap_blob_id.clone(),
+                _ => unreachable!("non-download in downloads bucket"),
+            };
+            async move {
+                let res = jmap_email::download_blob(client, &blob_id).await;
+                (action, res)
+            }
+        });
+        let mut stream = stream::iter(futures).buffer_unordered(concurrency);
+
+        let mut rate_limited = false;
+        let mut hard_error: Option<anyhow::Error> = None;
+        let mut to_retry: Vec<SyncAction> = Vec::new();
+
+        while let Some((action, result)) = stream.next().await {
+            match result {
+                Ok(blob) => {
+                    self.store_downloaded_message(&action, &blob, progress)?;
+                }
+                Err(e) => {
+                    if is_transient_error(&e) {
+                        rate_limited = true;
+                        if let SyncAction::DownloadMessage { id, .. } = &action {
+                            debug!("Rate-limited downloading email {}: {}", id, e);
+                        }
+                        to_retry.push(action);
+                    } else if hard_error.is_none() {
+                        hard_error = Some(e);
+                    }
+                }
+            }
+        }
+        if let Some(e) = hard_error {
+            return Err(e);
+        }
+        Ok(DownloadBatchOutcome {
+            to_retry,
+            rate_limited,
+        })
+    }
+
+    /// Persist one downloaded blob to disk, record it in the DB, and
+    /// advance progress accounting. Pulled out of `download_batch`
+    /// so the stream-drain loop only owns the error-classification
+    /// control flow; this fn owns the success-path side effects.
+    fn store_downloaded_message(
+        &self,
+        action: &SyncAction,
+        blob: &[u8],
+        progress: &mut DownloadProgress,
+    ) -> Result<()> {
+        let SyncAction::DownloadMessage {
+            id,
+            jmap_blob_id,
+            jmap_thread_id,
+            mailbox_id,
+            maildir_folder,
+            keywords,
+        } = action
+        else {
+            unreachable!("non-download in downloads bucket");
+        };
+        let flags = keywords_to_flags(keywords);
+        let maildir_path = self.maildir_root.join(maildir_folder);
+        let maildir = store::ensure_maildir(&maildir_path)?;
+        let mid = store::store_message(&maildir, blob, &flags)?;
+        if let Some(cache) = &self.self_writes {
+            // Suppress the fsevents echo of this delivery and -- for
+            // new/ deliveries -- the same-flag cur/ promotion an MUA
+            // may rename to next. A flag-changing promotion (e.g.
+            // MUA adds S on read) won't match the predicted path, so
+            // it falls through to a real classify cycle.
+            //
+            // The flag string used here must byte-match what the
+            // maildir crate writes. `keywords_to_flags` already
+            // returns canonical (sorted, deduped) output and the
+            // maildir crate writes it verbatim into the suffix; if
+            // either side ever diverges from canonical-sorted, this
+            // prediction silently misses every delivery.
+            let subdir = if flags.contains('S') { "cur" } else { "new" };
+            let suffix = format!("{}:2,{}", mid.as_ref(), flags);
+            let delivered = maildir_path.join(subdir).join(&suffix);
+            let mut paths = vec![delivered];
+            if subdir == "new" {
+                paths.push(maildir_path.join("cur").join(&suffix));
+            }
+            cache.record(paths);
+        }
+        let keywords_json = serde_json::to_string(keywords)?;
+        // Per-iteration transaction: pair the message_map and
+        // local_state upserts so the just-stored maildir file
+        // doesn't end up bound in only one of the two tables.
+        let txn = self.conn.unchecked_transaction()?;
+        queries::upsert_message(
+            &txn,
+            &MessageRecord {
+                jmap_email_id: id.jmap_email_id.clone(),
+                jmap_blob_id: Some(jmap_blob_id.clone()),
+                jmap_thread_id: Some(jmap_thread_id.clone()),
+                mailbox_id: mailbox_id.clone(),
+                maildir_id: Some(mid.clone()),
+                maildir_folder: Some(maildir_folder.clone()),
+                message_id: id.message_id.clone(),
+                flags: flags.clone(),
+                jmap_keywords: keywords_json,
+            },
+        )?;
+        queries::upsert_local_state(&txn, &mid, maildir_folder, &flags, None)?;
+        txn.commit()?;
+        progress.downloaded += 1;
+        if progress.verbose_per_message {
+            info!("Downloaded new email {} -> {}/{}", id, maildir_folder, mid);
+        } else {
+            debug!("Downloaded new email {} -> {}/{}", id, maildir_folder, mid);
+            if progress.last_progress.elapsed() >= DOWNLOAD_PROGRESS_INTERVAL {
+                let pct = (progress.downloaded * 100) / progress.total;
+                crate::notify!(
+                    "Downloaded {}/{} ({}%) so far",
+                    progress.downloaded,
+                    progress.total,
+                    pct
+                );
+                progress.last_progress = Instant::now();
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1081,6 +1071,93 @@ struct UploadResults {
     /// count matches what actually landed remotely rather than what
     /// the executor attempted.
     uploaded: usize,
+}
+
+/// Outcome of `run_upload_stream`: per-future result aggregation
+/// surfaced to the caller for the post-stream DB commit and the
+/// cycle-level chain ratchet.
+///
+/// `succeeded` carries `(index, JmapEmailId)` pairs; the index
+/// points back into the input slice so `commit_uploaded_messages`
+/// can recover full upload context (folder, mailbox, flags) for
+/// each successful import even though `buffer_unordered` returns
+/// out of order.
+struct UploadStreamOutcome {
+    succeeded: Vec<(usize, JmapEmailId)>,
+    chain_pairs: Vec<(String, String)>,
+    chain_intact: bool,
+    /// First hard error any future returned. Surfaced after the
+    /// stream drains so all in-flight uploads still get a chance to
+    /// land before the caller propagates the failure.
+    hard_error: Option<anyhow::Error>,
+}
+
+/// Drive `actions` through `upload_one` in parallel with `concurrency`
+/// in-flight. Errors don't abort the stream -- in-flight futures
+/// drain and the first hard error is reported back via the outcome's
+/// `hard_error` field. Per-future `enumerate` indices flow through
+/// each completion so the post-stream DB commit can correlate
+/// successes with their originating action even though the stream
+/// returns out of order.
+async fn run_upload_stream(
+    client: &Client,
+    actions: &[SyncAction],
+    concurrency: usize,
+) -> UploadStreamOutcome {
+    let futures = actions.iter().enumerate().map(|(i, action)| {
+        let SyncAction::UploadMessage {
+            id,
+            maildir_folder,
+            file_path,
+            mailbox_id,
+            flags,
+        } = action
+        else {
+            unreachable!("non-upload in uploads bucket");
+        };
+        let job = UploadJob {
+            id: id.clone(),
+            maildir_folder: maildir_folder.clone(),
+            file_path: file_path.clone(),
+            mailbox_id: mailbox_id.clone(),
+            flags: flags.clone(),
+        };
+        async move { (i, upload_one(client, job).await) }
+    });
+    let mut stream = stream::iter(futures).buffer_unordered(concurrency);
+
+    let mut succeeded: Vec<(usize, JmapEmailId)> = Vec::new();
+    let mut chain_pairs: Vec<(String, String)> = Vec::new();
+    let mut chain_intact = true;
+    let mut hard_error: Option<anyhow::Error> = None;
+
+    while let Some((i, result)) = stream.next().await {
+        match result {
+            Ok(UploadOutcome::Uploaded {
+                email_id,
+                chain_old,
+                chain_new,
+            }) => {
+                succeeded.push((i, email_id));
+                match (chain_old, chain_new) {
+                    (Some(o), Some(n)) => chain_pairs.push((o, n)),
+                    _ => chain_intact = false,
+                }
+            }
+            Ok(UploadOutcome::Skipped) => {}
+            Err(e) => {
+                if hard_error.is_none() {
+                    hard_error = Some(e);
+                }
+            }
+        }
+    }
+    UploadStreamOutcome {
+        succeeded,
+        chain_pairs,
+        chain_intact,
+        hard_error,
+    }
 }
 
 /// One upload's worth of work: read + import. Sync `std::fs::read`
