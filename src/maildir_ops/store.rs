@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
 use maildir::Maildir;
 use std::path::Path;
-use tracing::debug;
+use tracing::{Level, debug, event};
 
 use crate::ids::MaildirId;
+use crate::profile::TARGET_FILE_OP;
 
 /// Ensure a maildir folder exists with cur/new/tmp subdirectories.
 pub fn ensure_maildir(path: &Path) -> Result<Maildir> {
@@ -47,6 +48,7 @@ pub fn store_message(maildir: &Maildir, data: &[u8], flags: &str) -> Result<Mail
             .context("Failed to store message in maildir new/")?;
         (id, "new")
     };
+    event!(target: TARGET_FILE_OP, Level::TRACE, op = "store");
     debug!(
         "Stored message {} with flags '{}' in {}/",
         id, flags, subdir
@@ -59,6 +61,7 @@ pub fn delete_message(maildir: &Maildir, id: &str) -> Result<()> {
     maildir
         .delete(id)
         .with_context(|| format!("Failed to delete message {}", id))?;
+    event!(target: TARGET_FILE_OP, Level::TRACE, op = "delete");
     debug!("Deleted message {}", id);
     Ok(())
 }
@@ -73,6 +76,7 @@ pub fn set_flags(maildir: &Maildir, id: &str, flags: &str) -> Result<()> {
     maildir
         .set_flags(id, flags)
         .with_context(|| format!("Failed to set flags on message {}", id))?;
+    event!(target: TARGET_FILE_OP, Level::TRACE, op = "set_flags");
     debug!("Set flags '{}' on message {}", flags, id);
     Ok(())
 }
@@ -150,6 +154,7 @@ pub fn promote_to_cur_with_flags(maildir: &Maildir, id: &str, flags: &str) -> Re
             dest.display()
         )
     })?;
+    event!(target: TARGET_FILE_OP, Level::TRACE, op = "promote");
     debug!(
         "Promoted message {} from new/ to cur/ with flags '{}'",
         id, flags
@@ -161,6 +166,7 @@ pub fn promote_to_cur_with_flags(maildir: &Maildir, id: &str, flags: &str) -> Re
 pub fn move_message(from: &Maildir, to: &Maildir, id: &str) -> Result<()> {
     from.move_to(id, to)
         .with_context(|| format!("Failed to move message {}", id))?;
+    event!(target: TARGET_FILE_OP, Level::TRACE, op = "move");
     debug!("Moved message {} to {:?}", id, to.path());
     Ok(())
 }

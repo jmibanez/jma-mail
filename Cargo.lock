@@ -1888,6 +1888,7 @@ dependencies = [
  "include_dir",
  "jmap-client",
  "keyring-core",
+ "libc",
  "maildir",
  "mailparse 0.14.1",
  "notify",

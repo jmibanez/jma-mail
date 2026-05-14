@@ -549,7 +549,7 @@ async fn daemon_waits_for_session_recovery_at_startup() {
     // daemon future.
     let daemon_future = async {
         let conn = db::open_or_recreate(&db_path).unwrap();
-        let _ = daemon::runner::run(&conn, &config).await;
+        let _ = daemon::runner::run(&conn, &config, None).await;
     };
 
     let driver_future = async {
@@ -627,7 +627,7 @@ async fn daemon_processes_event_after_jmap_failure_window() {
 
     let daemon_future = async {
         let conn = db::open_or_recreate(&db_path).unwrap();
-        let _ = daemon::runner::run(&conn, &config).await;
+        let _ = daemon::runner::run(&conn, &config, None).await;
     };
 
     let driver_future = async {

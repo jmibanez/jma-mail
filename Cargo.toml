@@ -104,6 +104,12 @@ rpassword = "7"
 # Regex for pattern-based maildir rename rules
 regex = "1.12"
 
+# `getrusage` for per-phase peak-RSS sampling in the profile layer.
+# Already pulled in transitively (e.g. via tokio); declared directly
+# so `profile::rss_sampler` can call `libc::getrusage` without
+# routing through a re-export.
+libc = "0.2"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { version = "1", features = ["keychain"] }
 

@@ -313,9 +313,21 @@ run() {
     local label="$1"
     local binary="$2"
     local logfile="log-${label}.txt"
+    local profile_json="profile-${label}.json"
+
+    # Pass --profile-json only when the binary advertises it. BEFORE
+    # commits predating this flag would error out on an unknown arg,
+    # so probe `--help` once and fall through silently when the flag
+    # is missing. The JSON file is a side-channel; the bench summary
+    # below still reads RSS/wall-clock from `time -l` regardless.
+    local profile_args=()
+    if "$binary" --help 2>&1 | grep -q -- '--profile-json'; then
+        rm -f "$profile_json"
+        profile_args=(--profile-json "$profile_json")
+    fi
 
     echo "=== $label ==="
-    if /usr/bin/time -l "$binary" -c config.toml "$SUBCMD" > "$logfile" 2>&1; then
+    if /usr/bin/time -l "$binary" -c config.toml "${profile_args[@]}" "$SUBCMD" > "$logfile" 2>&1; then
         local rss real summary
         rss=$(awk '/maximum resident set size/ {print $1}' "$logfile")
         real=$(awk '/real/ {print $1; exit}' "$logfile")
@@ -326,6 +338,9 @@ run() {
         echo "  peak RSS:    ${rss} bytes (${rss_mb} MB)"
         echo "  wall clock:  ${real}s"
         echo "  outcome:     ${summary}"
+        if [[ -s "$profile_json" ]]; then
+            echo "  profile:     ${BENCH_DIR}/${profile_json}"
+        fi
     else
         echo "  FAILED -- see ${BENCH_DIR}/${logfile}"
         tail -10 "$logfile"

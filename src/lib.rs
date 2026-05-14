@@ -5,6 +5,7 @@ pub mod daemon;
 pub mod ids;
 pub mod jmap;
 pub mod maildir_ops;
+pub mod profile;
 pub mod state;
 pub mod sync;
 pub mod ui;

@@ -4,6 +4,7 @@ use jma_mail::maildir_ops::layout::FolderLayoutDefinition;
 use std::collections::BTreeSet;
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::prelude::*;
 
 use jma_mail::cli::{AuthAction, Cli, Command};
 use jma_mail::config::{self, Config};
@@ -11,6 +12,7 @@ use jma_mail::daemon;
 use jma_mail::jmap::retry::{self, RetryConfig};
 use jma_mail::jmap::session;
 use jma_mail::maildir_ops;
+use jma_mail::profile::{self, ProfileSink};
 use jma_mail::state;
 use jma_mail::sync::engine::SyncEngine;
 
@@ -38,27 +40,78 @@ async fn main() -> Result<()> {
     // stays parseable when the user redirects one and not the other.
     // tracing_subscriber's default writer is stdout, hence the
     // explicit override.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter)),
-        )
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter));
+    let fmt_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
-        .init();
+        .with_filter(env_filter);
+
+    // Build the optional profile layer + sink up front. The layer
+    // installs alongside fmt_layer; the sink rides through the
+    // command dispatch so end-of-run / per-cycle flushes share one
+    // place to render. `Option<L>` implements `Layer<S>` so the
+    // `.with(...)` arm is identical whether profiling is on or off.
+    let profile_sink: Option<ProfileSink> = if cli.profile || cli.profile_json.is_some() {
+        let (layer, handle) = profile::build_layer();
+        // Targets filter pins the profile layer to *only* our
+        // instrumentation targets, at any level. Two reasons: the
+        // visitor cost stays off unrelated events, and our profile
+        // spans/events fire even when the fmt layer's filter would
+        // otherwise drop them at the default verbosity.
+        let target_filter = tracing_subscriber::filter::Targets::new()
+            .with_target(profile::TARGET_PHASE, tracing::Level::TRACE)
+            .with_target(profile::TARGET_BLOB, tracing::Level::TRACE)
+            .with_target(profile::TARGET_FILE_OP, tracing::Level::TRACE);
+        tracing_subscriber::registry()
+            .with(fmt_layer)
+            .with(layer.with_filter(target_filter))
+            .init();
+        Some(ProfileSink {
+            handle,
+            print_table: cli.profile,
+            json_path: cli.profile_json.clone(),
+        })
+    } else {
+        tracing_subscriber::registry().with(fmt_layer).init();
+        None
+    };
 
     let command = cli.command.clone().unwrap_or(Command::Sync);
+    // Capture the discriminant up front: the Auth match arm
+    // partial-moves `account` out of `command`, so any later check
+    // against `command` would otherwise fail to compile.
+    let is_watch = matches!(command, Command::Watch);
 
     jma_mail::notify!("Running jma version {}", env!("JMA_VERSION"));
 
-    match command {
+    let result = match command {
         Command::Init => cmd_init(&cli).await,
         Command::Mailboxes => cmd_mailboxes(&cli).await,
         Command::Status => cmd_status(&cli).await,
         Command::Sync => cmd_sync(&cli).await,
         Command::Pull => cmd_pull(&cli).await,
         Command::Push => cmd_push(&cli).await,
-        Command::Watch => cmd_watch(&cli).await,
+        Command::Watch => cmd_watch(&cli, profile_sink.clone()).await,
         Command::Auth { action, account } => cmd_auth(&cli, action, account).await,
+    };
+
+    // One-shot commands (everything except Watch) flush their
+    // accumulated profile here. Watch flushes per cycle inside the
+    // daemon and has nothing meaningful left over for an end-of-run
+    // emit -- the sink it received owns the per-cycle flushing.
+    //
+    // Flush failure is logged but does not stomp the real command
+    // result: profiling is a non-load-bearing side channel, and a
+    // failed sync command is the error the user actually needs to
+    // see. Mirrors the warn-don't-fail policy in the daemon's
+    // per-cycle `flush_profile`.
+    if !is_watch
+        && let Some(sink) = &profile_sink
+        && let Err(e) = sink.flush_snapshot()
+    {
+        tracing::warn!("Failed to flush profile summary: {:#}", e);
     }
+
+    result
 }
 
 async fn cmd_auth(cli: &Cli, action: AuthAction, email: String) -> Result<()> {
@@ -551,12 +604,12 @@ async fn cmd_push(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_watch(cli: &Cli) -> Result<()> {
+async fn cmd_watch(cli: &Cli, profile_sink: Option<ProfileSink>) -> Result<()> {
     let config = load_config(cli)?;
     acquire_mutator_locks(&config)?;
     let conn = state::db::open_or_recreate(&config.db_path())?;
 
-    daemon::runner::run(&conn, &config).await?;
+    daemon::runner::run(&conn, &config, profile_sink).await?;
 
     Ok(())
 }

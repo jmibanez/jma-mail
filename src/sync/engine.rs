@@ -21,6 +21,7 @@ use crate::sync::execute::Executor;
 use crate::sync::plan::{SyncAction, SyncDirection};
 use crate::sync::reconcile::{self, MessageRecordIndex, ReconcileInput};
 use crate::sync::self_writes::SelfWriteCache;
+use tracing::Instrument;
 
 /// How the local-side scan should be carried out for one cycle.
 /// `Full` walks every synced folder; `Paths(...)` classifies only
@@ -200,19 +201,23 @@ impl<'a> SyncEngine<'a> {
         // stage-2 check already handles.
         let folder_names: Vec<String> = mailboxes.iter().map(|(_, f)| f.clone()).collect();
         let mut local_index = LocalIndex::default();
-        if queries::has_message_map_rows(self.conn)? {
-            dedupe::dedupe(&maildir_root, &folder_names, |_, _, _| ())?;
-        } else {
-            dedupe::dedupe(&maildir_root, &folder_names, |folder, msgid, mid| {
-                local_index
-                    .by_message_id
-                    .entry(msgid.clone())
-                    .or_default()
-                    .push(LocalEntry {
-                        folder: folder.to_string(),
-                        maildir_id: mid.clone(),
-                    });
-            })?;
+        {
+            let _phase =
+                tracing::info_span!(target: crate::profile::TARGET_PHASE, "dedupe").entered();
+            if queries::has_message_map_rows(self.conn)? {
+                dedupe::dedupe(&maildir_root, &folder_names, |_, _, _| ())?;
+            } else {
+                dedupe::dedupe(&maildir_root, &folder_names, |folder, msgid, mid| {
+                    local_index
+                        .by_message_id
+                        .entry(msgid.clone())
+                        .or_default()
+                        .push(LocalEntry {
+                            folder: folder.to_string(),
+                            maildir_id: mid.clone(),
+                        });
+                })?;
+            }
         }
 
         // Phase 1: scan local changes. `Full` walks every synced
@@ -220,31 +225,36 @@ impl<'a> SyncEngine<'a> {
         // groups touched by the supplied event paths -- the daemon's
         // common case, where the watcher already told us exactly
         // which files moved.
-        let all_local_changes = match &scan_scope {
-            ScanScope::Full => {
-                let mut changes = Vec::new();
-                for (_, folder_name) in &mailboxes {
-                    let maildir_path = maildir_root.join(folder_name);
-                    let maildir = store::ensure_maildir(&maildir_path)?;
-                    let known_state = queries::get_local_state_for_folder(self.conn, folder_name)?;
-                    let (folder_changes, _seen) =
-                        scan::scan_folder(&maildir, folder_name, &known_state)?;
-                    changes.extend(folder_changes);
+        let all_local_changes = {
+            let _phase =
+                tracing::info_span!(target: crate::profile::TARGET_PHASE, "scan").entered();
+            match &scan_scope {
+                ScanScope::Full => {
+                    let mut changes = Vec::new();
+                    for (_, folder_name) in &mailboxes {
+                        let maildir_path = maildir_root.join(folder_name);
+                        let maildir = store::ensure_maildir(&maildir_path)?;
+                        let known_state =
+                            queries::get_local_state_for_folder(self.conn, folder_name)?;
+                        let (folder_changes, _seen) =
+                            scan::scan_folder(&maildir, folder_name, &known_state)?;
+                        changes.extend(folder_changes);
+                    }
+                    changes
                 }
-                changes
-            }
-            ScanScope::Paths(paths) => {
-                let mut known_states = HashMap::new();
-                for (_, folder_name) in &mailboxes {
-                    // Make sure the maildir on disk exists, matching
-                    // the side-effect the Full path used to provide;
-                    // some downstream code assumes the directory tree
-                    // is in place.
-                    store::ensure_maildir(&maildir_root.join(folder_name))?;
-                    let state = queries::get_local_state_for_folder(self.conn, folder_name)?;
-                    known_states.insert(folder_name.clone(), state);
+                ScanScope::Paths(paths) => {
+                    let mut known_states = HashMap::new();
+                    for (_, folder_name) in &mailboxes {
+                        // Make sure the maildir on disk exists, matching
+                        // the side-effect the Full path used to provide;
+                        // some downstream code assumes the directory tree
+                        // is in place.
+                        store::ensure_maildir(&maildir_root.join(folder_name))?;
+                        let state = queries::get_local_state_for_folder(self.conn, folder_name)?;
+                        known_states.insert(folder_name.clone(), state);
+                    }
+                    scan::scan_paths(&maildir_root, paths, &known_states)?
                 }
-                scan::scan_paths(&maildir_root, paths, &known_states)?
             }
         };
 
@@ -272,23 +282,31 @@ impl<'a> SyncEngine<'a> {
         }
 
         // Phase 2: collect remote changes.
-        let (remote_emails, remote_destroyed, new_state, used_initial_path) =
-            self.fetch_remote_state(&mailboxes).await?;
+        let (remote_emails, remote_destroyed, new_state, used_initial_path) = self
+            .fetch_remote_state(&mailboxes)
+            .instrument(tracing::info_span!(
+                target: crate::profile::TARGET_PHASE,
+                "fetch_remote",
+            ))
+            .await?;
 
         // Phase 3: build known indices and reconcile.
-        let known = build_known_indices(self.conn, &mailboxes)?;
-
-        let plan = reconcile::reconcile(ReconcileInput {
-            remote_emails: &remote_emails,
-            remote_destroyed: &remote_destroyed,
-            local_changes: &all_local_changes,
-            known: &known,
-            local_index: &local_index,
-            mailboxes: &mailboxes,
-            strategy: self.config.sync.conflict_strategy,
-            new_email_state: Some(new_state),
-            max_upload_size: limits::max_size_upload(&self.client),
-        });
+        let plan = {
+            let _phase =
+                tracing::info_span!(target: crate::profile::TARGET_PHASE, "reconcile").entered();
+            let known = build_known_indices(self.conn, &mailboxes)?;
+            reconcile::reconcile(ReconcileInput {
+                remote_emails: &remote_emails,
+                remote_destroyed: &remote_destroyed,
+                local_changes: &all_local_changes,
+                known: &known,
+                local_index: &local_index,
+                mailboxes: &mailboxes,
+                strategy: self.config.sync.conflict_strategy,
+                new_email_state: Some(new_state),
+                max_upload_size: limits::max_size_upload(&self.client),
+            })
+        };
 
         // Snapshot before `into_filtered`: empty here means reconcile
         // produced nothing, not "everything got filtered out by
@@ -338,7 +356,13 @@ impl<'a> SyncEngine<'a> {
             self.config,
             self.self_writes.clone(),
         );
-        let mut outcome = executor.execute(filtered).await?;
+        let mut outcome = executor
+            .execute(filtered)
+            .instrument(tracing::info_span!(
+                target: crate::profile::TARGET_PHASE,
+                "execute",
+            ))
+            .await?;
         outcome.already_in_sync = already_in_sync;
 
         if outcome.failed_remote_actions > 0 {

@@ -4,7 +4,8 @@ use jmap_client::client::Client;
 use jmap_client::core::error::MethodErrorType;
 use jmap_client::email;
 use std::collections::HashMap;
-use tracing::{debug, info};
+use tracing::field::Empty;
+use tracing::{debug, info, instrument};
 
 use crate::ids::{JmapBlobId, JmapEmailId, JmapMailboxId, JmapThreadId, MessageId};
 use crate::jmap::limits;
@@ -418,6 +419,12 @@ pub struct ImportResult {
     pub chain_new: Option<String>,
 }
 
+#[instrument(
+    target = "jma::profile::blob",
+    name = "blob.upload",
+    skip_all,
+    fields(bytes = Empty),
+)]
 pub async fn import_email(
     client: &Client,
     raw_message: &[u8],
@@ -426,6 +433,7 @@ pub async fn import_email(
     local: &LocalId,
     keywords: &HashMap<String, bool>,
 ) -> Result<ImportResult> {
+    tracing::Span::current().record("bytes", raw_message.len() as u64);
     let keyword_list: Vec<String> = keywords
         .iter()
         .filter(|(_, v)| **v)
@@ -493,6 +501,12 @@ pub async fn import_email(
 }
 
 /// Download the raw blob of an email.
+#[instrument(
+    target = "jma::profile::blob",
+    name = "blob.download",
+    skip(client),
+    fields(bytes = Empty),
+)]
 pub async fn download_blob(client: &Client, blob_id: &JmapBlobId) -> Result<Vec<u8>> {
     let data = with_retry("Email/blob", || async {
         client
@@ -502,6 +516,7 @@ pub async fn download_blob(client: &Client, blob_id: &JmapBlobId) -> Result<Vec<
     })
     .await?;
 
+    tracing::Span::current().record("bytes", data.len() as u64);
     debug!("Downloaded blob {} ({} bytes)", blob_id, data.len());
     Ok(data)
 }

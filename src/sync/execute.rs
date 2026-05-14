@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, warn};
 
 use crate::config::Config;
 use crate::ids::{JmapAccountId, JmapEmailId, JmapMailboxId};
@@ -327,24 +327,33 @@ impl<'a> Executor<'a> {
                 uploaded: 0,
             });
         }
-        let n = limits::upload_concurrency(self.client, self.config.sync.upload_concurrency);
-        if n != self.config.sync.upload_concurrency {
-            info!(
-                "Clamped upload concurrency from {} to {} per server maxConcurrentUpload",
-                self.config.sync.upload_concurrency, n
-            );
+        // Phase span wraps the parallel upload work end-to-end. The
+        // per-blob spans inside `import_email` populate the upload
+        // aggregate; this span's wall-clock is the denominator for the
+        // effective upload-bytes-per-second figure.
+        let phase = tracing::info_span!(target: crate::profile::TARGET_PHASE, "upload_blobs");
+        async move {
+            let n = limits::upload_concurrency(self.client, self.config.sync.upload_concurrency);
+            if n != self.config.sync.upload_concurrency {
+                info!(
+                    "Clamped upload concurrency from {} to {} per server maxConcurrentUpload",
+                    self.config.sync.upload_concurrency, n
+                );
+            }
+            let outcome = run_upload_stream(self.client, &actions, n).await;
+            self.commit_uploaded_messages(&actions, &outcome.succeeded)?;
+            let uploaded = outcome.succeeded.len();
+            if let Some(e) = outcome.hard_error {
+                return Err(e);
+            }
+            Ok(UploadResults {
+                chain_pairs: outcome.chain_pairs,
+                chain_intact: outcome.chain_intact,
+                uploaded,
+            })
         }
-        let outcome = run_upload_stream(self.client, &actions, n).await;
-        self.commit_uploaded_messages(&actions, &outcome.succeeded)?;
-        let uploaded = outcome.succeeded.len();
-        if let Some(e) = outcome.hard_error {
-            return Err(e);
-        }
-        Ok(UploadResults {
-            chain_pairs: outcome.chain_pairs,
-            chain_intact: outcome.chain_intact,
-            uploaded,
-        })
+        .instrument(phase)
+        .await
     }
 
     /// Mirror each successful upload into `message_map` + `local_state`.
@@ -559,74 +568,84 @@ impl<'a> Executor<'a> {
         if actions.is_empty() {
             return Ok(0);
         }
-
-        // Server-cap-aware download concurrency. The clamp is logged
-        // here rather than at the top of `execute` so quiet "advance
-        // the cursor only" cycles (empty plan, no downloads) don't
-        // emit an info line that has no workload to describe.
-        let mut concurrency =
-            limits::concurrent_requests(self.client, self.config.sync.download_concurrency);
-        if concurrency != self.config.sync.download_concurrency {
-            info!(
-                "Clamped download concurrency from {} to {} per server maxConcurrentRequests",
-                self.config.sync.download_concurrency, concurrency
-            );
-        }
-
-        let total = actions.len();
-        // Up-front summary so the user sees that work is queued before
-        // any blob actually lands -- otherwise initial sync of a fresh
-        // server is silent for as long as the first download takes.
-        // Skip the one-message case: steady-state daemon cycles already
-        // log the per-message line below, and a single-message preamble
-        // is just noise.
-        if total > 1 {
-            crate::notify!("Downloading {} messages", total);
-        }
-        // Above the threshold, suppress per-message info and emit a
-        // periodic heartbeat instead. `last_progress` is reset on each
-        // heartbeat (and only advances when a store actually committed),
-        // so a rate-limited stall doesn't spam an unchanging percentage.
-        let mut progress = DownloadProgress {
-            downloaded: 0,
-            total,
-            verbose_per_message: total <= VERBOSE_DOWNLOAD_THRESHOLD,
-            last_progress: Instant::now(),
-        };
-
-        let mut pending = actions;
-        while !pending.is_empty() {
-            let n = concurrency.max(1);
-            let batch = std::mem::take(&mut pending);
-            let outcome = self.download_batch(batch, n, &mut progress).await?;
-            pending = outcome.to_retry;
-            if pending.is_empty() {
-                break;
-            }
-            if outcome.rate_limited {
-                let new = (n / 2).max(1);
-                if new < n {
-                    warn!(
-                        "Hit JMAP rate limit; lowering download concurrency from {} to {}",
-                        n, new
-                    );
-                    concurrency = new;
-                } else {
-                    warn!(
-                        "Hit JMAP rate limit at minimum concurrency ({}); backing off and retrying",
-                        n
-                    );
-                }
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            } else {
-                anyhow::bail!(
-                    "Download stream stalled with {} items remaining",
-                    pending.len()
+        // Phase span wraps the parallel download work end-to-end --
+        // including retry passes for transient rate-limit halving.
+        // The per-blob spans inside `download_blob` feed the download
+        // aggregate; this span's wall-clock is the denominator for
+        // the effective download-bytes-per-second figure.
+        let phase = tracing::info_span!(target: crate::profile::TARGET_PHASE, "download_blobs");
+        async move {
+            // Server-cap-aware download concurrency. The clamp is logged
+            // here rather than at the top of `execute` so quiet "advance
+            // the cursor only" cycles (empty plan, no downloads) don't
+            // emit an info line that has no workload to describe.
+            let mut concurrency =
+                limits::concurrent_requests(self.client, self.config.sync.download_concurrency);
+            if concurrency != self.config.sync.download_concurrency {
+                info!(
+                    "Clamped download concurrency from {} to {} per server maxConcurrentRequests",
+                    self.config.sync.download_concurrency, concurrency
                 );
             }
-        }
 
-        Ok(progress.downloaded)
+            let total = actions.len();
+            // Up-front summary so the user sees that work is queued before
+            // any blob actually lands -- otherwise initial sync of a fresh
+            // server is silent for as long as the first download takes.
+            // Skip the one-message case: steady-state daemon cycles already
+            // log the per-message line below, and a single-message preamble
+            // is just noise.
+            if total > 1 {
+                crate::notify!("Downloading {} messages", total);
+            }
+            // Above the threshold, suppress per-message info and emit a
+            // periodic heartbeat instead. `last_progress` is reset on each
+            // heartbeat (and only advances when a store actually
+            // committed), so a rate-limited stall doesn't spam an
+            // unchanging percentage.
+            let mut progress = DownloadProgress {
+                downloaded: 0,
+                total,
+                verbose_per_message: total <= VERBOSE_DOWNLOAD_THRESHOLD,
+                last_progress: Instant::now(),
+            };
+
+            let mut pending = actions;
+            while !pending.is_empty() {
+                let n = concurrency.max(1);
+                let batch = std::mem::take(&mut pending);
+                let outcome = self.download_batch(batch, n, &mut progress).await?;
+                pending = outcome.to_retry;
+                if pending.is_empty() {
+                    break;
+                }
+                if outcome.rate_limited {
+                    let new = (n / 2).max(1);
+                    if new < n {
+                        warn!(
+                            "Hit JMAP rate limit; lowering download concurrency from {} to {}",
+                            n, new
+                        );
+                        concurrency = new;
+                    } else {
+                        warn!(
+                            "Hit JMAP rate limit at minimum concurrency ({}); backing off and retrying",
+                            n
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                } else {
+                    anyhow::bail!(
+                        "Download stream stalled with {} items remaining",
+                        pending.len()
+                    );
+                }
+            }
+
+            Ok(progress.downloaded)
+        }
+        .instrument(phase)
+        .await
     }
 
     /// Run one parallel download batch. Returns the actions that hit

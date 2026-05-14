@@ -11,6 +11,7 @@ use tracing::{debug, error, info, warn};
 use super::{RECONNECT_INITIAL_BACKOFF, RECONNECT_MAX_BACKOFF};
 use crate::config::Config;
 use crate::jmap::retry::is_transient_error;
+use crate::profile::ProfileSink;
 use crate::state::queries;
 use crate::sync::engine::{ScanScope, SyncEngine};
 use crate::sync::plan::SyncDirection;
@@ -89,7 +90,16 @@ enum SessionExit {
 /// Run the daemon: spawn the FS watcher, do the one-time initial sync,
 /// and enter a watch loop that rebuilds the JMAP session on transport
 /// errors.
-pub async fn run(conn: &Connection, config: &Config) -> Result<()> {
+///
+/// `profile_sink`, if provided, is flushed and reset after every sync
+/// cycle (initial bootstrap plus each post-trigger run) so the daemon
+/// emits one profile report per cycle instead of accumulating across
+/// the daemon's whole lifetime.
+pub async fn run(
+    conn: &Connection,
+    config: &Config,
+    profile_sink: Option<ProfileSink>,
+) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<SyncTrigger>(32);
 
     let hook = super::hook::Hook::new(config.watch.post_arrival_command.clone());
@@ -151,6 +161,7 @@ pub async fn run(conn: &Connection, config: &Config) -> Result<()> {
         }
         Err(e) => error!("Initial sync failed: {:#}", e),
     }
+    flush_profile(profile_sink.as_ref());
 
     crate::notify!("Watch mode active. Press Ctrl+C to stop.");
 
@@ -165,7 +176,18 @@ pub async fn run(conn: &Connection, config: &Config) -> Result<()> {
     // hold backoff elevated until real work completes.
     let mut backoff = RECONNECT_INITIAL_BACKOFF;
     loop {
-        match session(&engine, conn, config, &hook, &tx, &mut rx, &mut backoff).await {
+        match session(
+            &engine,
+            conn,
+            config,
+            &hook,
+            &tx,
+            &mut rx,
+            &mut backoff,
+            profile_sink.as_ref(),
+        )
+        .await
+        {
             Ok(SessionExit::ChannelClosed) => break,
             Ok(SessionExit::TransportError(e)) => {
                 warn!(
@@ -200,6 +222,7 @@ async fn session<'a>(
     tx: &mpsc::Sender<SyncTrigger>,
     rx: &mut mpsc::Receiver<SyncTrigger>,
     backoff: &mut Duration,
+    profile_sink: Option<&ProfileSink>,
 ) -> Result<SessionExit> {
     // Post-initial-sync steps -- redone on every reconnect so a
     // freshly-built engine picks up rotated tokens, fresh URLs, and a
@@ -323,14 +346,29 @@ async fn session<'a>(
                 }
             }
             Err(e) if is_transient_error(&e) => {
+                flush_profile(profile_sink);
                 break SessionExit::TransportError(e);
             }
             Err(e) => error!("Sync failed: {:#}", e),
         }
+        flush_profile(profile_sink);
     };
 
     sse_handle.abort();
     Ok(exit)
+}
+
+/// Flush the per-cycle profile snapshot (table + JSON, depending on
+/// the sink's configuration) and reset the aggregate so the next
+/// cycle's report starts clean. No-op when profiling is disabled.
+/// A flush error doesn't abort the daemon -- it logs warn-level and
+/// the next cycle continues.
+fn flush_profile(sink: Option<&ProfileSink>) {
+    if let Some(sink) = sink
+        && let Err(e) = sink.flush_and_reset()
+    {
+        warn!("Failed to flush profile summary: {:#}", e);
+    }
 }
 
 /// Open a JMAP session, retrying transient failures forever with
