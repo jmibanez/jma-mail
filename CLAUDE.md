@@ -31,6 +31,16 @@ creating a new file or have been instructed explicitly to operate on
 a specific file. Untracked files may be the user's in-progress work
 or contain secrets — leave them alone.
 
+## Keeping DEVELOPMENT.md current
+
+`DEVELOPMENT.md` is only useful if it tracks the code. Update it in
+the same commit as any architecture-level change — module
+restructures, function or type renames the doc references,
+sync-pipeline reshapes, schema-version bumps, lock-ordering tweaks,
+new load-bearing modules. When you notice existing drift, fix it
+inline rather than letting it accumulate. Periodic catch-up audits
+are a fallback, not the primary mechanism.
+
 ## Commit conventions
 
 LKML-style commit messages: subsystem-prefixed subject (`sync:`,
