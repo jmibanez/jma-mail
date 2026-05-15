@@ -43,7 +43,14 @@ fn extract_msgid_value(value: &str) -> Option<MessageId> {
     if let (Some(lt), Some(gt)) = (s.find('<'), s.rfind('>'))
         && gt > lt
     {
-        return Some(MessageId::from(&s[lt + 1..gt]));
+        // `<>` carries no idempotency anchor; reject so empty
+        // MessageIds don't collide across messages in dedupe and
+        // LocalIndex.
+        let inner = s[lt + 1..gt].trim();
+        if inner.is_empty() {
+            return None;
+        }
+        return Some(MessageId::from(inner));
     }
     if s.is_empty() {
         None
@@ -80,6 +87,42 @@ mod tests {
     #[test]
     fn missing_header_returns_none() {
         let raw = b"Subject: hi\r\n\r\nbody";
+        assert_eq!(parse_message_id(raw), None);
+    }
+
+    /// `<>` violates RFC 5322 (`msg-id` requires non-empty `id-left`
+    /// and `id-right`). Returning `MessageId::from("")` would collide
+    /// every such message onto one dedupe / LocalIndex bucket; the
+    /// parser must reject it so callers see no usable anchor.
+    #[test]
+    fn empty_angle_brackets_returns_none() {
+        let raw = b"Message-ID: <>\r\nSubject: hi\r\n\r\nbody";
+        assert_eq!(parse_message_id(raw), None);
+    }
+
+    /// Whitespace-only inside angle brackets has the same collision
+    /// shape as the bare `<>` case and is treated the same.
+    #[test]
+    fn whitespace_only_angle_brackets_returns_none() {
+        let raw = b"Message-ID: <   >\r\nSubject: hi\r\n\r\nbody";
+        assert_eq!(parse_message_id(raw), None);
+    }
+
+    /// Header present with no value at all -- same `MessageId::from("")`
+    /// collision risk as `<>`, just via a different parse path
+    /// (no-angle-brackets branch instead of the empty-inner-content
+    /// branch).
+    #[test]
+    fn empty_value_returns_none() {
+        let raw = b"Message-ID:\r\nSubject: hi\r\n\r\nbody";
+        assert_eq!(parse_message_id(raw), None);
+    }
+
+    /// Header present with a whitespace-only value -- trims to empty
+    /// and shares the collision risk above.
+    #[test]
+    fn whitespace_only_value_returns_none() {
+        let raw = b"Message-ID:    \r\nSubject: hi\r\n\r\nbody";
         assert_eq!(parse_message_id(raw), None);
     }
 }
