@@ -28,7 +28,23 @@ $ jma watch
 
 ## Installation
 
-Currently, this project doesn't yet have releases. You need to install this manually via Cargo:
+Pre-built binaries for macOS (Apple Silicon and Intel), Linux (x86_64 and aarch64), and Windows (x86_64) are published on the [GitHub Releases page](https://github.com/jmibanez/jma-mail/releases) for each tagged release. Three install paths, pick whichever fits:
+
+  * **Shell installer (macOS, Linux).** Downloads the right binary for your platform and drops it in `$CARGO_HOME/bin` (default `~/.cargo/bin`):
+
+    ```shell
+    curl --proto '=https' --tlsv1.2 -LsSf https://github.com/jmibanez/jma-mail/releases/latest/download/jma-mail-installer.sh | sh
+    ```
+
+  * **PowerShell installer (Windows).**
+
+    ```powershell
+    powershell -ExecutionPolicy Bypass -c "irm https://github.com/jmibanez/jma-mail/releases/latest/download/jma-mail-installer.ps1 | iex"
+    ```
+
+  * **Direct download.** Grab the archive matching your platform from the [latest release](https://github.com/jmibanez/jma-mail/releases/latest) and put `jma` somewhere on your `PATH`.
+
+Or build from source with a Rust toolchain:
 
 ```shell
 cargo install --git https://github.com/jmibanez/jma-mail
@@ -59,7 +75,7 @@ None of the state DB's contents are required to do a `sync`, `push`, or `pull`.
 
 ### Breaking Changes
 
-If there are any changes that break state tracking, as mentioned above you can simply delete the state DB and re-run `jma`. For most cases, `jma` marks its SQLite state database with a schema version -- if there's a mismatch, it will automatically nuke the state DB and do a full sync to catch up.
+If there are any changes that break state tracking, as mentioned above you can simply delete the state DB and re-run `jma`. For most cases, `jma` marks its SQLite state database with a schema version -- if there's a mismatch, a mutating command (`sync`, `pull`, `push`, `watch`) will automatically nuke the state DB and do a full sync to catch up. Read-only commands (`status`, `mailboxes`, `auth rediscover`) refuse to open a mismatched DB and tell you to run a mutating command first, so a concurrent `sync`/`watch` doesn't get the DB yanked out from under it.
 
 ### Concurrency: One Mutator at a Time
 
@@ -77,7 +93,7 @@ The locks are held by the kernel, not by the contents of the files, so they're r
 
 ## Configuration
 
-Configuration for `jma` lives in `~/.config/jma/config.toml`. The key knobs to put in are your account details, the path to your Maildir mailboxes, and which mailboxes to sync.
+Configuration for `jma` lives in `~/.config/jma/config.toml` -- the same path on Linux, macOS, and the BSDs (the XDG convention, not the platform-native `~/Library/Application Support` on macOS). The key knobs to put in are your account details, the path to your Maildir mailboxes, and which mailboxes to sync.
 
 ### Authentication and Account `[account]`
 
@@ -95,14 +111,23 @@ Other `[account]` keys:
 
 This section configures which Maildirs `jma` will sync to, and how it syncs. The important knobs here are `maildir_path` which should point to the root of your Maildir mailboxes that you want to sync (e.g. `~/Mail/Fastmail`, or `~/Mail/my-provider`). By default `jma init` will also populate `mailboxes` with the common IMAP/JMAP mailboxes (INBOX, Archive, Sent, Drafts, Trash) and none of your custom folders/mailboxes -- if you want to populate _all_ mailboxes from upstream, unset this key or set it to an empty list.
 
-  * `maildir_path`: The path to the Maildir root you want to sync
+  * `maildir_path`: The path to the Maildir root you want to sync. Required.
   * `mailboxes`: The specific mailboxes you want to sync. Set this to `[]` (an empty list) or leave this empty to sync all mailboxes. Note that this respects the inbox role; if your upstream mailbox with the inbox role is named e.g. `Posteingang` (DE) it will be synced to the local folder `INBOX`.
   * `case_insensitive_match`: When checking mailbox names against upstream, it can happen that your local Maildirs do not match because of different cases (e.g. when you're on a case-insensitive, case preserving filesystem, and your mailbox is named `foo` but upstream is saved as `Foo`). Set this to `true` to ignore case; default is to respect case.
-  * `download_concurrency`: How many blobs (messages) to download concurrently. By default this is 8, but it is clamped by what your upstream specifies as its maximum supported concurrent requests (i.e. whichever is lower wins)
+  * `folder_layout`: How nested mailboxes land on disk. Three values:
+     * `flat` (default) -- mbsync's `Flatten=<sep>` convention. Nested folders collapse into a single dotted directory at the maildir root (e.g. `Lists.Rust.Internals`).
+     * `maildir++` -- Courier/Dovecot's flat-with-leading-dot convention (e.g. `.Lists.Rust.Internals`).
+     * `fs` -- Dovecot's `LAYOUT=fs` recursive directory tree (e.g. `Lists/Rust/Internals`).
+
+    Single-level mailboxes look identical under `flat` and `fs`; the choice only matters once a server has nested folders.
+  * `hierarchy_separator`: Single character used to join parent/child names under `flat` and `maildir++` (ignored for `fs`, which always uses `/`). Default `.` matches mbsync and Dovecot/Courier's typical deployments. `/`, `\`, and NUL are rejected at runtime. Pick a different character if your folder names commonly contain `.`.
+  * `download_concurrency`: How many blobs (messages) to download concurrently. Default 8, clamped at runtime to the server's advertised `maxConcurrentRequests` (whichever is lower wins).
+  * `upload_concurrency`: How many messages to upload concurrently. Default 8, clamped to the server's advertised `maxConcurrentUpload`. Tune this down if your upstream bandwidth is constrained.
   * `conflict_strategy`: How to resolve conflicts:
      * `server-wins` -- The state on the server wins. Any local changes are discarded
      * `local-wins`  -- Your local Maildir state wins. The server is updated to reflect your local Maildir
-  
+
+
 ### State `[state]`
 
 This section only has one key, `db_path`, which tells `jma` where to persist its state. Leave it unset to use the default (`<sync.maildir_path>/.jma.db`); set it to override -- e.g. when the maildir lives on a synced or networked volume and you want the SQLite files on a local-only path.
@@ -164,12 +189,14 @@ Commands:
   help       Print this message or the help of the given subcommand(s)
 
 Options:
-  -c, --config <CONFIG>  Config file path [default: ~/.config/jma/config.toml]
-  -v, --verbose...       Increase verbosity: -v info, -vv debug, -vvv all crates, -vvvv trace
-  -n, --dry-run          Show what would be done without making changes
-  -q, --quiet            Suppress all output except errors
-  -h, --help             Print help
-  -V, --version          Print version
+  -c, --config <CONFIG>       Config file path [default: ~/.config/jma/config.toml]
+  -v, --verbose...            Increase verbosity: -v info, -vv debug, -vvv all crates, -vvvv trace
+  -n, --dry-run               Show what would be done without making changes
+  -q, --quiet                 Suppress all output except errors
+      --profile               Print a profiling summary to stderr at end of run
+      --profile-json <PATH>   Write the profiling summary as JSON to PATH (NDJSON per cycle in daemon mode)
+  -h, --help                  Print help
+  -V, --version               Print version
 ```
 
 ### init : Initialize config
@@ -190,7 +217,7 @@ Options:
 
 ```console
 $ jma sync
-Running jma version 0.1.0
+Running jma version 0.9.0
 Syncing 7 mailboxes
 Downloading 4 messages
 Sync complete (4 downloaded, 1 uploaded, 2 flag updates, 0 moved, 0 deleted)
