@@ -2,7 +2,7 @@
 name = "jma-mail"
 version = "0.9.0"
 edition = "2024"
-description = "JM's Mail Agent: bidirectional JMAP-to-Maildir email sync for Fastmail"
+description = "JM's Mail Agent: bidirectional JMAP-to-Maildir email sync"
 repository = "https://github.com/jmibanez/jma-mail"
 license = "BSD-3-Clause"
 

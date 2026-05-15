@@ -212,8 +212,8 @@ async fn cmd_init(cli: &Cli) -> Result<()> {
         }
     }
 
-    println!("Edit the config file and set your Fastmail API token.");
-    println!("Generate a token at: https://www.fastmail.com/settings/security/tokens");
+    println!("Edit the config file and set your JMAP API token.");
+    println!("For Fastmail, generate one at: https://www.fastmail.com/settings/security/tokens");
 
     Ok(())
 }

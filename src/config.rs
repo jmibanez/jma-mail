@@ -491,7 +491,8 @@ pub fn default_config_template() -> &'static str {
 # JMAP session URL via DNS SRV (_jmap._tcp.<domain>) and the
 # /.well-known/jmap HTTPS endpoint, per RFC 8620 §2.2.
 email = "you@example.com"
-# API token (app-specific password). Generate at:
+# API token (app-specific password) from your JMAP provider.
+# For Fastmail, generate one at:
 #   https://www.fastmail.com/settings/security/tokens
 #
 # Two ways to provide it, in priority order:
@@ -509,11 +510,11 @@ token = ""
 # this only to override autodiscovery -- e.g. for a provider whose
 # discovery records aren't published, or to force a specific
 # endpoint during testing.
-# session_url = "https://api.fastmail.com/jmap/session"
+# session_url = "https://api.example.org/jmap/session"
 
 [sync]
 # Root directory for local maildir storage
-maildir_path = "~/Mail/Fastmail"
+maildir_path = "~/Mail"
 # Which mailboxes to sync (empty = all). The literal "INBOX" is a magic
 # alias for whichever mailbox has the JMAP "inbox" role; other entries
 # match the mailbox's name (case-sensitively unless case_insensitive_match
