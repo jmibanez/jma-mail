@@ -57,7 +57,7 @@ struct DownloadBatchOutcome {
 /// (e.g. the pure-DB adopt commits) stay as free functions and take
 /// just what they use.
 pub struct Executor<'a> {
-    client: &'a Client,
+    client: Arc<Client>,
     conn: &'a Connection,
     config: &'a Config,
     maildir_root: PathBuf,
@@ -71,7 +71,7 @@ pub struct Executor<'a> {
 
 impl<'a> Executor<'a> {
     pub fn new(
-        client: &'a Client,
+        client: Arc<Client>,
         conn: &'a Connection,
         config: &'a Config,
         self_writes: Option<Arc<SelfWriteCache>>,
@@ -333,14 +333,14 @@ impl<'a> Executor<'a> {
         // effective upload-bytes-per-second figure.
         let phase = tracing::info_span!(target: crate::profile::TARGET_PHASE, "upload_blobs");
         async move {
-            let n = limits::upload_concurrency(self.client, self.config.sync.upload_concurrency);
+            let n = limits::upload_concurrency(&self.client, self.config.sync.upload_concurrency);
             if n != self.config.sync.upload_concurrency {
                 info!(
                     "Clamped upload concurrency from {} to {} per server maxConcurrentUpload",
                     self.config.sync.upload_concurrency, n
                 );
             }
-            let outcome = run_upload_stream(self.client, &actions, n).await;
+            let outcome = run_upload_stream(&self.client, &actions, n).await;
             self.commit_uploaded_messages(&actions, &outcome.succeeded)?;
             let uploaded = outcome.succeeded.len();
             if let Some(e) = outcome.hard_error {
@@ -460,7 +460,7 @@ impl<'a> Executor<'a> {
             ));
         }
 
-        let outcome = jmap_email::set_email_batch(self.client, &ops).await?;
+        let outcome = jmap_email::set_email_batch(&self.client, &ops).await?;
 
         // One transaction wraps the entire post-network mirroring section.
         // The server's outcome is fixed; either we reflect all of it into
@@ -580,7 +580,7 @@ impl<'a> Executor<'a> {
             // the cursor only" cycles (empty plan, no downloads) don't
             // emit an info line that has no workload to describe.
             let mut concurrency =
-                limits::concurrent_requests(self.client, self.config.sync.download_concurrency);
+                limits::concurrent_requests(&self.client, self.config.sync.download_concurrency);
             if concurrency != self.config.sync.download_concurrency {
                 info!(
                     "Clamped download concurrency from {} to {} per server maxConcurrentRequests",
@@ -663,7 +663,7 @@ impl<'a> Executor<'a> {
         concurrency: usize,
         progress: &mut DownloadProgress,
     ) -> Result<DownloadBatchOutcome> {
-        let client = self.client;
+        let client = &self.client;
         let futures = batch.into_iter().map(|action| {
             let blob_id = match &action {
                 SyncAction::DownloadMessage { jmap_blob_id, .. } => jmap_blob_id.clone(),

@@ -90,7 +90,7 @@ pub struct SyncOutcome {
 /// client; keeping them off `SyncEngine` lets unit tests drive them
 /// with just an in-memory `Connection`.
 pub struct SyncEngine<'a> {
-    client: Client,
+    client: Arc<Client>,
     conn: &'a Connection,
     config: &'a Config,
     account_id: JmapAccountId,
@@ -113,7 +113,7 @@ impl<'a> SyncEngine<'a> {
         let client = session::connect(&config.account, conn).await?;
         let account_id: JmapAccountId = client.default_account_id().into();
         Ok(Self {
-            client,
+            client: Arc::new(client),
             conn,
             config,
             account_id,
@@ -351,7 +351,7 @@ impl<'a> SyncEngine<'a> {
 
         // Phase 5: execute.
         let executor = Executor::new(
-            &self.client,
+            Arc::clone(&self.client),
             self.conn,
             self.config,
             self.self_writes.clone(),
