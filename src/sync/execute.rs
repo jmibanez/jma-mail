@@ -682,8 +682,15 @@ impl<'a> Executor<'a> {
         let mut rate_limited = false;
         let mut hard_error: Option<anyhow::Error> = None;
         let mut to_retry: Vec<SyncAction> = Vec::new();
+        let mut blocked_recv_us: u64 = 0;
+        let mut recv_count: u64 = 0;
 
-        while let Some((action, result)) = rx.recv().await {
+        loop {
+            let t = Instant::now();
+            let item = rx.recv().await;
+            blocked_recv_us += t.elapsed().as_micros() as u64;
+            let Some((action, result)) = item else { break };
+            recv_count += 1;
             match result {
                 Ok(blob) => {
                     if let Err(e) = self.store_downloaded_message(&action, &blob, progress) {
@@ -708,7 +715,27 @@ impl<'a> Executor<'a> {
         // fail; the producer then breaks and drops its buffer_unordered
         // stream, cancelling any in-flight HTTP futures.
         drop(rx);
-        producer.await.expect("download producer task panicked");
+        let producer_stats = producer.await.expect("download producer task panicked");
+
+        // Channel backpressure telemetry: large blocked_send_us with
+        // small blocked_recv_us means the consumer is the bottleneck
+        // (producer often waited for channel space); the inverse means
+        // the producer is the bottleneck. Both small means the rates
+        // matched. Emitted at debug! so it's visible under -vv when an
+        // operator is investigating download performance, but stays
+        // out of normal -v milestone output. Target is a literal
+        // string rather than a `TARGET_CHANNEL` constant because this
+        // event deliberately sits outside the `ProfileLayer`
+        // aggregator -- it's one-event-per-batch diagnostic for the
+        // regular tracing sink.
+        debug!(
+            target: "jma::profile::channel",
+            producer_blocked_send_us = producer_stats.blocked_send_us,
+            consumer_blocked_recv_us = blocked_recv_us,
+            producer_send_count = producer_stats.send_count,
+            consumer_recv_count = recv_count,
+            "download channel backpressure stats",
+        );
 
         if let Some(e) = hard_error {
             return Err(e);
@@ -818,7 +845,9 @@ async fn download_producer(
     batch: Vec<SyncAction>,
     concurrency: usize,
     tx: mpsc::Sender<(SyncAction, Result<Vec<u8>>)>,
-) {
+) -> ChannelStats {
+    let mut blocked_send_us: u64 = 0;
+    let mut send_count: u64 = 0;
     let futures = batch.into_iter().map(|action| {
         let client = Arc::clone(&client);
         let blob_id = match &action {
@@ -832,10 +861,26 @@ async fn download_producer(
     });
     let mut stream = stream::iter(futures).buffer_unordered(concurrency);
     while let Some(item) = stream.next().await {
-        if tx.send(item).await.is_err() {
+        let t = Instant::now();
+        let sent = tx.send(item).await.is_ok();
+        blocked_send_us += t.elapsed().as_micros() as u64;
+        if !sent {
             break;
         }
+        send_count += 1;
     }
+    ChannelStats {
+        blocked_send_us,
+        send_count,
+    }
+}
+
+/// Producer-side channel telemetry returned to `download_batch` so the
+/// caller can emit a single backpressure summary event per batch
+/// alongside its own consumer-side recv timings.
+struct ChannelStats {
+    blocked_send_us: u64,
+    send_count: u64,
 }
 
 /// Walk a state-advance chain forward from `cursor`. The chain is the
