@@ -1,0 +1,29 @@
+# Categorization for GitHub's auto-generated release notes. Categories
+# fire on PR labels, so this only shapes output for changes that landed
+# via a labeled PR. Direct commits to mainline still show up, but
+# unlabeled, under "Other Changes".
+#
+# See: https://docs.github.com/en/repositories/releasing-projects-on-github/automatically-generated-release-notes
+changelog:
+  categories:
+    - title: New Features
+      labels:
+        - enhancement
+        - feature
+    - title: Bug Fixes
+      labels:
+        - bug
+        - fix
+    - title: Performance
+      labels:
+        - performance
+    - title: Documentation
+      labels:
+        - documentation
+    - title: Build and CI
+      labels:
+        - build
+        - ci
+    - title: Other Changes
+      labels:
+        - "*"

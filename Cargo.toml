@@ -1,8 +1,10 @@
 [package]
 name = "jma-mail"
-version = "0.1.0"
+version = "0.9.0"
 edition = "2024"
 description = "JM's Mail Agent: bidirectional JMAP-to-Maildir email sync for Fastmail"
+repository = "https://github.com/jmibanez/jma-mail"
+license = "BSD-3-Clause"
 
 [[bin]]
 name = "jma"
@@ -36,11 +38,11 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # `state::db::acquire_lock` (per-state-DB).
 fd-lock = "4"
 
-# Maildir. Pinned to a fork that carries staktrace/maildir#45
-# (`store_new_with_flags` + suffix-aware iteration of `new/`) until
-# upstream merges; tracked at https://github.com/staktrace/maildir/issues/44.
-# Swap back to a versioned crates.io dep once upstream releases.
-maildir = { git = "https://github.com/jmibanez/maildir", rev = "0d6509aefe4d91f1864ad62e003092030c3afeae" }
+# Maildir. staktrace/maildir#45 (`store_new_with_flags` +
+# suffix-aware iteration of `new/`) has merged upstream but no
+# crates.io release has shipped yet, so pin to an upstream commit.
+# Swap to a versioned crates.io dep once upstream releases.
+maildir = { git = "https://github.com/staktrace/maildir", rev = "2f5bb79e192231e14a4cc07df4f83c1148039cd9" }
 
 # RFC 5322 header parsing. Already pulled in transitively via the
 # maildir crate (which uses it for `MailEntry::headers()`); declare
@@ -155,3 +157,8 @@ fake = "4"
 # the same pattern 69c455a used for the (single-file) SQLite
 # fixture. Dev-only; production code never touches this.
 include_dir = "0.7"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

@@ -320,9 +320,10 @@ fn format_rate(bps: f64) -> String {
 }
 
 /// Snapshot `ru_maxrss` and normalize to bytes. macOS returns
-/// bytes; Linux and the BSDs return KiB. Anything that can't be
-/// queried returns 0 -- the resulting phase row will show a
-/// zero/zero RSS pair, which is honest about the missing data.
+/// bytes; Linux and the BSDs return KiB. Windows has no
+/// `getrusage` and reports 0 -- the resulting phase row will show
+/// a zero/zero RSS pair, which is honest about the missing data.
+#[cfg(unix)]
 fn read_rss_bytes() -> u64 {
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
     let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
@@ -335,6 +336,11 @@ fn read_rss_bytes() -> u64 {
     } else {
         raw.saturating_mul(1024)
     }
+}
+
+#[cfg(not(unix))]
+fn read_rss_bytes() -> u64 {
+    0
 }
 
 /// Per-span data we stash via `extensions_mut` on the Registry's
