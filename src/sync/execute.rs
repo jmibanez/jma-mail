@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 use tracing::{Instrument, debug, info, warn};
 
 use crate::config::Config;
@@ -653,37 +654,42 @@ impl<'a> Executor<'a> {
     /// uses to decide whether to halve concurrency before the retry
     /// pass. Hard errors abort the batch immediately.
     ///
-    /// Connection isn't Send, so DB writes happen inline on the
-    /// spawning task as each blob lands -- not inside the parallel
-    /// futures. Per-message progress thus flows during the wait
-    /// instead of arriving in one burst after the stream drains.
+    /// Downloads run on a spawned producer task that feeds a bounded
+    /// mpsc channel; this task drains the channel and performs the
+    /// disk + DB writes inline. Connection isn't Send, so the writer
+    /// must stay on this task -- but moving the download stream off
+    /// it means the producer keeps pulling blobs into the channel
+    /// while a write is in progress, instead of stalling between
+    /// stream.next() calls.
     async fn download_batch(
         &self,
         batch: Vec<SyncAction>,
         concurrency: usize,
         progress: &mut DownloadProgress,
     ) -> Result<DownloadBatchOutcome> {
-        let client = &self.client;
-        let futures = batch.into_iter().map(|action| {
-            let blob_id = match &action {
-                SyncAction::DownloadMessage { jmap_blob_id, .. } => jmap_blob_id.clone(),
-                _ => unreachable!("non-download in downloads bucket"),
-            };
-            async move {
-                let res = jmap_email::download_blob(client, &blob_id).await;
-                (action, res)
-            }
-        });
-        let mut stream = stream::iter(futures).buffer_unordered(concurrency);
+        // Bounded channel: at most `concurrency` completed blobs are
+        // buffered between producer and writer, capping the in-memory
+        // blob footprint at roughly 2 * concurrency (buffered +
+        // in-flight inside buffer_unordered).
+        let (tx, mut rx) = mpsc::channel(concurrency);
+        let producer = tokio::spawn(download_producer(
+            Arc::clone(&self.client),
+            batch,
+            concurrency,
+            tx,
+        ));
 
         let mut rate_limited = false;
         let mut hard_error: Option<anyhow::Error> = None;
         let mut to_retry: Vec<SyncAction> = Vec::new();
 
-        while let Some((action, result)) = stream.next().await {
+        while let Some((action, result)) = rx.recv().await {
             match result {
                 Ok(blob) => {
-                    self.store_downloaded_message(&action, &blob, progress)?;
+                    if let Err(e) = self.store_downloaded_message(&action, &blob, progress) {
+                        hard_error = Some(e);
+                        break;
+                    }
                 }
                 Err(e) => {
                     if is_transient_error(&e) {
@@ -698,6 +704,12 @@ impl<'a> Executor<'a> {
                 }
             }
         }
+        // Closing the receiver makes the next tx.send in the producer
+        // fail; the producer then breaks and drops its buffer_unordered
+        // stream, cancelling any in-flight HTTP futures.
+        drop(rx);
+        producer.await.expect("download producer task panicked");
+
         if let Some(e) = hard_error {
             return Err(e);
         }
@@ -792,6 +804,37 @@ impl<'a> Executor<'a> {
             }
         }
         Ok(())
+    }
+}
+
+/// Pump downloaded blobs into `tx` from a parallel `buffer_unordered`
+/// stream. Runs on its own tokio task so the writer side of the
+/// channel (which performs blocking disk + SQLite work inline) doesn't
+/// stall the stream between completions. Exits on stream exhaustion
+/// or when the receiver is dropped; dropping the stream cancels any
+/// in-flight HTTP futures.
+async fn download_producer(
+    client: Arc<Client>,
+    batch: Vec<SyncAction>,
+    concurrency: usize,
+    tx: mpsc::Sender<(SyncAction, Result<Vec<u8>>)>,
+) {
+    let futures = batch.into_iter().map(|action| {
+        let client = Arc::clone(&client);
+        let blob_id = match &action {
+            SyncAction::DownloadMessage { jmap_blob_id, .. } => jmap_blob_id.clone(),
+            _ => unreachable!("non-download in downloads bucket"),
+        };
+        async move {
+            let res = jmap_email::download_blob(&client, &blob_id).await;
+            (action, res)
+        }
+    });
+    let mut stream = stream::iter(futures).buffer_unordered(concurrency);
+    while let Some(item) = stream.next().await {
+        if tx.send(item).await.is_err() {
+            break;
+        }
     }
 }
 
