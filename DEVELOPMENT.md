@@ -35,7 +35,7 @@ CC=/usr/bin/cc cargo test --lib maildir_ops::headers::tests::parses_folded_value
 - `src/ids.rs` -- newtype wrappers for the various string IDs (see [ID newtypes](#id-newtypes)).
 - `src/jmap/` -- JMAP client wrapper. `session.rs` opens the connection, `discovery.rs` resolves the session URL via DNS SRV / well-known per RFC 8620 section 2.2, `limits.rs` clamps every server-advertised cap against a hardcoded ceiling (so a hostile or buggy server can't induce DoS via absurd values), `email.rs` is the per-method veneer over `jmap-client`, `mailbox.rs` handles `Mailbox/get`, `retry.rs` classifies errors as transient vs hard, `types.rs` holds the internal `EmailObject` shape.
 - `src/maildir_ops/` -- anything that touches the filesystem. `store.rs` wraps the `maildir` crate for read/write, `flags.rs` translates between maildir suffix flags and JMAP keywords, `scan.rs` walks a folder and emits `LocalChange`s, `dedupe.rs` does the Message-ID-based duplicate sweep, `headers.rs` parses `Message-ID` out of a maildir file, `layout.rs` resolves a JMAP mailbox tree onto a single on-disk folder name under the configured `FolderLayout` and applies any matching `[[rename_rules]]`, `lock.rs` takes the per-maildir advisory lock.
-- `src/state/` -- SQLite. Schema in `db.rs::SCHEMA`. Tables:
+- `src/state/` -- SQLite. Schema defined inline in `db.rs`; version constant is `db.rs::SCHEMA_VERSION`. Tables:
   - `jmap_state` -- per-entity sync cursor (one row per `(account, entity)` like `("acct", "Email")`).
   - `message_map` -- JMAP<->maildir binding, indexed on `maildir_id`, `message_id`, `mailbox_id`.
   - `mailbox_map` -- server mailbox metadata.
@@ -43,7 +43,8 @@ CC=/usr/bin/cc cargo test --lib maildir_ops::headers::tests::parses_folded_value
   - `jmap_discovery` -- cached session URL keyed on the account's email domain; populated by `session::connect` after autodiscovery, cleared and rediscovered on a structural connect failure.
 
   All access goes through `queries.rs`. Don't `prepare` ad-hoc SQL elsewhere; if you need a new query, add it there.
-- `src/sync/` -- orchestration. See [Sync internals](#sync-internals) below.
+- `src/sync/` -- orchestration (engine, plan, reconcile, execute, plus `self_writes.rs` for the daemon's self-write cache). See [Sync internals](#sync-internals) below.
+- `src/profile.rs` -- per-run profiling layer. Aggregates `tracing` spans and events from the sync engine and maildir ops into a phase-by-phase summary (timings, blob throughput, file-op counts, RSS deltas). Output is opt-in via `--profile` (stderr table) and `--profile-json <PATH>` (NDJSON per cycle in daemon mode).
 - `src/daemon/` -- `watch` mode. `runner.rs` runs an initial sync then concurrently spawns `eventsource.rs` (SSE listener on the JMAP `eventSourceUrl` from the session) and `watcher.rs` (filesystem `notify` with debouncing). Both feed a `tokio::sync::mpsc` channel of `SyncTrigger`s; the trigger loop holds open a coalescing window after the first arrival to absorb back-to-back batches, then dispatches one `SyncEngine::run` per coalesced cycle (path-driven scan for `LocalChange`, full scan otherwise). See [Trigger pipeline](#trigger-pipeline) for the layering. `hook.rs` runs `post_arrival_command` after cycles that downloaded mail, coalescing overlapping triggers.
 
 ## Identifiers
@@ -64,7 +65,7 @@ The system juggles several opaque IDs from different namespaces. Knowing which i
 
 **Cross-cutting.**
 
-- `Message-ID` -- the RFC 5322 header. The **only** identifier shared by both sides. Parsed out of the maildir file by `maildir_ops::headers`; reported by JMAP as `EmailObject.message_id` (a `Vec<String>`, since RFC 5322 technically allows multiple values). NOT unique in `message_map`: the same Message-ID can legitimately appear in multiple rows (same email delivered to two folders, or sent messages stored in both Sent and the conversation thread folder). This is the identifier that survives a state DB wipe and lets us rebind known files without re-downloading.
+- `Message-ID` -- the RFC 5322 header. The **only** identifier shared by both sides. Parsed out of the maildir file by `maildir_ops::headers`; reported by JMAP as `EmailObject.message_id` (a `Vec<MessageId>`, since RFC 5322 technically allows multiple values). NOT unique in `message_map`: the same Message-ID can legitimately appear in multiple rows (same email delivered to two folders, or sent messages stored in both Sent and the conversation thread folder). This is the identifier that survives a state DB wipe and lets us rebind known files without re-downloading.
 
 ### ID newtypes
 
@@ -74,7 +75,7 @@ The point is that the compiler now distinguishes a server `Email/id` from a fold
 
 There are exactly two boundaries that still take/return bare strings, and conversion happens *at those boundaries*:
 
-- **jmap-client** -- the upstream crate's APIs take `Into<String>`, return `&str`, and serialize JSON keys as plain strings. `EmailSetOp::SetMailboxes.target_mailbox_ids` is `Vec<String>` for the same reason. We cross with `String::from(&id)` / `id.as_ref()` at the call site.
+- **jmap-client** -- the upstream crate's APIs take `Into<String>`, return `&str`, and serialize JSON keys as plain strings. We cross with `String::from(&id)` / `id.as_ref()` at the actual call site -- e.g. `set_email_batch` newtypes its `EmailSetOp::SetMailboxes.target_mailbox_ids` as `Vec<JmapMailboxId>` and only crosses to bare strings at the `set.update(...).mailbox_ids(target_mailbox_ids.iter())` invocation.
 - **rusqlite + raw SQL** -- `queries::{get,set}_jmap_state` keeps `account_id: &str`. The newtype's `ToSql`/`FromSql` impls cover *column* values, but param boundaries against literal SQL stay string-typed because they're not bound to any one ID kind. We cross with `id.as_ref()`.
 
 Stay typed everywhere else. If you find yourself writing `String::from(...)` mid-pipeline, the right fix is almost always to change the slot's type, not to add another conversion.
@@ -85,7 +86,7 @@ The sync pipeline moves a small set of internal types between phases. Each one l
 
 **JMAP-side types** (`src/jmap/types.rs`). Hand-rolled rather than re-exported from `jmap-client` so the rest of the codebase doesn't depend on the upstream crate's shape.
 
-- `EmailObject` -- `{ id, blob_id, thread_id, mailbox_ids: HashMap<jmap_mailbox_id, bool>, keywords: HashMap<String, bool>, message_id: Option<Vec<String>>, subject }`. Produced by `Email/get` and `Email/changes`-then-`Email/get`; consumed by `reconcile`. The `mailbox_ids` map's bool is always `true` (JMAP's convention for set membership); we keep the type as-is to match the wire format.
+- `EmailObject` -- `{ id, blob_id, thread_id, mailbox_ids: HashMap<JmapMailboxId, bool>, keywords: HashMap<String, bool>, message_id: Option<Vec<MessageId>>, subject }`. Produced by `Email/get` and `Email/changes`-then-`Email/get`; consumed by `reconcile`. The `mailbox_ids` map's bool is always `true` (JMAP's convention for set membership); we keep the type as-is to match the wire format.
 - `MailboxObject` -- mailbox metadata from `Mailbox/get`. Consumed by `resolve_mailboxes` and immediately translated into a `MailboxRecord` for the DB.
 - `ChangesResponse` -- `{ old_state, new_state, created, updated, destroyed, has_more_changes }`. The shape `Email/changes` returns; loop control for `fetch_remote_state`.
 - `SessionInfo` -- session URLs and account id, captured at connect time.
@@ -140,7 +141,7 @@ There is no in-place migration system. Whenever the SQLite schema or the invaria
 On open, the binary compares the on-disk version against `SCHEMA_VERSION`:
 
 - **Match** -- proceed.
-- **Mismatch** under a mutating command (`sync`, `pull`, `push`, `watch`) -- `open_or_recreate` `warn!`s and unlinks `state.db` plus its `-wal` and `-shm` siblings, then recreates an empty schema. The mutating command holds the state DB lock at this point, so no concurrent jma sharing this DB (same config, or — once the multi-account refactor lands — sibling per-account drivers against a shared DB) can race with the unlink. The disposability invariant is what makes this safe: the maildir + JMAP server are the source of truth, and the dedupe pass plus Message-ID-anchored adoption rebind every existing local file without re-downloading bytes.
+- **Mismatch** under a mutating command (`sync`, `pull`, `push`, `watch`) -- `open_or_recreate` `warn!`s and unlinks `state.db` plus its `-wal` and `-shm` siblings, then recreates an empty schema. The mutating command holds the state DB lock at this point, so no concurrent jma sharing this DB can race with the unlink. The disposability invariant is what makes this safe: the maildir + JMAP server are the source of truth, and the dedupe pass plus Message-ID-anchored adoption rebind every existing local file without re-downloading bytes.
 - **Mismatch** under a read-only command (`status`, `mailboxes`, `auth rediscover`) -- `open` refuses with an actionable error pointing the user at `jma sync`. Read-only paths don't hold the state DB lock and so can't safely nuke; deferring to the next mutating run keeps the locking invariant intact.
 
 Both directions of mismatch (older binary, newer DB; or newer binary, older DB) take the same auto-nuke path. Disposability cuts both ways. A pre-versioning DB (`user_version = 0` with populated tables) is treated as stale.
@@ -161,7 +162,7 @@ The lock keys on the maildir root, not the state DB, because the maildir is the 
 
 `state::db::acquire_lock` takes a separate `flock` on `<db_path>.lock`. This lock specifically gates `open_or_recreate`'s schema-mismatch unlink path: without it, a process that decides the on-disk schema is stale would `unlink` the DB out from under any concurrent process that opened the same DB but doesn't realise it's about to be deleted (writes vanish into the orphaned inode; a later checkpoint can corrupt or panic).
 
-The maildir lock alone doesn't cover this, because two processes can hold *different* maildir locks while sharing a state DB -- which is exactly the topology the multi-account refactor produces (per-account daemon drivers, each with their own maildir, all pointing at one widened-PK DB).
+The maildir lock alone doesn't cover this, because two processes can hold *different* maildir locks while sharing a state DB -- e.g. two configs whose maildir roots differ but whose explicit `[state].db_path` points at the same DB.
 
 Note that with the maildir-relative default for `[state].db_path`, the state DB lives at `<maildir_root>/.jma.db` and the maildir lock structurally covers what the DB lock guards -- any process that could open this DB must already hold the maildir lock by construction. The DB lock is only load-bearing when `[state].db_path` is set explicitly to a path outside the maildir, where two configs can share a DB while owning different maildirs. Today both locks are taken unconditionally regardless of topology; gating the DB lock on config shape is a candidate simplification but not a current one.
 
@@ -171,7 +172,7 @@ Note that with the maildir-relative default for `[state].db_path`, the state DB 
 
 The locks above protect against destruction; per-batch transactions plus SQLite's WAL writer-lock protect against interleaved writes:
 
-1. **Intra-cycle write atomicity** -- `src/sync/execute.rs` wraps each mutation phase in a SQLite transaction via `Connection::unchecked_transaction()`. Pure-DB phases (`adopt_messages`, `apply_move_pair_adopts`, the post-network section of `apply_remote_set`) take one transaction per phase, so a panic mid-loop rolls the whole phase back. FS-mutating phases (`update_local_flags`, `move_local_messages`, `delete_local_messages`, `upload_messages`, `run_downloads`) take one transaction per iteration around the paired DB writes that follow each successful FS op, so a row's `message_map` and `local_state` never disagree even if the second DB write fails. Side benefit: SQLite's WAL writer-lock serializes any other writer on the file from the first write through commit; the eventual multi-account refactor (one engine per account against a shared DB) inherits this serialization for free.
+1. **Intra-cycle write atomicity** -- `src/sync/execute.rs` wraps each mutation phase in a SQLite transaction via `Connection::unchecked_transaction()`. Pure-DB phases (`adopt_messages`, `apply_move_pair_adopts`, the post-network section of `apply_remote_set`) take one transaction per phase, so a panic mid-loop rolls the whole phase back. FS-mutating phases (`update_local_flags`, `move_local_messages`, `delete_local_messages`, `upload_messages`, `download_messages`) take one transaction per iteration around the paired DB writes that follow each successful FS op, so a row's `message_map` and `local_state` never disagree even if the second DB write fails. Side benefit: SQLite's WAL writer-lock serializes any other writer on the file from the first write through commit.
 
 2. **External writers** -- a deliberate bypass (e.g. `sqlite3 state.db "UPDATE ..."` typed in error, or any tool that opens the DB without going through the state DB lock) is not prevented. Per-batch transactions block such writers from interleaving *within* a phase, but they can still interleave between phases. The recovery story is "next sync cycle re-reconciles from server state"; the design accepts this rather than holding cycle-spanning transactions across network I/O (which would balloon the WAL during long initial syncs and lose Ctrl-C-mid-cycle partial-progress recovery).
 
@@ -374,7 +375,9 @@ A handful of handler-specific notes:
 
 #### Download and upload concurrency
 
-Both `run_downloads` and `upload_messages` fan out via `buffer_unordered`, capped at the effective per-handler concurrency from `limits::` (`config.sync.{download,upload}_concurrency` clamped to the server's `maxConcurrentRequests` / `maxConcurrentUpload`). DB writes happen serially after the stream drains, since `rusqlite::Connection` isn't `Send` and can't cross await points inside the parallel futures. Each successful `Email/import` also contributes its `oldState` / `newState` pair to the cursor ratchet (see [State persistence](#state-persistence)); `Email/blob` is a pure data fetch so downloads don't.
+Uploads (`upload_messages`) fan out via `buffer_unordered`, capped at the effective concurrency from `limits::` (`config.sync.upload_concurrency` clamped to the server's `maxConcurrentUpload`). DB writes happen serially after the stream drains, since `rusqlite::Connection` isn't `Send` and can't cross await points inside the parallel futures. Each successful `Email/import` contributes its `oldState` / `newState` pair to the cursor ratchet (see [State persistence](#state-persistence)).
+
+Downloads (`download_messages`) use a producer-consumer shape instead: a spawned task does the parallel `buffer_unordered` blob fetch and pushes each completed blob into a bounded mpsc channel; the calling task drains the channel inline and does the disk + DB writes as bytes arrive. The split exists because `Connection` isn't `Send`, but unlike the upload path it overlaps store-and-DB work with subsequent fetches instead of waiting for the whole stream to drain. Concurrency is clamped the same way (`config.sync.download_concurrency` against `maxConcurrentRequests`). `Email/blob` is a pure data fetch so downloads don't ratchet the cursor.
 
 Downloads get a rate-limit halving loop: a transient failure within a pass commits the successes, halves concurrency, sleeps 500ms, and retries the unfinished entries; the halving is one-way per cycle, since a link that hit the cap once is likely to hit it again, and the next cycle resets from the configured value. A hard error short-circuits after committing whatever did succeed; a pass with no progress and no transient signal bails with "stream stalled" rather than spinning. Uploads don't halve -- they drain the stream regardless, and the first observed error becomes the cycle's hard error.
 

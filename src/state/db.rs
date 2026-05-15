@@ -103,10 +103,9 @@ pub fn open(path: &Path) -> Result<Connection> {
 ///
 /// Caller must hold the state DB lock from `acquire_lock` before
 /// calling this. Otherwise a concurrent jma sharing this state DB
-/// (e.g. a misconfigured second config pointing at the same `db_path`,
-/// or -- once the multi-account refactor lands -- a sibling per-account
-/// driver against the shared DB) could be midway through a cycle when
-/// we unlink the file out from under it.
+/// (e.g. a misconfigured second config pointing at the same `db_path`)
+/// could be midway through a cycle when we unlink the file out from
+/// under it.
 ///
 /// In practice every mutating caller also holds the maildir lock; see
 /// `acquire_mutator_locks` in `src/main.rs` for the canonical order.

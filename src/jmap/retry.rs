@@ -35,14 +35,10 @@ static RETRY_CONFIG: OnceLock<RetryConfig> = OnceLock::new();
 /// Set the retry parameters used by every subsequent `with_retry`
 /// call in this process. Idempotent: only the first call wins;
 /// subsequent calls are no-ops and the supplied value is dropped.
-/// This is the right shape today (one process-wide config) but will
-/// need to change if per-account `RetryConfig` ever becomes a thing
-/// — the multi-account refactor would have to either thread
-/// `&RetryConfig` explicitly or move the lock onto a per-account
-/// handle. Call once from `load_config`, before any JMAP work; do
-/// **not** call from tests — drive `do_retry` directly with a
-/// custom `RetryConfig` so the process-wide `OnceLock` stays at its
-/// uninit default and other tests aren't affected.
+/// Call once from `load_config`, before any JMAP work; do **not**
+/// call from tests -- drive `do_retry` directly with a custom
+/// `RetryConfig` so the process-wide `OnceLock` stays at its uninit
+/// default and other tests aren't affected.
 pub fn init_retry_config(config: RetryConfig) {
     RETRY_CONFIG.get_or_init(|| config);
 }
