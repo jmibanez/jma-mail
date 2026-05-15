@@ -6,7 +6,7 @@ use jmap_client::core::error::MethodErrorType;
 use jmap_client::email;
 use std::collections::HashMap;
 use tracing::field::Empty;
-use tracing::{Instrument, debug, info, instrument};
+use tracing::{Instrument, debug, info, instrument, warn};
 
 use crate::ids::{JmapBlobId, JmapEmailId, JmapMailboxId, JmapThreadId, MessageId};
 use crate::jmap::limits;
@@ -81,7 +81,10 @@ pub async fn get_by_ids(client: &Client, ids: &[JmapEmailId]) -> Result<Vec<Emai
                 .unwrap_get_email()
                 .context("Failed to parse email response")?;
 
-            Ok(get_response.list().iter().map(parse_email_object).collect())
+            let partitioned =
+                PartitionedRows::partition(get_response.list().iter().map(parse_email_object));
+            partitioned.log();
+            Ok(partitioned.valid)
         })
         .await
     }
@@ -595,7 +598,16 @@ pub async fn import_email(
             s => Some(s.to_string()),
         };
         let email = response.created(&create_id)?;
-        let email_id = JmapEmailId::from(email.id().unwrap_or_default());
+        // Recovery shape if we hit this: the blob is uploaded
+        // regardless, so next cycle's Email/changes lists the
+        // message as `created` and the unknown-remote-email path
+        // adopts via Message-ID anchor when the local file carries
+        // one.
+        let email_id = email
+            .id()
+            .filter(|s| !s.is_empty())
+            .map(JmapEmailId::from)
+            .context("Email/import response: server omitted or returned empty `id`")?;
 
         Ok(ImportResult {
             email_id,
@@ -634,18 +646,110 @@ pub async fn download_blob(client: &Client, blob_id: &JmapBlobId) -> Result<Vec<
     Ok(data)
 }
 
-fn parse_email_object(email: &jmap_client::email::Email<jmap_client::Get>) -> EmailObject {
-    let id = JmapEmailId::from(email.id().unwrap_or_default());
-    let blob_id = JmapBlobId::from(email.blob_id().unwrap_or_default());
-    let thread_id = JmapThreadId::from(email.thread_id().unwrap_or_default());
-    let message_id = email
-        .message_id()
-        .map(|ids| ids.iter().map(|s| MessageId::from(s.as_str())).collect());
+/// Reject rows where the server omitted any of `id`/`blobId`/
+/// `threadId`, or where they are empty -- per RFC 8621 each is a
+/// required non-empty `Id`, and empty values would collide on the
+/// `message_map` 1:1 invariant. Split out of `parse_email_object`
+/// so the rejection contract can be unit-tested without standing
+/// up a `jmap_client::email::Email<Get>`.
+fn validate_required_ids(
+    id: Option<&str>,
+    blob_id: Option<&str>,
+    thread_id: Option<&str>,
+) -> Result<(JmapEmailId, JmapBlobId, JmapThreadId)> {
+    let id = id
+        .filter(|s| !s.is_empty())
+        .map(JmapEmailId::from)
+        .context("Email/get response: server omitted or returned empty `id`")?;
+    let blob_id = blob_id
+        .filter(|s| !s.is_empty())
+        .map(JmapBlobId::from)
+        .with_context(|| format!("Email/get response for {}: missing/empty `blobId`", id))?;
+    let thread_id = thread_id
+        .filter(|s| !s.is_empty())
+        .map(JmapThreadId::from)
+        .with_context(|| format!("Email/get response for {}: missing/empty `threadId`", id))?;
+    Ok((id, blob_id, thread_id))
+}
+
+/// Result of partitioning an `Email/get` response's parsed rows.
+/// `valid` flows into reconcile; `dropped` and `first_err` drive
+/// the summary warn so the user sees something specific when a
+/// server response misbehaves at scale.
+struct PartitionedRows {
+    valid: Vec<EmailObject>,
+    dropped: usize,
+    first_err: Option<String>,
+}
+
+impl PartitionedRows {
+    /// Drop unparseable rows instead of failing the batch. A single
+    /// empty/missing-required-id row would otherwise take down
+    /// hundreds of valid rows returned in the same response.
+    /// Dropped emails are simply not reconciled this cycle; the
+    /// next Email/changes will list them again, and a server that
+    /// has since fixed itself will deliver a parseable row.
+    /// Per-row detail is logged at `debug!` here so `-vv` users see
+    /// every drop reason; `log` emits one summary `warn!` per
+    /// affected batch.
+    fn partition(rows: impl IntoIterator<Item = Result<EmailObject>>) -> Self {
+        let mut valid: Vec<EmailObject> = Vec::new();
+        let mut dropped = 0usize;
+        let mut first_err: Option<String> = None;
+        for row in rows {
+            match row {
+                Ok(eo) => valid.push(eo),
+                Err(e) => {
+                    dropped += 1;
+                    if first_err.is_none() {
+                        first_err = Some(format!("{:#}", e));
+                    }
+                    debug!("Email/get: dropped row: {:#}", e);
+                }
+            }
+        }
+        PartitionedRows {
+            valid,
+            dropped,
+            first_err,
+        }
+    }
+
+    fn log(&self) {
+        if self.dropped == 0 {
+            return;
+        }
+        warn!(
+            "Email/get: dropped {} of {} row(s) due to invalid server response \
+             (first error: {}); reconcile will see the remaining {} this cycle",
+            self.dropped,
+            self.dropped + self.valid.len(),
+            self.first_err.as_deref().unwrap_or("<unknown>"),
+            self.valid.len(),
+        );
+    }
+}
+
+/// Parse one `Email/get` row into an `EmailObject`. Required IDs
+/// are validated via `validate_required_ids`; `mailboxIds` and the
+/// RFC 5322 `messageId` list are filtered of empty members.
+fn parse_email_object(email: &jmap_client::email::Email<jmap_client::Get>) -> Result<EmailObject> {
+    let (id, blob_id, thread_id) =
+        validate_required_ids(email.id(), email.blob_id(), email.thread_id())?;
+    let message_id = email.message_id().map(|ids| {
+        ids.iter()
+            .map(|s| s.as_str().trim())
+            .filter(|s| !s.is_empty())
+            .map(MessageId::from)
+            .collect()
+    });
 
     let mailbox_ids: HashMap<JmapMailboxId, bool> = email
         .mailbox_ids()
         .iter()
-        .map(|id| (id.to_string().into(), true))
+        .map(|id| id.to_string())
+        .filter(|s| !s.is_empty())
+        .map(|s| (JmapMailboxId::from(s), true))
         .collect();
 
     let keywords: HashMap<String, bool> = email
@@ -654,7 +758,7 @@ fn parse_email_object(email: &jmap_client::email::Email<jmap_client::Get>) -> Em
         .map(|kw| (kw.to_string(), true))
         .collect();
 
-    EmailObject {
+    Ok(EmailObject {
         id,
         blob_id,
         thread_id,
@@ -662,7 +766,7 @@ fn parse_email_object(email: &jmap_client::email::Email<jmap_client::Get>) -> Em
         keywords,
         message_id,
         subject: None,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -747,5 +851,164 @@ mod tests {
         acc.merge(outcome_with_chain("Sx", "Sy")); // breaks
         acc.merge(outcome_with_chain("S1", "S2")); // would chain to original, but already broken
         assert!(acc.chain_new.is_none());
+    }
+
+    // -- Empty/missing ID rejection --
+
+    /// Happy path: all three required IDs present and non-empty.
+    /// Returns typed newtypes; downstream code keys on these.
+    #[test]
+    fn validate_required_ids_accepts_full_triple() {
+        let got = validate_required_ids(Some("E1"), Some("B1"), Some("T1")).unwrap();
+        assert_eq!(got.0, JmapEmailId::from("E1"));
+        assert_eq!(got.1, JmapBlobId::from("B1"));
+        assert_eq!(got.2, JmapThreadId::from("T1"));
+    }
+
+    /// Missing `id` is rejected -- the server has to identify the
+    /// row it's describing. Without it we have nowhere to bind the
+    /// `message_map` row, and `JmapEmailId::from("")` would have
+    /// silently collapsed every empty-id row onto one DB key.
+    #[test]
+    fn validate_required_ids_rejects_missing_id() {
+        let e = validate_required_ids(None, Some("B1"), Some("T1")).unwrap_err();
+        assert!(
+            format!("{:#}", e).contains("`id`"),
+            "expected error to name the field `id`, got {:#}",
+            e
+        );
+    }
+
+    #[test]
+    fn validate_required_ids_rejects_empty_id() {
+        let e = validate_required_ids(Some(""), Some("B1"), Some("T1")).unwrap_err();
+        assert!(
+            format!("{:#}", e).contains("`id`"),
+            "expected error to name the field `id`, got {:#}",
+            e
+        );
+    }
+
+    /// `blobId` is required for `Email/blob` downloads. The error
+    /// surface names both the bad field and the row's `id` so the
+    /// summary `warn!` can identify which row was bad without
+    /// dumping the whole response.
+    #[test]
+    fn validate_required_ids_rejects_empty_blob_id() {
+        let e = validate_required_ids(Some("E1"), Some(""), Some("T1")).unwrap_err();
+        let msg = format!("{:#}", e);
+        assert!(msg.contains("`blobId`"), "expected `blobId`, got {}", msg);
+        assert!(msg.contains("E1"), "expected row id E1, got {}", msg);
+    }
+
+    #[test]
+    fn validate_required_ids_rejects_missing_thread_id() {
+        let e = validate_required_ids(Some("E1"), Some("B1"), None).unwrap_err();
+        let msg = format!("{:#}", e);
+        assert!(
+            msg.contains("`threadId`"),
+            "expected `threadId`, got {}",
+            msg
+        );
+        assert!(msg.contains("E1"), "expected row id E1, got {}", msg);
+    }
+
+    #[test]
+    fn validate_required_ids_rejects_empty_thread_id() {
+        let e = validate_required_ids(Some("E1"), Some("B1"), Some("")).unwrap_err();
+        let msg = format!("{:#}", e);
+        assert!(
+            msg.contains("`threadId`"),
+            "expected `threadId`, got {}",
+            msg
+        );
+        assert!(msg.contains("E1"), "expected row id E1, got {}", msg);
+    }
+
+    // -- Skip-with-warn batch behavior --
+
+    fn email_obj(id: &str) -> EmailObject {
+        EmailObject {
+            id: JmapEmailId::from(id),
+            blob_id: JmapBlobId::from(format!("blob-{id}")),
+            thread_id: JmapThreadId::from(format!("thread-{id}")),
+            mailbox_ids: HashMap::new(),
+            keywords: HashMap::new(),
+            message_id: None,
+            subject: None,
+        }
+    }
+
+    /// All-valid batch: every row survives, no drops, no diagnostic
+    /// captured. Pins the no-op shape so a future tweak to the
+    /// partition logic can't start spuriously dropping rows.
+    #[test]
+    fn partition_keeps_all_valid_rows() {
+        let rows = vec![Ok(email_obj("A")), Ok(email_obj("B"))];
+        let p = PartitionedRows::partition(rows);
+        assert_eq!(p.valid.len(), 2);
+        assert_eq!(p.dropped, 0);
+        assert!(p.first_err.is_none());
+    }
+
+    /// Mixed batch: one bad row in the middle gets dropped, the
+    /// valid rows on either side survive. A single empty/missing-
+    /// required-id row must never take down the rest of the batch.
+    #[test]
+    fn partition_drops_bad_rows_keeps_valid() {
+        let rows: Vec<Result<EmailObject>> = vec![
+            Ok(email_obj("A")),
+            Err(anyhow::anyhow!(
+                "Email/get response for X: missing/empty `blobId`"
+            )),
+            Ok(email_obj("B")),
+        ];
+        let p = PartitionedRows::partition(rows);
+        assert_eq!(p.valid.len(), 2);
+        assert_eq!(p.valid[0].id, JmapEmailId::from("A"));
+        assert_eq!(p.valid[1].id, JmapEmailId::from("B"));
+        assert_eq!(p.dropped, 1);
+        assert!(p.first_err.as_deref().unwrap().contains("`blobId`"));
+    }
+
+    /// `first_err` captures the first failure, not the last, so the
+    /// summary log surfaces the earliest diagnostic. Later drops are
+    /// counted but their messages stay at `debug!` level only.
+    #[test]
+    fn partition_captures_first_error_not_last() {
+        let rows: Vec<Result<EmailObject>> = vec![
+            Err(anyhow::anyhow!("first failure")),
+            Err(anyhow::anyhow!("second failure")),
+        ];
+        let p = PartitionedRows::partition(rows);
+        assert_eq!(p.dropped, 2);
+        assert!(p.valid.is_empty());
+        assert_eq!(p.first_err.as_deref(), Some("first failure"));
+    }
+
+    /// All-bad batch: every row dropped, valid is empty. Reconcile
+    /// receives no remote_emails this cycle -- harmless but visible
+    /// via the summary warn.
+    #[test]
+    fn partition_handles_all_bad_batch() {
+        let rows: Vec<Result<EmailObject>> = vec![
+            Err(anyhow::anyhow!("bad one")),
+            Err(anyhow::anyhow!("bad two")),
+            Err(anyhow::anyhow!("bad three")),
+        ];
+        let p = PartitionedRows::partition(rows);
+        assert!(p.valid.is_empty());
+        assert_eq!(p.dropped, 3);
+        assert!(p.first_err.is_some());
+    }
+
+    /// Empty batch: nothing to partition. Pins the trivial case so
+    /// the partition helper stays safe to call unconditionally.
+    #[test]
+    fn partition_handles_empty_batch() {
+        let p = PartitionedRows::partition(Vec::<Result<EmailObject>>::new());
+        assert!(p.valid.is_empty());
+        assert_eq!(p.dropped, 0);
+        assert!(p.first_err.is_none());
     }
 }
