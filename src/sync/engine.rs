@@ -167,12 +167,15 @@ impl<'a> SyncEngine<'a> {
 
     /// Connect a fresh engine and push only (local -> server). Adoption
     /// still runs.
-    pub async fn push_only(conn: &'a Connection, config: &'a Config, dry_run: bool) -> Result<()> {
+    pub async fn push_only(
+        conn: &'a Connection,
+        config: &'a Config,
+        dry_run: bool,
+    ) -> Result<SyncOutcome> {
         Self::connect(conn, config)
             .await?
             .run(dry_run, SyncDirection::PushOnly, ScanScope::Full)
-            .await?;
-        Ok(())
+            .await
     }
 
     /// Single orchestration path. `direction` selects which side(s) of
