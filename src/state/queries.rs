@@ -357,3 +357,95 @@ pub fn clear_cached_session_url(conn: &Connection, domain: &str) -> Result<()> {
 
 // Bring in the Optional extension trait
 use rusqlite::OptionalExtension;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::db::open_or_recreate;
+    use tempfile::tempdir;
+
+    fn record_with_maildir_id(jmap_email_id: &str, maildir_id: Option<&str>) -> MessageRecord {
+        MessageRecord {
+            jmap_email_id: jmap_email_id.into(),
+            jmap_blob_id: None,
+            jmap_thread_id: None,
+            mailbox_id: "MB-INBOX".into(),
+            maildir_id: maildir_id.map(MaildirId::from),
+            maildir_folder: maildir_id.map(|_| "INBOX".to_string()),
+            message_id: "msg@x".into(),
+            flags: String::new(),
+            jmap_keywords: "{}".into(),
+        }
+    }
+
+    /// Two distinct `jmap_email_id`s claiming the same non-NULL
+    /// `maildir_id` must fail at the SQLite layer. Pins the partial
+    /// UNIQUE index that turns the code-level 1:1 invariant
+    /// (one local file backs at most one server email) into a
+    /// schema-enforced one. Without this index, an adoption-ordering
+    /// bug that emits two AdoptLocalMessage actions for the same
+    /// maildir_id would silently corrupt message_map; with it, the
+    /// second insert errors out and the bug surfaces immediately.
+    #[test]
+    fn upsert_rejects_duplicate_maildir_id_across_jmap_ids() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("state.db");
+        let conn = open_or_recreate(&db_path).unwrap();
+
+        let first = record_with_maildir_id("E1", Some("1700.M1.host"));
+        upsert_message(&conn, &first).expect("first insert should succeed");
+
+        let second = record_with_maildir_id("E2", Some("1700.M1.host"));
+        let err =
+            upsert_message(&conn, &second).expect_err("duplicate maildir_id must be rejected");
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("UNIQUE constraint failed") || msg.contains("unique constraint"),
+            "expected UNIQUE violation, got: {msg}"
+        );
+    }
+
+    /// Multiple rows with NULL `maildir_id` are allowed -- the index
+    /// is partial (`WHERE maildir_id IS NOT NULL`) so the
+    /// pre-adoption state, where many `jmap_email_id`s wait without
+    /// a bound local file, stays valid. Pins the partial-index shape
+    /// against a future refactor that drops the WHERE clause.
+    #[test]
+    fn upsert_allows_multiple_null_maildir_ids() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("state.db");
+        let conn = open_or_recreate(&db_path).unwrap();
+
+        upsert_message(&conn, &record_with_maildir_id("E1", None)).unwrap();
+        upsert_message(&conn, &record_with_maildir_id("E2", None)).unwrap();
+        upsert_message(&conn, &record_with_maildir_id("E3", None)).unwrap();
+
+        // Sanity: all three rows landed.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM message_map", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 3, "all NULL-maildir_id rows must be insertable");
+    }
+
+    /// Same `jmap_email_id` re-upserted with the same non-NULL
+    /// `maildir_id` must succeed (ON CONFLICT UPDATE on the
+    /// primary key). The partial UNIQUE index considers this the
+    /// same row, not a new conflicting one. Without this guard the
+    /// post-adoption re-sync (which re-emits every row each cycle)
+    /// would error on every existing message.
+    #[test]
+    fn upsert_idempotent_on_same_jmap_id_same_maildir_id() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("state.db");
+        let conn = open_or_recreate(&db_path).unwrap();
+
+        let row = record_with_maildir_id("E1", Some("1700.M1.host"));
+        upsert_message(&conn, &row).unwrap();
+        upsert_message(&conn, &row).expect("re-upserting the same row must be idempotent");
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM message_map", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+}

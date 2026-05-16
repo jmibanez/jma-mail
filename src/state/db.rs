@@ -38,7 +38,20 @@ CREATE TABLE IF NOT EXISTS message_map (
     PRIMARY KEY (jmap_email_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_message_map_maildir_id ON message_map(maildir_id);
+-- Partial UNIQUE schema-enforces the code-level 1:1 invariant between
+-- jmap_email_id and a non-NULL maildir_id, turning any adoption-ordering
+-- bug that tries to bind two emails to the same local file into a loud
+-- failure rather than silent message_map corruption. NULLs (rows without
+-- an adopted local file yet) are excluded so the pre-adoption state
+-- stays unconstrained. Named `_unique` rather than reusing the prior
+-- index name because SQLite's IF NOT EXISTS keys on name only -- the
+-- pre-existing non-unique `idx_message_map_maildir_id` on upgraded
+-- databases would otherwise mask this creation. Fresh databases get
+-- only the partial unique; upgraded databases keep the old non-unique
+-- index as harmless cruft alongside the new constraint.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_message_map_maildir_id_unique
+    ON message_map(maildir_id)
+    WHERE maildir_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_message_map_message_id ON message_map(message_id);
 CREATE INDEX IF NOT EXISTS idx_message_map_mailbox_id ON message_map(mailbox_id);
 
