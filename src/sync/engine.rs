@@ -8,12 +8,13 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
-use crate::ids::{JmapAccountId, JmapEmailId, JmapMailboxId};
+use crate::ids::{JmapAccountId, JmapEmailId, JmapMailboxId, MaildirId};
 use crate::jmap::{
     email as jmap_email, limits, mailbox as jmap_mailbox, session,
     types::{EmailObject, MailboxObject, SessionInfo},
 };
 use crate::maildir_ops::layout::{FolderLayoutDefinition, resolve_folder_path};
+use crate::maildir_ops::scan::LocalChange;
 use crate::maildir_ops::{scan, store};
 use crate::state::queries;
 use crate::sync::dedupe::{self, LocalEntry, LocalIndex};
@@ -192,38 +193,48 @@ impl<'a> SyncEngine<'a> {
         let mailboxes = self.resolve_mailboxes().await?;
         let maildir_root = self.config.maildir_path();
 
-        // Phase 0: dedupe + (conditionally) index. Always before scan so
-        // newly-introduced duplicates from a prior aborted run don't get
-        // treated as local changes to push.
+        // Phase 0: classify duplicates and (conditionally) index. Always
+        // before scan so newly-introduced duplicates from a prior aborted
+        // run don't get treated as local changes to push.
         //
         // Reconcile only consults `LocalIndex` when its DB-derived
         // lookup misses (initial sync, post-`c7a86e6`-recovery wipe, or
         // any other state where `message_map` is empty). In steady
         // state every remote Message-ID resolves through the DB, the
         // index is allocated and never read. Skip the build entirely
-        // when the DB has rows: dedupe still runs (its delete behavior
-        // is unconditional), but its `on_kept` callback is a no-op and
-        // `LocalIndex` stays at default-empty. Empty-HashMap lookups
-        // return None, which is exactly what the existing reconcile
-        // stage-2 check already handles.
+        // when the DB has rows: plan_dedupe still runs (cheap pure
+        // walk), `local_index` stays at default-empty, and
+        // Empty-HashMap lookups return None -- which is exactly what
+        // the existing reconcile stage-2 check already handles.
+        //
+        // Plan now, apply later: `apply_dedupe` only runs on non-dry
+        // cycles, so `jma sync --dry-run` no longer destroys local
+        // duplicates as a side effect of inspecting "what would
+        // happen." The plan also feeds (a) the dry-run printout below
+        // and (b) the post-scan filter, which suppresses scan's view
+        // of the duplicates so reconcile sees the post-dedupe shape
+        // even under dry-run.
         let folder_names: Vec<String> = mailboxes.iter().map(|(_, f)| f.clone()).collect();
-        let mut local_index = LocalIndex::default();
-        {
+        let dedupe_plan = {
             let _phase =
                 tracing::info_span!(target: crate::profile::TARGET_PHASE, "dedupe").entered();
-            if queries::has_message_map_rows(self.conn)? {
-                dedupe::dedupe(&maildir_root, &folder_names, |_, _, _| ())?;
-            } else {
-                dedupe::dedupe(&maildir_root, &folder_names, |folder, msgid, mid| {
-                    local_index
-                        .by_message_id
-                        .entry(msgid.clone())
-                        .or_default()
-                        .push(LocalEntry {
-                            folder: folder.to_string(),
-                            maildir_id: mid.clone(),
-                        });
-                })?;
+            let plan = dedupe::plan_dedupe(&maildir_root, &folder_names)?;
+            if !dry_run {
+                dedupe::apply_dedupe(&maildir_root, &plan)?;
+            }
+            plan
+        };
+        let mut local_index = LocalIndex::default();
+        if !queries::has_message_map_rows(self.conn)? {
+            for kept in &dedupe_plan.kept {
+                local_index
+                    .by_message_id
+                    .entry(kept.message_id.clone())
+                    .or_default()
+                    .push(LocalEntry {
+                        folder: kept.folder.clone(),
+                        maildir_id: kept.maildir_id.clone(),
+                    });
             }
         }
 
@@ -232,7 +243,7 @@ impl<'a> SyncEngine<'a> {
         // groups touched by the supplied event paths -- the daemon's
         // common case, where the watcher already told us exactly
         // which files moved.
-        let all_local_changes = {
+        let scan_changes = {
             let _phase =
                 tracing::info_span!(target: crate::profile::TARGET_PHASE, "scan").entered();
             match &scan_scope {
@@ -263,6 +274,41 @@ impl<'a> SyncEngine<'a> {
                     scan::scan_paths(&maildir_root, paths, &known_states)?
                 }
             }
+        };
+
+        // Suppress scan's view of files plan_dedupe flagged for
+        // removal. Under non-dry-run apply_dedupe ran above and the
+        // file is gone, so scan can't see it anyway -- the filter is
+        // a no-op. Under dry-run the file is still on disk and scan
+        // emits NewMessage/FlagsChanged against it; without this
+        // filter reconcile would print a plan with phantom actions
+        // for the soon-to-be-deduped duplicates, lying about what a
+        // real `jma sync` would do.
+        let all_local_changes: Vec<LocalChange> = if dry_run && !dedupe_plan.deletions.is_empty() {
+            let suppressed: HashSet<(String, MaildirId)> = dedupe_plan
+                .deletions
+                .iter()
+                .map(|d| (d.folder.clone(), d.maildir_id.clone()))
+                .collect();
+            scan_changes
+                .into_iter()
+                .filter(|c| {
+                    let key = match c {
+                        LocalChange::NewMessage {
+                            folder, maildir_id, ..
+                        }
+                        | LocalChange::FlagsChanged {
+                            folder, maildir_id, ..
+                        }
+                        | LocalChange::DeletedMessage { folder, maildir_id } => {
+                            (folder.clone(), maildir_id.clone())
+                        }
+                    };
+                    !suppressed.contains(&key)
+                })
+                .collect()
+        } else {
+            scan_changes
         };
 
         // Path-scan short-circuit: a LocalChange-driven cycle whose
@@ -319,10 +365,28 @@ impl<'a> SyncEngine<'a> {
         // produced nothing, not "everything got filtered out by
         // pull-only/push-only" -- those still need the regular log.
         // Computed before the dry-run branch so the field stays
-        // truthful for any caller that consumes the outcome.
-        let already_in_sync = plan.is_empty();
+        // truthful for any caller that consumes the outcome. Dedupe
+        // deletions count as work for the purposes of this flag:
+        // saying "already in sync" while N duplicates are queued for
+        // removal would be a lie under both dry-run (the user is
+        // about to see them in the plan) and non-dry-run (apply_dedupe
+        // just ran and removed them).
+        let already_in_sync = plan.is_empty() && dedupe_plan.deletions.is_empty();
 
         if dry_run {
+            if !dedupe_plan.deletions.is_empty() {
+                println!(
+                    "Dedupe pass: would remove {} duplicate file(s):",
+                    dedupe_plan.deletions.len()
+                );
+                for d in &dedupe_plan.deletions {
+                    println!(
+                        "  [DEDUPE] {} ({}) in {}/  (keeping {})",
+                        d.maildir_id, d.message_id, d.folder, d.kept_maildir_id
+                    );
+                }
+                println!();
+            }
             print!("{}", plan);
             return Ok(SyncOutcome {
                 already_in_sync,
