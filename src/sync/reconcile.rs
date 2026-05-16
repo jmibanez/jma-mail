@@ -1118,6 +1118,81 @@ mod tests {
         assert_eq!(jmap_email_id.as_ref(), "E1");
     }
 
+    /// Cold-start initial pull regression: state DB is empty AND scan
+    /// emitted a NewMessage for the local file (it's unknown to the
+    /// DB), AND the server reports an email with the same Message-ID.
+    /// Reconcile must emit exactly one AdoptLocalMessage and NO
+    /// UploadMessage. Emitting both -- the failure mode before commit
+    /// bdde764 / 8058ed0 (2026-05-01) -- created a duplicate Email
+    /// object server-side every time jma ran against an existing
+    /// maildir with a fresh DB. Hundreds of such duplicates landed in
+    /// real accounts before the guard at handle_local_new (consulting
+    /// `adopted_maildir_ids`) suppressed the upload.
+    ///
+    /// The guard works because process_remote_emails runs before
+    /// process_local_changes and populates `adopted_maildir_ids` with
+    /// the maildir_ids it adopted from the remote side. By the time
+    /// handle_local_new looks at this NewMessage, the maildir_id is
+    /// already in the set and the upload is short-circuited.
+    #[test]
+    fn cold_start_adopts_local_file_without_re_uploading() {
+        let mut idx = empty_index();
+        idx.by_message_id.insert(
+            "<a@x>".into(),
+            vec![LocalEntry {
+                folder: "INBOX".into(),
+                maildir_id: "FILE-1".into(),
+            }],
+        );
+        let plan = run(
+            &[email("E1", "MB-INBOX", "S", Some("<a@x>"))],
+            &[],
+            // Scan saw the local file and emitted NewMessage; the DB
+            // is empty so it has no prior binding for it.
+            &[LocalChange::NewMessage {
+                maildir_id: "FILE-1".into(),
+                folder: "INBOX".into(),
+                flags: "S".into(),
+                path: PathBuf::from("/tmp/file-1"),
+                message_id: "<a@x>".into(),
+                size_bytes: 0,
+            }],
+            // No message_map rows -- cold start.
+            &[],
+            &idx,
+            ConflictStrategy::ServerWins,
+        );
+
+        // Exactly one adoption for this file; no upload.
+        assert_eq!(
+            plan.adopt_count(),
+            1,
+            "expected one AdoptLocalMessage, got plan: {:?}",
+            plan.actions
+        );
+        assert_eq!(
+            plan.upload_count(),
+            0,
+            "Upload would re-import a message the server already has; \
+             this is the cold-start dedup-guard failure mode. Plan: {:?}",
+            plan.actions
+        );
+        let SyncAction::AdoptLocalMessage {
+            id:
+                BoundId {
+                    maildir_id,
+                    jmap_email_id,
+                    ..
+                },
+            ..
+        } = &plan.actions[0]
+        else {
+            panic!("expected adopt as first action, got {:?}", plan.actions[0]);
+        };
+        assert_eq!(maildir_id.as_ref(), "FILE-1");
+        assert_eq!(jmap_email_id.as_ref(), "E1");
+    }
+
     /// Known JMAP id, server keywords differ from message_map: emit a
     /// pull-side flag update, no upload.
     #[test]
