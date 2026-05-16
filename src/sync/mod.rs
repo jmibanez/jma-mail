@@ -1,3 +1,4 @@
+pub mod dedupe;
 pub mod engine;
 pub mod execute;
 pub mod plan;

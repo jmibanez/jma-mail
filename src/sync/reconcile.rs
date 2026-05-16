@@ -6,10 +6,10 @@ use tracing::{debug, error, warn};
 use crate::config::ConflictStrategy;
 use crate::ids::{JmapBlobId, JmapEmailId, JmapMailboxId, JmapThreadId, MaildirId, MessageId};
 use crate::jmap::types::EmailObject;
-use crate::maildir_ops::dedupe::LocalIndex;
 use crate::maildir_ops::flags::{flags_to_keywords, keywords_to_flags};
 use crate::maildir_ops::scan::LocalChange;
 use crate::state::queries::MessageRecord;
+use crate::sync::dedupe::LocalIndex;
 use crate::sync::plan::{BoundId, LocalId, RemoteId, SyncAction, SyncPlan};
 
 /// Look up a `MessageRecord` (or records) by whichever ID kind you
@@ -871,7 +871,7 @@ fn emit_local_flag_update(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::maildir_ops::dedupe::{LocalEntry, LocalIndex};
+    use crate::sync::dedupe::{LocalEntry, LocalIndex};
     use std::path::PathBuf;
 
     fn mailboxes() -> Vec<(JmapMailboxId, String)> {

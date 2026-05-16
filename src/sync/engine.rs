@@ -13,10 +13,10 @@ use crate::jmap::{
     email as jmap_email, limits, mailbox as jmap_mailbox, session,
     types::{EmailObject, MailboxObject, SessionInfo},
 };
-use crate::maildir_ops::dedupe::{LocalEntry, LocalIndex};
 use crate::maildir_ops::layout::{FolderLayoutDefinition, resolve_folder_path};
-use crate::maildir_ops::{dedupe, scan, store};
+use crate::maildir_ops::{scan, store};
 use crate::state::queries;
+use crate::sync::dedupe::{self, LocalEntry, LocalIndex};
 use crate::sync::execute::Executor;
 use crate::sync::plan::{SyncAction, SyncDirection};
 use crate::sync::reconcile::{self, MessageRecordIndex, ReconcileInput};
