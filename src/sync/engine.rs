@@ -154,19 +154,23 @@ impl<'a> SyncEngine<'a> {
 
     /// Connect a fresh engine and pull only (server -> local). Adoption
     /// still runs.
-    pub async fn pull_only(conn: &'a Connection, config: &'a Config) -> Result<SyncOutcome> {
+    pub async fn pull_only(
+        conn: &'a Connection,
+        config: &'a Config,
+        dry_run: bool,
+    ) -> Result<SyncOutcome> {
         Self::connect(conn, config)
             .await?
-            .run(false, SyncDirection::PullOnly, ScanScope::Full)
+            .run(dry_run, SyncDirection::PullOnly, ScanScope::Full)
             .await
     }
 
     /// Connect a fresh engine and push only (local -> server). Adoption
     /// still runs.
-    pub async fn push_only(conn: &'a Connection, config: &'a Config) -> Result<()> {
+    pub async fn push_only(conn: &'a Connection, config: &'a Config, dry_run: bool) -> Result<()> {
         Self::connect(conn, config)
             .await?
-            .run(false, SyncDirection::PushOnly, ScanScope::Full)
+            .run(dry_run, SyncDirection::PushOnly, ScanScope::Full)
             .await?;
         Ok(())
     }

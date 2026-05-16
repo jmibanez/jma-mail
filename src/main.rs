@@ -589,7 +589,7 @@ async fn cmd_pull(cli: &Cli) -> Result<()> {
     acquire_mutator_locks(&config)?;
     let conn = state::db::open_or_recreate(&config.db_path())?;
 
-    SyncEngine::pull_only(&conn, &config).await?;
+    SyncEngine::pull_only(&conn, &config, cli.dry_run).await?;
 
     Ok(())
 }
@@ -599,7 +599,7 @@ async fn cmd_push(cli: &Cli) -> Result<()> {
     acquire_mutator_locks(&config)?;
     let conn = state::db::open_or_recreate(&config.db_path())?;
 
-    SyncEngine::push_only(&conn, &config).await?;
+    SyncEngine::push_only(&conn, &config, cli.dry_run).await?;
 
     Ok(())
 }
