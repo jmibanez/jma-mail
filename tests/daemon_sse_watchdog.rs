@@ -25,9 +25,10 @@
 //!   forever on `es.next()`; count stays at 1.
 //! - **Pre-negotiation code** (6fef921..HEAD~1): watchdog sized from
 //!   the *requested* `ping_interval` (60 here), so it doesn't fire
-//!   within the 12 s test window; count stays at 1.
+//!   within any reasonable observation window; count stays at 1.
 //! - **Current code**: watchdog negotiates down to 7 s on the first
-//!   ping event; reconnects at ~8 s; count >= 2 by t=12 s.
+//!   ping event; reconnects at ~8 s after the first ping is
+//!   parsed; count >= 2 within the post-first-accept window.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -96,17 +97,36 @@ async fn ping_watchdog_reconnects_against_silent_server() {
 
     // Request a 60 s ping interval (matching the default config).
     // The server's first event hands back `interval: 2`, so the
-    // listener should narrow its watchdog to 2 + 5 = 7 s, time out
-    // on the ensuing silence, sleep 1 s of initial backoff, and
-    // reconnect at ~8 s. We wait 12 s -- 4 s of margin past the
-    // second accept -- which keeps the test cheap on CI without
-    // flaking. Pre-negotiation code would size the watchdog from
-    // the requested 60 and never fire in this window.
+    // listener narrows its watchdog to 2 + 5 = 7 s, times out on
+    // the ensuing silence, sleeps 1 s of initial backoff, and
+    // reconnects at ~8 s after the first ping arrives.
+    //
+    // We anchor the deadline on the *first observed accept* rather
+    // than on test start so the test stays insensitive to per-
+    // process firewall / TLS-inspection overhead on the very first
+    // outbound connection (e.g. Little Snitch evaluating a rule
+    // for a freshly-built test binary, which can add several
+    // seconds of one-off latency before the connect lands). After
+    // the first connect the per-process decision is cached, so
+    // the reconnect after the watchdog fires runs at native
+    // speed. Pre-negotiation code would size the watchdog from
+    // the requested 60 s and never fire in any reasonable window.
     let listen_future =
         eventsource::listen(&url, "test-token", &account_id, 60, HashMap::new(), tx);
 
     let driver_future = async {
-        tokio::time::sleep(Duration::from_secs(12)).await;
+        while connections.load(Ordering::SeqCst) < 1 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // 7 s watchdog (measured from first-ping-parsed, not from
+        // the first accept) + 1 s backoff + 2 s margin. The margin
+        // covers scheduler jitter, tokio test-runtime timer slop,
+        // and the sub-second gap between the accept the loop
+        // above observes and the listener parsing the first ping
+        // event the server writes immediately after. Tight enough
+        // to fail loud if the watchdog doesn't fire; generous
+        // enough not to masquerade transient slop as a regression.
+        tokio::time::sleep(Duration::from_secs(10)).await;
         connections.load(Ordering::SeqCst)
     };
 
