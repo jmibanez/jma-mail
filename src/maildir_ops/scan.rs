@@ -17,10 +17,9 @@ struct CurEntry {
     path: PathBuf,
 }
 
-/// One scan pass's output: the classified `LocalChange`s, a
+/// One scan pass's output: the classified `LocalChange`s and a
 /// MaildirId-keyed map of every on-disk filename's flag suffix the
-/// scan visited, and (for exhaustive walks) the list of all observed
-/// maildir_ids.
+/// scan visited.
 ///
 /// `local_flags` is the filesystem-truth view of flags. Reconcile
 /// reads it at adoption emit sites and `commit_adopt` writes the
@@ -35,18 +34,10 @@ struct CurEntry {
 /// (`MessageRecord.flags` post-adoption is the standard-six
 /// projection of the server's keywords, which adoption's split also
 /// keeps consistent).
-///
-/// `seen_ids` is populated only by exhaustive walks (`scan_folder`):
-/// it's the observed-on-disk set used to detect "in DB but missing"
-/// deletions. `scan_paths` returns an empty vec here because a
-/// path-driven scan has no exhaustive view -- it sees only the
-/// event paths and trusts the event stream to deliver any deletions
-/// directly.
 #[derive(Debug)]
 pub struct ScanResult {
     pub changes: Vec<LocalChange>,
     pub local_flags: HashMap<MaildirId, String>,
-    pub seen_ids: Vec<MaildirId>,
 }
 
 /// A change detected in the local maildir.
@@ -99,10 +90,6 @@ pub enum LocalChange {
 ///   NewMessage as appropriate against `known_state`. Files whose
 ///   Message-ID is missing are skipped (logged at error!) so they
 ///   stay on disk untouched.
-/// - `new_entries`: live `new/` ids the caller observed. They never
-///   produce a LocalChange (the MUA's eventual cur/ promotion is the
-///   trigger we care about); they're tracked so callers can derive
-///   `seen` for their own deletion detection.
 /// - `explicit_deletes`: maildir ids the caller is sure have
 ///   disappeared from this folder. Each becomes a DeletedMessage.
 ///   The caller is responsible for ensuring the DB anchors each id
@@ -110,21 +97,24 @@ pub enum LocalChange {
 ///   serves both exhaustive (folder-walk) and event-driven
 ///   (fsevents) deletion sources without an extra mode flag.
 ///
-/// Returns `(changes, seen_ids)` where `seen_ids` is the union of
-/// `cur_entries` and `new_entries` ids, useful for callers doing
-/// their own folder-wide deletion bookkeeping.
+/// Live new/ entries aren't passed in: jma (as the MDA) is the only
+/// writer to new/, MUAs only ever promote new/ -> cur/, and anything
+/// delivered to new/ is tracked in the DB at write time. Any later
+/// MUA promotion shows up through the cur/ scan as either a
+/// NewMessage (post-DB-wipe rescue) or a FlagsChanged. The caller
+/// (scan_folder / scan_paths) still observes new/ entries so it can
+/// build its own observed-on-disk set before deciding which DB-
+/// anchored ids belong in `explicit_deletes`, but classify_changes
+/// itself has no use for them.
 fn classify_changes(
     folder_name: &str,
     cur_entries: &[CurEntry],
-    new_entries: &[MaildirId],
     explicit_deletes: &[MaildirId],
     known_state: &HashMap<MaildirId, (String, String)>,
-) -> Result<(Vec<LocalChange>, Vec<MaildirId>)> {
+) -> Result<Vec<LocalChange>> {
     let mut changes = Vec::new();
-    let mut seen_ids = Vec::with_capacity(cur_entries.len() + new_entries.len());
 
     for entry in cur_entries {
-        seen_ids.push(entry.maildir_id.clone());
         match known_state.get(&entry.maildir_id) {
             // Maildir-id-preserving cross-folder move: same unique part
             // of the filename, different folder than the DB recorded.
@@ -185,22 +175,6 @@ fn classify_changes(
         }
     }
 
-    // Walk new/ for presence only -- we never emit a LocalChange for
-    // a file there. Premise: jma (as the MDA) is the only writer to
-    // new/, and MUAs only ever promote new/ -> cur/. Anything we
-    // delivered to new/ is already tracked in the DB at write time;
-    // any later MUA promotion shows up through the cur/ scan as
-    // either a NewMessage (post-DB-wipe rescue) or a FlagsChanged.
-    // Files left in new/ by external MDAs likewise surface once the
-    // MUA promotes them. The only reason new_entries is plumbed
-    // through here is so seen_ids carries those ids back out, letting
-    // exhaustive callers (scan_folder) detect deletions correctly
-    // without spuriously firing DeletedMessage against
-    // undelivered-but-pending messages.
-    for id in new_entries {
-        seen_ids.push(id.clone());
-    }
-
     for id in explicit_deletes {
         debug!("Deleted message: {} (was in {})", id, folder_name);
         changes.push(LocalChange::DeletedMessage {
@@ -209,7 +183,7 @@ fn classify_changes(
         });
     }
 
-    Ok((changes, seen_ids))
+    Ok(changes)
 }
 
 /// Scan a maildir folder and detect changes vs. the known state.
@@ -277,17 +251,10 @@ pub fn scan_folder(
         })
         .collect();
 
-    let (changes, seen_ids) = classify_changes(
-        folder_name,
-        &cur_entries,
-        &new_entries,
-        &explicit_deletes,
-        known_state,
-    )?;
+    let changes = classify_changes(folder_name, &cur_entries, &explicit_deletes, known_state)?;
     Ok(ScanResult {
         changes,
         local_flags,
-        seen_ids,
     })
 }
 
@@ -418,15 +385,13 @@ pub fn scan_paths(
         for id in &new {
             local_flags.entry(id.clone()).or_default();
         }
-        let (changes, _seen) = classify_changes(&folder, &cur, &new, &deletes, known_state)?;
+        let changes = classify_changes(&folder, &cur, &deletes, known_state)?;
         all_changes.extend(changes);
     }
 
     Ok(ScanResult {
         changes: all_changes,
         local_flags,
-        // Path-driven walks have no exhaustive observed set.
-        seen_ids: Vec::new(),
     })
 }
 
@@ -770,19 +735,13 @@ mod tests {
         write_message(&inbox_path, "new", unique, body);
 
         let known = HashMap::new();
-        let ScanResult {
-            changes,
-            seen_ids: seen,
-            ..
-        } = scan_folder(&inbox, "INBOX", &known).unwrap();
+        let ScanResult { changes, .. } = scan_folder(&inbox, "INBOX", &known).unwrap();
 
         assert!(
             changes.is_empty(),
             "unknown new/ file must not surface as a LocalChange, got {:?}",
             changes
         );
-        let seen_strs: Vec<&str> = seen.iter().map(|m| m.as_ref()).collect();
-        assert_eq!(seen_strs, vec![unique], "seen_ids contents");
     }
 
     /// Files sitting in new/ -- whether bare (`<unique>`) or
@@ -790,13 +749,13 @@ mod tests {
     /// delivering an unseen message with server-set flags) -- must NOT
     /// produce any LocalChange. They're tracked in the DB at delivery
     /// time and only become "real" changes once an MUA promotes them
-    /// to cur/. Equally important, both shapes must register as seen
-    /// so the deletion-detection loop doesn't fire DeletedMessage
-    /// against an undelivered-but-pending file (which would cascade
-    /// into a DestroyRemote and silently delete the message
-    /// server-side).
+    /// to cur/. Equally important, both shapes must register as
+    /// observed so the deletion-detection loop doesn't fire
+    /// DeletedMessage against an undelivered-but-pending file (which
+    /// would cascade into a DestroyRemote and silently delete the
+    /// message server-side).
     #[test]
-    fn new_files_emit_no_change_but_count_as_seen() {
+    fn new_files_known_to_db_do_not_trigger_deleted_message() {
         let tmp = TempDir::new().unwrap();
         let inbox_path = tmp.path().join("INBOX");
         let inbox = ensure_maildir(&inbox_path).unwrap();
@@ -809,8 +768,11 @@ mod tests {
         write_message(&inbox_path, "new", &suffixed, body);
 
         // Both ids are known to the DB (delivery-time tracking). If
-        // scan failed to count either as seen, the deletion loop would
-        // emit DeletedMessage for the missing one.
+        // scan failed to observe either, the deletion-detection loop
+        // would emit DeletedMessage for the missing one -- the failure
+        // mode this test pins. The suffixed file's `:2,F` portion
+        // must be stripped by the walker so the canonical id matches
+        // what the DB indexed at delivery time.
         let mut known = HashMap::new();
         known.insert(bare.into(), ("INBOX".to_string(), "".to_string()));
         known.insert(
@@ -818,27 +780,17 @@ mod tests {
             ("INBOX".to_string(), "F".to_string()),
         );
 
-        let ScanResult {
-            changes,
-            seen_ids: seen,
-            ..
-        } = scan_folder(&inbox, "INBOX", &known).unwrap();
+        let ScanResult { changes, .. } = scan_folder(&inbox, "INBOX", &known).unwrap();
 
+        // No LocalChange of any kind: not a NewMessage (new/ files
+        // don't surface as changes), and crucially not a
+        // DeletedMessage for either DB-anchored id.
         assert!(
             changes.is_empty(),
-            "new/ must not emit LocalChange events, got {:?}",
+            "new/ files known to the DB must not emit any LocalChange (\
+             a DeletedMessage here would cascade into DestroyRemote and \
+             silently delete server-side): {:?}",
             changes
-        );
-        let seen_strs: Vec<&str> = seen.iter().map(|m| m.as_ref()).collect();
-        assert!(
-            seen_strs.contains(&bare),
-            "bare new/ file must be in seen_ids, got {:?}",
-            seen_strs
-        );
-        assert!(
-            seen_strs.contains(&suffixed_unique),
-            "suffixed new/ file must surface its canonical id (without :2,) in seen_ids, got {:?}",
-            seen_strs
         );
     }
 
@@ -847,46 +799,48 @@ mod tests {
     /// anchors idempotency on Message-ID, and emitting NewMessage
     /// without one would either drop the message at reconcile or
     /// produce a server-side duplicate after a state DB wipe. Scan
-    /// drops the file (logs error!) so it stays on disk untouched.
+    /// drops the file (logs error!) so it stays on disk untouched
+    /// -- crucially, it does NOT emit DeletedMessage either,
+    /// because the file is still observed on disk; only files
+    /// missing from disk trigger deletion-detection.
     #[test]
-    fn scan_folder_skips_file_without_message_id() {
+    fn scan_folder_msgid_missing_does_not_trigger_deleted_message() {
         let tmp = TempDir::new().unwrap();
         let inbox_path = tmp.path().join("INBOX");
         let inbox = ensure_maildir(&inbox_path).unwrap();
 
-        // No Message-ID header — only a Subject + body.
+        // No Message-ID header -- only a Subject + body.
         let unique = "1700000000.M1.host";
         let filename = format!("{unique}:2,");
         let body = "Subject: no msgid\r\n\r\nbody\r\n";
         write_message(&inbox_path, "cur", &filename, body);
 
-        let known = HashMap::new();
-        let ScanResult {
-            changes,
-            seen_ids: seen,
-            ..
-        } = scan_folder(&inbox, "INBOX", &known).unwrap();
+        // DB anchors the same id in INBOX. The deletion-detection
+        // loop must NOT fire DeletedMessage for it, even though we
+        // dropped the file from LocalChange emission for missing
+        // its Message-ID -- the file is still on disk and still
+        // observed.
+        let mut known = HashMap::new();
+        known.insert(unique.into(), ("INBOX".to_string(), "".to_string()));
+
+        let ScanResult { changes, .. } = scan_folder(&inbox, "INBOX", &known).unwrap();
 
         assert!(
             changes.is_empty(),
-            "expected no LocalChanges for a file without Message-ID, got {:?}",
+            "expected no LocalChanges for a file without Message-ID \
+             (especially no DeletedMessage -- the file is on disk): {:?}",
             changes
         );
-        // The file is still seen on disk, so it counts as observed —
-        // we just refuse to emit a NewMessage for it.
-        assert_eq!(seen.len(), 1);
-        assert_eq!(seen[0].as_ref(), unique);
     }
 
     /// Same folder, file already known to the DB, but the file's
     /// Message-ID header is missing. This hits the
     /// `Some((_, known_flags))` branch where `require_message_id`
-    /// isn't even called (flags match), so no `NewMessage` is emitted
-    /// — but more importantly: the maildir_id IS pushed onto
-    /// `seen_ids` before any matching, so the trailing
-    /// deletion-detection loop must NOT spuriously emit a
-    /// DeletedMessage for it. Pins the "seen_ids tracks every walked
-    /// file regardless of whether we emit a change for it" invariant.
+    /// isn't even called (flags match), so no `NewMessage` is
+    /// emitted -- but more importantly: the deletion-detection loop
+    /// must NOT spuriously emit a DeletedMessage for it. Pins the
+    /// "deletion-detection only fires for files missing from disk,
+    /// not for files we declined to emit a change for" contract.
     #[test]
     fn scan_folder_known_file_without_message_id_emits_nothing() {
         let tmp = TempDir::new().unwrap();
