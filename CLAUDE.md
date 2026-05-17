@@ -14,11 +14,19 @@ under gcc on macOS. **Always run cargo with `CC=/usr/bin/cc`** if
 
 ```
 CC=/usr/bin/cc cargo check
+CC=/usr/bin/cc cargo clippy --all-targets
 CC=/usr/bin/cc cargo test
 CC=/usr/bin/cc cargo build --release
 ```
 
 Single test: `CC=/usr/bin/cc cargo test --lib maildir_ops::headers::tests::parses_folded_value`.
+
+Run `cargo clippy --all-targets` as part of every verification pass,
+not just before commit — treat new warnings the same as new test
+failures. The `--all-targets` flag is load-bearing: tests, examples,
+and benches all surface their own lints. Address warnings at the
+source; reach for `#[allow]` only when the lint is genuinely wrong
+for the code in question, and pair it with a comment that says why.
 
 If rust-analyzer / flymake reports diagnostics that contradict a
 clean `cargo check`, trust `cargo check` — the LSP cache goes stale
