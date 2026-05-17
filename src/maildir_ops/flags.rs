@@ -47,6 +47,29 @@ pub fn flags_to_keywords(flags: &str) -> HashMap<String, bool> {
     keywords
 }
 
+/// Build a full-coverage patch for the six standard JMAP keywords from
+/// a Maildir flags string: each of $draft, $flagged, $forwarded,
+/// $answered, $seen, $deleted gets an explicit `true` or `false` entry
+/// according to whether its flag letter is present in `flags`. Used in
+/// patch-style `Email/set` `keywords/<name>` updates where the goal is
+/// to make the server's view of the *standard* set agree with the
+/// on-disk filename, without touching server-only keywords ($imported,
+/// $hasattachment, $x-me-annot-2, user-defined labels).
+///
+/// `flags_to_keywords` only emits `true` entries, which under JMAP's
+/// patch semantics means "set these on, leave everything else alone"
+/// -- it cannot remove a standard keyword the server has set. This
+/// function pairs with `set_email_batch`'s per-key `upd.keyword(kw,
+/// val)` wire shape so a `false` here patches `keywords/<name>: null`
+/// and actually clears the keyword.
+pub fn flags_to_keyword_patch(flags: &str) -> HashMap<String, bool> {
+    let mut keywords = HashMap::new();
+    for (kw, flag) in FLAG_MAPPINGS {
+        keywords.insert(kw.to_string(), flags.contains(*flag));
+    }
+    keywords
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,5 +123,39 @@ mod tests {
         assert_eq!(keywords.get("$seen"), Some(&true));
         assert_eq!(keywords.get("$flagged"), Some(&true));
         assert_eq!(keywords.get("$answered"), None);
+    }
+
+    /// Patch shape must include every standard JMAP keyword with
+    /// an explicit `true`/`false` value derived from the filename
+    /// suffix. The `false` half is the load-bearing part: the JMAP
+    /// patch wire-shape only clears a keyword when its value is
+    /// patched to `null` (which the jmap-client `keyword(name,
+    /// false)` call serializes as), so a caller that wants to
+    /// remove e.g. server-side `$forwarded` to match a filename
+    /// missing the `P` letter relies on this function's `false`
+    /// entries. Pin all six so a refactor narrowing the loop
+    /// can't silently break removal semantics.
+    #[test]
+    fn test_flags_to_keyword_patch_covers_all_six_explicitly() {
+        let patch = flags_to_keyword_patch("FS");
+        assert_eq!(patch.len(), 6, "patch must cover every standard keyword");
+        assert_eq!(patch.get("$flagged"), Some(&true));
+        assert_eq!(patch.get("$seen"), Some(&true));
+        assert_eq!(patch.get("$forwarded"), Some(&false));
+        assert_eq!(patch.get("$draft"), Some(&false));
+        assert_eq!(patch.get("$answered"), Some(&false));
+        assert_eq!(patch.get("$deleted"), Some(&false));
+    }
+
+    /// Empty suffix => every standard keyword explicitly `false`.
+    /// Matches the wire intent for "make the server forget every
+    /// standard keyword on this email."
+    #[test]
+    fn test_flags_to_keyword_patch_empty_clears_all_six() {
+        let patch = flags_to_keyword_patch("");
+        assert_eq!(patch.len(), 6);
+        for (kw, _) in FLAG_MAPPINGS {
+            assert_eq!(patch.get(*kw), Some(&false), "{kw} must patch to false");
+        }
     }
 }

@@ -6,7 +6,7 @@ use tracing::{debug, error, warn};
 use crate::config::ConflictStrategy;
 use crate::ids::{JmapBlobId, JmapEmailId, JmapMailboxId, JmapThreadId, MaildirId, MessageId};
 use crate::jmap::types::EmailObject;
-use crate::maildir_ops::flags::{flags_to_keywords, keywords_to_flags};
+use crate::maildir_ops::flags::{flags_to_keyword_patch, flags_to_keywords, keywords_to_flags};
 use crate::maildir_ops::scan::LocalChange;
 use crate::state::queries::MessageRecord;
 use crate::sync::dedupe::LocalIndex;
@@ -542,40 +542,43 @@ fn try_adopt_remote(
                       adopted: &mut HashSet<MaildirId>,
                       maildir_id: MaildirId,
                       filename_flags: String| {
-        adopted.insert(maildir_id.clone());
+        let bound_id = BoundId {
+            maildir_id: maildir_id.clone(),
+            jmap_email_id: email.id.clone(),
+            message_id: mid.clone(),
+        };
+        adopted.insert(maildir_id);
         plan.actions.push(SyncAction::AdoptLocalMessage {
-            id: BoundId {
-                maildir_id,
-                jmap_email_id: email.id.clone(),
-                message_id: mid.clone(),
-            },
+            id: bound_id.clone(),
             maildir_folder: target_folder.to_string(),
             jmap_blob_id: Some(email.blob_id.clone()),
             jmap_thread_id: Some(email.thread_id.clone()),
             mailbox_id: target_mailbox_id.clone(),
             keywords: email.keywords.clone(),
-            filename_flags,
+            filename_flags: filename_flags.clone(),
             old_maildir_id: None,
         });
+        emit_adoption_flag_reconciliation(
+            plan,
+            ctx.strategy,
+            &bound_id,
+            target_folder,
+            target_mailbox_id,
+            &email.keywords,
+            Some(&email.blob_id),
+            Some(&email.thread_id),
+            &filename_flags,
+        );
     };
 
     // Filename-truth source priority: this cycle's scan first (always
     // accurate when the path was in the event set or a full scan
     // ran), then the DB record's `flags` column as a steady-state
     // fallback. The DB column is what `commit_adopt` or the
-    // apply_remote_set mirror last wrote for the standard-six
-    // projection -- accurate enough as a guess when scan didn't walk
-    // this path.
-    //
-    // FIXME: a stricter fallback is `local_state.flags` (the
-    // filesystem-truth column written by `commit_adopt`'s split),
-    // which doesn't drift even when `message_map.flags` diverges
-    // mid-cycle. Doing so requires threading the known_state map
-    // (or a derived MaildirId -> local_state.flags lookup) through
-    // ReconcileInput / ReconcileCtx. Deferred to the adoption-
-    // reconciliation follow-up commit, which already touches this
-    // function; folding the fallback swap in there keeps the
-    // foundation commit narrow.
+    // apply_remote_set mirror last wrote -- accurate when filename
+    // and server keywords already agree at last sync time, which is
+    // the steady-state contract `commit_adopt`'s split and the
+    // reconciliation step below keep current.
     if let Some(recs) = ctx.known_by_message_id.get(mid)
         && let Some(rec) = recs
             .iter()
@@ -634,6 +637,84 @@ fn process_remote_destroys(
                     message_id: msg.message_id.clone(),
                 },
                 maildir_folder: folder.clone(),
+            });
+        }
+    }
+}
+
+/// Emit the post-adoption action that bridges the standard-six gap
+/// between the filename's flag suffix and `keywords_to_flags(server_
+/// keywords)`. Adoption itself just records what each side currently
+/// has; if the on-disk file disagrees on any of the six maildir-
+/// mappable keywords, this is where `conflict_strategy` actually
+/// decides which view propagates.
+///
+/// Called from each `AdoptLocalMessage` emit site, so all three
+/// adoption paths (cold-start rescue, alreadyExists-on-upload guard,
+/// post-prior-cycle `known_by_message_id` hit) get the same
+/// convergence behavior. No-ops when filename and server-derived
+/// flags already agree, so the steady-state case stays a pure
+/// adoption with no extra wire traffic.
+///
+/// Non-standard server keywords ($imported, $hasattachment,
+/// $x-me-annot-2, user-defined labels) are untouched: under
+/// `LocalWins` we send an explicit-six patch via
+/// `flags_to_keyword_patch`, leaving every non-standard key
+/// unmentioned in the wire request; under `ServerWins` we rename
+/// the local file to match the server's standard-six derivation and
+/// the local filename has no way to carry non-standard keywords
+/// anyway.
+///
+/// `jmap_blob_id` and `jmap_thread_id` are `Option` because
+/// `MessageRecord` carries them as such (a row may exist before
+/// blob/thread binding completes). `ServerWins` needs both to
+/// emit `UpdateLocalFlags`; if either is missing, we skip the
+/// reconciliation step and rely on the next sync cycle's
+/// regular flag-update path to catch up.
+#[allow(clippy::too_many_arguments)]
+fn emit_adoption_flag_reconciliation(
+    plan: &mut SyncPlan,
+    strategy: ConflictStrategy,
+    bound_id: &BoundId,
+    target_folder: &str,
+    target_mailbox_id: &JmapMailboxId,
+    server_keywords: &HashMap<String, bool>,
+    jmap_blob_id: Option<&JmapBlobId>,
+    jmap_thread_id: Option<&JmapThreadId>,
+    on_disk_flags: &str,
+) {
+    let server_flags = keywords_to_flags(server_keywords);
+    if on_disk_flags == server_flags {
+        return;
+    }
+    match strategy {
+        ConflictStrategy::ServerWins => {
+            let (Some(blob_id), Some(thread_id)) = (jmap_blob_id, jmap_thread_id) else {
+                debug!(
+                    "Adoption flag reconciliation for {} skipped under ServerWins: \
+                     missing blob_id/thread_id on the matched record. Next cycle's \
+                     regular flag-update path will reconcile.",
+                    bound_id
+                );
+                return;
+            };
+            plan.actions.push(SyncAction::UpdateLocalFlags {
+                id: bound_id.clone(),
+                maildir_folder: target_folder.to_string(),
+                new_flags: server_flags,
+                keywords: server_keywords.clone(),
+                jmap_blob_id: blob_id.clone(),
+                jmap_thread_id: thread_id.clone(),
+                mailbox_id: target_mailbox_id.clone(),
+            });
+        }
+        ConflictStrategy::LocalWins => {
+            plan.actions.push(SyncAction::UpdateRemoteKeywords {
+                id: RemoteId {
+                    jmap_email_id: bound_id.jmap_email_id.clone(),
+                    message_id: bound_id.message_id.clone(),
+                },
+                keywords: flags_to_keyword_patch(on_disk_flags),
             });
         }
     }
@@ -722,20 +803,38 @@ fn handle_local_new(
     {
         let keywords =
             serde_json::from_str::<HashMap<String, bool>>(&rec.jmap_keywords).unwrap_or_default();
+        let bound_id = BoundId {
+            maildir_id: maildir_id.clone(),
+            jmap_email_id: rec.jmap_email_id.clone(),
+            message_id: message_id.clone(),
+        };
         plan.actions.push(SyncAction::AdoptLocalMessage {
-            id: BoundId {
-                maildir_id: maildir_id.clone(),
-                jmap_email_id: rec.jmap_email_id.clone(),
-                message_id: message_id.clone(),
-            },
+            id: bound_id.clone(),
             maildir_folder: folder.to_string(),
             jmap_blob_id: rec.jmap_blob_id.clone(),
             jmap_thread_id: rec.jmap_thread_id.clone(),
-            mailbox_id,
-            keywords,
+            mailbox_id: mailbox_id.clone(),
+            keywords: keywords.clone(),
             filename_flags: flags.clone(),
             old_maildir_id: None,
         });
+        // Adoption-time flag reconciliation: the local NewMessage's
+        // filename flag suffix may disagree with the DB record's
+        // stored server keyword set. Same convergence step
+        // try_adopt_remote applies -- ServerWins renames the file,
+        // LocalWins pushes an explicit-six patch. Skips silently
+        // when filename and server-derived flags already agree.
+        emit_adoption_flag_reconciliation(
+            plan,
+            ctx.strategy,
+            &bound_id,
+            folder,
+            &mailbox_id,
+            &keywords,
+            rec.jmap_blob_id.as_ref(),
+            rec.jmap_thread_id.as_ref(),
+            flags,
+        );
         return;
     }
 
@@ -1274,6 +1373,263 @@ mod tests {
         };
         assert_eq!(maildir_id.as_ref(), "FILE-1");
         assert_eq!(jmap_email_id.as_ref(), "E1");
+    }
+
+    /// Cold-start adoption against a maildir file whose on-disk flag
+    /// suffix already matches `keywords_to_flags(server)` emits a
+    /// bare adoption and nothing else. Pins the equality-skip half of
+    /// `emit_adoption_flag_reconciliation` so the steady-state case
+    /// stays a pure DB write.
+    #[test]
+    fn adopt_with_matching_flags_emits_no_reconciliation() {
+        let mut idx = empty_index();
+        idx.by_message_id.insert(
+            "<a@x>".into(),
+            vec![LocalEntry {
+                folder: "INBOX".into(),
+                maildir_id: "FILE-1".into(),
+            }],
+        );
+        let mut local_flags = HashMap::new();
+        local_flags.insert(MaildirId::from("FILE-1"), "FS".to_string());
+        let plan = run_with_local_flags(
+            // Server keywords map to "FS" -- exactly the on-disk suffix.
+            &[email("E1", "MB-INBOX", "FS", Some("<a@x>"))],
+            &[],
+            &[],
+            &[],
+            &idx,
+            &local_flags,
+            ConflictStrategy::ServerWins,
+        );
+        assert_eq!(plan.adopt_count(), 1);
+        assert_eq!(
+            plan.flag_update_count(),
+            0,
+            "matching flags must not emit a reconciliation action: {:?}",
+            plan.actions
+        );
+    }
+
+    /// Cold-start adoption: server has $forwarded ("P" in maildir
+    /// suffix terms) but the on-disk file is `:2,FS`. Under
+    /// `ServerWins`, the adoption must be paired with an
+    /// `UpdateLocalFlags` that renames the local file to add the
+    /// missing P so the next scan doesn't classify the divergence
+    /// as a local FlagsChanged.
+    #[test]
+    fn adopt_reconciles_filename_vs_server_flag_drift_server_wins() {
+        let mut idx = empty_index();
+        idx.by_message_id.insert(
+            "<a@x>".into(),
+            vec![LocalEntry {
+                folder: "INBOX".into(),
+                maildir_id: "FILE-1".into(),
+            }],
+        );
+        // Server email carries both a standard ($forwarded -> P) and a
+        // non-standard ($imported) keyword; the non-standard side must
+        // ride through to UpdateLocalFlags.keywords so the eventual
+        // jmap_keywords mirror preserves the server's full set.
+        let mut server = email("E1", "MB-INBOX", "FPS", Some("<a@x>"));
+        server.keywords.insert("$imported".into(), true);
+        let mut local_flags = HashMap::new();
+        local_flags.insert(MaildirId::from("FILE-1"), "FS".to_string());
+
+        let plan = run_with_local_flags(
+            &[server],
+            &[],
+            &[],
+            &[],
+            &idx,
+            &local_flags,
+            ConflictStrategy::ServerWins,
+        );
+        assert_eq!(plan.adopt_count(), 1);
+        let local_updates: Vec<&SyncAction> = plan
+            .actions
+            .iter()
+            .filter(|a| matches!(a, SyncAction::UpdateLocalFlags { .. }))
+            .collect();
+        assert_eq!(
+            local_updates.len(),
+            1,
+            "expected one UpdateLocalFlags alongside adopt under ServerWins: {:?}",
+            plan.actions
+        );
+        let SyncAction::UpdateLocalFlags {
+            id,
+            new_flags,
+            keywords,
+            ..
+        } = local_updates[0]
+        else {
+            unreachable!();
+        };
+        assert_eq!(id.maildir_id.as_ref(), "FILE-1");
+        assert_eq!(id.jmap_email_id.as_ref(), "E1");
+        assert_eq!(new_flags, "FPS", "must rename file to match server");
+        assert_eq!(keywords.get("$forwarded"), Some(&true));
+        assert_eq!(
+            keywords.get("$imported"),
+            Some(&true),
+            "non-standard server keyword must pass through to the action"
+        );
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| matches!(a, SyncAction::UpdateRemoteKeywords { .. })),
+            "ServerWins must not push remote keywords during adoption: {:?}",
+            plan.actions
+        );
+    }
+
+    /// Same flag-drift scenario as the server-wins test, but with
+    /// `LocalWins`. The adoption must be paired with an
+    /// `UpdateRemoteKeywords` carrying an explicit-six patch so the
+    /// server clears `$forwarded` (and any other standard keyword
+    /// the local file doesn't carry). Non-standard keywords like
+    /// `$imported` / `$x-me-annot-2` must NOT appear in the patch
+    /// -- the per-key wire shape leaves keys we don't mention alone.
+    #[test]
+    fn adopt_reconciles_filename_vs_server_flag_drift_local_wins() {
+        let mut idx = empty_index();
+        idx.by_message_id.insert(
+            "<a@x>".into(),
+            vec![LocalEntry {
+                folder: "INBOX".into(),
+                maildir_id: "FILE-1".into(),
+            }],
+        );
+        let mut server = email("E1", "MB-INBOX", "FPS", Some("<a@x>"));
+        server.keywords.insert("$imported".into(), true);
+        let mut local_flags = HashMap::new();
+        local_flags.insert(MaildirId::from("FILE-1"), "FS".to_string());
+
+        let plan = run_with_local_flags(
+            &[server],
+            &[],
+            &[],
+            &[],
+            &idx,
+            &local_flags,
+            ConflictStrategy::LocalWins,
+        );
+        assert_eq!(plan.adopt_count(), 1);
+        let remote_updates: Vec<&SyncAction> = plan
+            .actions
+            .iter()
+            .filter(|a| matches!(a, SyncAction::UpdateRemoteKeywords { .. }))
+            .collect();
+        assert_eq!(
+            remote_updates.len(),
+            1,
+            "expected one UpdateRemoteKeywords alongside adopt under LocalWins: {:?}",
+            plan.actions
+        );
+        let SyncAction::UpdateRemoteKeywords { id, keywords } = remote_updates[0] else {
+            unreachable!();
+        };
+        assert_eq!(id.jmap_email_id.as_ref(), "E1");
+        // Explicit-six patch: every standard keyword present with the
+        // local file's value, $forwarded explicitly false to clear it.
+        assert_eq!(keywords.get("$flagged"), Some(&true));
+        assert_eq!(keywords.get("$seen"), Some(&true));
+        assert_eq!(keywords.get("$forwarded"), Some(&false));
+        assert_eq!(keywords.get("$draft"), Some(&false));
+        assert_eq!(keywords.get("$answered"), Some(&false));
+        assert_eq!(keywords.get("$deleted"), Some(&false));
+        assert!(
+            !keywords.contains_key("$imported"),
+            "patch must leave non-standard server keywords alone: {:?}",
+            keywords
+        );
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| matches!(a, SyncAction::UpdateLocalFlags { .. })),
+            "LocalWins must not rename the local file during adoption: {:?}",
+            plan.actions
+        );
+    }
+
+    /// `handle_local_new`'s alreadyExists adopt path must call the
+    /// same reconciliation step `try_adopt_remote` does. A local
+    /// NewMessage with Message-ID matching a DB record whose stored
+    /// server keywords disagree on the standard six emits both the
+    /// adopt and the side-effecting reconciliation action -- under
+    /// ServerWins, an UpdateLocalFlags that renames the file to the
+    /// server-derived suffix.
+    #[test]
+    fn already_exists_adopt_reconciles_flag_drift_server_wins() {
+        // DB has the record with server keywords including $forwarded
+        // (jmap_keywords) and the projected `flags` column set to "FPS".
+        let mut keywords_map = HashMap::new();
+        keywords_map.insert("$flagged".to_string(), true);
+        keywords_map.insert("$seen".to_string(), true);
+        keywords_map.insert("$forwarded".to_string(), true);
+        let rec = MessageRecord {
+            jmap_email_id: "E1".into(),
+            jmap_blob_id: Some("B1".into()),
+            jmap_thread_id: Some("T1".into()),
+            mailbox_id: "MB-INBOX".into(),
+            maildir_id: Some("M-EXISTING".into()),
+            maildir_folder: Some("INBOX".into()),
+            message_id: "<a@x>".into(),
+            flags: "FPS".into(),
+            jmap_keywords: serde_json::to_string(&keywords_map).unwrap(),
+        };
+        // Local NewMessage with the same Message-ID but `:2,FS` -- no P.
+        let new_change = LocalChange::NewMessage {
+            maildir_id: "M-NEW".into(),
+            folder: "INBOX".into(),
+            flags: "FS".into(),
+            path: PathBuf::from("/tmp/m-new"),
+            message_id: "<a@x>".into(),
+            size_bytes: 0,
+        };
+        let plan = run(
+            &[],
+            &[],
+            &[new_change],
+            &[rec],
+            &empty_index(),
+            ConflictStrategy::ServerWins,
+        );
+        // Adopted (no upload), AND reconciliation emitted UpdateLocalFlags.
+        assert_eq!(plan.adopt_count(), 1);
+        assert_eq!(plan.upload_count(), 0);
+        let local_updates: Vec<&SyncAction> = plan
+            .actions
+            .iter()
+            .filter(|a| matches!(a, SyncAction::UpdateLocalFlags { .. }))
+            .collect();
+        assert_eq!(
+            local_updates.len(),
+            1,
+            "alreadyExists adopt must reconcile flag drift under ServerWins: {:?}",
+            plan.actions
+        );
+        let SyncAction::UpdateLocalFlags { id, new_flags, .. } = local_updates[0] else {
+            unreachable!();
+        };
+        assert_eq!(id.maildir_id.as_ref(), "M-NEW");
+        assert_eq!(
+            id.jmap_email_id.as_ref(),
+            "E1",
+            "reconciliation must share the adopt's BoundId.jmap_email_id"
+        );
+        assert_eq!(new_flags, "FPS");
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| matches!(a, SyncAction::UpdateRemoteKeywords { .. })),
+            "ServerWins must not push remote keywords on the alreadyExists adopt path: {:?}",
+            plan.actions
+        );
     }
 
     /// Known JMAP id, server keywords differ from message_map: emit a
