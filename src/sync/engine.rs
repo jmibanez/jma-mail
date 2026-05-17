@@ -214,8 +214,20 @@ impl<'a> SyncEngine<'a> {
         // and (b) the post-scan filter, which suppresses scan's view
         // of the duplicates so reconcile sees the post-dedupe shape
         // even under dry-run.
+        //
+        // Path-scoped cycles skip the dedupe walk entirely. The walk
+        // is folder-wide -- it parses Message-IDs out of every cur/
+        // and new/ file across every synced folder -- so its cost
+        // doesn't shrink when the trigger only touches a handful of
+        // paths. Paths-scope only fires from the daemon's LocalChange
+        // triggers, where (a) the DB always has rows (Initial seeded
+        // it via Full), so the LocalIndex bridge is unused; (b)
+        // dry-run never applies (the daemon never runs dry); and (c)
+        // any duplicate the cycle misses is caught by the next
+        // Full-scope trigger (SSE pulse, Initial, CLI sync), which
+        // arrives soon on a connected daemon.
         let folder_names: Vec<String> = mailboxes.iter().map(|(_, f)| f.clone()).collect();
-        let dedupe_plan = {
+        let dedupe_plan = if matches!(scan_scope, ScanScope::Full) {
             let _phase =
                 tracing::info_span!(target: crate::profile::TARGET_PHASE, "dedupe").entered();
             let plan = dedupe::plan_dedupe(&maildir_root, &folder_names)?;
@@ -223,6 +235,8 @@ impl<'a> SyncEngine<'a> {
                 dedupe::apply_dedupe(&maildir_root, &plan)?;
             }
             plan
+        } else {
+            dedupe::DedupePlan::default()
         };
         let mut local_index = LocalIndex::default();
         if !queries::has_message_map_rows(self.conn)? {
