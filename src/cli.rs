@@ -29,13 +29,11 @@ pub struct Cli {
     #[arg(short, long, global = true)]
     pub quiet: bool,
 
-    /// Print a profiling summary (phase timings, blob throughput,
-    /// file-op counts, RSS deltas) to stderr at end of run.
+    /// Print profiling summary to stderr at end of run
     #[arg(long, global = true)]
     pub profile: bool,
 
-    /// Write the profiling summary as JSON to PATH at end of run.
-    /// In daemon mode, appends one NDJSON line per sync cycle.
+    /// Write profiling summary as JSON to PATH
     #[arg(long, global = true, value_name = "PATH")]
     pub profile_json: Option<PathBuf>,
 

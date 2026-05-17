@@ -193,8 +193,8 @@ Options:
   -v, --verbose...            Increase verbosity: -v info, -vv debug, -vvv all crates, -vvvv trace
   -n, --dry-run               Show what would be done without making changes
   -q, --quiet                 Suppress all output except errors
-      --profile               Print a profiling summary to stderr at end of run
-      --profile-json <PATH>   Write the profiling summary as JSON to PATH (NDJSON per cycle in daemon mode)
+      --profile               Print profiling summary to stderr at end of run
+      --profile-json <PATH>   Write profiling summary as JSON to PATH
   -h, --help                  Print help
   -V, --version               Print version
 ```
