@@ -143,11 +143,9 @@ fn main() -> Result<()> {
         // only when new_pct evenly divides 100. Determined by the
         // counter rather than the RNG so placement is reproducible
         // across runs regardless of --seed.
-        let in_new = if args.new_pct == 0 {
-            false
-        } else {
-            let stride = (100 / args.new_pct).max(1) as usize;
-            i % stride == 0
+        let in_new = match 100u32.checked_div(args.new_pct) {
+            Some(stride) => i % (stride.max(1) as usize) == 0,
+            None => false,
         };
 
         let unixtime = BASE_UNIXTIME + (i as u64);

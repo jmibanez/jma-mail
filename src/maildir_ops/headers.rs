@@ -297,7 +297,7 @@ mod tests {
         let mut content = Vec::new();
         // Pick filler sized so the EOH sequence straddles the
         // 64-byte soft cap.
-        content.extend_from_slice(&vec![b'X'; 62]);
+        content.extend_from_slice(&[b'X'; 62]);
         content.extend_from_slice(b"\r\n");
         content.extend_from_slice(b"\r\nbody");
         write_file(&path, &content);

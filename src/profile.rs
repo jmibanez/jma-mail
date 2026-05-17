@@ -47,8 +47,10 @@ pub struct ProfileLayer {
 
 impl ProfileLayer {
     pub fn new() -> Self {
-        let mut state = ProfileState::default();
-        state.run_start = Some(Instant::now());
+        let state = ProfileState {
+            run_start: Some(Instant::now()),
+            ..Default::default()
+        };
         Self {
             state: Arc::new(Mutex::new(state)),
         }
@@ -227,9 +229,7 @@ impl ProfileSummary {
                 p.wall_ms,
                 format_signed_bytes(p.rss_delta_bytes),
                 format_bytes(p.rss_peak_after_bytes),
-                p.bytes
-                    .map(|b| format_bytes(b))
-                    .unwrap_or_else(|| "-".into()),
+                p.bytes.map(format_bytes).unwrap_or_else(|| "-".into()),
                 p.count.map(|c| c.to_string()).unwrap_or_else(|| "-".into()),
             )?;
         }
@@ -517,10 +517,8 @@ impl<'a> NumericFieldVisitor<'a> {
                 "count" => *count = Some(value),
                 _ => {}
             },
-            NumericTarget::Blob(SpanData::Blob { bytes, .. }) => {
-                if name == "bytes" {
-                    *bytes = Some(value);
-                }
+            NumericTarget::Blob(SpanData::Blob { bytes, .. }) if name == "bytes" => {
+                *bytes = Some(value);
             }
             _ => {}
         }

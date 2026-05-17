@@ -487,12 +487,10 @@ impl<'a> SyncEngine<'a> {
         // idempotency contract that lets the next cycle replay
         // unaffected work also covers the per-folder snapshot
         // here.
-        if matches!(scan_scope, ScanScope::Full) {
-            if let Err(e) = record_folder_checkpoints(self.conn, &maildir_root, &folder_names) {
-                warn!(
-                    "Failed to record folder_checkpoint rows; next cycle will re-walk dedupe: {e:#}"
-                );
-            }
+        if matches!(scan_scope, ScanScope::Full)
+            && let Err(e) = record_folder_checkpoints(self.conn, &maildir_root, &folder_names)
+        {
+            warn!("Failed to record folder_checkpoint rows; next cycle will re-walk dedupe: {e:#}");
         }
 
         if already_in_sync {

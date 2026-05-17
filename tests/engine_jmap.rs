@@ -22,9 +22,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use jma_mail::config::FolderLayout;
-use jma_mail::config::{
-    AccountConfig, Config, ConflictStrategy, StateConfig, SyncConfig, WatchConfig,
-};
+use jma_mail::config::{AccountConfig, Config, ConflictStrategy, StateConfig, SyncConfig};
 use jma_mail::ids::{JmapEmailId, JmapMailboxId};
 use jma_mail::state::{db, queries};
 use jma_mail::sync::engine::SyncEngine;

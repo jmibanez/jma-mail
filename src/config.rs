@@ -736,8 +736,10 @@ mod tests {
     /// valid override (effectively disables the cache).
     #[test]
     fn effective_self_write_ttl_override_wins() {
-        let mut cfg = WatchConfig::default();
-        cfg.self_write_ttl_secs = Some(60);
+        let mut cfg = WatchConfig {
+            self_write_ttl_secs: Some(60),
+            ..Default::default()
+        };
         assert_eq!(cfg.effective_self_write_ttl().as_secs(), 60);
 
         cfg.self_write_ttl_secs = Some(0);
@@ -750,9 +752,11 @@ mod tests {
     /// -> 7s (nearest).
     #[test]
     fn effective_self_write_ttl_tracks_pipeline_widening() {
-        let mut cfg = WatchConfig::default();
-        cfg.debounce_secs = 3;
-        cfg.coalesce_window_ms = 700;
+        let cfg = WatchConfig {
+            debounce_secs: 3,
+            coalesce_window_ms: 700,
+            ..Default::default()
+        };
         assert_eq!(cfg.effective_self_write_ttl().as_secs(), 7);
     }
 
@@ -761,9 +765,11 @@ mod tests {
     /// least one fsevents tick.
     #[test]
     fn effective_self_write_ttl_floors_at_one_second() {
-        let mut cfg = WatchConfig::default();
-        cfg.debounce_secs = 0;
-        cfg.coalesce_window_ms = 100;
+        let cfg = WatchConfig {
+            debounce_secs: 0,
+            coalesce_window_ms: 100,
+            ..Default::default()
+        };
         assert_eq!(cfg.effective_self_write_ttl().as_secs(), 1);
     }
 }

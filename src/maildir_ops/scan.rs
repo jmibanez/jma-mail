@@ -299,9 +299,17 @@ pub fn scan_paths(
     event_paths: &[PathBuf],
     known_states: &HashMap<String, HashMap<MaildirId, (String, String)>>,
 ) -> Result<ScanResult> {
+    // (subdir, flags, raw on-disk path) for one event hitting a
+    // (folder, maildir_id) group. Multiple entries per group cover
+    // both halves of a rename collapsed into the same key.
+    type GroupEntry = (String, String, PathBuf);
+    // Per-folder classification input: cur/ live entries, new/ ids,
+    // and ids that disappeared (live path missing).
+    type FolderBucket = (Vec<CurEntry>, Vec<MaildirId>, Vec<MaildirId>);
+
     // Group events by (folder, maildir_id) so the source + destination
     // sides of a single rename collapse into one classification.
-    let mut groups: HashMap<(String, MaildirId), Vec<(String, String, PathBuf)>> = HashMap::new();
+    let mut groups: HashMap<(String, MaildirId), Vec<GroupEntry>> = HashMap::new();
     for raw in event_paths {
         let Some((folder, subdir, id, flags)) = parse_event_path(maildir_root, raw) else {
             continue;
@@ -316,8 +324,7 @@ pub fn scan_paths(
     }
 
     // Bucket into per-folder inputs for classify_changes.
-    let mut by_folder: HashMap<String, (Vec<CurEntry>, Vec<MaildirId>, Vec<MaildirId>)> =
-        HashMap::new();
+    let mut by_folder: HashMap<String, FolderBucket> = HashMap::new();
     for ((folder, maildir_id), entries) in groups {
         // Live representative for this group. Prefer cur/ over new/:
         // cur/ is where flag-bearing files land after MUA promotion,
