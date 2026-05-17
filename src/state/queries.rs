@@ -355,6 +355,70 @@ pub fn clear_cached_session_url(conn: &Connection, domain: &str) -> Result<()> {
     Ok(())
 }
 
+// --- Folder Checkpoint ---
+
+/// One row of the `folder_checkpoint` table -- a snapshot of a
+/// maildir folder's cur/ and new/ subdirectories taken at the end
+/// of a successful sync cycle. The Phase 0 dedupe gate compares a
+/// fresh snapshot against the recorded row to decide whether the
+/// folder needs another dedupe walk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderCheckpoint {
+    pub cur_mtime_ns: i64,
+    pub new_mtime_ns: i64,
+    pub cur_count: i64,
+    pub new_count: i64,
+}
+
+/// Read the checkpoint row for one folder, or None when no cycle
+/// has ever checkpointed it (first sync, recovery, freshly added).
+pub fn get_folder_checkpoint(conn: &Connection, folder: &str) -> Result<Option<FolderCheckpoint>> {
+    let mut stmt = conn.prepare(
+        "SELECT cur_mtime_ns, new_mtime_ns, cur_count, new_count \
+         FROM folder_checkpoint WHERE maildir_folder = ?1",
+    )?;
+    let row = stmt
+        .query_row(params![folder], |row| {
+            Ok(FolderCheckpoint {
+                cur_mtime_ns: row.get(0)?,
+                new_mtime_ns: row.get(1)?,
+                cur_count: row.get(2)?,
+                new_count: row.get(3)?,
+            })
+        })
+        .optional()?;
+    Ok(row)
+}
+
+/// Upsert the checkpoint row for one folder, stamping `checkpointed_at`
+/// to the current time. Called once per synced folder at the tail of
+/// every successful cycle.
+pub fn upsert_folder_checkpoint(
+    conn: &Connection,
+    folder: &str,
+    cp: &FolderCheckpoint,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO folder_checkpoint \
+            (maildir_folder, cur_mtime_ns, new_mtime_ns, cur_count, new_count, checkpointed_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, datetime('now')) \
+         ON CONFLICT(maildir_folder) DO UPDATE SET \
+            cur_mtime_ns = excluded.cur_mtime_ns, \
+            new_mtime_ns = excluded.new_mtime_ns, \
+            cur_count = excluded.cur_count, \
+            new_count = excluded.new_count, \
+            checkpointed_at = excluded.checkpointed_at",
+        params![
+            folder,
+            cp.cur_mtime_ns,
+            cp.new_mtime_ns,
+            cp.cur_count,
+            cp.new_count,
+        ],
+    )?;
+    Ok(())
+}
+
 // Bring in the Optional extension trait
 use rusqlite::OptionalExtension;
 

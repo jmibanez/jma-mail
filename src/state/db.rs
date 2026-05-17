@@ -77,6 +77,23 @@ CREATE TABLE IF NOT EXISTS jmap_discovery (
     session_url    TEXT NOT NULL,
     discovered_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- Per-folder snapshot recorded at the end of every successful sync
+-- cycle. The next cycle stats cur/ and new/, counts their entries,
+-- and compares; a folder whose mtimes and entry counts both match
+-- the recorded checkpoint cannot have grown a duplicate since the
+-- last walk and is skipped during the Phase 0 dedupe scan. Missing
+-- row (first sync, post-recovery wipe, freshly-added folder) is
+-- treated as dirty so the dedupe walk still anchors on real disk
+-- state in the cases that need it.
+CREATE TABLE IF NOT EXISTS folder_checkpoint (
+    maildir_folder    TEXT NOT NULL PRIMARY KEY,
+    cur_mtime_ns      INTEGER NOT NULL,
+    new_mtime_ns      INTEGER NOT NULL,
+    cur_count         INTEGER NOT NULL,
+    new_count         INTEGER NOT NULL,
+    checkpointed_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
 "#;
 
 /// Open the state database for read-only callers (`status`, `mailboxes`,

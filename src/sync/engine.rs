@@ -226,11 +226,29 @@ impl<'a> SyncEngine<'a> {
         // any duplicate the cycle misses is caught by the next
         // Full-scope trigger (SSE pulse, Initial, CLI sync), which
         // arrives soon on a connected daemon.
+        //
+        // Within a Full cycle, the walk is further narrowed against
+        // `folder_checkpoint`: any folder whose current (cur_mtime,
+        // new_mtime, cur_count, new_count) snapshot matches the row
+        // written at the tail of the last successful cycle cannot
+        // have grown a per-folder Message-ID duplicate since then.
+        // mtime advances on any add, remove, or in-place rename;
+        // count advances only on add/remove. Requiring both to match
+        // means an in-place rename (the common MUA flag-flip path)
+        // is correctly recognised as not-dupe-inducing. A missing
+        // checkpoint row (first sync, post-recovery wipe, freshly
+        // added folder) is treated as dirty, so the LocalIndex
+        // bridge still gets populated on first sync.
         let folder_names: Vec<String> = mailboxes.iter().map(|(_, f)| f.clone()).collect();
-        let dedupe_plan = if matches!(scan_scope, ScanScope::Full) {
+        let dedupe_targets: Vec<String> = if matches!(scan_scope, ScanScope::Full) {
+            compute_dirty_folders(self.conn, &maildir_root, &folder_names)?
+        } else {
+            Vec::new()
+        };
+        let dedupe_plan = if !dedupe_targets.is_empty() {
             let _phase =
                 tracing::info_span!(target: crate::profile::TARGET_PHASE, "dedupe").entered();
-            let plan = dedupe::plan_dedupe(&maildir_root, &folder_names)?;
+            let plan = dedupe::plan_dedupe(&maildir_root, &dedupe_targets)?;
             if !dry_run {
                 dedupe::apply_dedupe(&maildir_root, &plan)?;
             }
@@ -460,6 +478,33 @@ impl<'a> SyncEngine<'a> {
             );
         }
 
+        // Phase 6: record per-folder checkpoints. Snapshot every
+        // synced folder after the executor has landed its writes,
+        // so the next cycle's Phase 0 dirty check sees the
+        // post-cycle state. Done for every Full cycle (Paths
+        // cycles skip both dedupe and this write, since the
+        // watcher events drive the same recheck cadence). Failures
+        // here are non-fatal: a missing or out-of-date checkpoint
+        // row just means the next Full cycle re-walks dedupe for
+        // that folder, which is the safe direction. Placed outside
+        // any transaction with the executor's cursor write -- if
+        // the process dies between cursor advance and checkpoint
+        // write, the next cycle replays cleanly off the cursor
+        // and re-walks dedupe.
+        //
+        // Partial-failure cycles (`failed_remote_actions > 0`)
+        // still checkpoint: the cursor advanced too, so the same
+        // idempotency contract that lets the next cycle replay
+        // unaffected work also covers the per-folder snapshot
+        // here.
+        if matches!(scan_scope, ScanScope::Full) {
+            if let Err(e) = record_folder_checkpoints(self.conn, &maildir_root, &folder_names) {
+                warn!(
+                    "Failed to record folder_checkpoint rows; next cycle will re-walk dedupe: {e:#}"
+                );
+            }
+        }
+
         if already_in_sync {
             crate::notify!("Already in sync");
         } else if used_initial_path {
@@ -669,6 +714,58 @@ impl<'a> SyncEngine<'a> {
         }
         Ok(out)
     }
+}
+
+/// Compare each synced folder's current `(cur, new)` snapshot
+/// against the row written by the last successful cycle. Returns
+/// the folders whose snapshot differs (or whose checkpoint row is
+/// absent entirely) -- the set Phase 0 must walk for dedupe to
+/// remain authoritative. Folders the maildir has just been
+/// `ensure_maildir`'d are treated as dirty on first sight: a
+/// freshly added folder has no row, so its snapshot trivially
+/// doesn't match anything.
+fn compute_dirty_folders(
+    conn: &Connection,
+    maildir_root: &std::path::Path,
+    folder_names: &[String],
+) -> Result<Vec<String>> {
+    let mut dirty = Vec::new();
+    for folder in folder_names {
+        let path = maildir_root.join(folder);
+        // ensure_maildir runs again in Phase 1 (scan), but snapshot
+        // needs cur/ and new/ to exist now. The call is cheap and
+        // idempotent.
+        crate::maildir_ops::store::ensure_maildir(&path)?;
+        let current = crate::maildir_ops::snapshot::snapshot_folder(&path)?;
+        let recorded = queries::get_folder_checkpoint(conn, folder)?;
+        match recorded {
+            Some(prev) if prev == current => {
+                debug!("folder_checkpoint match -- skipping dedupe for {}", folder);
+            }
+            _ => dirty.push(folder.clone()),
+        }
+    }
+    Ok(dirty)
+}
+
+/// Snapshot every synced folder after a successful cycle and upsert
+/// the row that the next cycle's `compute_dirty_folders` will compare
+/// against. Stat'd unconditionally for every synced folder (not just
+/// dedupe targets) because Phase 5 may have downloaded into a
+/// folder Phase 0 classified as clean -- without re-snapshotting,
+/// the unchanged checkpoint row would be stale, and the next cycle
+/// would flag the folder dirty and re-walk dedupe for nothing.
+fn record_folder_checkpoints(
+    conn: &Connection,
+    maildir_root: &std::path::Path,
+    folder_names: &[String],
+) -> Result<()> {
+    for folder in folder_names {
+        let path = maildir_root.join(folder);
+        let snapshot = crate::maildir_ops::snapshot::snapshot_folder(&path)?;
+        queries::upsert_folder_checkpoint(conn, folder, &snapshot)?;
+    }
+    Ok(())
 }
 
 /// Build the three message_map projections the reconcile step consumes.
@@ -943,5 +1040,92 @@ mod tests {
             Arc::ptr_eq(from_jmap, from_msgid),
             "by_jmap and by_message_id must share the same Arc"
         );
+    }
+
+    mod folder_checkpoint {
+        use super::*;
+        use std::fs;
+        use tempfile::tempdir;
+
+        fn make_maildir(root: &std::path::Path, folder: &str) -> std::path::PathBuf {
+            let path = root.join(folder);
+            crate::maildir_ops::store::ensure_maildir(&path).unwrap();
+            path
+        }
+
+        /// First-ever cycle: no `folder_checkpoint` rows exist, so
+        /// every synced folder is dirty. This is what unlocks the
+        /// initial dedupe walk that populates `LocalIndex` for the
+        /// recovery-from-empty-DB case.
+        #[test]
+        fn compute_dirty_folders_treats_missing_row_as_dirty() {
+            let conn = db::open_in_memory().unwrap();
+            let dir = tempdir().unwrap();
+            make_maildir(dir.path(), "INBOX");
+            make_maildir(dir.path(), "Archive");
+
+            let dirty = compute_dirty_folders(
+                &conn,
+                dir.path(),
+                &["INBOX".to_string(), "Archive".to_string()],
+            )
+            .unwrap();
+
+            assert_eq!(dirty.len(), 2);
+            assert!(dirty.contains(&"INBOX".to_string()));
+            assert!(dirty.contains(&"Archive".to_string()));
+        }
+
+        /// After `record_folder_checkpoints` has captured the
+        /// current state, an unchanged folder is clean on the next
+        /// cycle -- no walk, no Message-ID parsing.
+        #[test]
+        fn compute_dirty_folders_skips_folder_matching_checkpoint() {
+            let conn = db::open_in_memory().unwrap();
+            let dir = tempdir().unwrap();
+            let folder_path = make_maildir(dir.path(), "INBOX");
+            fs::write(folder_path.join("cur").join("1234.host:2,S"), b"body").unwrap();
+
+            record_folder_checkpoints(&conn, dir.path(), &["INBOX".to_string()]).unwrap();
+
+            let dirty = compute_dirty_folders(&conn, dir.path(), &["INBOX".to_string()]).unwrap();
+            assert!(dirty.is_empty(), "checkpoint matches; folder must be clean");
+        }
+
+        /// Adding a file after the checkpoint moves count past the
+        /// recorded value, which forces dirty even if mtime
+        /// somehow held steady. Count is the structural guardrail.
+        #[test]
+        fn compute_dirty_folders_flags_count_change() {
+            let conn = db::open_in_memory().unwrap();
+            let dir = tempdir().unwrap();
+            let folder_path = make_maildir(dir.path(), "INBOX");
+            record_folder_checkpoints(&conn, dir.path(), &["INBOX".to_string()]).unwrap();
+
+            fs::write(folder_path.join("new").join("9999.host:2,"), b"new body").unwrap();
+
+            let dirty = compute_dirty_folders(&conn, dir.path(), &["INBOX".to_string()]).unwrap();
+            assert_eq!(dirty, vec!["INBOX".to_string()]);
+        }
+
+        /// Each call overwrites the prior row -- the checkpoint
+        /// is a snapshot, not a log. Concretely, recording an
+        /// older state then a newer state must leave the newer
+        /// state's `cur_count` in the row.
+        #[test]
+        fn record_folder_checkpoints_upserts_in_place() {
+            let conn = db::open_in_memory().unwrap();
+            let dir = tempdir().unwrap();
+            let folder_path = make_maildir(dir.path(), "INBOX");
+
+            record_folder_checkpoints(&conn, dir.path(), &["INBOX".to_string()]).unwrap();
+            fs::write(folder_path.join("cur").join("1.host:2,"), b"x").unwrap();
+            record_folder_checkpoints(&conn, dir.path(), &["INBOX".to_string()]).unwrap();
+
+            let row = queries::get_folder_checkpoint(&conn, "INBOX")
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.cur_count, 1);
+        }
     }
 }

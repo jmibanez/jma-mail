@@ -41,6 +41,7 @@ CC=/usr/bin/cc cargo test --lib maildir_ops::headers::tests::parses_folded_value
   - `mailbox_map` -- server mailbox metadata.
   - `local_state` -- filesystem snapshot for change detection.
   - `jmap_discovery` -- cached session URL keyed on the account's email domain; populated by `session::connect` after autodiscovery, cleared and rediscovered on a structural connect failure.
+  - `folder_checkpoint` -- per-folder `(cur_mtime, new_mtime, cur_count, new_count)` snapshot written at the tail of every successful Full cycle. Phase 0 reads it to skip the dedupe walk for folders whose on-disk state hasn't changed; see [The sync cycle](#the-sync-cycle).
 
   All access goes through `queries.rs`. Don't `prepare` ad-hoc SQL elsewhere; if you need a new query, add it there.
 - `src/sync/` -- orchestration (engine, plan, reconcile, execute, plus `self_writes.rs` for the daemon's self-write cache). See [Sync internals](#sync-internals) below.
@@ -200,13 +201,13 @@ The orchestration lives in `src/sync/` and is layered:
 
 ### The sync cycle
 
-One call to `SyncEngine::sync` (or `pull_only` / `push_only`) goes through five phases. Phases 1-3 are pure data-gathering and
-planning; phase 5 is the only place we mutate anything.
+One call to `SyncEngine::sync` (or `pull_only` / `push_only`) goes through six phases. Phases 1-3 are pure data-gathering and
+planning; phase 5 is the only place we mutate the maildir or server, and phase 6 records the cycle's outcome for the next cycle's Phase 0 gate.
 
 1. **Resolve mailboxes.** `resolve_mailboxes` queries `Mailbox/get`, honours `[sync].mailboxes`, applies the `INBOX` magic alias, and upserts each into `mailbox_map`. Returns a `Vec<(jmap_id, folder_name)>` that every later phase indexes against.
 
 2. **Scan local + dedupe + collect remote changes.**
-   - `dedupe::dedupe` runs first (see [Idempotency model](#idempotency-model)).
+   - `dedupe::plan_dedupe` runs first (see [Idempotency model](#idempotency-model)), narrowed to the folders `compute_dirty_folders` flagged. On a Full cycle that's the folders whose current `(cur_mtime_ns, new_mtime_ns, cur_count, new_count)` snapshot differs from the row recorded by the last successful cycle, plus any folder with no row at all (first sync, post-recovery wipe, freshly added folder). On a Paths cycle it's the empty set: the dedupe walk is skipped entirely and `DedupePlan::default()` flows through the rest of the cycle, since the watcher's authoritative event set already drives the necessary recheck cadence.
    - `scan::scan_folder` walks each folder, compares against `local_state`, emits `LocalChange::{NewMessage, FlagsChanged, DeletedMessage}`. `NewMessage` carries the parsed Message-ID when the file has one -- reconcile uses it for adoption and move detection.
    - `fetch_remote_state` either loops `Email/changes` from the persisted cursor (delta path) or runs `Email/query` per mailbox followed by `Email/get` (initial path). The `cannotCalculateChanges` error wipes the cursor and falls back to the initial path. Returns `(remote_emails, remote_destroyed, new_state, used_initial_path)`.
 
@@ -220,6 +221,8 @@ planning; phase 5 is the only place we mutate anything.
 4. **Filter by direction.** `SyncPlan::into_filtered(direction)` splits the plan into `(kept, dropped)`. `AdoptLocalMessage` is always kept regardless of direction (see [documentation on `plan.rs`, next](#plan-rs--the-action-vocabulary)). Dropped actions are logged so a `pull` or `push` user sees what was suppressed.
 
 5. **Execute.** `Executor::execute` walks the plan in a fixed bucket order, performs the JMAP / filesystem / DB writes, and ratchets the JMAP cursor at the tail. See [`execute.rs`](#executers--performing-the-side-effects) for the full bucket order, load-bearing dependencies, and the chain-validation step that decides whether the cursor advances.
+
+6. **Record folder checkpoints.** On Full cycles, `record_folder_checkpoints` snapshots `(cur_mtime_ns, new_mtime_ns, cur_count, new_count)` for every synced folder and upserts the row in `folder_checkpoint`. The next cycle's Phase 0 compares against these rows to decide which folders to walk. Failures here are non-fatal -- a missing or stale row just causes the next cycle to re-walk dedupe for that folder. The write happens outside the executor's cursor-advance transaction; if the process dies between the two, the next cycle replays cleanly off the cursor and conservatively re-walks dedupe. Paths cycles skip this phase entirely (they also skipped phase 0).
 
 ### `plan.rs` -- the action vocabulary
 
