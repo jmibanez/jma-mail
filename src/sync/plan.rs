@@ -159,6 +159,21 @@ pub enum SyncAction {
     UpdateRemoteKeywords {
         id: RemoteId,
         keywords: HashMap<String, bool>,
+        /// On-disk maildir filename flag suffix at the time the
+        /// patch was emitted -- the filesystem-truth view of flags,
+        /// mirrored by every emit site from the same source it used
+        /// to build the patch (a `LocalChange::FlagsChanged.new_
+        /// flags`, a `DetectedMove.new_flags`, or the filename
+        /// suffix that drove `flags_to_keyword_patch` in adoption
+        /// reconciliation). `apply_remote_set`'s mirror writes this
+        /// into `local_state.flags` so the next scan's `known_
+        /// flags != entry.flags` comparison stays consistent with
+        /// the filesystem, without depending on the implicit
+        /// (and fragile) invariant that `keywords_to_flags(patch)
+        /// == filename` -- an invariant that holds for additive
+        /// patches built from `flags_to_keywords(filename)` but
+        /// breaks for any other patch shape.
+        filename_flags: String,
     },
     DestroyRemote {
         id: RemoteId,

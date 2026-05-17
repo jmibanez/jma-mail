@@ -337,6 +337,7 @@ fn emit_detected_moves(moves: &[DetectedMove], plan: &mut SyncPlan) {
                     message_id: m.message_id.clone(),
                 },
                 keywords,
+                filename_flags: m.new_flags.clone(),
             });
         }
     }
@@ -519,6 +520,7 @@ fn handle_known_remote(
                             message_id: existing.message_id.clone(),
                         },
                         keywords: flags_to_keywords(new_flags),
+                        filename_flags: new_flags.clone(),
                     });
                 }
             }
@@ -788,6 +790,7 @@ fn emit_adoption_flag_reconciliation(
                     message_id: bound_id.message_id.clone(),
                 },
                 keywords: flags_to_keyword_patch(on_disk_flags),
+                filename_flags: on_disk_flags.to_string(),
             });
         }
     }
@@ -989,6 +992,7 @@ fn handle_local_flags(
             message_id: msg.message_id.clone(),
         },
         keywords: flags_to_keywords(new_flags),
+        filename_flags: new_flags.to_string(),
     });
 }
 
@@ -1602,10 +1606,20 @@ mod tests {
             "expected one UpdateRemoteKeywords alongside adopt under LocalWins: {:?}",
             plan.actions
         );
-        let SyncAction::UpdateRemoteKeywords { id, keywords } = remote_updates[0] else {
+        let SyncAction::UpdateRemoteKeywords {
+            id,
+            keywords,
+            filename_flags,
+        } = remote_updates[0]
+        else {
             unreachable!();
         };
         assert_eq!(id.jmap_email_id.as_ref(), "E1");
+        assert_eq!(
+            filename_flags, "FS",
+            "filename_flags must carry the on-disk suffix so the mirror writes \
+             local_state.flags = filename rather than deriving from the patch"
+        );
         // Explicit-six patch: every standard keyword present with the
         // local file's value, $forwarded explicitly false to clear it.
         assert_eq!(keywords.get("$flagged"), Some(&true));
@@ -2011,6 +2025,50 @@ mod tests {
                 .actions
                 .iter()
                 .any(|a| matches!(a, SyncAction::UpdateLocalFlags { .. }))
+        );
+    }
+
+    /// Regression pin for the `local_state.flags` invariant the
+    /// `apply_remote_set` mirror relies on: every UpdateRemoteKeywords
+    /// emit site must carry `filename_flags = on-disk filename
+    /// suffix`. Without this, an additive patch (the shape
+    /// `handle_local_flags` produces) lets the mirror derive
+    /// `local_state.flags` from the merged-server view -- which
+    /// after the keyword-merge fix includes server keywords the
+    /// patch didn't touch, e.g. a still-set $flagged that the user
+    /// removed locally. Next scan would then see `local_state.flags
+    /// != entry.flags` and resurrect the phantom-FlagsChanged loop
+    /// that the column-semantics split was written to eliminate.
+    #[test]
+    fn handle_local_flags_carries_filename_flags_for_mirror() {
+        // DB has the message with $flagged + $seen (server view).
+        let rec = record("E1", "MB-INBOX", "INBOX", Some("M-1"), "FS", "<a@x>");
+        // User removed $flagged: on-disk filename is now ":2,S".
+        let plan = run(
+            &[email("E1", "MB-INBOX", "FS", Some("<a@x>"))],
+            &[],
+            &[LocalChange::FlagsChanged {
+                maildir_id: "M-1".into(),
+                folder: "INBOX".into(),
+                old_flags: "FS".into(),
+                new_flags: "S".into(),
+            }],
+            &[rec],
+            &empty_index(),
+            ConflictStrategy::LocalWins,
+        );
+        let SyncAction::UpdateRemoteKeywords { filename_flags, .. } = plan
+            .actions
+            .iter()
+            .find(|a| matches!(a, SyncAction::UpdateRemoteKeywords { .. }))
+            .expect("handle_local_flags must emit UpdateRemoteKeywords")
+        else {
+            unreachable!();
+        };
+        assert_eq!(
+            filename_flags, "S",
+            "filename_flags must carry the on-disk suffix so the mirror's \
+             local_state.flags write stays consistent with the filesystem"
         );
     }
 

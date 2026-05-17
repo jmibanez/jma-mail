@@ -426,7 +426,7 @@ impl<'a> Executor<'a> {
     ) -> Result<(jmap_email::EmailSetOutcome, ApplyRemoteSetCounts)> {
         let mut ops: Vec<EmailSetOp> = Vec::new();
         for action in &keywords {
-            if let SyncAction::UpdateRemoteKeywords { id, keywords } = action {
+            if let SyncAction::UpdateRemoteKeywords { id, keywords, .. } = action {
                 ops.push(EmailSetOp::Keywords {
                     email_id: id.jmap_email_id.clone(),
                     keywords: keywords.clone(),
@@ -473,7 +473,12 @@ impl<'a> Executor<'a> {
         // Mirror keyword updates into the local DB.
         let mut counts = ApplyRemoteSetCounts::default();
         for action in keywords {
-            let SyncAction::UpdateRemoteKeywords { id, keywords } = action else {
+            let SyncAction::UpdateRemoteKeywords {
+                id,
+                keywords,
+                filename_flags,
+            } = action
+            else {
                 continue;
             };
             if outcome.failed_updates.contains(&id.jmap_email_id) {
@@ -485,20 +490,34 @@ impl<'a> Executor<'a> {
                 continue;
             }
             if let Some(rec) = queries::get_message_by_jmap_id(&txn, &id.jmap_email_id)? {
-                let keywords_json = serde_json::to_string(&keywords)?;
-                let flags = keywords_to_flags(&keywords);
+                // Split the two flag-column writes by source, same
+                // discipline `commit_adopt` follows: message_map.
+                // flags derives from the merged-server view (what
+                // we believe the server has after the patch);
+                // local_state.flags reflects the on-disk filename
+                // suffix carried in via `filename_flags`. Pre-fix
+                // the mirror derived both from the patch HashMap,
+                // which silently worked for additive `flags_to_
+                // keywords(filename)` patches (their `keywords_to_
+                // flags` reduction *happens* to equal the filename)
+                // but broke as soon as the patch shape diverged --
+                // see the doc on `UpdateRemoteKeywords.filename_
+                // flags`.
+                let merged = apply_keyword_patch(&rec.jmap_keywords, &keywords);
+                let keywords_json = serde_json::to_string(&merged)?;
+                let server_flags = keywords_to_flags(&merged);
                 let maildir_id = rec.maildir_id.clone();
                 let maildir_folder = rec.maildir_folder.clone();
                 queries::upsert_message(
                     &txn,
                     &MessageRecord {
-                        flags: flags.clone(),
+                        flags: server_flags,
                         jmap_keywords: keywords_json,
                         ..rec
                     },
                 )?;
                 if let (Some(mid), Some(folder)) = (maildir_id, maildir_folder) {
-                    queries::upsert_local_state(&txn, &mid, &folder, &flags, None)?;
+                    queries::upsert_local_state(&txn, &mid, &folder, &filename_flags, None)?;
                 }
             }
             counts.keyword_updates += 1;
@@ -1070,6 +1089,57 @@ fn apply_update_local_flags(
     Ok(succeeded)
 }
 
+/// Merge a JMAP keyword patch into our DB's view of the server's
+/// keyword set. `existing_json` is `MessageRecord.jmap_keywords` as
+/// the DB stores it (a `HashMap<String, bool>` serialized to JSON);
+/// `patch` is the keywords map we just sent via `Email/set`'s per-key
+/// `keywords/<name>` shape. Returns the merged HashMap.
+///
+/// JMAP patch semantics under jmap-client's wire shape: a `true`
+/// value sets (or keeps) the key on the server; a `false` value
+/// serializes as `keywords/<name>: null` and clears the key. Keys
+/// not mentioned in the patch are untouched on the server.
+///
+/// The mirror's whole point is to reflect that: non-standard server
+/// keywords ($imported, $hasattachment, $x-me-annot-2, user-defined
+/// labels) that adoption captured and that the patch never mentioned
+/// must survive the round-trip. Overwriting `jmap_keywords` with
+/// the patch alone (the pre-fix behavior) silently truncated those
+/// entries out of the local DB even though the server still had
+/// them.
+///
+/// A malformed `existing_json` (corrupted row, schema mismatch)
+/// degrades to "start with an empty map and apply the patch" --
+/// equivalent to the pre-fix overwrite, but at least the patch
+/// itself lands cleanly. Better than panicking in the mirror.
+fn apply_keyword_patch(
+    existing_json: &str,
+    patch: &HashMap<String, bool>,
+) -> HashMap<String, bool> {
+    let mut merged: HashMap<String, bool> = match serde_json::from_str(existing_json) {
+        Ok(m) => m,
+        Err(e) => {
+            // Self-healing: the next full Email/get round-trip
+            // overwrites the column with a fresh serialization.
+            // warn! (not error!) per the log-level convention; the
+            // row recovers automatically without user intervention.
+            warn!(
+                "Malformed jmap_keywords JSON; degrading to empty merge base: {}",
+                e
+            );
+            HashMap::new()
+        }
+    };
+    for (k, v) in patch {
+        if *v {
+            merged.insert(k.clone(), true);
+        } else {
+            merged.remove(k);
+        }
+    }
+    merged
+}
+
 /// DB writes for a single AdoptLocalMessage. Shared between the
 /// up-front adopt phase and the post-remote-set move-pair phase so
 /// both go through the same row-shape and ordering.
@@ -1545,6 +1615,108 @@ mod tests {
              `known_flags != entry.flags` comparison would otherwise emit \
              a phantom FlagsChanged"
         );
+    }
+
+    /// `apply_keyword_patch` must merge the patch into the existing
+    /// server-keyword view rather than overwriting. Overwriting
+    /// would truncate non-standard server keywords ($imported,
+    /// $hasattachment, $x-me-annot-2, user-defined labels) that
+    /// adoption captured and that the patch never mentioned --
+    /// the server still has them, but the DB's `jmap_keywords`
+    /// column would silently lose them. Merge contract: keep keys
+    /// not in the patch unchanged, set keys with `true`, remove
+    /// keys with `false`.
+    #[test]
+    fn apply_keyword_patch_preserves_non_standard_keywords_on_additive_patch() {
+        let existing = r#"{"$imported":true,"$flagged":true,"$x-me-annot-2":true}"#;
+        let mut patch = HashMap::new();
+        // Additive patch: just sets $seen. No mention of the existing
+        // entries -- they must survive the round-trip.
+        patch.insert("$seen".to_string(), true);
+
+        let merged = apply_keyword_patch(existing, &patch);
+
+        assert_eq!(merged.get("$seen"), Some(&true), "new key must be set");
+        assert_eq!(
+            merged.get("$flagged"),
+            Some(&true),
+            "existing standard keyword must survive"
+        );
+        assert_eq!(
+            merged.get("$imported"),
+            Some(&true),
+            "existing non-standard keyword must survive (this was the bug)"
+        );
+        assert_eq!(
+            merged.get("$x-me-annot-2"),
+            Some(&true),
+            "existing non-standard keyword must survive"
+        );
+    }
+
+    /// Explicit-six patch (the shape `flags_to_keyword_patch`
+    /// emits for adoption LocalWins): standard keywords with
+    /// explicit `false` must clear those keys, while non-standard
+    /// keywords unmentioned in the patch must survive.
+    #[test]
+    fn apply_keyword_patch_removes_false_keys_and_preserves_non_standard() {
+        let existing = r#"{"$forwarded":true,"$flagged":true,"$seen":true,"$imported":true}"#;
+        // Explicit-six patch matching on-disk ":2,FS" (no P): $seen
+        // and $flagged stay, $forwarded and the rest clear.
+        let mut patch = HashMap::new();
+        patch.insert("$flagged".to_string(), true);
+        patch.insert("$seen".to_string(), true);
+        patch.insert("$forwarded".to_string(), false);
+        patch.insert("$draft".to_string(), false);
+        patch.insert("$answered".to_string(), false);
+        patch.insert("$deleted".to_string(), false);
+
+        let merged = apply_keyword_patch(existing, &patch);
+
+        assert_eq!(merged.get("$flagged"), Some(&true));
+        assert_eq!(merged.get("$seen"), Some(&true));
+        assert!(
+            !merged.contains_key("$forwarded"),
+            "false patch must clear the standard keyword: {:?}",
+            merged
+        );
+        assert_eq!(
+            merged.get("$imported"),
+            Some(&true),
+            "non-standard keyword unmentioned in the patch must survive: {:?}",
+            merged
+        );
+        // Keys we cleared shouldn't pollute the merged shape with
+        // `false` sentinels -- they're just absent.
+        assert!(
+            !merged.contains_key("$draft"),
+            "absent-in-existing + false-in-patch must stay absent: {:?}",
+            merged
+        );
+    }
+
+    /// Empty or malformed `existing_json` degrades to "apply patch
+    /// to an empty map" rather than panicking. Same end-state as
+    /// the pre-fix overwrite behavior; preserves the patch itself.
+    #[test]
+    fn apply_keyword_patch_handles_malformed_existing_json() {
+        let mut patch = HashMap::new();
+        patch.insert("$seen".to_string(), true);
+
+        // "" is malformed JSON per serde_json (same branch as
+        // "not json"), not "from_str of empty == empty map".
+        let from_empty = apply_keyword_patch("", &patch);
+        let from_garbage = apply_keyword_patch("not json", &patch);
+
+        for merged in [from_empty, from_garbage] {
+            assert_eq!(merged.get("$seen"), Some(&true));
+            assert_eq!(
+                merged.len(),
+                1,
+                "malformed existing must degrade to patch-only: {:?}",
+                merged
+            );
+        }
     }
 
     fn edges_from(pairs: &[(&str, &str)]) -> HashMap<String, String> {
