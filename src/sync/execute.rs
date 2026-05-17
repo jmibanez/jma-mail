@@ -1081,6 +1081,7 @@ fn commit_adopt(conn: &Connection, action: SyncAction) -> Result<()> {
         jmap_thread_id,
         mailbox_id,
         keywords,
+        filename_flags,
         old_maildir_id,
     } = action
     else {
@@ -1095,7 +1096,19 @@ fn commit_adopt(conn: &Connection, action: SyncAction) -> Result<()> {
     if let Some(old) = old_maildir_id.as_ref() {
         queries::delete_local_state(conn, old)?;
     }
-    let flags = keywords_to_flags(&keywords);
+    // Split the two flag columns by semantic: `message_map.flags`
+    // derives from the server's `keywords` (the standard-six
+    // projection of what we believe the server has), while
+    // `local_state.flags` is the on-disk filename suffix carried
+    // through `filename_flags`. Seeding both from the server-derived
+    // value (the pre-fix behavior) caused the next scan's
+    // `known_flags != entry.flags` comparison to fire a phantom
+    // FlagsChanged for any message whose filename and server
+    // keywords disagreed on the standard six -- which then drove an
+    // UpdateRemoteKeywords push, whose mirror in apply_remote_set
+    // truncated `jmap_keywords` to just the patched standard
+    // entries. Two birds with one fix: split the seed source.
+    let server_flags = keywords_to_flags(&keywords);
     let keywords_json = serde_json::to_string(&keywords)?;
     queries::upsert_message(
         conn,
@@ -1107,11 +1120,11 @@ fn commit_adopt(conn: &Connection, action: SyncAction) -> Result<()> {
             maildir_id: Some(maildir_id.clone()),
             maildir_folder: Some(maildir_folder.clone()),
             message_id,
-            flags: flags.clone(),
+            flags: server_flags,
             jmap_keywords: keywords_json,
         },
     )?;
-    queries::upsert_local_state(conn, &maildir_id, &maildir_folder, &flags, None)?;
+    queries::upsert_local_state(conn, &maildir_id, &maildir_folder, &filename_flags, None)?;
     debug!(
         "Adopted {}/{} as {}",
         maildir_folder,
@@ -1370,6 +1383,7 @@ mod tests {
             jmap_thread_id: Some("T1".into()),
             mailbox_id: "MB-SPAM".into(),
             keywords,
+            filename_flags: "S".into(),
             old_maildir_id: Some("M-OLD".into()),
         }
     }
@@ -1445,6 +1459,80 @@ mod tests {
         );
         let spam_state = queries::get_local_state_for_folder(&conn, "Spam").unwrap();
         assert!(spam_state.contains_key("M-NEW"));
+    }
+
+    /// `commit_adopt` must split the two flag columns by semantic:
+    /// `message_map.flags` derives from the server's `keywords` (the
+    /// standard-six projection of what we believe the server has),
+    /// while `local_state.flags` is the on-disk filename suffix
+    /// carried in through `filename_flags`. Seeding both from the
+    /// server-derived value (the pre-fix behavior) caused the next
+    /// scan to classify the filename-vs-DB divergence as a phantom
+    /// FlagsChanged for any message whose filename suffix and server
+    /// keywords disagreed on the standard six, which drove a spurious
+    /// UpdateRemoteKeywords push whose mirror truncated `jmap_keywords`
+    /// to the patched standard entries -- silent DB corruption of the
+    /// full server keyword set.
+    #[test]
+    fn commit_adopt_splits_message_map_flags_from_local_state_flags() {
+        let conn = db::open_in_memory().unwrap();
+        let mut keywords = HashMap::new();
+        keywords.insert("$flagged".to_string(), true);
+        keywords.insert("$seen".to_string(), true);
+        keywords.insert("$forwarded".to_string(), true);
+        // Plus a non-standard keyword the filename can't carry.
+        keywords.insert("$imported".to_string(), true);
+
+        // On-disk filename is `:2,FS` -- no P even though server has
+        // $forwarded. The pre-fix code would have written "FPS" into
+        // both columns.
+        commit_adopt(
+            &conn,
+            SyncAction::AdoptLocalMessage {
+                id: BoundId {
+                    maildir_id: "FILE-1".into(),
+                    jmap_email_id: "E1".into(),
+                    message_id: "a@x".into(),
+                },
+                maildir_folder: "INBOX".into(),
+                jmap_blob_id: Some("B1".into()),
+                jmap_thread_id: Some("T1".into()),
+                mailbox_id: "MB-INBOX".into(),
+                keywords,
+                filename_flags: "FS".into(),
+                old_maildir_id: None,
+            },
+        )
+        .unwrap();
+
+        // message_map.flags: server-derived standard-six projection.
+        let rec = queries::get_message_by_jmap_id(&conn, &JmapEmailId::from("E1"))
+            .unwrap()
+            .expect("E1 must be present after commit_adopt");
+        assert_eq!(
+            rec.flags, "FPS",
+            "message_map.flags must reflect server-derived standard six"
+        );
+        // jmap_keywords still carries the full set including $imported.
+        assert!(
+            rec.jmap_keywords.contains("$imported"),
+            "jmap_keywords must preserve non-standard keywords: {}",
+            rec.jmap_keywords
+        );
+
+        // local_state.flags: on-disk filename truth, NOT server-derived.
+        let inbox_state = queries::get_local_state_for_folder(&conn, "INBOX").unwrap();
+        let (folder, flags) = inbox_state
+            .get(&MaildirId::from("FILE-1"))
+            .expect("local_state row for FILE-1 must exist");
+        assert_eq!(folder, "INBOX");
+        assert_eq!(
+            flags, "FS",
+            "local_state.flags must reflect the on-disk filename suffix, \
+             not keywords_to_flags(server) -- the next scan's \
+             `known_flags != entry.flags` comparison would otherwise emit \
+             a phantom FlagsChanged"
+        );
     }
 
     fn edges_from(pairs: &[(&str, &str)]) -> HashMap<String, String> {

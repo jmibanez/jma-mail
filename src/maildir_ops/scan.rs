@@ -17,6 +17,38 @@ struct CurEntry {
     path: PathBuf,
 }
 
+/// One scan pass's output: the classified `LocalChange`s, a
+/// MaildirId-keyed map of every on-disk filename's flag suffix the
+/// scan visited, and (for exhaustive walks) the list of all observed
+/// maildir_ids.
+///
+/// `local_flags` is the filesystem-truth view of flags. Reconcile
+/// reads it at adoption emit sites and `commit_adopt` writes the
+/// adopted file's entry into `local_state.flags`, so the next scan's
+/// `known_flags != entry.flags` comparison doesn't fire a phantom
+/// FlagsChanged. Both scan shapes populate this map from the same
+/// `entry.flags()` reads they already do for classification -- no
+/// extra I/O. For `scan_folder` the map covers every cur/ + new/
+/// file in the folder; for `scan_paths` it covers only the
+/// maildir_ids that the event paths pointed at. Out-of-event-set
+/// maildir_ids in steady state are covered by the state DB instead
+/// (`MessageRecord.flags` post-adoption is the standard-six
+/// projection of the server's keywords, which adoption's split also
+/// keeps consistent).
+///
+/// `seen_ids` is populated only by exhaustive walks (`scan_folder`):
+/// it's the observed-on-disk set used to detect "in DB but missing"
+/// deletions. `scan_paths` returns an empty vec here because a
+/// path-driven scan has no exhaustive view -- it sees only the
+/// event paths and trusts the event stream to deliver any deletions
+/// directly.
+#[derive(Debug)]
+pub struct ScanResult {
+    pub changes: Vec<LocalChange>,
+    pub local_flags: HashMap<MaildirId, String>,
+    pub seen_ids: Vec<MaildirId>,
+}
+
 /// A change detected in the local maildir.
 #[derive(Debug)]
 pub enum LocalChange {
@@ -192,7 +224,7 @@ pub fn scan_folder(
     maildir: &Maildir,
     folder_name: &str,
     known_state: &HashMap<MaildirId, (String, String)>,
-) -> Result<(Vec<LocalChange>, Vec<MaildirId>)> {
+) -> Result<ScanResult> {
     let mut cur_entries = Vec::new();
     for entry in maildir.list_cur() {
         let entry = entry?;
@@ -207,6 +239,22 @@ pub fn scan_folder(
     for entry in maildir.list_new() {
         let entry = entry?;
         new_entries.push(MaildirId::from(entry.id()));
+    }
+
+    // Per-file filename-flag-suffix map for reconcile's adoption
+    // emit sites. Built from the same `entry.flags()` reads
+    // classify_changes inspects -- no extra I/O. new/ ids carry an
+    // empty suffix because the maildir crate doesn't expose flags
+    // for new/ entries (and the spec doesn't define them there);
+    // they're included for completeness so a downstream lookup
+    // never misses due to placement.
+    let mut local_flags: HashMap<MaildirId, String> =
+        HashMap::with_capacity(cur_entries.len() + new_entries.len());
+    for entry in &cur_entries {
+        local_flags.insert(entry.maildir_id.clone(), entry.flags.clone());
+    }
+    for id in &new_entries {
+        local_flags.entry(id.clone()).or_default();
     }
 
     // Exhaustive deletion detection: any DB entry anchored to this
@@ -229,13 +277,18 @@ pub fn scan_folder(
         })
         .collect();
 
-    classify_changes(
+    let (changes, seen_ids) = classify_changes(
         folder_name,
         &cur_entries,
         &new_entries,
         &explicit_deletes,
         known_state,
-    )
+    )?;
+    Ok(ScanResult {
+        changes,
+        local_flags,
+        seen_ids,
+    })
 }
 
 /// Path-driven local scan: classify only the `(folder, maildir_id)`
@@ -278,7 +331,7 @@ pub fn scan_paths(
     maildir_root: &Path,
     event_paths: &[PathBuf],
     known_states: &HashMap<String, HashMap<MaildirId, (String, String)>>,
-) -> Result<Vec<LocalChange>> {
+) -> Result<ScanResult> {
     // Group events by (folder, maildir_id) so the source + destination
     // sides of a single rename collapse into one classification.
     let mut groups: HashMap<(String, MaildirId), Vec<(String, String, PathBuf)>> = HashMap::new();
@@ -344,6 +397,10 @@ pub fn scan_paths(
     }
 
     let mut all_changes = Vec::new();
+    // Path-driven scans cover only the maildir_ids in the event set,
+    // so `local_flags` here is intentionally partial -- callers fall
+    // back to the state DB for everything not in this map.
+    let mut local_flags: HashMap<MaildirId, String> = HashMap::new();
     for (folder, (cur, new, deletes)) in by_folder {
         // Same defensive guard as above; by_folder is built from
         // `groups`, which was filtered against `known_states`, so this
@@ -355,11 +412,22 @@ pub fn scan_paths(
             );
             continue;
         };
+        for entry in &cur {
+            local_flags.insert(entry.maildir_id.clone(), entry.flags.clone());
+        }
+        for id in &new {
+            local_flags.entry(id.clone()).or_default();
+        }
         let (changes, _seen) = classify_changes(&folder, &cur, &new, &deletes, known_state)?;
         all_changes.extend(changes);
     }
 
-    Ok(all_changes)
+    Ok(ScanResult {
+        changes: all_changes,
+        local_flags,
+        // Path-driven walks have no exhaustive observed set.
+        seen_ids: Vec::new(),
+    })
 }
 
 /// Strip the maildir root prefix off an event path and split out the
@@ -451,6 +519,57 @@ mod tests {
         fs::write(&path, body).unwrap();
     }
 
+    /// `ScanResult.local_flags` is the contract reconcile reads at
+    /// adoption emit sites. Pin its shape here: one entry per
+    /// observed cur/ file with the filename's flag suffix, plus
+    /// one entry per new/ id with an empty suffix (since the spec
+    /// doesn't define flags for new/ and the maildir crate doesn't
+    /// expose them either). A regression that broke this map would
+    /// otherwise surface only as a downstream local_state.flags
+    /// mis-seeding, which would be tedious to bisect back to scan.
+    #[test]
+    fn scan_folder_populates_local_flags_for_cur_and_new() {
+        let tmp = TempDir::new().unwrap();
+        let inbox_path = tmp.path().join("INBOX");
+        let inbox = ensure_maildir(&inbox_path).unwrap();
+
+        let cur_seen = "1700000000.M1.host";
+        let cur_replied = "1700000001.M2.host";
+        let new_bare = "1700000002.M3.host";
+        let body = "Message-ID: <a@x>\r\n\r\nbody\r\n";
+        write_message(&inbox_path, "cur", &format!("{cur_seen}:2,S"), body);
+        write_message(&inbox_path, "cur", &format!("{cur_replied}:2,RS"), body);
+        write_message(&inbox_path, "new", new_bare, body);
+
+        let known = HashMap::new();
+        let result = scan_folder(&inbox, "INBOX", &known).unwrap();
+
+        assert_eq!(
+            result.local_flags.get(&MaildirId::from(cur_seen)),
+            Some(&"S".to_string()),
+            "cur/ file with `:2,S` must map to flags `S`: {:?}",
+            result.local_flags
+        );
+        assert_eq!(
+            result.local_flags.get(&MaildirId::from(cur_replied)),
+            Some(&"RS".to_string()),
+            "cur/ file with `:2,RS` must map to flags `RS`: {:?}",
+            result.local_flags
+        );
+        assert_eq!(
+            result.local_flags.get(&MaildirId::from(new_bare)),
+            Some(&String::new()),
+            "new/ file must map to empty flags (spec-undefined for new/): {:?}",
+            result.local_flags
+        );
+        assert_eq!(
+            result.local_flags.len(),
+            3,
+            "no extra entries beyond the three observed files: {:?}",
+            result.local_flags
+        );
+    }
+
     /// Maildir-id-preserving cross-folder move: the spec recommends that
     /// movers preserve the unique part of the filename. When that
     /// happens, scan_folder must emit a NewMessage on the destination
@@ -478,7 +597,7 @@ mod tests {
         let mut known = HashMap::new();
         known.insert(unique.into(), ("INBOX".to_string(), "FS".to_string()));
 
-        let (changes, _seen) = scan_folder(&spam, "Spam", &known).unwrap();
+        let ScanResult { changes, .. } = scan_folder(&spam, "Spam", &known).unwrap();
 
         assert_eq!(
             changes.len(),
@@ -517,7 +636,7 @@ mod tests {
         let mut known = HashMap::new();
         known.insert(unique.into(), ("INBOX".to_string(), "FS".to_string()));
 
-        let (changes, _seen) = scan_folder(&inbox, "INBOX", &known).unwrap();
+        let ScanResult { changes, .. } = scan_folder(&inbox, "INBOX", &known).unwrap();
 
         assert_eq!(changes.len(), 1);
         match &changes[0] {
@@ -546,7 +665,7 @@ mod tests {
         let mut known = HashMap::new();
         known.insert(unique.into(), ("INBOX".to_string(), "F".to_string()));
 
-        let (changes, _seen) = scan_folder(&inbox, "INBOX", &known).unwrap();
+        let ScanResult { changes, .. } = scan_folder(&inbox, "INBOX", &known).unwrap();
 
         assert_eq!(changes.len(), 1);
         match &changes[0] {
@@ -592,8 +711,14 @@ mod tests {
         let mut known = HashMap::new();
         known.insert(old_id.into(), ("INBOX".to_string(), "FS".to_string()));
 
-        let (inbox_changes, _) = scan_folder(&inbox, "INBOX", &known).unwrap();
-        let (spam_changes, _) = scan_folder(&spam, "Spam", &known).unwrap();
+        let ScanResult {
+            changes: inbox_changes,
+            ..
+        } = scan_folder(&inbox, "INBOX", &known).unwrap();
+        let ScanResult {
+            changes: spam_changes,
+            ..
+        } = scan_folder(&spam, "Spam", &known).unwrap();
 
         assert_eq!(
             inbox_changes.len(),
@@ -645,7 +770,11 @@ mod tests {
         write_message(&inbox_path, "new", unique, body);
 
         let known = HashMap::new();
-        let (changes, seen) = scan_folder(&inbox, "INBOX", &known).unwrap();
+        let ScanResult {
+            changes,
+            seen_ids: seen,
+            ..
+        } = scan_folder(&inbox, "INBOX", &known).unwrap();
 
         assert!(
             changes.is_empty(),
@@ -689,7 +818,11 @@ mod tests {
             ("INBOX".to_string(), "F".to_string()),
         );
 
-        let (changes, seen) = scan_folder(&inbox, "INBOX", &known).unwrap();
+        let ScanResult {
+            changes,
+            seen_ids: seen,
+            ..
+        } = scan_folder(&inbox, "INBOX", &known).unwrap();
 
         assert!(
             changes.is_empty(),
@@ -728,7 +861,11 @@ mod tests {
         write_message(&inbox_path, "cur", &filename, body);
 
         let known = HashMap::new();
-        let (changes, seen) = scan_folder(&inbox, "INBOX", &known).unwrap();
+        let ScanResult {
+            changes,
+            seen_ids: seen,
+            ..
+        } = scan_folder(&inbox, "INBOX", &known).unwrap();
 
         assert!(
             changes.is_empty(),
@@ -765,7 +902,7 @@ mod tests {
         let mut known = HashMap::new();
         known.insert(unique.into(), ("INBOX".to_string(), "FS".to_string()));
 
-        let (changes, _seen) = scan_folder(&inbox, "INBOX", &known).unwrap();
+        let ScanResult { changes, .. } = scan_folder(&inbox, "INBOX", &known).unwrap();
 
         assert!(
             changes.is_empty(),
@@ -796,7 +933,7 @@ mod tests {
         let mut known = HashMap::new();
         known.insert(unique.into(), ("INBOX".to_string(), "FS".to_string()));
 
-        let (changes, _seen) = scan_folder(&spam, "Spam", &known).unwrap();
+        let ScanResult { changes, .. } = scan_folder(&spam, "Spam", &known).unwrap();
 
         assert!(
             changes.is_empty(),
@@ -905,7 +1042,9 @@ mod tests {
             inbox_path.join("cur").join(format!("{unique}:2,FS")),
         ];
 
-        let changes = scan_paths(tmp.path(), &event_paths, &known).unwrap();
+        let changes = scan_paths(tmp.path(), &event_paths, &known)
+            .unwrap()
+            .changes;
         assert_eq!(changes.len(), 1);
         match &changes[0] {
             LocalChange::FlagsChanged {
@@ -940,7 +1079,9 @@ mod tests {
         let known = known_for("INBOX", &[(unique, "INBOX", "S")]);
         let event_paths = vec![inbox_path.join("cur").join(format!("{unique}:2,S"))];
 
-        let changes = scan_paths(tmp.path(), &event_paths, &known).unwrap();
+        let changes = scan_paths(tmp.path(), &event_paths, &known)
+            .unwrap()
+            .changes;
         assert!(
             changes.is_empty(),
             "expected no changes for in-sync file, got {:?}",
@@ -963,7 +1104,9 @@ mod tests {
         let known = known_for("INBOX", &[(unique, "INBOX", "S")]);
         let event_paths = vec![inbox_path.join("cur").join(format!("{unique}:2,S"))];
 
-        let changes = scan_paths(tmp.path(), &event_paths, &known).unwrap();
+        let changes = scan_paths(tmp.path(), &event_paths, &known)
+            .unwrap()
+            .changes;
         assert_eq!(changes.len(), 1);
         match &changes[0] {
             LocalChange::DeletedMessage { maildir_id, folder } => {
@@ -1006,7 +1149,9 @@ mod tests {
             spam_path.join("cur").join(format!("{unique}:2,FS")),
         ];
 
-        let mut changes = scan_paths(tmp.path(), &event_paths, &known_states).unwrap();
+        let mut changes = scan_paths(tmp.path(), &event_paths, &known_states)
+            .unwrap()
+            .changes;
         // Order isn't guaranteed (HashMap iteration), so sort for the
         // assertion.
         changes.sort_by_key(|c| match c {
@@ -1045,7 +1190,9 @@ mod tests {
         let known = known_for("INBOX", &[(unique, "INBOX", "")]);
         let event_paths = vec![inbox_path.join("new").join(unique)];
 
-        let changes = scan_paths(tmp.path(), &event_paths, &known).unwrap();
+        let changes = scan_paths(tmp.path(), &event_paths, &known)
+            .unwrap()
+            .changes;
         assert_eq!(changes.len(), 1);
         match &changes[0] {
             LocalChange::DeletedMessage { maildir_id, folder } => {
@@ -1080,7 +1227,9 @@ mod tests {
         let known = known_for("INBOX", &[(unique, "INBOX", "")]);
         let event_paths = vec![inbox_path.join("new").join(unique)];
 
-        let changes = scan_paths(tmp.path(), &event_paths, &known).unwrap();
+        let changes = scan_paths(tmp.path(), &event_paths, &known)
+            .unwrap()
+            .changes;
         assert!(
             changes.is_empty(),
             "new/ event must not produce a LocalChange, got {:?}",
@@ -1111,7 +1260,9 @@ mod tests {
             inbox_path.join("cur").join(format!("{unique}:2,S")),
         ];
 
-        let changes = scan_paths(tmp.path(), &event_paths, &known).unwrap();
+        let changes = scan_paths(tmp.path(), &event_paths, &known)
+            .unwrap()
+            .changes;
         assert_eq!(changes.len(), 1);
         match &changes[0] {
             LocalChange::FlagsChanged {
@@ -1153,7 +1304,9 @@ mod tests {
             inbox_path.join("cur").join(format!("{unique}:2,S")),
         ];
 
-        let changes = scan_paths(tmp.path(), &event_paths, &known).unwrap();
+        let changes = scan_paths(tmp.path(), &event_paths, &known)
+            .unwrap()
+            .changes;
         assert_eq!(
             changes.len(),
             1,
@@ -1183,7 +1336,9 @@ mod tests {
         let known = known_for("INBOX", &[]);
         let event_paths = vec![other_path.join("cur").join(format!("{unique}:2,"))];
 
-        let changes = scan_paths(tmp.path(), &event_paths, &known).unwrap();
+        let changes = scan_paths(tmp.path(), &event_paths, &known)
+            .unwrap()
+            .changes;
         assert!(
             changes.is_empty(),
             "events under untracked folder must be dropped, got {:?}",

@@ -110,6 +110,18 @@ pub enum SyncAction {
         jmap_thread_id: Option<JmapThreadId>,
         mailbox_id: JmapMailboxId,
         keywords: HashMap<String, bool>,
+        /// On-disk maildir filename flag suffix at plan time -- the
+        /// filesystem-truth view of flags, as opposed to `keywords`
+        /// (server's full keyword set including non-standard
+        /// entries). `commit_adopt` writes this into
+        /// `local_state.flags` so the next scan's filename-vs-DB
+        /// comparison sees agreement, while `message_map.flags` is
+        /// derived from `keywords` to keep our "what we believe the
+        /// server has" view consistent. Populated by each emit site
+        /// from whatever filesystem-truth source it has: scan's
+        /// `local_flags` map, a `LocalChange::NewMessage.flags`
+        /// field, or a `DetectedMove.new_flags`.
+        filename_flags: String,
         /// When the adopt rebinds an existing JMAP id from one local
         /// maildir_id to another (cross-folder local move), the old
         /// local_state row needs to be cleaned up so subsequent scans

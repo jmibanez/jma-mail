@@ -42,6 +42,16 @@ struct ReconcileCtx<'a> {
     known_by_jmap: &'a HashMap<JmapEmailId, Arc<MessageRecord>>,
     known_by_message_id: &'a HashMap<MessageId, Vec<Arc<MessageRecord>>>,
     local_index: &'a LocalIndex,
+    /// Per-file on-disk filename flag suffix from this cycle's scan
+    /// (`scan::ScanResult.local_flags`). Reconcile reads it at
+    /// adoption emit sites so `commit_adopt` can seed
+    /// `local_state.flags` from filesystem truth rather than from
+    /// the server's keyword-derived projection. For path-driven
+    /// scans this map is partial (only event-set maildir_ids); for
+    /// full scans it covers every cur/+new/ file. Adoption emit
+    /// sites that miss this map fall back to the matched DB
+    /// record's `flags` column.
+    local_flags: &'a HashMap<MaildirId, String>,
     local_flag_changes: HashMap<JmapEmailId, &'a LocalChange>,
     local_deletes: HashSet<JmapEmailId>,
     destroyed_set: HashSet<&'a str>,
@@ -68,6 +78,10 @@ pub struct ReconcileInput<'a> {
     pub local_changes: &'a [LocalChange],
     pub known: &'a MessageRecordIndex,
     pub local_index: &'a LocalIndex,
+    /// Per-file MaildirId -> filename-flag-suffix from this cycle's
+    /// `scan::ScanResult.local_flags`. See `ReconcileCtx.local_flags`
+    /// for the read-side contract.
+    pub local_flags: &'a HashMap<MaildirId, String>,
     pub mailboxes: &'a [(JmapMailboxId, String)],
     pub strategy: ConflictStrategy,
     pub new_email_state: Option<String>,
@@ -87,6 +101,7 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
         local_changes,
         known,
         local_index,
+        local_flags,
         mailboxes,
         strategy,
         new_email_state,
@@ -209,6 +224,7 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
         known_by_jmap,
         known_by_message_id,
         local_index,
+        local_flags,
         local_flag_changes,
         local_deletes,
         destroyed_set,
@@ -296,6 +312,7 @@ fn emit_detected_moves(moves: &[DetectedMove], plan: &mut SyncPlan) {
             jmap_thread_id: m.jmap_thread_id.clone(),
             mailbox_id: m.to_mailbox_id.clone(),
             keywords: keywords.clone(),
+            filename_flags: m.new_flags.clone(),
             old_maildir_id: Some(m.old_maildir_id.clone()),
         });
         if m.prior_flags != m.new_flags {
@@ -521,41 +538,80 @@ fn try_adopt_remote(
         target_folder,
     } = *matched;
 
-    let push_adopt =
-        |plan: &mut SyncPlan, adopted: &mut HashSet<MaildirId>, maildir_id: MaildirId| {
-            adopted.insert(maildir_id.clone());
-            plan.actions.push(SyncAction::AdoptLocalMessage {
-                id: BoundId {
-                    maildir_id,
-                    jmap_email_id: email.id.clone(),
-                    message_id: mid.clone(),
-                },
-                maildir_folder: target_folder.to_string(),
-                jmap_blob_id: Some(email.blob_id.clone()),
-                jmap_thread_id: Some(email.thread_id.clone()),
-                mailbox_id: target_mailbox_id.clone(),
-                keywords: email.keywords.clone(),
-                old_maildir_id: None,
-            });
-        };
+    let push_adopt = |plan: &mut SyncPlan,
+                      adopted: &mut HashSet<MaildirId>,
+                      maildir_id: MaildirId,
+                      filename_flags: String| {
+        adopted.insert(maildir_id.clone());
+        plan.actions.push(SyncAction::AdoptLocalMessage {
+            id: BoundId {
+                maildir_id,
+                jmap_email_id: email.id.clone(),
+                message_id: mid.clone(),
+            },
+            maildir_folder: target_folder.to_string(),
+            jmap_blob_id: Some(email.blob_id.clone()),
+            jmap_thread_id: Some(email.thread_id.clone()),
+            mailbox_id: target_mailbox_id.clone(),
+            keywords: email.keywords.clone(),
+            filename_flags,
+            old_maildir_id: None,
+        });
+    };
 
+    // Filename-truth source priority: this cycle's scan first (always
+    // accurate when the path was in the event set or a full scan
+    // ran), then the DB record's `flags` column as a steady-state
+    // fallback. The DB column is what `commit_adopt` or the
+    // apply_remote_set mirror last wrote for the standard-six
+    // projection -- accurate enough as a guess when scan didn't walk
+    // this path.
+    //
+    // FIXME: a stricter fallback is `local_state.flags` (the
+    // filesystem-truth column written by `commit_adopt`'s split),
+    // which doesn't drift even when `message_map.flags` diverges
+    // mid-cycle. Doing so requires threading the known_state map
+    // (or a derived MaildirId -> local_state.flags lookup) through
+    // ReconcileInput / ReconcileCtx. Deferred to the adoption-
+    // reconciliation follow-up commit, which already touches this
+    // function; folding the fallback swap in there keeps the
+    // foundation commit narrow.
     if let Some(recs) = ctx.known_by_message_id.get(mid)
-        && let Some(maildir_id) = recs.iter().find_map(|r| {
-            if r.maildir_folder.as_deref() == Some(target_folder) {
-                r.maildir_id.clone()
-            } else {
-                None
-            }
-        })
+        && let Some(rec) = recs
+            .iter()
+            .find(|r| r.maildir_folder.as_deref() == Some(target_folder))
+        && let Some(maildir_id) = rec.maildir_id.clone()
     {
-        push_adopt(plan, adopted_maildir_ids, maildir_id);
+        let filename_flags = ctx
+            .local_flags
+            .get(&maildir_id)
+            .cloned()
+            .unwrap_or_else(|| rec.flags.clone());
+        push_adopt(plan, adopted_maildir_ids, maildir_id, filename_flags);
         return true;
     }
 
+    // Cold-start rescue: state DB is empty, the in-memory index from
+    // this cycle's dedupe walk identifies the file, and the full
+    // scan that fires alongside cold-start populates local_flags
+    // exhaustively. The unwrap_or_default fallback is defensive only
+    // -- it would mean a future refactor decoupled dedupe from
+    // scan's walk; an empty filename suffix degrades safely (the
+    // next scan's FlagsChanged path catches the drift).
     if let Some(entries) = ctx.local_index.by_message_id.get(mid)
         && let Some(entry) = entries.iter().find(|e| e.folder == target_folder)
     {
-        push_adopt(plan, adopted_maildir_ids, entry.maildir_id.clone());
+        let filename_flags = ctx
+            .local_flags
+            .get(&entry.maildir_id)
+            .cloned()
+            .unwrap_or_default();
+        push_adopt(
+            plan,
+            adopted_maildir_ids,
+            entry.maildir_id.clone(),
+            filename_flags,
+        );
         return true;
     }
 
@@ -677,6 +733,7 @@ fn handle_local_new(
             jmap_thread_id: rec.jmap_thread_id.clone(),
             mailbox_id,
             keywords,
+            filename_flags: flags.clone(),
             old_maildir_id: None,
         });
         return;
@@ -946,6 +1003,31 @@ mod tests {
         local_index: &LocalIndex,
         strategy: ConflictStrategy,
     ) -> SyncPlan {
+        run_with_local_flags(
+            remote_emails,
+            remote_destroyed,
+            local_changes,
+            records,
+            local_index,
+            &HashMap::new(),
+            strategy,
+        )
+    }
+
+    /// Same as `run`, but threads an explicit on-disk-flags-by-maildir-id
+    /// map through to reconcile. Tests that need to exercise adoption-
+    /// time filename-truth lookups (or, later, the adoption flag
+    /// reconciliation step that builds on it) use this to inject what
+    /// production gets from `scan::ScanResult.local_flags`.
+    fn run_with_local_flags(
+        remote_emails: &[EmailObject],
+        remote_destroyed: &[JmapEmailId],
+        local_changes: &[LocalChange],
+        records: &[MessageRecord],
+        local_index: &LocalIndex,
+        local_flags: &HashMap<MaildirId, String>,
+        strategy: ConflictStrategy,
+    ) -> SyncPlan {
         let known = indices(records);
         let mailboxes = mailboxes();
         reconcile(ReconcileInput {
@@ -954,6 +1036,7 @@ mod tests {
             local_changes,
             known: &known,
             local_index,
+            local_flags,
             mailboxes: &mailboxes,
             strategy,
             new_email_state: None,
@@ -1365,6 +1448,7 @@ mod tests {
             local_changes: &local_changes,
             known: &known,
             local_index: &local_index,
+            local_flags: &HashMap::new(),
             mailboxes: &mailboxes,
             strategy: ConflictStrategy::ServerWins,
             new_email_state: None,

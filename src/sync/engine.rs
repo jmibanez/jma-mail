@@ -243,22 +243,23 @@ impl<'a> SyncEngine<'a> {
         // groups touched by the supplied event paths -- the daemon's
         // common case, where the watcher already told us exactly
         // which files moved.
-        let scan_changes = {
+        let (scan_changes, local_flags) = {
             let _phase =
                 tracing::info_span!(target: crate::profile::TARGET_PHASE, "scan").entered();
             match &scan_scope {
                 ScanScope::Full => {
                     let mut changes = Vec::new();
+                    let mut local_flags: HashMap<MaildirId, String> = HashMap::new();
                     for (_, folder_name) in &mailboxes {
                         let maildir_path = maildir_root.join(folder_name);
                         let maildir = store::ensure_maildir(&maildir_path)?;
                         let known_state =
                             queries::get_local_state_for_folder(self.conn, folder_name)?;
-                        let (folder_changes, _seen) =
-                            scan::scan_folder(&maildir, folder_name, &known_state)?;
-                        changes.extend(folder_changes);
+                        let result = scan::scan_folder(&maildir, folder_name, &known_state)?;
+                        changes.extend(result.changes);
+                        local_flags.extend(result.local_flags);
                     }
-                    changes
+                    (changes, local_flags)
                 }
                 ScanScope::Paths(paths) => {
                     let mut known_states = HashMap::new();
@@ -271,7 +272,8 @@ impl<'a> SyncEngine<'a> {
                         let state = queries::get_local_state_for_folder(self.conn, folder_name)?;
                         known_states.insert(folder_name.clone(), state);
                     }
-                    scan::scan_paths(&maildir_root, paths, &known_states)?
+                    let result = scan::scan_paths(&maildir_root, paths, &known_states)?;
+                    (result.changes, result.local_flags)
                 }
             }
         };
@@ -354,6 +356,7 @@ impl<'a> SyncEngine<'a> {
                 local_changes: &all_local_changes,
                 known: &known,
                 local_index: &local_index,
+                local_flags: &local_flags,
                 mailboxes: &mailboxes,
                 strategy: self.config.sync.conflict_strategy,
                 new_email_state: Some(new_state),
