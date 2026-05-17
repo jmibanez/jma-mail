@@ -68,8 +68,7 @@ pub enum Command {
     },
     /// Run maintenance tasks against the maildir tree and state DB
     Janitor {
-        /// Specific task to run. Omit to run the safe-default set
-        /// (today: dedupe).
+        /// Specific task to run; omit for the safe-default set
         #[command(subcommand)]
         action: Option<JanitorAction>,
     },
@@ -87,7 +86,6 @@ pub enum AuthAction {
 
 #[derive(Subcommand, Clone)]
 pub enum JanitorAction {
-    /// Scan synced folders for per-folder Message-ID duplicates
-    /// and remove the younger copies. Use `--dry-run` to preview.
+    /// Scan and remove per-folder Message-ID duplicates
     Dedupe,
 }
