@@ -129,6 +129,18 @@ pub enum SyncAction {
         /// `MaildirId` (not a `LocalId` bundle) — this is purely a
         /// DB-cleanup hint, never logged as identity.
         old_maildir_id: Option<MaildirId>,
+        /// When the adopt rebinds an existing maildir_id from one JMAP
+        /// email to another -- the remote analog of `old_maildir_id`,
+        /// used when the server destroyed Email A and created Email B
+        /// with the same wire-format Message-ID, and reconcile has
+        /// paired them into a single rebind action so the new row
+        /// (jmap_email_id=B, maildir_id=FILE-1) doesn't collide with
+        /// the old row (jmap_email_id=A, maildir_id=FILE-1) under the
+        /// unique-index-on-maildir-id constraint. commit_adopt deletes
+        /// the A row inside the same txn before upserting B. Skipped
+        /// here means: the old message_map row stays put. A DB-cleanup
+        /// hint, never an identity.
+        old_jmap_email_id: Option<JmapEmailId>,
     },
 
     // Local -> Server

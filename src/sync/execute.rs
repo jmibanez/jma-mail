@@ -1083,6 +1083,7 @@ fn commit_adopt(conn: &Connection, action: SyncAction) -> Result<()> {
         keywords,
         filename_flags,
         old_maildir_id,
+        old_jmap_email_id,
     } = action
     else {
         return Ok(());
@@ -1095,6 +1096,15 @@ fn commit_adopt(conn: &Connection, action: SyncAction) -> Result<()> {
     } = id;
     if let Some(old) = old_maildir_id.as_ref() {
         queries::delete_local_state(conn, old)?;
+    }
+    // Destroy+create-with-shared-Message-ID rebind: drop the old
+    // jmap_email_id's row before upserting the new row that targets
+    // the same maildir_id. Without this the unique partial index on
+    // message_map(maildir_id) refuses the upsert and the whole
+    // commit txn rolls back, leaving the cycle stuck because the
+    // next iteration will reproduce the same conflicting plan.
+    if let Some(old) = old_jmap_email_id.as_ref() {
+        queries::delete_message_by_jmap_id(conn, old)?;
     }
     // Split the two flag columns by semantic: `message_map.flags`
     // derives from the server's `keywords` (the standard-six
@@ -1385,6 +1395,7 @@ mod tests {
             keywords,
             filename_flags: "S".into(),
             old_maildir_id: Some("M-OLD".into()),
+            old_jmap_email_id: None,
         }
     }
 
@@ -1501,6 +1512,7 @@ mod tests {
                 keywords,
                 filename_flags: "FS".into(),
                 old_maildir_id: None,
+                old_jmap_email_id: None,
             },
         )
         .unwrap();

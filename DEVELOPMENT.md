@@ -249,6 +249,8 @@ planning; phase 5 is the only place we mutate anything.
 
   `old_maildir_id: Option<MaildirId>` on `AdoptLocalMessage` covers the cross-folder local-move case: the same JMAP id is being rebound from an old maildir_id (about to be removed by the move's paired `DeletedMessage`) to a new one. Execute deletes the stale `local_state` row before upserting the new binding so the next scan doesn't re-emit `DeletedMessage` for the orphan.
 
+  `old_jmap_email_id: Option<JmapEmailId>` is the remote-side analog and covers the destroy+create-with-shared-Message-ID rebind: the server destroyed Email A and created Email B carrying the same wire-format Message-ID header, and reconcile has paired them so the same maildir_id can be rebound from A to B. `commit_adopt` drops A's `message_map` row inside the same txn before upserting B, so the partial unique index on `message_map(maildir_id)` never observes both rows holding the same value. `try_adopt_remote` populates a `consumed_remote_destroys` set when it emits one of these rebinds, and `process_remote_destroys` skips ids in that set so the paired destroy doesn't emit a `DeleteLocal` against the file we just rebound.
+
 #### `SyncPlan`
 
 Holds the action vector plus the JMAP `Email` state cursor that should be persisted *if and only if* the cycle completes. Per-action counters (`download_count`, `adopt_count`, ...) drive the dry-run display. `into_filtered` is the one non-trivial method:
@@ -277,7 +279,7 @@ reconcile()
 \-- process_local_changes    (upload / flag-push / destroy-remote)
 ```
 
-Every helper takes an immutable `&ReconcileCtx<'a>` so the parameter lists stay bounded as new branches are added. Mutable per-cycle state (`adopted_maildir_ids`, `deletes_overruled_by_server`, the move bookkeeping sets) is threaded explicitly because the order of the passes matters.
+Every helper takes an immutable `&ReconcileCtx<'a>` so the parameter lists stay bounded as new branches are added. Mutable per-cycle state (`adopted_maildir_ids`, `deletes_overruled_by_server`, `consumed_remote_destroys`, the move bookkeeping sets) is threaded explicitly because the order of the passes matters. `consumed_remote_destroys` is the hand-off between `process_remote_emails` (where the destroy+create-with-shared-Message-ID rebind is detected and the source JMAP id is marked consumed) and `process_remote_destroys` (which skips ids in the set so the paired delete doesn't undo the rebind).
 
 #### The move pre-pass
 

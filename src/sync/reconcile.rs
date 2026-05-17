@@ -240,14 +240,28 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
     // server-side update won the local-delete-vs-remote-update conflict.
     let mut deletes_overruled_by_server: HashSet<JmapEmailId> = HashSet::new();
 
+    // JMAP ids consumed by a destroy+create-with-shared-Message-ID
+    // rebind in `try_adopt_remote`'s Branch A. `process_remote_
+    // destroys` skips these so we don't emit a `DeleteLocal` against
+    // a maildir_id we just rebound to the new JMAP id (which would
+    // also trip the unique-on-maildir-id index under execute's
+    // adopt-before-delete phase order).
+    let mut consumed_remote_destroys: HashSet<JmapEmailId> = HashSet::new();
+
     process_remote_emails(
         &ctx,
         &mut adopted_maildir_ids,
         &mut deletes_overruled_by_server,
+        &mut consumed_remote_destroys,
         &mut plan,
     );
 
-    process_remote_destroys(remote_destroyed, ctx.known_by_jmap, &mut plan);
+    process_remote_destroys(
+        remote_destroyed,
+        ctx.known_by_jmap,
+        &consumed_remote_destroys,
+        &mut plan,
+    );
 
     emit_detected_moves(&detected_moves, &mut plan);
 
@@ -314,6 +328,7 @@ fn emit_detected_moves(moves: &[DetectedMove], plan: &mut SyncPlan) {
             keywords: keywords.clone(),
             filename_flags: m.new_flags.clone(),
             old_maildir_id: Some(m.old_maildir_id.clone()),
+            old_jmap_email_id: None,
         });
         if m.prior_flags != m.new_flags {
             plan.actions.push(SyncAction::UpdateRemoteKeywords {
@@ -331,6 +346,7 @@ fn process_remote_emails(
     ctx: &ReconcileCtx<'_>,
     adopted_maildir_ids: &mut HashSet<MaildirId>,
     deletes_overruled_by_server: &mut HashSet<JmapEmailId>,
+    consumed_remote_destroys: &mut HashSet<JmapEmailId>,
     plan: &mut SyncPlan,
 ) {
     for email in ctx.remote_emails {
@@ -396,7 +412,14 @@ fn process_remote_emails(
         // Path 2: not bound by JMAP id, but Message-ID matches a local file
         // (either via DB carry-over from a half-completed prior run, or via
         // the dedupe-pass index after a state DB wipe). Adopt it.
-        if try_adopt_remote(ctx, &matched, &local_msg_id, adopted_maildir_ids, plan) {
+        if try_adopt_remote(
+            ctx,
+            &matched,
+            &local_msg_id,
+            adopted_maildir_ids,
+            consumed_remote_destroys,
+            plan,
+        ) {
             continue;
         }
 
@@ -530,6 +553,7 @@ fn try_adopt_remote(
     matched: &RemoteMatch<'_>,
     mid: &MessageId,
     adopted_maildir_ids: &mut HashSet<MaildirId>,
+    consumed_remote_destroys: &mut HashSet<JmapEmailId>,
     plan: &mut SyncPlan,
 ) -> bool {
     let RemoteMatch {
@@ -541,7 +565,8 @@ fn try_adopt_remote(
     let push_adopt = |plan: &mut SyncPlan,
                       adopted: &mut HashSet<MaildirId>,
                       maildir_id: MaildirId,
-                      filename_flags: String| {
+                      filename_flags: String,
+                      old_jmap_email_id: Option<JmapEmailId>| {
         let bound_id = BoundId {
             maildir_id: maildir_id.clone(),
             jmap_email_id: email.id.clone(),
@@ -557,6 +582,7 @@ fn try_adopt_remote(
             keywords: email.keywords.clone(),
             filename_flags: filename_flags.clone(),
             old_maildir_id: None,
+            old_jmap_email_id,
         });
         emit_adoption_flag_reconciliation(
             plan,
@@ -571,14 +597,33 @@ fn try_adopt_remote(
         );
     };
 
-    // Filename-truth source priority: this cycle's scan first (always
-    // accurate when the path was in the event set or a full scan
-    // ran), then the DB record's `flags` column as a steady-state
-    // fallback. The DB column is what `commit_adopt` or the
-    // apply_remote_set mirror last wrote -- accurate when filename
-    // and server keywords already agree at last sync time, which is
-    // the steady-state contract `commit_adopt`'s split and the
-    // reconciliation step below keep current.
+    // Branch A: a DB row already exists for this Message-ID. Two
+    // sub-cases:
+    //   (i)  The matched record's jmap_email_id is in this cycle's
+    //        destroyed_set -- i.e. the server destroyed Email A and
+    //        re-created Email B with the same wire-format Message-
+    //        ID. Pair them into a single rebind: adopt the file
+    //        under B's id and tell commit_adopt to drop A's row in
+    //        the same txn so the unique-on-maildir-id index doesn't
+    //        refuse the new row. Also mark A as consumed so the
+    //        destroy pass doesn't re-emit DeleteLocal against the
+    //        file we just rebound.
+    //   (ii) The matched record stays alive on the server (e.g. two
+    //        coexisting Emails with shared Message-ID -- duplicate-
+    //        delivery / migration-tool scenarios). Plain adopt; no
+    //        rebind, no consumed-destroys entry.
+    // Per RFC 8620 JMAP ids are stable for an Email's lifetime, so
+    // a "different JMAP id with the same Message-ID" always means a
+    // different Email object, not a server-side id rewrite.
+    //
+    // Filename-truth source priority: this cycle's scan first
+    // (always accurate when the path was in the event set or a
+    // full scan ran), then the DB record's `flags` column as a
+    // steady-state fallback. The DB column is what `commit_adopt`
+    // or the apply_remote_set mirror last wrote -- accurate when
+    // filename and server keywords already agree at last sync time,
+    // which is the steady-state contract that `commit_adopt`'s
+    // split and `emit_adoption_flag_reconciliation` keep current.
     if let Some(recs) = ctx.known_by_message_id.get(mid)
         && let Some(rec) = recs
             .iter()
@@ -590,7 +635,20 @@ fn try_adopt_remote(
             .get(&maildir_id)
             .cloned()
             .unwrap_or_else(|| rec.flags.clone());
-        push_adopt(plan, adopted_maildir_ids, maildir_id, filename_flags);
+        let old_jmap_email_id = if ctx.destroyed_set.contains(rec.jmap_email_id.as_ref()) {
+            let id = rec.jmap_email_id.clone();
+            consumed_remote_destroys.insert(id.clone());
+            Some(id)
+        } else {
+            None
+        };
+        push_adopt(
+            plan,
+            adopted_maildir_ids,
+            maildir_id,
+            filename_flags,
+            old_jmap_email_id,
+        );
         return true;
     }
 
@@ -614,6 +672,7 @@ fn try_adopt_remote(
             adopted_maildir_ids,
             entry.maildir_id.clone(),
             filename_flags,
+            None,
         );
         return true;
     }
@@ -624,9 +683,23 @@ fn try_adopt_remote(
 fn process_remote_destroys(
     remote_destroyed: &[JmapEmailId],
     known_by_jmap: &HashMap<JmapEmailId, Arc<MessageRecord>>,
+    consumed_remote_destroys: &HashSet<JmapEmailId>,
     plan: &mut SyncPlan,
 ) {
     for jmap_id in remote_destroyed {
+        // A destroy that was paired with a same-Message-ID create
+        // earlier in this cycle (see `try_adopt_remote`'s Branch A
+        // rebind sub-case) is not a delete from the local
+        // filesystem's perspective -- it is the source half of an
+        // AdoptLocalMessage that already rebound the file to the
+        // new JMAP id. Emitting DeleteLocal here would delete the
+        // file we just adopted, and execute's adopt-before-delete
+        // phase order would also trip the unique-on-maildir-id
+        // index even if the data-loss risk weren't enough on its
+        // own.
+        if consumed_remote_destroys.contains(jmap_id) {
+            continue;
+        }
         if let Some(msg) = known_by_jmap.get(jmap_id)
             && let (Some(maildir_id), Some(folder)) = (&msg.maildir_id, &msg.maildir_folder)
         {
@@ -817,6 +890,7 @@ fn handle_local_new(
             keywords: keywords.clone(),
             filename_flags: flags.clone(),
             old_maildir_id: None,
+            old_jmap_email_id: None,
         });
         // Adoption-time flag reconciliation: the local NewMessage's
         // filename flag suffix may disagree with the DB record's
@@ -1629,6 +1703,166 @@ mod tests {
                 .any(|a| matches!(a, SyncAction::UpdateRemoteKeywords { .. })),
             "ServerWins must not push remote keywords on the alreadyExists adopt path: {:?}",
             plan.actions
+        );
+    }
+
+    /// Destroy + re-create with the same wire-format Message-ID:
+    /// server destroys Email A and creates Email B sharing the
+    /// Message-ID header. Reconcile must coalesce them into a single
+    /// rebind: AdoptLocalMessage on B carrying `old_jmap_email_id=
+    /// Some(A)` so commit_adopt drops A's row inside the same txn,
+    /// and `process_remote_destroys` skips A (no DeleteLocal). Before
+    /// this fix execute's adopt-before-delete phase order would
+    /// commit the new B row first and trip the unique-on-maildir-id
+    /// partial index, rolling the whole txn back and stalling the
+    /// cycle indefinitely.
+    #[test]
+    fn destroy_plus_create_with_shared_message_id_rebinds_atomically() {
+        // DB anchors the old email A under maildir_id FILE-1 in INBOX.
+        let rec_a = record("A", "MB-INBOX", "INBOX", Some("FILE-1"), "S", "<a@x>");
+        // Server destroys A and creates B with the same Message-ID.
+        let plan = run(
+            &[email("B", "MB-INBOX", "S", Some("<a@x>"))],
+            &[JmapEmailId::from("A")],
+            &[],
+            &[rec_a],
+            &empty_index(),
+            ConflictStrategy::ServerWins,
+        );
+        // Exactly one AdoptLocalMessage, rebinding FILE-1 from A to B.
+        let adopts: Vec<&SyncAction> = plan
+            .actions
+            .iter()
+            .filter(|a| matches!(a, SyncAction::AdoptLocalMessage { .. }))
+            .collect();
+        assert_eq!(
+            adopts.len(),
+            1,
+            "expected one rebind AdoptLocalMessage: {:?}",
+            plan.actions
+        );
+        let SyncAction::AdoptLocalMessage {
+            id,
+            old_jmap_email_id,
+            ..
+        } = adopts[0]
+        else {
+            unreachable!();
+        };
+        assert_eq!(id.jmap_email_id.as_ref(), "B");
+        assert_eq!(id.maildir_id.as_ref(), "FILE-1");
+        assert_eq!(
+            old_jmap_email_id.as_ref().map(JmapEmailId::as_ref),
+            Some("A"),
+            "rebind must carry the old jmap_email_id so commit_adopt drops A's row"
+        );
+        // No DeleteLocal for A -- the rebind consumes the destroy.
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| matches!(a, SyncAction::DeleteLocal { .. })),
+            "destroy must be consumed by the rebind, not emit DeleteLocal: {:?}",
+            plan.actions
+        );
+    }
+
+    /// Same-Message-ID collision WITHOUT a destroy: the DB anchors an
+    /// older Email A and the server reports a new Email B with the
+    /// same Message-ID, but A is not in remote_destroyed (both
+    /// coexist server-side -- e.g. duplicate-delivery or a migration
+    /// tool that didn't dedupe). Plain adopt; no rebind, no
+    /// consumed-destroys entry. Pins that the destroy-aware code
+    /// path only fires when the matched record's id is actually being
+    /// destroyed this cycle.
+    #[test]
+    fn shared_message_id_without_destroy_plain_adopts() {
+        let rec_a = record("A", "MB-INBOX", "INBOX", Some("FILE-1"), "S", "<a@x>");
+        let plan = run(
+            &[email("B", "MB-INBOX", "S", Some("<a@x>"))],
+            // empty remote_destroyed -- A is NOT being destroyed.
+            &[],
+            &[],
+            &[rec_a],
+            &empty_index(),
+            ConflictStrategy::ServerWins,
+        );
+        let adopts: Vec<&SyncAction> = plan
+            .actions
+            .iter()
+            .filter(|a| matches!(a, SyncAction::AdoptLocalMessage { .. }))
+            .collect();
+        assert_eq!(adopts.len(), 1);
+        let SyncAction::AdoptLocalMessage {
+            old_jmap_email_id, ..
+        } = adopts[0]
+        else {
+            unreachable!();
+        };
+        assert!(
+            old_jmap_email_id.is_none(),
+            "no destroy in this cycle => no rebind, plain adopt: got {:?}",
+            old_jmap_email_id
+        );
+    }
+
+    /// Rebind + flag drift: server destroys A and creates B with the
+    /// shared Message-ID, AND on-disk filename suffix disagrees with
+    /// `keywords_to_flags(B.keywords)`. The rebind path must reuse
+    /// `emit_adoption_flag_reconciliation` -- under ServerWins emit
+    /// both the rebind adopt (with `old_jmap_email_id=Some(A)`) and
+    /// an UpdateLocalFlags that brings the filename in line with
+    /// B's server-derived flags.
+    #[test]
+    fn rebind_also_reconciles_flag_drift_server_wins() {
+        // DB has A bound to FILE-1 in INBOX with flags "S".
+        let rec_a = record("A", "MB-INBOX", "INBOX", Some("FILE-1"), "S", "<a@x>");
+        // B's server keywords include $forwarded => derived "PS".
+        let server = email("B", "MB-INBOX", "PS", Some("<a@x>"));
+        // On-disk file is still ":2,S" (no P) -- the divergence.
+        let mut local_flags = HashMap::new();
+        local_flags.insert(MaildirId::from("FILE-1"), "S".to_string());
+
+        let plan = run_with_local_flags(
+            &[server],
+            &[JmapEmailId::from("A")],
+            &[],
+            &[rec_a],
+            &empty_index(),
+            &local_flags,
+            ConflictStrategy::ServerWins,
+        );
+        // Rebind adopt with old_jmap_email_id=Some(A).
+        let SyncAction::AdoptLocalMessage {
+            old_jmap_email_id, ..
+        } = plan
+            .actions
+            .iter()
+            .find(|a| matches!(a, SyncAction::AdoptLocalMessage { .. }))
+            .expect("rebind adopt missing")
+        else {
+            unreachable!();
+        };
+        assert_eq!(
+            old_jmap_email_id.as_ref().map(JmapEmailId::as_ref),
+            Some("A")
+        );
+        // Plus an UpdateLocalFlags that renames FILE-1 to add P.
+        let SyncAction::UpdateLocalFlags { new_flags, .. } = plan
+            .actions
+            .iter()
+            .find(|a| matches!(a, SyncAction::UpdateLocalFlags { .. }))
+            .expect("flag reconciliation missing on rebind path")
+        else {
+            unreachable!();
+        };
+        assert_eq!(new_flags, "PS");
+        // And A is consumed, not deleted.
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| matches!(a, SyncAction::DeleteLocal { .. }))
         );
     }
 
