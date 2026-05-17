@@ -68,6 +68,13 @@ pub enum Command {
         #[arg(long, value_name = "EMAIL")]
         account: String,
     },
+    /// Run maintenance tasks against the maildir tree and state DB
+    Janitor {
+        /// Specific task to run. Omit to run the safe-default set
+        /// (today: dedupe).
+        #[command(subcommand)]
+        action: Option<JanitorAction>,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -78,4 +85,11 @@ pub enum AuthAction {
     ClearToken,
     /// Re-run JMAP session URL autodiscovery
     Rediscover,
+}
+
+#[derive(Subcommand, Clone)]
+pub enum JanitorAction {
+    /// Scan synced folders for per-folder Message-ID duplicates
+    /// and remove the younger copies. Use `--dry-run` to preview.
+    Dedupe,
 }

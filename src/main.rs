@@ -6,7 +6,7 @@ use std::time::Duration;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 
-use jma_mail::cli::{AuthAction, Cli, Command};
+use jma_mail::cli::{AuthAction, Cli, Command, JanitorAction};
 use jma_mail::config::{self, Config};
 use jma_mail::daemon;
 use jma_mail::jmap::retry::{self, RetryConfig};
@@ -92,6 +92,7 @@ async fn main() -> Result<()> {
         Command::Push => cmd_push(&cli).await,
         Command::Watch => cmd_watch(&cli, profile_sink.clone()).await,
         Command::Auth { action, account } => cmd_auth(&cli, action, account).await,
+        Command::Janitor { action } => cmd_janitor(&cli, action).await,
     };
 
     // One-shot commands (everything except Watch) flush their
@@ -611,6 +612,60 @@ async fn cmd_watch(cli: &Cli, profile_sink: Option<ProfileSink>) -> Result<()> {
 
     daemon::runner::run(&conn, &config, profile_sink).await?;
 
+    Ok(())
+}
+
+async fn cmd_janitor(cli: &Cli, action: Option<JanitorAction>) -> Result<()> {
+    // None defaults to the safe-default set; today that's just
+    // dedupe. As prune/db_gc tasks land, this match grows to fan
+    // out across all of them when no specific action was named.
+    let action = action.unwrap_or(JanitorAction::Dedupe);
+    match action {
+        JanitorAction::Dedupe => cmd_janitor_dedupe(cli).await,
+    }
+}
+
+async fn cmd_janitor_dedupe(cli: &Cli) -> Result<()> {
+    let config = load_config(cli)?;
+    acquire_mutator_locks(&config)?;
+    let conn = state::db::open_or_recreate(&config.db_path())?;
+
+    // Offline path: enumerate folders from the DB's mailbox_map
+    // instead of going through JMAP. Janitor work shouldn't
+    // require connectivity. If no sync has ever run, the DB has
+    // no folder list and there is nothing to dedupe.
+    let folders = jma_mail::state::queries::list_known_maildir_folders(&conn)?;
+    if folders.is_empty() {
+        jma_mail::notify!("No known synced folders -- run `jma sync` first.");
+        return Ok(());
+    }
+
+    let maildir_root = config.maildir_path();
+    let plan = jma_mail::janitor::dedupe::run(&maildir_root, &folders, cli.dry_run)?;
+
+    if plan.deletions.is_empty() {
+        jma_mail::notify!(
+            "Dedupe: no duplicates found across {} folder(s).",
+            folders.len()
+        );
+    } else if cli.dry_run {
+        jma_mail::notify!(
+            "Dedupe (dry-run): would remove {} duplicate file(s):",
+            plan.deletions.len()
+        );
+        for d in &plan.deletions {
+            println!(
+                "  [DEDUPE] {} ({}) in {}/  (keeping {})",
+                d.maildir_id, d.message_id, d.folder, d.kept_maildir_id
+            );
+        }
+    } else {
+        jma_mail::notify!(
+            "Dedupe: removed {} duplicate file(s) across {} folder(s).",
+            plan.deletions.len(),
+            folders.len()
+        );
+    }
     Ok(())
 }
 

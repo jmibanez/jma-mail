@@ -17,7 +17,7 @@ use crate::maildir_ops::layout::{FolderLayoutDefinition, resolve_folder_path};
 use crate::maildir_ops::scan::LocalChange;
 use crate::maildir_ops::{scan, store};
 use crate::state::queries;
-use crate::sync::dedupe::{self, LocalEntry, LocalIndex};
+use crate::sync::dedupe::{LocalEntry, LocalIndex};
 use crate::sync::execute::Executor;
 use crate::sync::plan::{SyncAction, SyncDirection};
 use crate::sync::reconcile::{self, MessageRecordIndex, ReconcileInput};
@@ -245,17 +245,7 @@ impl<'a> SyncEngine<'a> {
         } else {
             Vec::new()
         };
-        let dedupe_plan = if !dedupe_targets.is_empty() {
-            let _phase =
-                tracing::info_span!(target: crate::profile::TARGET_PHASE, "dedupe").entered();
-            let plan = dedupe::plan_dedupe(&maildir_root, &dedupe_targets)?;
-            if !dry_run {
-                dedupe::apply_dedupe(&maildir_root, &plan)?;
-            }
-            plan
-        } else {
-            dedupe::DedupePlan::default()
-        };
+        let dedupe_plan = crate::janitor::dedupe::run(&maildir_root, &dedupe_targets, dry_run)?;
         let mut local_index = LocalIndex::default();
         if !queries::has_message_map_rows(self.conn)? {
             for kept in &dedupe_plan.kept {
