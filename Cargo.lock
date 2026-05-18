@@ -2142,9 +2142,10 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 [[package]]
 name = "maildir"
 version = "0.6.4"
-source = "git+https://github.com/staktrace/maildir?rev=2f5bb79e192231e14a4cc07df4f83c1148039cd9#2f5bb79e192231e14a4cc07df4f83c1148039cd9"
+source = "git+https://github.com/jmibanez/maildir?rev=03141ab58f559c2369a7479e69cb56d6e628a96f#03141ab58f559c2369a7479e69cb56d6e628a96f"
 dependencies = [
  "gethostname",
+ "libc",
  "mailparse 0.15.0",
 ]
 

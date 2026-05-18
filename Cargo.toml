@@ -38,11 +38,12 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # `state::db::acquire_lock` (per-state-DB).
 fd-lock = "4"
 
-# Maildir. staktrace/maildir#45 (`store_new_with_flags` +
-# suffix-aware iteration of `new/`) has merged upstream but no
-# crates.io release has shipped yet, so pin to an upstream commit.
-# Swap to a versioned crates.io dep once upstream releases.
-maildir = { git = "https://github.com/staktrace/maildir", rev = "2f5bb79e192231e14a4cc07df4f83c1148039cd9" }
+# Maildir. staktrace/maildir#45 (`store_new_with_flags` + suffix-aware
+# iteration of `new/`) has merged upstream but no crates.io release
+# has shipped yet, and we also have forked this crate to avoid
+# F_FULLFSYNC on macOS; pin to a commit on our fork that contains both
+# the upstream and our fsync change.
+maildir = { git = "https://github.com/jmibanez/maildir", rev = "03141ab58f559c2369a7479e69cb56d6e628a96f", features = ["barrier_fsync"] }
 
 # RFC 5322 header parsing. Already pulled in transitively via the
 # maildir crate (which uses it for `MailEntry::headers()`); declare
