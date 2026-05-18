@@ -205,6 +205,18 @@ run() {
     local binary="$2"
     local timelog="time-${label}.txt"
     local pmlog="power-${label}.txt"
+    local profile_json="profile-${label}.json"
+
+    # Pass --profile-json only when the binary advertises it. BEFORE
+    # commits predating this flag would error out on an unknown arg,
+    # so probe `--help` once and fall through silently when the flag
+    # is missing. The JSON file is a side-channel; the bench summary
+    # below still reads RSS/wall-clock from `time -l` regardless.
+    local profile_args=()
+    if "$binary" --help 2>&1 | grep -q -- '--profile-json'; then
+        rm -f "$profile_json"
+        profile_args=(--profile-json "$profile_json")
+    fi
 
     echo "=== $label ==="
 
@@ -225,7 +237,7 @@ run() {
     sleep "$(awk -v ms="$SAMPLE_MS" 'BEGIN { printf "%.2f", (ms / 1000) + 0.2 }')"
 
     local jma_status=0
-    /usr/bin/time -l "$binary" -c config.toml "$SUBCMD" > "$timelog" 2>&1 || jma_status=$?
+    /usr/bin/time -l "$binary" -c config.toml "${profile_args[@]}" "$SUBCMD" > "$timelog" 2>&1 || jma_status=$?
 
     # Stop powermetrics. It's root-owned, so kill via sudo. INT lets
     # it flush its final sample; wait for the pid to reap.
@@ -255,6 +267,9 @@ run() {
     echo "  energy impact:   ${energy} (sum over ${samples} jma samples @ ${SAMPLE_MS}ms)"
     echo "  outcome:         ${summary}"
     echo "  time log:        ${BENCH_DIR}/${timelog}"
+    if [[ -s "$profile_json" ]]; then
+        echo "  profile:     ${BENCH_DIR}/${profile_json}"
+    fi
     echo "  power log:       ${BENCH_DIR}/${pmlog}"
     echo
 }
