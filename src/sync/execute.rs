@@ -1,6 +1,7 @@
 use anyhow::Result;
 use futures_util::stream::{self, StreamExt};
 use jmap_client::client::Client;
+use reqwest::Client as HttpClient;
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -686,12 +687,21 @@ impl<'a> Executor<'a> {
         concurrency: usize,
         progress: &mut DownloadProgress,
     ) -> Result<DownloadBatchOutcome> {
+        // Pooled HTTP client scoped to this batch attempt. Built here
+        // (not on the executor) so the underlying reqwest connection
+        // pool is shared across the parallel fan-out below, and so it
+        // is dropped at the end of every batch attempt -- a rate-
+        // limit retry pass therefore starts from a fresh pool rather
+        // than inheriting possibly-poisoned connections.
+        let http = jmap_email::build_blob_http_client(&self.client)?;
+
         // Bounded channel: at most `concurrency` completed blobs are
         // buffered between producer and writer, capping the in-memory
         // blob footprint at roughly 2 * concurrency (buffered +
         // in-flight inside buffer_unordered).
         let (tx, mut rx) = mpsc::channel(concurrency);
         let producer = tokio::spawn(download_producer(
+            http,
             Arc::clone(&self.client),
             batch,
             concurrency,
@@ -860,7 +870,8 @@ impl<'a> Executor<'a> {
 /// or when the receiver is dropped; dropping the stream cancels any
 /// in-flight HTTP futures.
 async fn download_producer(
-    client: Arc<Client>,
+    http: HttpClient,
+    jmap: Arc<Client>,
     batch: Vec<SyncAction>,
     concurrency: usize,
     tx: mpsc::Sender<(SyncAction, Result<Vec<u8>>)>,
@@ -868,13 +879,17 @@ async fn download_producer(
     let mut blocked_send_us: u64 = 0;
     let mut send_count: u64 = 0;
     let futures = batch.into_iter().map(|action| {
-        let client = Arc::clone(&client);
+        // reqwest::Client::clone is internally an Arc bump; the
+        // Arc<Client> clone is an explicit refcount bump. Both are
+        // O(1) per future.
+        let http = http.clone();
+        let jmap = Arc::clone(&jmap);
         let blob_id = match &action {
             SyncAction::DownloadMessage { jmap_blob_id, .. } => jmap_blob_id.clone(),
             _ => unreachable!("non-download in downloads bucket"),
         };
         async move {
-            let res = jmap_email::download_blob(&client, &blob_id).await;
+            let res = jmap_email::download_blob(&http, &jmap, &blob_id).await;
             (action, res)
         }
     });

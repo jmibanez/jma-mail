@@ -59,8 +59,23 @@ pub fn is_transient_error(err: &anyhow::Error) -> bool {
         if let Some(e) = cause.downcast_ref::<JmapError>() {
             return is_transient_jmap_error(e);
         }
+        // Blob downloads go through our own `reqwest::Client` (see
+        // `jmap::email::download_blob`), so the typed error in the
+        // chain is `reqwest::Error` directly -- not wrapped in
+        // `JmapError::Transport`. Same precision, same predicates.
+        if let Some(e) = cause.downcast_ref::<reqwest::Error>() {
+            return is_transient_reqwest_error(e);
+        }
     }
     is_transient_substring(&err.to_string())
+}
+
+fn is_transient_reqwest_error(e: &reqwest::Error) -> bool {
+    e.is_timeout()
+        || e.is_connect()
+        || transport_source_is_dead_connection(e)
+        || e.status()
+            .is_some_and(|s| is_transient_status_u32(u32::from(s.as_u16())))
 }
 
 fn is_transient_jmap_error(e: &JmapError) -> bool {

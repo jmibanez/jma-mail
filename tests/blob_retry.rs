@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use jma_mail::ids::JmapBlobId;
-use jma_mail::jmap::email::download_blob;
+use jma_mail::jmap::email::{build_blob_http_client, download_blob};
 use jmap_client::client::{Client, Credentials};
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -115,6 +115,7 @@ async fn download_blob_retries_503_then_succeeds() {
         .await;
 
     let client = build_client(&server).await;
+    let http = build_blob_http_client(&client).expect("build blob http client");
     let blob_id = JmapBlobId::from("B-test");
 
     // Happy path: ~1.5s of backoff (500ms + 1s) then success on attempt 3.
@@ -122,7 +123,7 @@ async fn download_blob_retries_503_then_succeeds() {
     // all 5 attempts get exercised (500+1000+2000+4000 = 7.5s of sleeps).
     let bytes = tokio::time::timeout(
         std::time::Duration::from_secs(15),
-        download_blob(&client, &blob_id),
+        download_blob(&http, &client, &blob_id),
     )
     .await
     .expect("download_blob should not exceed timeout")
@@ -155,11 +156,12 @@ async fn download_blob_does_not_retry_404() {
         .await;
 
     let client = build_client(&server).await;
+    let http = build_blob_http_client(&client).expect("build blob http client");
     let blob_id = JmapBlobId::from("B-missing");
 
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        download_blob(&client, &blob_id),
+        download_blob(&http, &client, &blob_id),
     )
     .await
     .expect("download_blob should not exceed timeout");
@@ -169,5 +171,64 @@ async fn download_blob_does_not_retry_404() {
         calls.load(Ordering::SeqCst),
         1,
         "404 should not trigger any retry attempts"
+    );
+}
+
+/// Parity check: our blob fetcher and jmap-client must construct
+/// byte-identical download URLs from the same session metadata. Both
+/// substitute `{accountId}`, `{blobId}`, `{name}`, and `{type}` per
+/// RFC 8620 section 6.2; this test pins that both paths walk the
+/// template the same way (`name=none`, `type=application/octet-stream`,
+/// query-string ordering, no extra path segments) so a future
+/// upstream rename or accessor change doesn't silently diverge them.
+#[tokio::test]
+async fn download_blob_url_matches_jmap_client() {
+    init_tracing();
+
+    let server = MockServer::start().await;
+    mount_session(&server).await;
+
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/download/u-test-account/"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(b"x".to_vec())
+                .insert_header("content-type", "application/octet-stream"),
+        )
+        .mount(&server)
+        .await;
+
+    let client = build_client(&server).await;
+    let blob_id = JmapBlobId::from("B-parity");
+
+    client
+        .download(blob_id.as_ref())
+        .await
+        .expect("jmap-client download");
+
+    let http = build_blob_http_client(&client).expect("build blob http client");
+    download_blob(&http, &client, &blob_id)
+        .await
+        .expect("our download_blob");
+
+    let received = server
+        .received_requests()
+        .await
+        .expect("wiremock retains requests by default");
+    let download_urls: Vec<String> = received
+        .iter()
+        .filter(|r| r.url.path().starts_with("/download/"))
+        .map(|r| r.url.to_string())
+        .collect();
+
+    assert_eq!(
+        download_urls.len(),
+        2,
+        "expected one GET per path (jmap-client + ours); got {:?}",
+        download_urls
+    );
+    assert_eq!(
+        download_urls[0], download_urls[1],
+        "jmap-client and our path must hit byte-identical URLs"
     );
 }

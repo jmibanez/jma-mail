@@ -1,9 +1,13 @@
 use anyhow::{Context, Result};
 use futures_util::stream::{self, StreamExt};
 use jmap_client::Error as JmapError;
+use jmap_client::blob::URLParameter;
 use jmap_client::client::Client;
 use jmap_client::core::error::MethodErrorType;
+use jmap_client::core::session::URLPart;
 use jmap_client::email;
+use reqwest::Client as HttpClient;
+use reqwest::header::CONTENT_TYPE;
 use std::collections::HashMap;
 use tracing::field::Empty;
 use tracing::{Instrument, debug, info, instrument, warn};
@@ -625,19 +629,97 @@ pub async fn import_email(
     Ok(result)
 }
 
-/// Download the raw blob of an email.
+/// Build a pooled HTTP client for fetching blobs against the JMAP
+/// download endpoint. Constructed once per `download_batch` attempt
+/// (and dropped at the end of it) so the underlying reqwest
+/// connection pool is shared across the N parallel blob fetches but
+/// owns no idle connections during quiet periods.
+///
+/// `jmap_client::Client::download` would otherwise call
+/// `HttpClient::builder().build()` on every blob -- giving each
+/// fetch its own zero-warm pool, so every blob paid a fresh TCP
+/// handshake. That churn was hidden behind the per-file fsync floor
+/// before the maildir barrier-sync swap; post-swap, the rate of new
+/// TCP setups against the test fixture surfaced as transient
+/// `BrokenPipe` / connection-establishment errors that the retry
+/// loop was masking.
+///
+/// Copies the bearer-bearing default headers off the JMAP client
+/// (minus Content-Type, which is wrong for a GET) and inherits its
+/// request timeout. Redirect / TLS policy uses reqwest defaults --
+/// jmap-client's stricter redirect-policy fields aren't exposed via
+/// getters, but the session already established trust at connect
+/// time and the download URL is server-advertised, so the wider
+/// default is acceptable for the blob path.
+pub fn build_blob_http_client(jmap: &Client) -> Result<HttpClient> {
+    let mut headers = jmap.headers().clone();
+    headers.remove(CONTENT_TYPE);
+    HttpClient::builder()
+        .timeout(jmap.timeout())
+        .default_headers(headers)
+        .build()
+        .context("Failed to build blob-download HTTP client")
+}
+
+/// Build the download URL by walking the JMAP-advertised template
+/// (parsed by jmap-client at session-connect time) and substituting
+/// account id, blob id, and the spec-required `name`/`type`
+/// placeholders. `name` and `type` match what
+/// `jmap_client::Client::download` uses; the server doesn't care
+/// about either value for the retrieval (per RFC 8620 section 6.2).
+fn build_download_url(jmap: &Client, blob_id: &str) -> String {
+    let account_id = jmap.default_account_id();
+    let mut url = String::with_capacity(64 + account_id.len() + blob_id.len());
+    for part in jmap.download_url() {
+        match part {
+            URLPart::Value(v) => url.push_str(v),
+            URLPart::Parameter(p) => match p {
+                URLParameter::AccountId => url.push_str(account_id),
+                URLParameter::BlobId => url.push_str(blob_id),
+                URLParameter::Name => url.push_str("none"),
+                URLParameter::Type => url.push_str("application/octet-stream"),
+            },
+        }
+    }
+    url
+}
+
+/// Download the raw blob of an email through a caller-provided
+/// `reqwest::Client`. Callers build the client once per batch (see
+/// `build_blob_http_client`) so the pool is shared across the
+/// parallel fan-out; this fn is intentionally state-free beyond the
+/// passed-in handles.
+///
+/// The download URL is derived from the JMAP session metadata
+/// `jmap_client::Client::download` uses internally
+/// (`Client::download_url()` / `Client::default_account_id()`).
+/// Both are zero-cost field accessors, so reading them here per
+/// call beats pre-extracting them at the call site.
 #[instrument(
     target = "jma::profile::blob",
     name = "blob.download",
-    skip(client),
+    skip(http, jmap),
     fields(bytes = Empty),
 )]
-pub async fn download_blob(client: &Client, blob_id: &JmapBlobId) -> Result<Vec<u8>> {
+pub async fn download_blob(
+    http: &HttpClient,
+    jmap: &Client,
+    blob_id: &JmapBlobId,
+) -> Result<Vec<u8>> {
+    let url = build_download_url(jmap, blob_id.as_ref());
     let data = with_retry("Email/blob", || async {
-        client
-            .download(blob_id.as_ref())
+        let resp = http
+            .get(&url)
+            .send()
             .await
-            .with_context(|| format!("Failed to download blob {}", blob_id))
+            .with_context(|| format!("Failed to download blob {}", blob_id))?
+            .error_for_status()
+            .with_context(|| format!("Server error downloading blob {}", blob_id))?;
+        let bytes = resp
+            .bytes()
+            .await
+            .with_context(|| format!("Failed to read body for blob {}", blob_id))?;
+        Ok::<Vec<u8>, anyhow::Error>(bytes.to_vec())
     })
     .await?;
 
