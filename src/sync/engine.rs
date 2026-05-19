@@ -383,6 +383,7 @@ impl<'a> SyncEngine<'a> {
                 strategy: self.config.sync.conflict_strategy,
                 new_email_state: Some(new_state),
                 max_upload_size: limits::max_size_upload(&self.client),
+                used_initial_path,
             })
         };
 

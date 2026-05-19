@@ -56,6 +56,9 @@ struct ReconcileCtx<'a> {
     local_deletes: HashSet<JmapEmailId>,
     destroyed_set: HashSet<&'a str>,
     max_upload_size: usize,
+    /// Mirror of `ReconcileInput::used_initial_path`. See that field
+    /// for the reasoning.
+    used_initial_path: bool,
 }
 
 /// One reconcile cycle's inputs, gathered into a single struct so the
@@ -91,6 +94,18 @@ pub struct ReconcileInput<'a> {
     /// `size_bytes` exceeds this don't get an `UploadMessage` in
     /// the plan.
     pub max_upload_size: usize,
+    /// True iff this cycle's `remote_emails` came from the full
+    /// initial-pull path (`initial_remote_state`) rather than from
+    /// `Email/changes`. On the initial path, `remote_emails` is the
+    /// full survivor set across synced mailboxes; on the
+    /// incremental path it's just this cycle's created+updated ids.
+    /// Reconcile uses this to gate the Branch A case-iii carry-over
+    /// rebind: only the initial path can prove that an old
+    /// jmap_email_id absent from `remote_emails` is genuinely gone
+    /// from the server. In incremental mode the same absence could
+    /// mean "alive but unchanged this cycle," and silently rebinding
+    /// would lose track of a live duplicate locally.
+    pub used_initial_path: bool,
 }
 
 /// Reconcile remote changes and local changes into a sync plan.
@@ -106,6 +121,7 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
         strategy,
         new_email_state,
         max_upload_size,
+        used_initial_path,
     } = input;
     let known_by_maildir = &known.by_maildir;
     let known_by_jmap = &known.by_jmap;
@@ -229,6 +245,7 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
         local_deletes,
         destroyed_set,
         max_upload_size,
+        used_initial_path,
     };
 
     // Track local maildir_ids that have been claimed by an adoption emitted
@@ -599,21 +616,46 @@ fn try_adopt_remote(
         );
     };
 
-    // Branch A: a DB row already exists for this Message-ID. Two
-    // sub-cases:
-    //   (i)  The matched record's jmap_email_id is in this cycle's
-    //        destroyed_set -- i.e. the server destroyed Email A and
-    //        re-created Email B with the same wire-format Message-
-    //        ID. Pair them into a single rebind: adopt the file
-    //        under B's id and tell commit_adopt to drop A's row in
-    //        the same txn so the unique-on-maildir-id index doesn't
-    //        refuse the new row. Also mark A as consumed so the
-    //        destroy pass doesn't re-emit DeleteLocal against the
-    //        file we just rebound.
-    //   (ii) The matched record stays alive on the server (e.g. two
-    //        coexisting Emails with shared Message-ID -- duplicate-
-    //        delivery / migration-tool scenarios). Plain adopt; no
-    //        rebind, no consumed-destroys entry.
+    // Branch A: a DB row already exists for this Message-ID. Three
+    // sub-cases distinguished by what the server says about the
+    // matched record's jmap_email_id:
+    //   (i)  In this cycle's destroyed_set -- the server destroyed
+    //        Email A and re-created Email B with the same wire-
+    //        format Message-ID. Pair them into a single rebind:
+    //        adopt the file under B's id and tell commit_adopt to
+    //        drop A's row in the same txn so the unique-on-maildir-
+    //        id index doesn't refuse the new row. Mark A as consumed
+    //        so the destroy pass doesn't re-emit DeleteLocal against
+    //        the file we just rebound.
+    //   (ii) Alive on the server (A's id appears in remote_emails,
+    //        or we lack positive evidence of staleness) -- two
+    //        coexisting Emails sharing a Message-ID (duplicate
+    //        delivery, migration-tool import, or an older jma upload
+    //        bug). Refuse the adopt: an upsert with the same
+    //        maildir_id and a new jmap_email_id violates the
+    //        partial-unique index, rolling the cycle txn back. Emit
+    //        a warn pointing at `jma janitor remotededupe` and
+    //        return as if handled, so the executor neither downloads
+    //        a third copy nor stalls the cycle. The duplicate stays
+    //        on the server until the janitor scan blob-checks the
+    //        group and destroys the extras.
+    //   (iii) Provably gone from the server -- carry-over-from-
+    //        stale-DB. A's id is absent from this cycle's
+    //        remote_emails AND the cycle used the initial-pull path,
+    //        meaning remote_emails is the full survivor set across
+    //        synced mailboxes. Only with both conditions can we
+    //        treat absence as "destroyed without notification."
+    //        Rebind to B and let commit_adopt drop A's stale row.
+    //        Same code path as (i) minus the consumed-destroys
+    //        entry. The incremental-mode equivalent ("A absent
+    //        because it didn't change this cycle") deliberately
+    //        falls into (ii): in incremental mode Email/changes
+    //        can't distinguish "destroyed without notification"
+    //        from "alive but unchanged," so silently rebinding to
+    //        B and dropping A's row would set up a flip-flop --
+    //        the next cycle in which A's flags mutate would find
+    //        no row for A, re-adopt the file under A's id, then
+    //        the cycle after that would do the same in reverse.
     // Per RFC 8620 JMAP ids are stable for an Email's lifetime, so
     // a "different JMAP id with the same Message-ID" always means a
     // different Email object, not a server-side id rewrite.
@@ -632,24 +674,37 @@ fn try_adopt_remote(
             .find(|r| r.maildir_folder.as_deref() == Some(target_folder))
         && let Some(maildir_id) = rec.maildir_id.clone()
     {
+        let in_destroyed = ctx.destroyed_set.contains(rec.jmap_email_id.as_ref());
+        let old_in_remote_emails = ctx
+            .remote_emails
+            .iter()
+            .any(|e| e.id.as_ref() == rec.jmap_email_id.as_ref());
+        let provably_gone = !in_destroyed && !old_in_remote_emails && ctx.used_initial_path;
+        if !in_destroyed && !provably_gone {
+            warn!(
+                "Server-side duplicate Message-ID in {}: {} is bound to JMAP id \
+                 {} (maildir_id {}); new JMAP id {} carries the same header. \
+                 Skipping adoption to avoid a partial-unique violation -- run \
+                 `jma janitor remotededupe` to destroy the duplicate copies.",
+                target_folder, mid, rec.jmap_email_id, maildir_id, email.id
+            );
+            return true;
+        }
         let filename_flags = ctx
             .local_flags
             .get(&maildir_id)
             .cloned()
             .unwrap_or_else(|| rec.flags.clone());
-        let old_jmap_email_id = if ctx.destroyed_set.contains(rec.jmap_email_id.as_ref()) {
-            let id = rec.jmap_email_id.clone();
-            consumed_remote_destroys.insert(id.clone());
-            Some(id)
-        } else {
-            None
-        };
+        let old_jmap_email_id = rec.jmap_email_id.clone();
+        if in_destroyed {
+            consumed_remote_destroys.insert(old_jmap_email_id.clone());
+        }
         push_adopt(
             plan,
             adopted_maildir_ids,
             maildir_id,
             filename_flags,
-            old_jmap_email_id,
+            Some(old_jmap_email_id),
         );
         return true;
     }
@@ -661,9 +716,25 @@ fn try_adopt_remote(
     // -- it would mean a future refactor decoupled dedupe from
     // scan's walk; an empty filename suffix degrades safely (the
     // next scan's FlagsChanged path catches the drift).
+    //
+    // Per-cycle duplicate guard: if a prior iteration in this same
+    // cycle already adopted the local file (server returned two
+    // Email objects sharing the Message-ID), refuse the second
+    // adopt for the same reason Branch A sub-case ii does -- the
+    // partial-unique index would reject the upsert. Warn and skip.
     if let Some(entries) = ctx.local_index.by_message_id.get(mid)
         && let Some(entry) = entries.iter().find(|e| e.folder == target_folder)
     {
+        if adopted_maildir_ids.contains(&entry.maildir_id) {
+            warn!(
+                "Server-side duplicate Message-ID in {}: {} was already adopted \
+                 to maildir_id {} earlier in this cycle; new JMAP id {} carries \
+                 the same header. Skipping adoption -- run `jma janitor \
+                 remotededupe` to destroy the duplicate copies on the server.",
+                target_folder, mid, entry.maildir_id, email.id
+            );
+            return true;
+        }
         let filename_flags = ctx
             .local_flags
             .get(&entry.maildir_id)
@@ -1220,6 +1291,42 @@ mod tests {
             // Tests pass usize::MAX so the size cap never bites
             // unless a test explicitly opts in to it.
             max_upload_size: usize::MAX,
+            // Default the test bench to the initial-pull path so
+            // `remote_emails` is treated as the full survivor set;
+            // tests that need to exercise the incremental-mode
+            // disambiguation set up via `run_incremental` instead.
+            used_initial_path: true,
+        })
+    }
+
+    /// Same as `run`, but flags this cycle as the incremental path
+    /// (`Email/changes` rather than initial pull). Used by tests that
+    /// pin Branch A case-iii's incremental-mode behavior: an old
+    /// jmap_email_id absent from `remote_emails` is "alive but
+    /// unchanged" in this mode, not "destroyed without notification."
+    fn run_incremental(
+        remote_emails: &[EmailObject],
+        remote_destroyed: &[JmapEmailId],
+        local_changes: &[LocalChange],
+        records: &[MessageRecord],
+        local_index: &LocalIndex,
+        strategy: ConflictStrategy,
+    ) -> SyncPlan {
+        let known = indices(records);
+        let mailboxes = mailboxes();
+        let local_flags: HashMap<MaildirId, String> = HashMap::new();
+        reconcile(ReconcileInput {
+            remote_emails,
+            remote_destroyed,
+            local_changes,
+            known: &known,
+            local_index,
+            local_flags: &local_flags,
+            mailboxes: &mailboxes,
+            strategy,
+            new_email_state: None,
+            max_upload_size: usize::MAX,
+            used_initial_path: false,
         })
     }
 
@@ -1781,23 +1888,88 @@ mod tests {
         );
     }
 
-    /// Same-Message-ID collision WITHOUT a destroy: the DB anchors an
-    /// older Email A and the server reports a new Email B with the
-    /// same Message-ID, but A is not in remote_destroyed (both
-    /// coexist server-side -- e.g. duplicate-delivery or a migration
-    /// tool that didn't dedupe). Plain adopt; no rebind, no
-    /// consumed-destroys entry. Pins that the destroy-aware code
-    /// path only fires when the matched record's id is actually being
-    /// destroyed this cycle.
+    /// Same-Message-ID collision where the server still acknowledges
+    /// BOTH ids: DB anchors Email A bound to FILE-1, and this cycle's
+    /// remote_emails includes both A (unchanged) and a sibling B
+    /// sharing the Message-ID header. remote_destroyed is empty -- A
+    /// is alive. Adopting B onto FILE-1 would upsert a second
+    /// message_map row with maildir_id=FILE-1, which the partial-
+    /// unique index refuses, rolling the cycle txn back. Reconcile
+    /// must refuse the adopt and surface the duplicate as a warn so
+    /// the user can run `jma janitor remotededupe`. No second
+    /// AdoptLocalMessage, no DownloadMessage, no DeleteLocal.
     #[test]
-    fn shared_message_id_without_destroy_plain_adopts() {
+    fn shared_message_id_with_old_id_alive_skips_adoption() {
         let rec_a = record("A", "MB-INBOX", "INBOX", Some("FILE-1"), "S", "<a@x>");
         let plan = run(
-            &[email("B", "MB-INBOX", "S", Some("<a@x>"))],
+            &[
+                // A still alive on the server in this cycle's view.
+                email("A", "MB-INBOX", "S", Some("<a@x>")),
+                // B is the new sibling with the same Message-ID.
+                email("B", "MB-INBOX", "S", Some("<a@x>")),
+            ],
             // empty remote_destroyed -- A is NOT being destroyed.
             &[],
             &[],
             &[rec_a],
+            &empty_index(),
+            ConflictStrategy::ServerWins,
+        );
+        // No AdoptLocalMessage for B (A's known-by-jmap hit is a
+        // no-op flag-only path that emits nothing here).
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| matches!(a, SyncAction::AdoptLocalMessage { .. })),
+            "duplicate Message-ID must not produce an adopt for the new id: {:?}",
+            plan.actions
+        );
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| matches!(a, SyncAction::DownloadMessage { .. })),
+            "duplicate must not fall through to download a third copy: {:?}",
+            plan.actions
+        );
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| matches!(a, SyncAction::DeleteLocal { .. })),
+            "duplicate must not trigger a local delete: {:?}",
+            plan.actions
+        );
+    }
+
+    /// Carry-over-from-stale-DB twin of the duplicate test on the
+    /// *initial-pull* path: DB has an old jmap_id STALE-ID bound to
+    /// FILE-1, the server reports E1 with the same Message-ID, and
+    /// STALE-ID does NOT appear in this cycle's remote_emails. With
+    /// `used_initial_path = true`, `remote_emails` is the full
+    /// survivor set across synced mailboxes, so absence proves
+    /// staleness. The right behavior is a rebind: emit one
+    /// AdoptLocalMessage carrying `old_jmap_email_id=Some(STALE-ID)`
+    /// so commit_adopt drops the stale row in the same txn. Without
+    /// the rebind, commit_adopt's upsert would conflict with the
+    /// partial-unique index.
+    #[test]
+    fn shared_message_id_with_old_id_absent_rebinds_on_initial_path() {
+        let rec = record(
+            "STALE-ID",
+            "MB-INBOX",
+            "INBOX",
+            Some("FILE-1"),
+            "S",
+            "<a@x>",
+        );
+        let plan = run(
+            // Only E1 in this cycle; STALE-ID is not in remote_emails.
+            &[email("E1", "MB-INBOX", "S", Some("<a@x>"))],
+            &[],
+            &[],
+            &[rec],
             &empty_index(),
             ConflictStrategy::ServerWins,
         );
@@ -1806,17 +1978,121 @@ mod tests {
             .iter()
             .filter(|a| matches!(a, SyncAction::AdoptLocalMessage { .. }))
             .collect();
-        assert_eq!(adopts.len(), 1);
+        assert_eq!(adopts.len(), 1, "carry-over case must emit one adopt");
         let SyncAction::AdoptLocalMessage {
-            old_jmap_email_id, ..
+            id:
+                BoundId {
+                    jmap_email_id,
+                    maildir_id,
+                    ..
+                },
+            old_jmap_email_id,
+            ..
         } = adopts[0]
         else {
             unreachable!();
         };
+        assert_eq!(jmap_email_id.as_ref(), "E1");
+        assert_eq!(maildir_id.as_ref(), "FILE-1");
+        assert_eq!(
+            old_jmap_email_id.as_ref().map(JmapEmailId::as_ref),
+            Some("STALE-ID"),
+            "carry-over rebind must drop the stale row in the same txn"
+        );
+    }
+
+    /// Incremental-path twin: the same DB anchor (STALE-ID -> FILE-1)
+    /// and the same `remote_emails` payload, but this cycle used
+    /// `Email/changes` (`used_initial_path = false`). Now absence of
+    /// STALE-ID from remote_emails does NOT prove it's gone -- it
+    /// could be alive but unchanged. Default to the duplicate-skip
+    /// warn so a live duplicate isn't silently rebound away.
+    #[test]
+    fn shared_message_id_with_old_id_absent_in_incremental_mode_skips_adoption() {
+        let rec = record(
+            "STALE-ID",
+            "MB-INBOX",
+            "INBOX",
+            Some("FILE-1"),
+            "S",
+            "<a@x>",
+        );
+        let plan = run_incremental(
+            &[email("E1", "MB-INBOX", "S", Some("<a@x>"))],
+            &[],
+            &[],
+            &[rec],
+            &empty_index(),
+            ConflictStrategy::ServerWins,
+        );
         assert!(
-            old_jmap_email_id.is_none(),
-            "no destroy in this cycle => no rebind, plain adopt: got {:?}",
-            old_jmap_email_id
+            !plan
+                .actions
+                .iter()
+                .any(|a| matches!(a, SyncAction::AdoptLocalMessage { .. })),
+            "incremental mode without positive staleness evidence must not \
+             rebind blindly: {:?}",
+            plan.actions
+        );
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| matches!(a, SyncAction::DownloadMessage { .. })),
+            "skip must not fall through to download: {:?}",
+            plan.actions
+        );
+    }
+
+    /// Cold-start variant: state DB is empty, the local maildir
+    /// already has FILE-1 carrying Message-ID <a@x>, and the server
+    /// returns *two* Email objects sharing that header. The first
+    /// claims FILE-1 via the local_index rescue; the second hits the
+    /// same rescue path but `adopted_maildir_ids` already contains
+    /// FILE-1, so the second adopt must be refused -- otherwise
+    /// commit_adopt would try two message_map upserts with the same
+    /// maildir_id and the partial-unique would reject the second.
+    #[test]
+    fn cold_start_shared_message_id_skips_second_adoption() {
+        let mut idx = empty_index();
+        idx.by_message_id.insert(
+            "<a@x>".into(),
+            vec![LocalEntry {
+                folder: "INBOX".into(),
+                maildir_id: "FILE-1".into(),
+            }],
+        );
+        let plan = run(
+            &[
+                email("E1", "MB-INBOX", "S", Some("<a@x>")),
+                email("E2", "MB-INBOX", "S", Some("<a@x>")),
+            ],
+            &[],
+            &[],
+            // No message_map rows -- cold start.
+            &[],
+            &idx,
+            ConflictStrategy::ServerWins,
+        );
+        // Exactly one adopt: E1 took FILE-1, E2 was refused.
+        let adopts: Vec<&SyncAction> = plan
+            .actions
+            .iter()
+            .filter(|a| matches!(a, SyncAction::AdoptLocalMessage { .. }))
+            .collect();
+        assert_eq!(
+            adopts.len(),
+            1,
+            "cold-start dupe must adopt only the first: {:?}",
+            plan.actions
+        );
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| matches!(a, SyncAction::DownloadMessage { .. })),
+            "second duplicate must not fall through to download: {:?}",
+            plan.actions
         );
     }
 
@@ -2101,6 +2377,7 @@ mod tests {
             strategy: ConflictStrategy::ServerWins,
             new_email_state: None,
             max_upload_size: 1_000,
+            used_initial_path: true,
         });
         assert_eq!(plan.upload_count(), 0);
         assert!(plan.actions.is_empty());
