@@ -140,7 +140,10 @@ impl<'a> WatchDaemon<'a> {
     ) -> Result<Self> {
         let (tx, rx) = mpsc::channel::<SyncTrigger>(32);
 
-        let hook = super::hook::Hook::new(config.watch.post_arrival_command.clone());
+        let hook = super::hook::Hook::new(
+            config.watch.post_arrival_command.clone(),
+            config.watch.post_arrival_command_retries,
+        );
         if hook.is_enabled() {
             info!("Post-arrival hook configured");
         }

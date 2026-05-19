@@ -256,6 +256,17 @@ pub struct WatchConfig {
     /// (multiple events coalesce into one). Only fires in `watch` mode.
     #[serde(default)]
     pub post_arrival_command: Option<String>,
+    /// Number of times to retry `post_arrival_command` if it fails
+    /// (non-zero exit, spawn failure, or wait error). Default 0 -- run
+    /// once and log a warning on failure. Each retry runs synchronously
+    /// inside the same logical hook invocation, so an in-flight retry
+    /// chain still coalesces follow-up triggers into one queued run.
+    /// Values above the cap (currently 10; see
+    /// `daemon::hook::MAX_POST_ARRIVAL_RETRIES`) are clamped at startup
+    /// so a steady-state failure can't block follow-up triggers
+    /// indefinitely.
+    #[serde(default)]
+    pub post_arrival_command_retries: u32,
 }
 
 impl WatchConfig {
@@ -323,6 +334,7 @@ impl Default for WatchConfig {
             coalesce_window_ms: default_coalesce_window_ms(),
             self_write_ttl_secs: None,
             post_arrival_command: None,
+            post_arrival_command_retries: 0,
         }
     }
 }
@@ -589,6 +601,9 @@ ping_interval = 60
 # new messages. Runs asynchronously; overlapping events coalesce into
 # a single follow-up run. Leave unset to disable.
 # post_arrival_command = "mu index"
+# Retry the command on failure (non-zero exit, spawn error) this many
+# times before giving up on the trigger. Default 0.
+# post_arrival_command_retries = 0
 "#
 }
 

@@ -382,6 +382,7 @@ fn build_test_config(server_uri: &str, maildir_root: &Path, db_path: &Path) -> C
             coalesce_window_ms: 0,
             self_write_ttl_secs: None,
             post_arrival_command: None,
+            post_arrival_command_retries: 0,
         },
         ..Default::default()
     }

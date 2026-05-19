@@ -137,6 +137,7 @@ This section only has one key, `db_path`, which tells `jma` where to persist its
 `jma` supports JMAP's EventSource for push emails. This section has knobs around that feature. You should probably leave the defaults in, but if you want to tweak things this is the place:
 
   * `post_arrival_command`: A shell command that `jma` will invoke when it observes new mail. If you use a mail indexer such as `mu` or `notmuch`, put the indexing command here -- e.g. set this to `notmuch new` for `notmuch`.
+  * `post_arrival_command_retries`: Number of times to retry `post_arrival_command` if it fails (non-zero exit, spawn failure). Default `0` (run once and log a warning on failure); capped at `10`. Retries run synchronously inside the same logical invocation, so an in-flight retry chain still coalesces follow-up triggers into one queued run.
   * `ping_interval`: How often (in seconds) to request the server send heartbeat pings on the EventSource (SSE) stream. Per RFC 8620 section 7.3 the server is allowed to clamp this value; some providers (Fastmail, notably) use a longer interval than requested. The actual interval the server uses drives the daemon's stream watchdog -- see `watch` below.
 
 ### Maildir rename rules `[[rename_rules]]`
@@ -234,7 +235,7 @@ Two trigger sources feed it:
   * **JMAP EventSource (SSE).** A long-running HTTPS connection to your server's push endpoint. The server pushes a `state` event whenever an entity (Email, Mailbox) advances; `jma` runs a sync cycle in response. This is what gives you push email.
   * **Filesystem watcher.** Watches the maildir root via the OS's native filesystem-events API (`inotify` on Linux, `FSEvents` on macOS). Local edits (a message marked read by your MUA, a move between folders, a delete) trigger a sync cycle so changes propagate upstream. Events are debounced and coalesced before triggering a cycle so a burst of edits collapses into one sync.
 
-After every cycle that downloaded new mail, the optional `[watch].post_arrival_command` shell command runs (use this to kick off `mu index`, `notmuch new`, etc.).
+After every cycle that downloaded new mail, the optional `[watch].post_arrival_command` shell command runs (use this to kick off `mu index`, `notmuch new`, etc.). Failed invocations can be retried up to `[watch].post_arrival_command_retries` times before the daemon gives up on that trigger.
 
 #### Reconnect on failure
 
