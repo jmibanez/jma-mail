@@ -51,9 +51,17 @@ pub enum Command {
     Push,
     /// Daemon mode: continuous sync on server + local changes
     Watch,
-    /// Initialize config file. Maildirs are created on the first
+    /// Initialize config file. Runs the interactive setup wizard by
+    /// default; pass --no-interactive to write a fully-commented
+    /// template config instead. Maildirs are created on the first
     /// sync (preview with `sync --dry-run`).
-    Init,
+    Init {
+        /// Skip the wizard and write the default fully-commented
+        /// template config. Useful for headless deployments and any
+        /// flow where you'd rather edit the file by hand.
+        #[arg(long)]
+        no_interactive: bool,
+    },
     /// List remote mailboxes and their local mapping
     Mailboxes,
     /// Show sync staleness, cursor health, and maildir drift.

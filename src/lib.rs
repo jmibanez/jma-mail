@@ -10,6 +10,7 @@ pub mod profile;
 pub mod state;
 pub mod sync;
 pub mod ui;
+pub mod wizard;
 
 /// Status text printed to stdout. Use for the small set of "what the
 /// tool is doing" messages a user expects at the default verbosity --

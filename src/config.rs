@@ -471,8 +471,22 @@ impl AccountConfig {
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let path = expand_tilde(path);
-        let contents = std::fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read config file: {}", path.display()))?;
+        let contents = std::fs::read_to_string(&path).map_err(|e| {
+            // A missing file at the default path is the first-run
+            // case; point the user at `jma init`. Other IO errors
+            // (permission denied, broken symlink) carry their own
+            // message through anyhow's source chain.
+            if e.kind() == std::io::ErrorKind::NotFound {
+                anyhow::anyhow!(
+                    "No config at {}. Run `jma init` to set one up \
+                     (or pass --config to point at an existing file).",
+                    path.display()
+                )
+            } else {
+                anyhow::Error::new(e)
+                    .context(format!("Failed to read config file: {}", path.display()))
+            }
+        })?;
         let mut config: Config =
             toml::from_str(&contents).context("Failed to parse config file")?;
         if let Some(msg) = check_token_perms(&path, config.account.token.as_deref()) {
@@ -584,13 +598,60 @@ pub fn compile_maildir_rename_rules(
         .collect()
 }
 
-/// Generate a default config file template.
-pub fn default_config_template() -> &'static str {
-    r#"[account]
+/// Inputs to `render_config_toml`. Both the unedited init template
+/// and the wizard's filled-in output flow through the same template
+/// body; only the substituted slots differ.
+#[derive(Debug, Clone)]
+pub struct ConfigTomlValues<'a> {
+    pub email: &'a str,
+    pub token: TomlTokenSlot<'a>,
+    pub maildir_path: &'a str,
+    /// Already-rendered TOML enum spelling: `"flat"`, `"maildir++"`, `"fs"`.
+    pub folder_layout: &'a str,
+    pub hierarchy_separator: char,
+    /// Already-rendered: `"server-wins"` or `"local-wins"`.
+    pub conflict_strategy: &'a str,
+}
+
+/// How the `token = ...` slot in the rendered config is filled.
+#[derive(Debug, Clone, Copy)]
+pub enum TomlTokenSlot<'a> {
+    /// `token = ""` placeholder. Used by `jma init` for an
+    /// unedited template the user fills in later.
+    Placeholder,
+    /// No `token` line; substitute a note pointing the reader at
+    /// the keychain entry the wizard already created.
+    InKeychain,
+    /// `token = "<value>"`. Used when the wizard had to fall back
+    /// to in-file storage because the keychain rejected the write.
+    InFile(&'a str),
+}
+
+/// Render the canonical config template with the given values
+/// substituted into the answered slots. Single source of truth for
+/// the on-disk shape -- the unedited `jma init` template and the
+/// wizard's filled-in output share this template body so the two
+/// can't drift.
+pub fn render_config_toml(values: &ConfigTomlValues<'_>) -> String {
+    let token_line = match values.token {
+        TomlTokenSlot::Placeholder => "token = \"\"".to_string(),
+        TomlTokenSlot::InKeychain => format!(
+            "# Token is stored in your OS keychain under this account.\n\
+             # Run `jma auth set-token --account {}` to rotate it; uncomment\n\
+             # the line below and paste the token only if you need a\n\
+             # headless / CI fallback that bypasses the keychain.\n\
+             # token = \"\"",
+            values.email
+        ),
+        TomlTokenSlot::InFile(t) => format!("token = {}", toml_basic_string(t)),
+    };
+
+    format!(
+        r#"[account]
 # Email address for this account. The domain is used to discover the
 # JMAP session URL via DNS SRV (_jmap._tcp.<domain>) and the
-# /.well-known/jmap HTTPS endpoint, per RFC 8620 §2.2.
-email = "you@example.com"
+# /.well-known/jmap HTTPS endpoint, per RFC 8620 section 2.2.
+email = {email}
 # API token (app-specific password) from your JMAP provider.
 # For Fastmail, generate one at:
 #   https://www.fastmail.com/settings/security/tokens
@@ -603,7 +664,7 @@ email = "you@example.com"
 #      multi-account configs from sharing credentials.
 #   2. The `token` field below -- fallback for headless servers and
 #      CI where the keychain isn't available.
-token = ""
+{token_line}
 # Explicit JMAP session URL. Leave unset to have it autodiscovered
 # from the email domain (DNS SRV + /.well-known/jmap, RFC 8620
 # section 2.2). The discovered URL is cached in the state DB. Set
@@ -614,12 +675,14 @@ token = ""
 
 [sync]
 # Root directory for local maildir storage
-maildir_path = "~/Mail"
-# Which mailboxes to sync (empty = all). The literal "INBOX" is a magic
+maildir_path = {maildir_path}
+# Which mailboxes to sync. Omit (or set to []) to sync every server
+# mailbox -- the right default for most users. Uncomment and curate
+# this list only if you want a subset. The literal "INBOX" is a magic
 # alias for whichever mailbox has the JMAP "inbox" role; other entries
-# match the mailbox's name (case-sensitively unless case_insensitive_match
-# is true).
-mailboxes = ["INBOX", "Archive", "Sent", "Drafts", "Trash"]
+# match the mailbox's name (case-sensitively unless
+# case_insensitive_match is true).
+# mailboxes = ["INBOX", "Archive", "Sent", "Drafts", "Trash"]
 # Match `mailboxes` entries case-insensitively against server names.
 case_insensitive_match = false
 # On-disk layout for hierarchical mailboxes:
@@ -629,14 +692,14 @@ case_insensitive_match = false
 #   "fs"        -- Dovecot LAYOUT=fs: <root>/parent/child/
 # Single-level mailboxes look identical under "flat" and "fs"; the
 # choice only matters once a server has nested folders.
-folder_layout = "flat"
+folder_layout = "{folder_layout}"
 # Hierarchy separator for "flat" and "maildir++" layouts. Ignored
 # under "fs" (which always uses "/"). Single character; "/", "\", and
 # NUL are rejected at runtime. Default "." matches mbsync and
 # Dovecot/Courier conventions.
-hierarchy_separator = "."
+hierarchy_separator = "{separator}"
 # Conflict resolution: server-wins or local-wins
-conflict_strategy = "server-wins"
+conflict_strategy = "{conflict_strategy}"
 # Max concurrent blob downloads during pull. Clamped to the server's
 # advertised maxConcurrentRequests (Fastmail: 10).
 download_concurrency = 8
@@ -692,7 +755,95 @@ ping_interval = 60
 # Retry the command on failure (non-zero exit, spawn error) this many
 # times before giving up on the trigger. Default 0.
 # post_arrival_command_retries = 0
-"#
+"#,
+        email = toml_basic_string(values.email),
+        token_line = token_line,
+        maildir_path = toml_basic_string(values.maildir_path),
+        folder_layout = values.folder_layout,
+        separator = values.hierarchy_separator,
+        conflict_strategy = values.conflict_strategy,
+    )
+}
+
+/// Unedited config template written by `jma init`. The escape
+/// hatch for users who want to fill in the file by hand instead of
+/// going through the wizard -- typically headless servers, CI
+/// seeds, or anyone curating an advanced config from scratch.
+pub fn default_config_template() -> String {
+    render_config_toml(&ConfigTomlValues {
+        email: "you@example.com",
+        token: TomlTokenSlot::Placeholder,
+        maildir_path: "~/Mail",
+        folder_layout: "flat",
+        hierarchy_separator: '.',
+        conflict_strategy: "server-wins",
+    })
+}
+
+/// Escape a string for a TOML basic-string literal. Wraps the input
+/// in double quotes and escapes `"` and `\`. We control the inputs
+/// (template constants or wizard answers that were already
+/// whitespace-trimmed and structurally validated), so a minimal
+/// escape set is sufficient.
+pub(crate) fn toml_basic_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
+}
+
+#[cfg(test)]
+mod template_tests {
+    use super::*;
+
+    #[test]
+    fn toml_basic_string_escapes_quotes_and_backslashes() {
+        assert_eq!(toml_basic_string("simple"), "\"simple\"");
+        assert_eq!(
+            toml_basic_string("with \"quote\""),
+            "\"with \\\"quote\\\"\""
+        );
+        assert_eq!(toml_basic_string("with\\slash"), "\"with\\\\slash\"");
+    }
+
+    /// `jma init`'s template must parse cleanly. A typo in the
+    /// rendered TOML or a drift in `ConfigTomlValues` shouldn't
+    /// hand users a config jma can't load.
+    #[test]
+    fn default_template_round_trips() {
+        let toml = default_config_template();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, &toml).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let cfg = Config::load(&path).expect("default template must load");
+        assert_eq!(cfg.account.email, "you@example.com");
+        assert_eq!(cfg.sync.maildir_path, "~/Mail");
+        assert_eq!(cfg.sync.folder_layout, FolderLayout::Flat);
+        assert_eq!(
+            cfg.sync.conflict_strategy as u8,
+            ConflictStrategy::ServerWins as u8
+        );
+        // Default template ships with `mailboxes` commented out so
+        // the "sync everything" branch is the out-of-the-box
+        // behaviour. Pin that against an accidental uncomment.
+        assert!(
+            cfg.sync.mailboxes.is_empty(),
+            "default template must leave [sync].mailboxes empty (sync-all); got {:?}",
+            cfg.sync.mailboxes
+        );
+    }
 }
 
 #[cfg(test)]

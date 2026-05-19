@@ -107,8 +107,13 @@ notify-debouncer-mini = "0.7"
 # before any Entry is created — see `src/auth.rs::init_store`.
 keyring-core = "1"
 
-# Hidden TTY prompt for `auth set-token`
-rpassword = "7"
+# Interactive prompts for the first-run wizard and `jma auth
+# set-token`. `Input`/`Password` cover text and hidden inputs;
+# `Select` is the arrow-key chooser used for the wizard's layout
+# and conflict-strategy questions. Only the `password` feature is
+# enabled; if you ever reach for `dialoguer::Editor`, add `editor`
+# (which pulls in `tempfile` transitively).
+dialoguer = { version = "0.11", default-features = false, features = ["password"] }
 
 # Regex for pattern-based maildir rename rules
 regex = "1.12"

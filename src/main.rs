@@ -84,7 +84,7 @@ async fn main() -> Result<()> {
     jma_mail::notify!("Running jma version {}", env!("JMA_VERSION"));
 
     let result = match command {
-        Command::Init => cmd_init(&cli).await,
+        Command::Init { no_interactive } => cmd_init(&cli, no_interactive).await,
         Command::Mailboxes => cmd_mailboxes(&cli).await,
         Command::Status => cmd_status(&cli).await,
         Command::Sync => cmd_sync(&cli).await,
@@ -119,8 +119,14 @@ async fn cmd_auth(cli: &Cli, action: AuthAction, email: String) -> Result<()> {
     use std::io::{BufRead, IsTerminal};
     match action {
         AuthAction::SetToken => {
+            // TTY: hidden interactive prompt via dialoguer (same
+            // library the first-run wizard uses). Non-TTY: read one
+            // line from stdin so a scripted `echo $TOKEN | jma auth
+            // set-token ...` invocation keeps working in CI.
             let token = if std::io::stdin().is_terminal() {
-                rpassword::prompt_password("Bearer token: ")
+                dialoguer::Password::with_theme(&dialoguer::theme::ColorfulTheme::default())
+                    .with_prompt("Bearer token")
+                    .interact()
                     .context("Failed to read token from prompt")?
             } else {
                 let mut s = String::new();
@@ -175,38 +181,90 @@ async fn cmd_auth(cli: &Cli, action: AuthAction, email: String) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_init(cli: &Cli) -> Result<()> {
+async fn cmd_init(cli: &Cli, no_interactive: bool) -> Result<()> {
+    use std::io::IsTerminal;
+
     let config_path = config::expand_tilde(&cli.config);
 
     if config_path.exists() {
         println!("Config file already exists: {}", config_path.display());
     } else {
-        if let Some(parent) = config_path.parent() {
-            std::fs::create_dir_all(parent)?;
+        // The wizard is the friendlier first-run path, but it
+        // requires a TTY (dialoguer drives the prompts directly
+        // against the terminal). Fall back to the template
+        // automatically when stdin isn't a TTY -- this is the
+        // case CI / scripted installs hit, and erroring there
+        // would force every automated setup to remember a flag.
+        // `--no-interactive` forces the template path even when a
+        // TTY is available, for users who prefer hand-editing.
+        let use_wizard = !no_interactive && std::io::stdin().is_terminal();
+        if use_wizard {
+            jma_mail::wizard::run(&config_path)?;
+        } else {
+            write_template_config(&config_path)?;
+            println!("Created config file: {}", config_path.display());
+            println!("Edit the config file and set your JMAP API token.");
+            println!(
+                "For Fastmail, generate one at: \
+                 https://www.fastmail.com/settings/security/tokens"
+            );
+            println!(
+                "Then run `jma sync` to provision your local maildirs \
+                 and pull existing messages."
+            );
         }
-        // Mode 0o600 from creation so a token added later isn't briefly
-        // exposed under the user's umask. The load-time perms check (in
-        // config::check_token_perms) catches files that already exist
-        // with looser perms.
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut f = opts
-            .open(&config_path)
-            .with_context(|| format!("Failed to create config file: {}", config_path.display()))?;
-        std::io::Write::write_all(&mut f, config::default_config_template().as_bytes())
-            .with_context(|| format!("Failed to write config file: {}", config_path.display()))?;
-        println!("Created config file: {}", config_path.display());
     }
 
-    println!("Edit the config file and set your JMAP API token.");
-    println!("For Fastmail, generate one at: https://www.fastmail.com/settings/security/tokens");
-    println!("Then run `jma sync` to provision your local maildirs and pull existing messages.");
+    // Create the maildir root (not the per-folder tree) so the
+    // per-maildir advisory lock has somewhere to live on the first
+    // `jma sync`. The sync engine materializes one maildir per
+    // server-known mailbox on its first cycle via `CreateLocalMailbox`.
+    match Config::load(&config_path) {
+        Ok(config) => create_maildir_root(&config)?,
+        Err(e) => {
+            println!("Skipping maildir root creation: could not load config ({e})");
+        }
+    }
 
+    Ok(())
+}
+
+/// Create the maildir root so the per-maildir advisory lock has
+/// somewhere to live when the user runs `jma sync`. Only the root
+/// directory is created here; the per-folder maildir tree is
+/// materialized on the first sync, one folder per server-known
+/// mailbox, through plan-visible `CreateLocalMailbox` actions.
+fn create_maildir_root(config: &Config) -> Result<()> {
+    let root = config.maildir_path();
+    if !root.exists() {
+        std::fs::create_dir_all(&root)
+            .with_context(|| format!("Failed to create maildir root {}", root.display()))?;
+        println!("Created maildir root: {}", root.display());
+    }
+    Ok(())
+}
+
+/// Write the fully-commented default template to `config_path`.
+/// Mode 0o600 from creation so a token added later isn't briefly
+/// exposed under the user's umask; the load-time perms check (in
+/// `config::check_token_perms`) catches files that already exist
+/// with looser perms.
+fn write_template_config(config_path: &std::path::Path) -> Result<()> {
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts
+        .open(config_path)
+        .with_context(|| format!("Failed to create config file: {}", config_path.display()))?;
+    std::io::Write::write_all(&mut f, config::default_config_template().as_bytes())
+        .with_context(|| format!("Failed to write config file: {}", config_path.display()))?;
     Ok(())
 }
 
