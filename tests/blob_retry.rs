@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use jma_mail::ids::JmapBlobId;
 use jma_mail::jmap::email::{build_blob_http_client, download_blob};
+use jma_mail::maildir_ops::store::ensure_maildir;
 use jmap_client::client::{Client, Credentials};
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -117,23 +118,44 @@ async fn download_blob_retries_503_then_succeeds() {
     let client = build_client(&server).await;
     let http = build_blob_http_client(&client).expect("build blob http client");
     let blob_id = JmapBlobId::from("B-test");
+    let tempdir = tempfile::tempdir().expect("tempdir for maildir");
+    let maildir = ensure_maildir(tempdir.path()).expect("ensure_maildir");
 
     // Happy path: ~1.5s of backoff (500ms + 1s) then success on attempt 3.
     // The 15s cap covers the worst case where the matcher regresses and
     // all 5 attempts get exercised (500+1000+2000+4000 = 7.5s of sleeps).
-    let bytes = tokio::time::timeout(
+    let tmp = tokio::time::timeout(
         std::time::Duration::from_secs(15),
-        download_blob(&http, &client, &blob_id),
+        download_blob(&http, &client, &blob_id, &maildir),
     )
     .await
     .expect("download_blob should not exceed timeout")
     .expect("download_blob should succeed after retries");
 
+    let bytes = std::fs::read(tmp.path()).expect("read streamed tmp file");
     assert_eq!(bytes.as_slice(), b"raw rfc5322 message");
     assert_eq!(
         calls.load(Ordering::SeqCst),
         3,
         "expected 2 transient failures + 1 success"
+    );
+    // Each failed attempt opened its own tmp file before erroring; the
+    // `TemporaryMailFile::drop` guard must unlink those, leaving only
+    // the successful attempt's still-open handle behind. Without this
+    // assertion, a regression where a failed-attempt handle leaks a
+    // sibling file would pass undetected.
+    let tmp_entries: Vec<_> = std::fs::read_dir(tempdir.path().join("tmp"))
+        .expect("tmp/ should exist after ensure_maildir")
+        .filter_map(|e| e.ok())
+        .collect();
+    assert_eq!(
+        tmp_entries.len(),
+        1,
+        "tmp/ must contain exactly the final attempt's file; got {:?}",
+        tmp_entries
+            .iter()
+            .map(|e| e.file_name())
+            .collect::<Vec<_>>()
     );
 }
 
@@ -158,10 +180,12 @@ async fn download_blob_does_not_retry_404() {
     let client = build_client(&server).await;
     let http = build_blob_http_client(&client).expect("build blob http client");
     let blob_id = JmapBlobId::from("B-missing");
+    let tempdir = tempfile::tempdir().expect("tempdir for maildir");
+    let maildir = ensure_maildir(tempdir.path()).expect("ensure_maildir");
 
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        download_blob(&http, &client, &blob_id),
+        download_blob(&http, &client, &blob_id, &maildir),
     )
     .await
     .expect("download_blob should not exceed timeout");
@@ -171,6 +195,22 @@ async fn download_blob_does_not_retry_404() {
         calls.load(Ordering::SeqCst),
         1,
         "404 should not trigger any retry attempts"
+    );
+    // Hard-error path must not leave the partial tmp file behind:
+    // `TemporaryMailFile::drop` unlinks on the failing attempt's
+    // handle so subsequent retry attempts can't accumulate orphans
+    // in tmp/. Verify by reading the directory directly.
+    let tmp_entries: Vec<_> = std::fs::read_dir(tempdir.path().join("tmp"))
+        .expect("tmp/ should exist after ensure_maildir")
+        .filter_map(|e| e.ok())
+        .collect();
+    assert!(
+        tmp_entries.is_empty(),
+        "tmp/ must be empty after a hard error; got {:?}",
+        tmp_entries
+            .iter()
+            .map(|e| e.file_name())
+            .collect::<Vec<_>>()
     );
 }
 
@@ -207,7 +247,9 @@ async fn download_blob_url_matches_jmap_client() {
         .expect("jmap-client download");
 
     let http = build_blob_http_client(&client).expect("build blob http client");
-    download_blob(&http, &client, &blob_id)
+    let tempdir = tempfile::tempdir().expect("tempdir for maildir");
+    let maildir = ensure_maildir(tempdir.path()).expect("ensure_maildir");
+    download_blob(&http, &client, &blob_id, &maildir)
         .await
         .expect("our download_blob");
 

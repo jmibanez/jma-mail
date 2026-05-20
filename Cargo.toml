@@ -43,7 +43,7 @@ fd-lock = "4"
 # has shipped yet, and we also have forked this crate to avoid
 # F_FULLFSYNC on macOS; pin to a commit on our fork that contains both
 # the upstream and our fsync change.
-maildir = { git = "https://github.com/jmibanez/maildir", rev = "03141ab58f559c2369a7479e69cb56d6e628a96f", features = ["barrier_fsync"] }
+maildir = { git = "https://github.com/jmibanez/maildir", rev = "0d34d4d78e61acedbfc3385a85169cf2498f4a84", features = ["barrier_fsync"] }
 
 # RFC 5322 header parsing. Already pulled in transitively via the
 # maildir crate (which uses it for `MailEntry::headers()`); declare

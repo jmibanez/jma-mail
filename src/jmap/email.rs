@@ -6,9 +6,11 @@ use jmap_client::client::Client;
 use jmap_client::core::error::MethodErrorType;
 use jmap_client::core::session::URLPart;
 use jmap_client::email;
+use maildir::{Maildir, TemporaryMailFile};
 use reqwest::Client as HttpClient;
 use reqwest::header::CONTENT_TYPE;
 use std::collections::HashMap;
+use std::io::Write;
 use tracing::field::Empty;
 use tracing::{Instrument, debug, info, instrument, warn};
 
@@ -16,6 +18,7 @@ use crate::ids::{JmapBlobId, JmapEmailId, JmapMailboxId, JmapThreadId, MessageId
 use crate::jmap::limits;
 use crate::jmap::retry::with_retry;
 use crate::jmap::types::{ChangesResponse, EmailObject};
+use crate::maildir_ops::store;
 use crate::sync::plan::LocalId;
 
 /// True iff `err`'s anyhow chain carries a JMAP method-level
@@ -685,11 +688,19 @@ pub(crate) fn build_download_url(jmap: &Client, blob_id: &str) -> String {
     url
 }
 
-/// Download the raw blob of an email through a caller-provided
-/// `reqwest::Client`. Callers build the client once per batch (see
-/// `build_blob_http_client`) so the pool is shared across the
-/// parallel fan-out; this fn is intentionally state-free beyond the
-/// passed-in handles.
+/// Download the raw blob of an email straight into a freshly-opened
+/// `tmp/` file under `maildir`. The returned `TemporaryMailFile` is
+/// the producer half of the streaming download path: the consumer
+/// passes it to `store::finalize_message` (F_BARRIERFSYNC + rename to
+/// `new/`/`cur/`) and then commits the per-message DB transaction.
+/// Peak memory per in-flight blob is one HTTP chunk (~16 KB) plus
+/// the open-file handle, instead of the full message size that a
+/// buffered `Vec<u8>` would hold.
+///
+/// Each `with_retry` attempt opens a fresh tmp file. A mid-stream
+/// HTTP failure on an earlier attempt drops its tmp handle, whose
+/// `Drop` guard unlinks the partial file -- so retries don't leak
+/// orphans into `tmp/`.
 ///
 /// The download URL is derived from the JMAP session metadata
 /// `jmap_client::Client::download` uses internally
@@ -699,16 +710,19 @@ pub(crate) fn build_download_url(jmap: &Client, blob_id: &str) -> String {
 #[instrument(
     target = "jma::profile::blob",
     name = "blob.download",
-    skip(http, jmap),
+    skip(http, jmap, maildir),
     fields(bytes = Empty),
 )]
 pub async fn download_blob(
     http: &HttpClient,
     jmap: &Client,
     blob_id: &JmapBlobId,
-) -> Result<Vec<u8>> {
+    maildir: &Maildir,
+) -> Result<TemporaryMailFile> {
     let url = build_download_url(jmap, blob_id.as_ref());
-    let data = with_retry("Email/blob", || async {
+    let (tmp, bytes) = with_retry("Email/blob", || async {
+        let mut tmp = store::open_tmp(maildir)
+            .with_context(|| format!("Allocating tmp/ for blob {}", blob_id))?;
         let resp = http
             .get(&url)
             .send()
@@ -716,17 +730,36 @@ pub async fn download_blob(
             .with_context(|| format!("Failed to download blob {}", blob_id))?
             .error_for_status()
             .with_context(|| format!("Server error downloading blob {}", blob_id))?;
-        let bytes = resp
-            .bytes()
+        let mut total: u64 = 0;
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk =
+                chunk.with_context(|| format!("Failed to read body chunk for blob {}", blob_id))?;
+            total += chunk.len() as u64;
+            // `TemporaryMailFile::write_all` is sync. Hop to the
+            // blocking pool so a slow filesystem (NFS, sshfs, SMB)
+            // doesn't stall the producer task's internal
+            // `buffer_unordered` concurrency -- all in-flight blob
+            // futures share this task, so a multi-millisecond write
+            // would otherwise serialize them. Ownership of `tmp`
+            // round-trips through the closure so the handle's Drop
+            // (which unlinks on the error path) stays correct.
+            let (returned, write_res) = tokio::task::spawn_blocking(move || {
+                let res = tmp.write_all(&chunk);
+                (tmp, res)
+            })
             .await
-            .with_context(|| format!("Failed to read body for blob {}", blob_id))?;
-        Ok::<Vec<u8>, anyhow::Error>(bytes.to_vec())
+            .expect("blob-write blocking task panicked");
+            tmp = returned;
+            write_res.with_context(|| format!("Failed to write blob {} into tmp/", blob_id))?;
+        }
+        Ok::<_, anyhow::Error>((tmp, total))
     })
     .await?;
 
-    tracing::Span::current().record("bytes", data.len() as u64);
-    debug!("Downloaded blob {} ({} bytes)", blob_id, data.len());
-    Ok(data)
+    tracing::Span::current().record("bytes", bytes);
+    debug!("Downloaded blob {} ({} bytes)", blob_id, bytes);
+    Ok(tmp)
 }
 
 /// Reject rows where the server omitted any of `id`/`blobId`/

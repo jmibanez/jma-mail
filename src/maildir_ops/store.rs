@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use maildir::Maildir;
+use maildir::{Maildir, TemporaryMailFile};
 use std::path::Path;
 use tracing::{Level, debug, event};
 
@@ -46,6 +46,55 @@ pub fn store_message(maildir: &Maildir, data: &[u8], flags: &str) -> Result<Mail
         let id = maildir
             .store_new_with_flags(data, flags)
             .context("Failed to store message in maildir new/")?;
+        (id, "new")
+    };
+    event!(target: TARGET_FILE_OP, Level::TRACE, op = "store");
+    debug!(
+        "Stored message {} with flags '{}' in {}/",
+        id, flags, subdir
+    );
+    Ok(MaildirId::from(id))
+}
+
+/// Open a fresh `tmp/` file in the maildir, returning an owned handle
+/// that callers stream bytes into via its `Write` impl. The handle's
+/// `Drop` unlinks the file unless `finalize_message` consumed it, so
+/// abandoned downloads (cancellation, mid-stream HTTP failure) don't
+/// leak.
+///
+/// Paired with `finalize_message` to split the buffered `store_message`
+/// path into a producer (open then stream) and consumer (fsync, rename,
+/// and DB commit) for the JMAP download pipeline. The upstream call
+/// uses the same `secs.#counterMnanosPpid.hostname` filename scheme
+/// and EEXIST-retry uniqueness loop that the buffered path does,
+/// so parallel openers in the same maildir stay collision-safe.
+pub fn open_tmp(maildir: &Maildir) -> Result<TemporaryMailFile> {
+    maildir
+        .open_file_in_tmp()
+        .context("Failed to open tmp/ file in maildir")
+}
+
+/// Promote a tmp-streamed file into `new/` (or `cur/` when `S` is in
+/// `flags`), matching the routing in `store_message` for the buffered
+/// path. The upstream call performs the `fsync_file` (F_BARRIERFSYNC
+/// on Apple with the `barrier_fsync` feature, plain `sync_all`
+/// elsewhere) and the tmp -> destination rename; on success the
+/// `TemporaryMailFile` Drop guard is disarmed, on failure it unlinks
+/// the orphan tmp file.
+pub fn finalize_message(
+    maildir: &Maildir,
+    tmp: TemporaryMailFile,
+    flags: &str,
+) -> Result<MaildirId> {
+    let (id, subdir) = if flags.contains('S') {
+        let id = maildir
+            .move_tmp_to_cur_with_flags(tmp, flags)
+            .context("Failed to promote tmp file into maildir cur/")?;
+        (id, "cur")
+    } else {
+        let id = maildir
+            .move_tmp_to_new_with_flags(tmp, flags)
+            .context("Failed to promote tmp file into maildir new/")?;
         (id, "new")
     };
     event!(target: TARGET_FILE_OP, Level::TRACE, op = "store");

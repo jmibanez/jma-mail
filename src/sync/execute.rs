@@ -1,6 +1,7 @@
 use anyhow::Result;
 use futures_util::stream::{self, StreamExt};
 use jmap_client::client::Client;
+use maildir::TemporaryMailFile;
 use reqwest::Client as HttpClient;
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
@@ -696,15 +697,18 @@ impl<'a> Executor<'a> {
         let http = jmap_email::build_blob_http_client(&self.client)?;
 
         // Bounded channel: at most `concurrency` completed blobs are
-        // buffered between producer and writer, capping the in-memory
-        // blob footprint at roughly 2 * concurrency (buffered +
-        // in-flight inside buffer_unordered).
+        // buffered between producer and writer. Each item carries a
+        // `TemporaryMailFile` (an open `tmp/` file handle) rather
+        // than the blob bytes -- peak memory is now ~16 KB per
+        // in-flight blob (one HTTP chunk in the bytes_stream loop),
+        // not the full message size.
         let (tx, mut rx) = mpsc::channel(concurrency);
         let producer = tokio::spawn(download_producer(
             http,
             Arc::clone(&self.client),
             batch,
             concurrency,
+            Arc::new(self.maildir_root.clone()),
             tx,
         ));
 
@@ -721,8 +725,8 @@ impl<'a> Executor<'a> {
             let Some((action, result)) = item else { break };
             recv_count += 1;
             match result {
-                Ok(blob) => {
-                    if let Err(e) = self.store_downloaded_message(&action, &blob, progress) {
+                Ok(tmp) => {
+                    if let Err(e) = self.store_downloaded_message(&action, tmp, progress) {
                         hard_error = Some(e);
                         break;
                     }
@@ -775,14 +779,16 @@ impl<'a> Executor<'a> {
         })
     }
 
-    /// Persist one downloaded blob to disk, record it in the DB, and
-    /// advance progress accounting. Pulled out of `download_batch`
-    /// so the stream-drain loop only owns the error-classification
-    /// control flow; this fn owns the success-path side effects.
+    /// Promote the producer-streamed `tmp/` file into `new/`/`cur/`,
+    /// record the message in the DB, and advance progress accounting.
+    /// The `F_BARRIERFSYNC` on the tmp file and the SQLite WAL fsync
+    /// stay on this task so the maildir-write -> DB-commit ordering
+    /// invariant (barrier orders the file content before the WAL
+    /// fsync that publishes the DB row) is preserved per-message.
     fn store_downloaded_message(
         &self,
         action: &SyncAction,
-        blob: &[u8],
+        tmp: TemporaryMailFile,
         progress: &mut DownloadProgress,
     ) -> Result<()> {
         let SyncAction::DownloadMessage {
@@ -798,8 +804,11 @@ impl<'a> Executor<'a> {
         };
         let flags = keywords_to_flags(keywords);
         let maildir_path = self.maildir_root.join(maildir_folder);
-        let maildir = store::ensure_maildir(&maildir_path)?;
-        let mid = store::store_message(&maildir, blob, &flags)?;
+        // Producer-side `ensure_maildir` already created `cur/new/tmp`
+        // before opening the tmp file; constructing a fresh `Maildir`
+        // handle here is just a `PathBuf` wrap.
+        let maildir = maildir::Maildir::from(maildir_path.clone());
+        let mid = store::finalize_message(&maildir, tmp, &flags)?;
         if let Some(cache) = &self.self_writes {
             // Suppress the fsevents echo of this delivery and -- for
             // new/ deliveries -- the same-flag cur/ promotion an MUA
@@ -863,18 +872,24 @@ impl<'a> Executor<'a> {
     }
 }
 
-/// Pump downloaded blobs into `tx` from a parallel `buffer_unordered`
-/// stream. Runs on its own tokio task so the writer side of the
-/// channel (which performs blocking disk + SQLite work inline) doesn't
-/// stall the stream between completions. Exits on stream exhaustion
-/// or when the receiver is dropped; dropping the stream cancels any
-/// in-flight HTTP futures.
+/// Pump downloaded blob tmp-file handles into `tx` from a parallel
+/// `buffer_unordered` stream. Runs on its own tokio task so the
+/// writer side of the channel (which performs blocking
+/// barrier-fsync + rename + SQLite work inline) doesn't stall the
+/// stream between completions. Each per-action future opens a fresh
+/// `tmp/` file in the action's target maildir and streams the HTTP
+/// body straight into it, so the bytes never sit in memory; only
+/// the open `TemporaryMailFile` handle crosses the channel. Exits
+/// on stream exhaustion or when the receiver is dropped; dropping
+/// the stream cancels any in-flight HTTP futures and the partial
+/// tmp files are unlinked by `TemporaryMailFile::drop`.
 async fn download_producer(
     http: HttpClient,
     jmap: Arc<Client>,
     batch: Vec<SyncAction>,
     concurrency: usize,
-    tx: mpsc::Sender<(SyncAction, Result<Vec<u8>>)>,
+    maildir_root: Arc<PathBuf>,
+    tx: mpsc::Sender<(SyncAction, Result<TemporaryMailFile>)>,
 ) -> ChannelStats {
     let mut blocked_send_us: u64 = 0;
     let mut send_count: u64 = 0;
@@ -884,12 +899,21 @@ async fn download_producer(
         // O(1) per future.
         let http = http.clone();
         let jmap = Arc::clone(&jmap);
-        let blob_id = match &action {
-            SyncAction::DownloadMessage { jmap_blob_id, .. } => jmap_blob_id.clone(),
+        let maildir_root = Arc::clone(&maildir_root);
+        let (blob_id, maildir_folder) = match &action {
+            SyncAction::DownloadMessage {
+                jmap_blob_id,
+                maildir_folder,
+                ..
+            } => (jmap_blob_id.clone(), maildir_folder.clone()),
             _ => unreachable!("non-download in downloads bucket"),
         };
         async move {
-            let res = jmap_email::download_blob(&http, &jmap, &blob_id).await;
+            let maildir_path = maildir_root.join(&maildir_folder);
+            let res = match store::ensure_maildir(&maildir_path) {
+                Ok(maildir) => jmap_email::download_blob(&http, &jmap, &blob_id, &maildir).await,
+                Err(e) => Err(e),
+            };
             (action, res)
         }
     });
