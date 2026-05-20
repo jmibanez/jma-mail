@@ -137,6 +137,11 @@ pub struct SeedMessage {
     pub subject: String,
     pub body: String,
     pub flags: Vec<&'static str>,
+    /// Explicit `Message-ID` header. When `None`, `seed_inbox`
+    /// generates one as `<seed-{i}@test.local>`. Set this when a
+    /// test needs to force a Message-ID collision (e.g. the remote-
+    /// dedupe path requires two Email objects sharing a header).
+    pub message_id: Option<String>,
 }
 
 impl SeedMessage {
@@ -146,11 +151,17 @@ impl SeedMessage {
             subject: subject.to_string(),
             body: body.to_string(),
             flags: Vec::new(),
+            message_id: None,
         }
     }
 
     pub fn with_flags(mut self, flags: &[&'static str]) -> Self {
         self.flags = flags.to_vec();
+        self
+    }
+
+    pub fn with_message_id(mut self, mid: &str) -> Self {
+        self.message_id = Some(mid.to_string());
         self
     }
 }
@@ -321,7 +332,10 @@ pub async fn seed_inbox(fx: &JmapFixture, msgs: &[SeedMessage]) -> Result<()> {
         .map_err(|(e, _)| anyhow!("IMAP login as {}: {e}", fx.account_email))?;
 
     for (i, msg) in msgs.iter().enumerate() {
-        let msgid = format!("<seed-{i}@test.local>");
+        let msgid = msg
+            .message_id
+            .clone()
+            .unwrap_or_else(|| format!("<seed-{i}@test.local>"));
         let eml = render_eml(msg, &msgid);
         let flag_clause = if msg.flags.is_empty() {
             None

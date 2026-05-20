@@ -4,8 +4,10 @@
 //! (the engine's Phase 0, the `jma janitor` CLI, future scheduled
 //! jobs) can compose only what they need.
 //!
-//! Today this module owns one task -- `dedupe` -- with stubs
-//! reserved for tasks already on the roadmap:
+//! Today this module owns two tasks -- `dedupe` (per-folder local
+//! Message-ID dedupe) and `remotededupe` (per-mailbox server-side
+//! Message-ID dedupe via `Email/set`) -- with stubs reserved for
+//! tasks already on the roadmap:
 //!
 //! - `prune`: drift remediation per issue #8 (orphan local
 //!   maildirs, stale `mailbox_map` rows, server-deleted folders
@@ -23,3 +25,4 @@
 //! or feed to follow-on logic.
 
 pub mod dedupe;
+pub mod remotededupe;

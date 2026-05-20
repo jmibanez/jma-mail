@@ -79,6 +79,12 @@ chrono = { version = "0.4", features = ["serde"] }
 reqwest-eventsource = "0.6"
 futures-util = "0.3"
 
+# Streaming SHA-256 for `janitor::remotededupe`'s content-equality
+# check. Already in the dependency tree transitively (TLS stack);
+# declare directly so the dedupe planner can hash a blob without
+# buffering it in full.
+sha2 = "0.10"
+
 # DNS SRV lookup for JMAP autodiscovery (RFC 8620 section 2.2).
 # `tokio` enables the async runtime; `system-config` lets the
 # resolver pick up /etc/resolv.conf (or the Windows registry) so it

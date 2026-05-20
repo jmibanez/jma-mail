@@ -88,4 +88,23 @@ pub enum AuthAction {
 pub enum JanitorAction {
     /// Scan and remove per-folder Message-ID duplicates
     Dedupe,
+    /// Scan the server for per-mailbox Message-ID duplicates and
+    /// destroy the extras via Email/set. Two-tier safety check:
+    /// refuses groups whose members disagree on Email/get `size`
+    /// (cheap pre-check) or, for groups passing size, on the byte-
+    /// for-byte content of their downloaded blobs (forgery
+    /// defense). Requires --yes to apply outside of --dry-run.
+    Remotededupe {
+        /// Limit the scan to one maildir folder name (as it
+        /// appears in `mailbox_map.maildir_folder` -- e.g. INBOX,
+        /// Archive, [Airmail].Sent). Defaults to every folder
+        /// known to the state DB.
+        #[arg(long, value_name = "FOLDER")]
+        mailbox: Option<String>,
+        /// Apply the destroy plan. Without this flag (and without
+        /// --dry-run) the plan is printed and the command refuses
+        /// to destroy anything.
+        #[arg(long)]
+        yes: bool,
+    },
 }

@@ -13,6 +13,13 @@ pub struct EmailObject {
     pub keywords: HashMap<String, bool>,
     pub message_id: Option<Vec<MessageId>>,
     pub subject: Option<String>,
+    /// RFC 8621 §4.1.1 `size`: total octets of the RFC 5322
+    /// message, as known to the server. Used by the remote-dedupe
+    /// planner as a cheap pre-check before downloading blobs to
+    /// confirm byte-equality; not consulted by the sync engine
+    /// (which keys off the maildir file's on-disk size when it
+    /// needs one).
+    pub size: u64,
 }
 
 /// Represents a JMAP Mailbox object.

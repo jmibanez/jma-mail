@@ -619,9 +619,15 @@ async fn cmd_janitor(cli: &Cli, action: Option<JanitorAction>) -> Result<()> {
     // None defaults to the safe-default set; today that's just
     // dedupe. As prune/db_gc tasks land, this match grows to fan
     // out across all of them when no specific action was named.
+    // `remotededupe` stays off the default set deliberately: it
+    // talks to the server and destroys remote Email objects, so
+    // it must always be invoked explicitly.
     let action = action.unwrap_or(JanitorAction::Dedupe);
     match action {
         JanitorAction::Dedupe => cmd_janitor_dedupe(cli).await,
+        JanitorAction::Remotededupe { mailbox, yes } => {
+            cmd_janitor_remotededupe(cli, mailbox, yes).await
+        }
     }
 }
 
@@ -667,6 +673,132 @@ async fn cmd_janitor_dedupe(cli: &Cli) -> Result<()> {
         );
     }
     Ok(())
+}
+
+async fn cmd_janitor_remotededupe(cli: &Cli, mailbox: Option<String>, yes: bool) -> Result<()> {
+    let config = load_config(cli)?;
+    // Acquire the same locks any mutating command does. We don't
+    // write the maildir, but a running `jma sync` holds *both* the
+    // maildir and DB locks via `acquire_mutator_locks`, so asking
+    // only for the DB lock would queue behind the same contention
+    // without communicating to the operator that the conflict is
+    // total. The honest posture is "this and sync don't co-exist."
+    acquire_mutator_locks(&config)?;
+    let conn = state::db::open_or_recreate(&config.db_path())?;
+
+    // Resolve --mailbox (if given) against the synced set so we
+    // never query a folder the user has no local mapping for; the
+    // server might have many more mailboxes than jma is syncing,
+    // and "I meant Archive" vs "I meant [Airmail].Archive" should
+    // surface as an error before any JMAP call.
+    let mailboxes = jma_mail::state::queries::get_all_mailboxes(&conn)?;
+    if mailboxes.is_empty() {
+        jma_mail::notify!("No known synced mailboxes -- run `jma sync` first.");
+        return Ok(());
+    }
+    let folders: Vec<(String, jma_mail::ids::JmapMailboxId)> = if let Some(name) = mailbox {
+        let matched = mailboxes
+            .iter()
+            .find(|m| m.maildir_folder == name)
+            .with_context(|| {
+                format!(
+                    "No synced mailbox with maildir folder {:?}. Run `jma mailboxes` \
+                     to see the known set.",
+                    name
+                )
+            })?;
+        vec![(
+            matched.maildir_folder.clone(),
+            matched.jmap_mailbox_id.clone(),
+        )]
+    } else {
+        mailboxes
+            .iter()
+            .map(|m| (m.maildir_folder.clone(), m.jmap_mailbox_id.clone()))
+            .collect()
+    };
+
+    let client = session::connect(&config.account, &conn).await?;
+
+    // Refuse-by-default outside --dry-run: --yes is the affirmative
+    // gate for a destructive remote action. We still build the plan
+    // so the user sees what *would* have been destroyed; we just
+    // skip the apply step.
+    let effective_dry_run = cli.dry_run || !yes;
+    let (plan, outcome) =
+        jma_mail::janitor::remotededupe::run(&client, &conn, &folders, effective_dry_run).await?;
+
+    render_remotededupe_plan(&plan);
+
+    if plan.destroy_count() == 0 && plan.skipped.is_empty() {
+        jma_mail::notify!(
+            "Remote dedupe: no duplicates found across {} mailbox(es).",
+            folders.len()
+        );
+        return Ok(());
+    }
+
+    if cli.dry_run {
+        jma_mail::notify!(
+            "Remote dedupe (dry-run): would destroy {} id(s) across {} group(s); \
+             {} group(s) skipped. See [REMOTE-DEDUPE-SKIP] lines above for the reason on each.",
+            plan.destroy_count(),
+            plan.groups.len(),
+            plan.skipped.len(),
+        );
+    } else if !yes {
+        jma_mail::notify!(
+            "Remote dedupe: {} id(s) eligible for destruction across {} group(s); \
+             {} group(s) skipped. Re-run with --yes to apply.",
+            plan.destroy_count(),
+            plan.groups.len(),
+            plan.skipped.len(),
+        );
+    } else if let Some(outcome) = outcome {
+        jma_mail::notify!(
+            "Remote dedupe: destroyed {} id(s), {} failed, {} group(s) skipped.",
+            outcome.succeeded(),
+            outcome.failed.len(),
+            plan.skipped.len(),
+        );
+        if !outcome.failed.is_empty() {
+            let mut sorted: Vec<&jma_mail::ids::JmapEmailId> = outcome.failed.iter().collect();
+            sorted.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+            for id in sorted {
+                println!("  [REMOTE-DEDUPE-FAILED] {}", id);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn render_remotededupe_plan(plan: &jma_mail::janitor::remotededupe::RemoteDedupePlan) {
+    for g in &plan.groups {
+        println!(
+            "  [REMOTE-DEDUPE] {}/  Message-ID {}  blob {}  keep {}  destroy {}",
+            g.mailbox_folder,
+            g.message_id,
+            g.blob_id,
+            g.survivor,
+            g.destroy
+                .iter()
+                .map(|id| id.as_ref())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    }
+    for s in &plan.skipped {
+        let members = s
+            .members
+            .iter()
+            .map(|(id, blob)| format!("{}@{}", id, blob))
+            .collect::<Vec<_>>()
+            .join(",");
+        println!(
+            "  [REMOTE-DEDUPE-SKIP] {}/  Message-ID {}  reason {:?}  members {}",
+            s.mailbox_folder, s.message_id, s.reason, members,
+        );
+    }
 }
 
 fn load_config(cli: &Cli) -> Result<Config> {

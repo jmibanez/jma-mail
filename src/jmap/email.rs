@@ -50,6 +50,7 @@ fn email_properties() -> Vec<email::Property> {
         email::Property::MailboxIds,
         email::Property::Keywords,
         email::Property::MessageId,
+        email::Property::Size,
     ]
 }
 
@@ -667,7 +668,7 @@ pub fn build_blob_http_client(jmap: &Client) -> Result<HttpClient> {
 /// placeholders. `name` and `type` match what
 /// `jmap_client::Client::download` uses; the server doesn't care
 /// about either value for the retrieval (per RFC 8620 section 6.2).
-fn build_download_url(jmap: &Client, blob_id: &str) -> String {
+pub(crate) fn build_download_url(jmap: &Client, blob_id: &str) -> String {
     let account_id = jmap.default_account_id();
     let mut url = String::with_capacity(64 + account_id.len() + blob_id.len());
     for part in jmap.download_url() {
@@ -848,6 +849,7 @@ fn parse_email_object(email: &jmap_client::email::Email<jmap_client::Get>) -> Re
         keywords,
         message_id,
         subject: None,
+        size: email.size() as u64,
     })
 }
 
@@ -1018,6 +1020,7 @@ mod tests {
             keywords: HashMap::new(),
             message_id: None,
             subject: None,
+            size: 0,
         }
     }
 
