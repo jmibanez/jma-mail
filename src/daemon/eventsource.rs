@@ -19,10 +19,16 @@ enum ConnectOutcome {
 }
 
 /// Entity types whose state changes should drive a sync. Other types
-/// (EmailDelivery, Identity, ...) appear in StateChange payloads but
-/// have no effect on what we sync, and treating them as triggers
-/// causes a no-op sync loop.
-const TRACKED_TYPES: &[&str] = &["Email", "Mailbox"];
+/// (Mailbox, EmailDelivery, Identity, ...) appear in StateChange
+/// payloads but have no effect on what we sync, and treating them as
+/// triggers causes a no-op sync loop. Mailbox in particular: every
+/// folder mutation that matters to jma (mail moved in or out,
+/// destroyed) also advances Email state, and `Mailbox/get` runs at
+/// the top of every cycle regardless of trigger, so the only thing
+/// Mailbox tracking would buy us is sub-cycle latency on metadata-
+/// only ops (empty-folder rename, sortOrder change). Not worth the
+/// extra cursor plumbing or the post-connect double-sync.
+const TRACKED_TYPES: &[&str] = &["Email"];
 
 /// Spec-mandated upper bound on a server's allowed maximum ping
 /// interval (RFC 8620 §7.3: "servers MUST NOT have ... a maximum
@@ -345,11 +351,15 @@ mod tests {
     }
 
     #[test]
-    fn fires_on_mailbox_change_even_if_email_same() {
+    fn mailbox_only_change_does_not_fire() {
+        // Mailbox is intentionally untracked; an event that only
+        // advances Mailbox state (e.g. empty-folder rename, sortOrder
+        // change) must not drive a sync. The next Email-driven cycle
+        // re-fetches Mailbox/get and surfaces whatever changed.
         let mut last = HashMap::from([("Email".to_string(), "J1".to_string())]);
         let data = make_event("acct", &[("Email", "J1"), ("Mailbox", "M2")]);
-        assert!(decide_trigger(&data, "acct", &mut last).unwrap());
-        assert_eq!(last.get("Mailbox").unwrap(), "M2");
+        assert!(!decide_trigger(&data, "acct", &mut last).unwrap());
+        assert!(!last.contains_key("Mailbox"));
     }
 
     #[test]
