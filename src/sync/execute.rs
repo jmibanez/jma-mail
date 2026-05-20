@@ -102,7 +102,6 @@ impl<'a> Executor<'a> {
         let SyncPlan {
             actions,
             new_email_state,
-            new_mailbox_state: _,
         } = plan;
 
         let mut unconditional_adopts = Vec::new();

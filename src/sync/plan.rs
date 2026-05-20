@@ -236,7 +236,6 @@ pub enum SyncDirection {
 pub struct SyncPlan {
     pub actions: Vec<SyncAction>,
     pub new_email_state: Option<String>,
-    pub new_mailbox_state: Option<String>,
 }
 
 impl SyncPlan {
@@ -298,7 +297,6 @@ impl SyncPlan {
         let SyncPlan {
             actions,
             new_email_state,
-            new_mailbox_state,
         } = self;
 
         let mut kept = Vec::with_capacity(actions.len());
@@ -322,7 +320,6 @@ impl SyncPlan {
             SyncPlan {
                 actions: kept,
                 new_email_state,
-                new_mailbox_state,
             },
             dropped,
         )
