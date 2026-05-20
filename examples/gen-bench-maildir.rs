@@ -13,9 +13,18 @@
 //! is deterministic regardless of seed. The RNG drives only content:
 //! From-name and address come from the `fake` name/email dictionaries,
 //! Subject is a 3-7 word lorem sentence with trailing period stripped,
-//! and body is sampled from a 60/30/8/2 short/medium/large/extra-large
-//! size distribution. Same `--seed` reproduces the same corpus
-//! byte-for-byte.
+//! and body is sampled from a 59/30/8/1/2
+//! short/medium/large/extra-large/jumbo size distribution targeting
+//! real-world local-maildir shapes (typical median ~7-40 KB, p90
+//! ~40-120 KB, p99 ~0.5-1.1 MB, with a fat tail driven by attachment
+//! and inline-image traffic). Medium covers 2-20 KB, large 20-200 KB,
+//! extra-large 10-64 KB (overlaps the lower half of large for
+//! parser-buffer density), and the 2% jumbo tier produces ~1 MB
+//! bodies so the corpus carries an attachment-class tail that
+//! testcontainer-style synthetic blobs (typically <1 KB) lack.
+//! Sizing jumbo at 2% rather than 1% pins the corpus's strict P99
+//! statistic inside the jumbo tier. Same `--seed` reproduces the
+//! same corpus byte-for-byte.
 //!
 //! Intended consumers: `tools/bench-rss.sh`, `tools/bench-power.sh`,
 //! `tools/bench-power-watch.sh`. Run once to produce a stable
@@ -32,7 +41,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use clap::Parser;
 use fake::Fake;
 use fake::faker::internet::en::FreeEmail;
-use fake::faker::lorem::en::{Paragraphs, Sentence};
+use fake::faker::lorem::en::{Paragraph, Sentence};
 use fake::faker::name::en::Name;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -90,6 +99,27 @@ struct Args {
     /// `--out` first.
     #[arg(long)]
     allow_non_empty: bool,
+}
+
+/// Generate lorem paragraphs into a single body string until the
+/// total byte count reaches a target drawn uniformly from
+/// `[min_target, max_target)`. Paragraphs are joined with the
+/// `\r\n\r\n` separator the rest of the generator uses; the +4
+/// accounts for that separator when tracking running total. The
+/// loop overshoots the chosen target by at most one paragraph's
+/// length (a few hundred bytes), so the resulting body sits very
+/// close to the target window rather than wherever paragraph-count
+/// sampling variance happens to land.
+fn body_until<R: Rng>(rng: &mut R, min_target: usize, max_target: usize) -> String {
+    let target = rng.random_range(min_target..max_target);
+    let mut chunks: Vec<String> = Vec::new();
+    let mut total: usize = 0;
+    while total < target {
+        let p: String = Paragraph(4..7).fake_with_rng(rng);
+        total += p.len() + 4;
+        chunks.push(p);
+    }
+    chunks.join("\r\n\r\n")
 }
 
 fn main() -> Result<()> {
@@ -167,30 +197,61 @@ fn main() -> Result<()> {
         let subject_raw: String = Sentence(3..8).fake_with_rng(&mut rng);
         let subject = subject_raw.trim_end_matches('.').to_string();
 
-        // Body size distribution. Tiers stress different parts of the
-        // I/O stack: short messages dominate per-message overhead
-        // (open/close, framing), medium messages exercise typical
-        // network/disk throughput, large and extra-large lean on
-        // chunked-write and parser-buffer paths. The boundaries are
-        // RNG-driven so --seed still locks the corpus.
+        // Body size distribution. Tier byte ranges track measured
+        // real-world local-maildir shapes (typical median ~7-40 KB,
+        // p90 ~40-120 KB, p99 ~0.5-1.1 MB; the heavy tail comes
+        // from attachments and inline-image traffic). The
+        // 59/30/8/1/2 split keeps a single-sentence majority that
+        // matches the "many short replies and notifications"
+        // character of a real account (and leaves the corpus P50
+        // in the short tier), while the per-tier byte windows pull
+        // p75 onward (12 KB / 35 KB at p75 / p90 in the generated
+        // corpus) into ranges that exercise the chunked-write,
+        // parser-buffer, and attachment paths realistically.
+        // Earlier paragraph-count-based sizing produced p90 < 1 KB,
+        // which couldn't surface buffer-pressure deltas in the
+        // streaming-download path.
+        //
+        // Jumbo is 2% (not 1%) so the corpus's strict P99 statistic
+        // lands inside the jumbo tier rather than at the boundary
+        // below it -- with only 1% jumbo, RNG variance on the
+        // jumbo-tier hit count can pull a[P99] back into the large
+        // tier (sub-200 KB), which doesn't match the real-world
+        // shape.
+        //
+        // All non-short tiers use generate-until-byte-target
+        // (`body_until`) because paragraph-count-based sizing
+        // doesn't converge tightly: fake's Paragraph length has a
+        // heavy tail driven by per-sentence word-count variance,
+        // and a fixed N can produce anywhere from a small fraction
+        // to a large multiple of the intended size. Short stays as
+        // a single `Sentence` call because the variance band is
+        // small relative to the target there.
+        //
+        // Boundaries are RNG-driven so --seed still locks the corpus.
         let tier = rng.random_range(0u8..100);
-        let body = if tier < 60 {
-            // ~60% short: 1 lorem sentence (~80-200 bytes)
+        let body = if tier < 59 {
+            // ~59% short: 1 lorem sentence (~80-200 bytes)
             Sentence(8..20).fake_with_rng(&mut rng)
-        } else if tier < 90 {
-            // ~30% medium: 1-2 paragraphs (~500-2000 bytes)
-            let paragraphs: Vec<String> = Paragraphs(1..3).fake_with_rng(&mut rng);
-            paragraphs.join("\r\n\r\n")
+        } else if tier < 89 {
+            // ~30% medium: 2-20 KB. Body-of-the-distribution range
+            // for a typical reply chain with quoted history.
+            body_until(&mut rng, 2_000, 20_000)
+        } else if tier < 97 {
+            // ~8% large: 20-200 KB. HTML-formatted threads, inline
+            // images, mailing-list digests.
+            body_until(&mut rng, 20_000, 200_000)
         } else if tier < 98 {
-            // ~8% large: 3-5 paragraphs (~3000-8000 bytes)
-            let paragraphs: Vec<String> = Paragraphs(3..6).fake_with_rng(&mut rng);
-            paragraphs.join("\r\n\r\n")
+            // ~1% extra-large: 10-64 KB. Overlaps the lower half of
+            // the large tier on purpose -- adds density in the
+            // parser-buffer-stress range that a single-percent
+            // sample of large would otherwise under-cover.
+            body_until(&mut rng, 10_000, 64_000)
         } else {
-            // ~2% extra-large: 8-15 paragraphs (~10k-30k bytes). The
-            // fat tail lets the bench surface anything quadratic on
-            // body length without dominating the typical case.
-            let paragraphs: Vec<String> = Paragraphs(8..16).fake_with_rng(&mut rng);
-            paragraphs.join("\r\n\r\n")
+            // ~2% jumbo: 1.0-1.3 MB. Pins the corpus's strict
+            // P99 statistic inside this tier so jumbo-class
+            // I/O actually shows up in P99-headlined metrics.
+            body_until(&mut rng, 1_000_000, 1_300_000)
         };
 
         let msgid = format!("<bench-{i}@jma-bench>");
