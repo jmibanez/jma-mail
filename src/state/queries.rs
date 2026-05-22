@@ -242,6 +242,32 @@ pub fn list_known_maildir_folders(conn: &Connection) -> Result<Vec<String>> {
     Ok(rows)
 }
 
+/// List every `jmap_mailbox_id` currently recorded in `mailbox_map`,
+/// sorted. Lighter than `get_all_mailboxes` for callers that only
+/// need the id set, e.g. diffing the cached set against a fresh
+/// `Mailbox/get` response to find ids the server no longer has.
+pub fn list_known_mailbox_ids(conn: &Connection) -> Result<Vec<JmapMailboxId>> {
+    let mut stmt =
+        conn.prepare("SELECT jmap_mailbox_id FROM mailbox_map ORDER BY jmap_mailbox_id")?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, JmapMailboxId>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Delete the `mailbox_map` row for `id`. Missing rows are a no-op
+/// (zero rows affected, still `Ok(())`); the caller does not need
+/// to pre-check existence. Counterpart to `upsert_mailbox` for the
+/// server-side deletion path, where a mailbox we previously cached
+/// no longer appears in the latest `Mailbox/get` response.
+pub fn delete_mailbox(conn: &Connection, id: &JmapMailboxId) -> Result<()> {
+    conn.execute(
+        "DELETE FROM mailbox_map WHERE jmap_mailbox_id = ?1",
+        params![id],
+    )?;
+    Ok(())
+}
+
 /// Get all mailbox mappings.
 pub fn get_all_mailboxes(conn: &Connection) -> Result<Vec<MailboxRecord>> {
     let mut stmt = conn.prepare(
@@ -511,5 +537,88 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM message_map", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    fn mailbox_record(id: &str, name: &str, folder: &str) -> MailboxRecord {
+        MailboxRecord {
+            jmap_mailbox_id: JmapMailboxId::from(id),
+            name: name.to_string(),
+            role: None,
+            parent_id: None,
+            maildir_folder: folder.to_string(),
+            sort_order: 0,
+        }
+    }
+
+    /// `list_known_mailbox_ids` returns every cached id in sorted
+    /// order. Cheaper than `get_all_mailboxes` when the caller only
+    /// needs the id set; the server-deletion detector will diff
+    /// this against a fresh `Mailbox/get`.
+    #[test]
+    fn list_known_mailbox_ids_returns_sorted_set() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("state.db");
+        let conn = open_or_recreate(&db_path).unwrap();
+
+        upsert_mailbox(&conn, &mailbox_record("MB-INBOX", "Inbox", "INBOX")).unwrap();
+        upsert_mailbox(&conn, &mailbox_record("MB-ARCH", "Archive", "Archive")).unwrap();
+        upsert_mailbox(&conn, &mailbox_record("MB-SENT", "Sent", "Sent")).unwrap();
+
+        let ids = list_known_mailbox_ids(&conn).unwrap();
+        assert_eq!(
+            ids,
+            vec![
+                JmapMailboxId::from("MB-ARCH"),
+                JmapMailboxId::from("MB-INBOX"),
+                JmapMailboxId::from("MB-SENT"),
+            ]
+        );
+    }
+
+    /// Empty `mailbox_map` returns an empty vec rather than erroring
+    /// or panicking. The drift detector hits this on a freshly
+    /// recreated state DB.
+    #[test]
+    fn list_known_mailbox_ids_empty_table_is_ok() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("state.db");
+        let conn = open_or_recreate(&db_path).unwrap();
+        let ids = list_known_mailbox_ids(&conn).unwrap();
+        assert!(ids.is_empty(), "expected empty vec, got: {ids:?}");
+    }
+
+    /// `delete_mailbox` removes the row whose `jmap_mailbox_id`
+    /// matches and leaves the others untouched.
+    #[test]
+    fn delete_mailbox_removes_target_row_only() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("state.db");
+        let conn = open_or_recreate(&db_path).unwrap();
+
+        upsert_mailbox(&conn, &mailbox_record("MB-INBOX", "Inbox", "INBOX")).unwrap();
+        upsert_mailbox(&conn, &mailbox_record("MB-ARCH", "Archive", "Archive")).unwrap();
+
+        delete_mailbox(&conn, &JmapMailboxId::from("MB-ARCH")).unwrap();
+
+        let ids = list_known_mailbox_ids(&conn).unwrap();
+        assert_eq!(ids, vec![JmapMailboxId::from("MB-INBOX")]);
+    }
+
+    /// `delete_mailbox` on a missing id is a silent no-op. The
+    /// caller doesn't need to pre-check existence before issuing
+    /// the delete.
+    #[test]
+    fn delete_mailbox_missing_id_is_noop() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("state.db");
+        let conn = open_or_recreate(&db_path).unwrap();
+
+        upsert_mailbox(&conn, &mailbox_record("MB-INBOX", "Inbox", "INBOX")).unwrap();
+
+        delete_mailbox(&conn, &JmapMailboxId::from("MB-DOES-NOT-EXIST"))
+            .expect("missing id should not error");
+
+        let ids = list_known_mailbox_ids(&conn).unwrap();
+        assert_eq!(ids, vec![JmapMailboxId::from("MB-INBOX")]);
     }
 }
