@@ -4,5 +4,6 @@ pub mod layout;
 pub mod lock;
 pub mod namespace;
 pub mod scan;
+pub mod sentinel;
 pub mod snapshot;
 pub mod store;
