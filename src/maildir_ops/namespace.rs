@@ -18,6 +18,12 @@ pub const STATE_DB_FILENAME: &str = ".jma.db";
 /// (`<maildir_root>/.jma.lock`).
 pub const MAILDIR_LOCK_FILENAME: &str = ".jma.lock";
 
+/// Basename of the sentinel file inside a per-folder maildir
+/// directory. Matches the `.jma.*` namespace used by `.jma.lock`
+/// and the default `.jma.db` so it never collides with mail files
+/// or other MUAs' state.
+pub const SENTINEL_FILENAME: &str = ".jma.mapping";
+
 /// Whether a single path-component name belongs to jma's private
 /// namespace at the maildir root. Operates on the file or directory
 /// name (`OsStr::to_string_lossy()` output is fine), not a full
