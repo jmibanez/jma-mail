@@ -44,7 +44,8 @@
 mod common;
 
 use jma_mail::config::{
-    AccountConfig, Config, ConflictStrategy, FolderLayout, StateConfig, SyncConfig, WatchConfig,
+    AccountConfig, AllowDestructiveFolderSync, Config, ConflictStrategy, FolderLayout, StateConfig,
+    SyncConfig, WatchConfig,
 };
 use jma_mail::jmap::{mailbox as jmap_mailbox, session};
 use jma_mail::maildir_ops::sentinel;
@@ -82,6 +83,7 @@ async fn create_remote_mailbox_round_trips_through_server() {
             retry_max_attempts: 1,
             retry_initial_backoff_ms: 1,
             retry_max_backoff_ms: 1,
+            allow_destructive_folder_sync: AllowDestructiveFolderSync::None,
         },
         state: StateConfig {
             db_path: Some(db_path.to_string_lossy().into_owned()),

@@ -16,7 +16,8 @@
 mod common;
 
 use jma_mail::config::{
-    AccountConfig, Config, ConflictStrategy, FolderLayout, StateConfig, SyncConfig, WatchConfig,
+    AccountConfig, AllowDestructiveFolderSync, Config, ConflictStrategy, FolderLayout, StateConfig,
+    SyncConfig, WatchConfig,
 };
 use jma_mail::state::{db, queries};
 use jma_mail::sync::engine::SyncEngine;
@@ -64,6 +65,7 @@ async fn initial_pull_downloads_seeded_inbox_then_steady_state_is_noop() {
             retry_max_attempts: 1,
             retry_initial_backoff_ms: 1,
             retry_max_backoff_ms: 1,
+            allow_destructive_folder_sync: AllowDestructiveFolderSync::None,
         },
         state: StateConfig {
             db_path: Some(db_path.to_string_lossy().into_owned()),

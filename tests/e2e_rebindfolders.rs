@@ -39,7 +39,8 @@
 mod common;
 
 use jma_mail::config::{
-    AccountConfig, Config, ConflictStrategy, FolderLayout, StateConfig, SyncConfig, WatchConfig,
+    AccountConfig, AllowDestructiveFolderSync, Config, ConflictStrategy, FolderLayout, StateConfig,
+    SyncConfig, WatchConfig,
 };
 use jma_mail::janitor::rebindfolders;
 use jma_mail::jmap::session;
@@ -86,6 +87,7 @@ async fn rebindfolders_rebinds_inbox_after_db_nuke_and_sentinel_loss() {
             retry_max_attempts: 1,
             retry_initial_backoff_ms: 1,
             retry_max_backoff_ms: 1,
+            allow_destructive_folder_sync: AllowDestructiveFolderSync::None,
         },
         state: StateConfig {
             db_path: Some(db_path.to_string_lossy().into_owned()),
