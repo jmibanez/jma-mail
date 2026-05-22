@@ -4,11 +4,12 @@ use std::sync::Arc;
 use tracing::{debug, error, warn};
 
 use crate::config::ConflictStrategy;
-use crate::ids::{JmapBlobId, JmapEmailId, JmapMailboxId, JmapThreadId, MaildirId, MessageId};
-use crate::jmap::types::EmailObject;
+use crate::ids::{JmapBlobId, JmapEmailId, JmapThreadId, MaildirId, MessageId};
+use crate::jmap::types::{EmailObject, MailboxFolderBinding};
 use crate::maildir_ops::flags::{flags_to_keyword_patch, flags_to_keywords, keywords_to_flags};
 use crate::maildir_ops::scan::LocalChange;
 use crate::state::queries::MessageRecord;
+use crate::sync::bindings::MailboxBindings;
 use crate::sync::dedupe::LocalIndex;
 use crate::sync::plan::{BoundId, LocalId, RemoteId, SyncAction, SyncPlan};
 
@@ -36,7 +37,7 @@ pub struct MessageRecordIndex {
 /// share a single source of truth for the cycle's data.
 struct ReconcileCtx<'a> {
     remote_emails: &'a [EmailObject],
-    mailboxes: &'a [(JmapMailboxId, String)],
+    mailboxes: &'a MailboxBindings,
     strategy: ConflictStrategy,
     known_by_maildir: &'a HashMap<MaildirId, Arc<MessageRecord>>,
     known_by_jmap: &'a HashMap<JmapEmailId, Arc<MessageRecord>>,
@@ -85,7 +86,7 @@ pub struct ReconcileInput<'a> {
     /// `scan::ScanResult.local_flags`. See `ReconcileCtx.local_flags`
     /// for the read-side contract.
     pub local_flags: &'a HashMap<MaildirId, String>,
-    pub mailboxes: &'a [(JmapMailboxId, String)],
+    pub mailboxes: &'a MailboxBindings,
     pub strategy: ConflictStrategy,
     pub new_email_state: Option<String>,
     /// Effective `maxSizeUpload` cap for this cycle. Resolved by the
@@ -174,7 +175,7 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
     for change in local_changes {
         let LocalChange::DeletedMessage {
             maildir_id: old_id,
-            folder: src_folder,
+            binding: src_binding,
         } = change
         else {
             continue;
@@ -185,31 +186,28 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
         let mid = &rec.message_id;
         let Some(LocalChange::NewMessage {
             maildir_id: new_id,
-            folder: dst_folder,
+            binding: dst_binding,
             flags: new_flags,
             ..
         }) = news_by_message_id.get(mid).copied()
         else {
             continue;
         };
-        if dst_folder == src_folder {
+        // Whole-binding compare rather than just `.jmap_mailbox_id`:
+        // future folder-lifecycle work can produce two bindings that
+        // share an id but disagree on `maildir_folder` (e.g. a rename
+        // that wasn't applied to local_state yet), and we want the
+        // move-pair path to fire in that case too.
+        if dst_binding == src_binding {
             continue;
         }
-        let Some(dst_mailbox_id) = mailboxes
-            .iter()
-            .find(|(_, f)| f == dst_folder)
-            .map(|(m, _)| m.clone())
-        else {
-            continue;
-        };
 
         detected_moves.push(DetectedMove {
             jmap_email_id: rec.jmap_email_id.clone(),
-            to_mailbox_id: dst_mailbox_id,
             old_maildir_id: old_id.clone(),
             new_maildir_id: new_id.clone(),
-            from_folder: src_folder.clone(),
-            new_folder: dst_folder.clone(),
+            from_folder: src_binding.maildir_folder.clone(),
+            to_binding: Arc::clone(dst_binding),
             new_flags: new_flags.clone(),
             jmap_blob_id: rec.jmap_blob_id.clone(),
             jmap_thread_id: rec.jmap_thread_id.clone(),
@@ -276,6 +274,7 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
     process_remote_destroys(
         remote_destroyed,
         ctx.known_by_jmap,
+        ctx.mailboxes,
         &consumed_remote_destroys,
         &mut plan,
     );
@@ -299,11 +298,10 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
 /// the move pre-pass.
 struct DetectedMove {
     jmap_email_id: JmapEmailId,
-    to_mailbox_id: JmapMailboxId,
     old_maildir_id: MaildirId,
     new_maildir_id: MaildirId,
     from_folder: String,
-    new_folder: String,
+    to_binding: Arc<MailboxFolderBinding>,
     new_flags: String,
     jmap_blob_id: Option<JmapBlobId>,
     jmap_thread_id: Option<JmapThreadId>,
@@ -327,9 +325,9 @@ fn emit_detected_moves(moves: &[DetectedMove], plan: &mut SyncPlan) {
             // server-side label rules), this full-replacement strips
             // those memberships -- accepted for now; the alternative
             // is a per-cycle Email/get to read the current set first.
-            target_mailbox_ids: vec![m.to_mailbox_id.clone()],
+            target_mailbox_ids: vec![m.to_binding.jmap_mailbox_id.clone()],
             from_folder: m.from_folder.clone(),
-            to_folder: m.new_folder.clone(),
+            to_folder: m.to_binding.maildir_folder.clone(),
         });
         let keywords = flags_to_keywords(&m.new_flags);
         plan.actions.push(SyncAction::AdoptLocalMessage {
@@ -338,10 +336,9 @@ fn emit_detected_moves(moves: &[DetectedMove], plan: &mut SyncPlan) {
                 jmap_email_id: m.jmap_email_id.clone(),
                 message_id: m.message_id.clone(),
             },
-            maildir_folder: m.new_folder.clone(),
+            binding: Arc::clone(&m.to_binding),
             jmap_blob_id: m.jmap_blob_id.clone(),
             jmap_thread_id: m.jmap_thread_id.clone(),
-            mailbox_id: m.to_mailbox_id.clone(),
             keywords: keywords.clone(),
             filename_flags: m.new_flags.clone(),
             old_maildir_id: Some(m.old_maildir_id.clone()),
@@ -376,8 +373,8 @@ fn process_remote_emails(
         let mailbox_match = ctx
             .mailboxes
             .iter()
-            .find(|(mid, _)| email.mailbox_ids.contains_key(mid));
-        let Some((target_mailbox_id, target_folder)) = mailbox_match else {
+            .find(|b| email.mailbox_ids.contains_key(&b.jmap_mailbox_id));
+        let Some(binding) = mailbox_match else {
             debug!(
                 "Remote email {} not in any synced mailbox, skipping",
                 email.id
@@ -387,8 +384,7 @@ fn process_remote_emails(
 
         let matched = RemoteMatch {
             email,
-            target_mailbox_id,
-            target_folder,
+            target_binding: binding,
         };
 
         // Path 1: already bound by JMAP id -- flag/move updates only.
@@ -422,7 +418,7 @@ fn process_remote_emails(
                 "Skipping remote email {} (folder {}): no Message-ID in Email/get response. \
                  jma requires Message-ID to anchor idempotency across state-DB wipes; \
                  the server returned an RFC-violating email and we won't ingest it.",
-                email.id, target_folder
+                email.id, binding.maildir_folder
             );
             continue;
         };
@@ -449,22 +445,20 @@ fn process_remote_emails(
             },
             jmap_blob_id: email.blob_id.clone(),
             jmap_thread_id: email.thread_id.clone(),
-            mailbox_id: target_mailbox_id.clone(),
-            maildir_folder: target_folder.clone(),
+            binding: Arc::clone(binding),
             keywords: email.keywords.clone(),
         });
     }
 }
 
 /// One iteration's worth of "this remote email maps to that local target":
-/// the email itself plus the chosen mailbox/folder pair. Computed once in
+/// the email itself plus the chosen mailbox binding. Computed once in
 /// `process_remote_emails` and threaded through both the JMAP-bound and
 /// adopt paths.
 #[derive(Clone, Copy)]
 struct RemoteMatch<'a> {
     email: &'a EmailObject,
-    target_mailbox_id: &'a JmapMailboxId,
-    target_folder: &'a str,
+    target_binding: &'a Arc<MailboxFolderBinding>,
 }
 
 fn handle_known_remote(
@@ -476,8 +470,7 @@ fn handle_known_remote(
 ) {
     let RemoteMatch {
         email,
-        target_mailbox_id,
-        target_folder,
+        target_binding,
     } = *matched;
 
     // Conflict: local deleted the file while the server updated
@@ -498,8 +491,7 @@ fn handle_known_remote(
                     },
                     jmap_blob_id: email.blob_id.clone(),
                     jmap_thread_id: email.thread_id.clone(),
-                    mailbox_id: target_mailbox_id.clone(),
-                    maildir_folder: target_folder.to_string(),
+                    binding: Arc::clone(target_binding),
                     keywords: email.keywords.clone(),
                 });
             }
@@ -525,7 +517,7 @@ fn handle_known_remote(
         );
         match resolved {
             FlagWinner::Server => {
-                emit_local_flag_update(plan, existing, email, target_mailbox_id);
+                emit_local_flag_update(plan, existing, email, ctx.mailboxes);
             }
             FlagWinner::Local => {
                 if let Some(LocalChange::FlagsChanged { new_flags, .. }) =
@@ -543,16 +535,16 @@ fn handle_known_remote(
             }
         }
     } else if server_flag_change {
-        emit_local_flag_update(plan, existing, email, target_mailbox_id);
+        emit_local_flag_update(plan, existing, email, ctx.mailboxes);
     }
 
     // Mailbox-membership change: server claims the email lives in
-    // a different folder than where our local copy is bound.
+    // a different mailbox than where our local copy is bound.
     // TODO: cross-detect when the local copy was *also* moved
     // (scan emits NewMessage in dest + DeletedMessage in src,
     // not a true Move). For now, blindly follow the server.
-    if let Some(local_folder) = &existing.maildir_folder
-        && local_folder != target_folder
+    if existing.mailbox_id != target_binding.jmap_mailbox_id
+        && let Some(from_binding) = ctx.mailboxes.by_id(&existing.mailbox_id)
         && let Some(local_maildir_id) = &existing.maildir_id
     {
         plan.actions.push(SyncAction::MoveLocal {
@@ -561,8 +553,8 @@ fn handle_known_remote(
                 jmap_email_id: email.id.clone(),
                 message_id: existing.message_id.clone(),
             },
-            from_folder: local_folder.clone(),
-            to_folder: target_folder.to_string(),
+            from_folder: from_binding.maildir_folder.clone(),
+            to_binding: Arc::clone(target_binding),
         });
     }
 }
@@ -577,8 +569,7 @@ fn try_adopt_remote(
 ) -> bool {
     let RemoteMatch {
         email,
-        target_mailbox_id,
-        target_folder,
+        target_binding,
     } = *matched;
 
     let push_adopt = |plan: &mut SyncPlan,
@@ -594,10 +585,9 @@ fn try_adopt_remote(
         adopted.insert(maildir_id);
         plan.actions.push(SyncAction::AdoptLocalMessage {
             id: bound_id.clone(),
-            maildir_folder: target_folder.to_string(),
+            binding: Arc::clone(target_binding),
             jmap_blob_id: Some(email.blob_id.clone()),
             jmap_thread_id: Some(email.thread_id.clone()),
-            mailbox_id: target_mailbox_id.clone(),
             keywords: email.keywords.clone(),
             filename_flags: filename_flags.clone(),
             old_maildir_id: None,
@@ -606,13 +596,14 @@ fn try_adopt_remote(
         emit_adoption_flag_reconciliation(
             plan,
             ctx.strategy,
-            &bound_id,
-            target_folder,
-            target_mailbox_id,
-            &email.keywords,
-            Some(&email.blob_id),
-            Some(&email.thread_id),
-            &filename_flags,
+            &AdoptionReconciliation {
+                bound_id: &bound_id,
+                binding: target_binding,
+                server_keywords: &email.keywords,
+                jmap_blob_id: Some(&email.blob_id),
+                jmap_thread_id: Some(&email.thread_id),
+                on_disk_flags: &filename_flags,
+            },
         );
     };
 
@@ -671,7 +662,7 @@ fn try_adopt_remote(
     if let Some(recs) = ctx.known_by_message_id.get(mid)
         && let Some(rec) = recs
             .iter()
-            .find(|r| r.maildir_folder.as_deref() == Some(target_folder))
+            .find(|r| r.mailbox_id == target_binding.jmap_mailbox_id)
         && let Some(maildir_id) = rec.maildir_id.clone()
     {
         let in_destroyed = ctx.destroyed_set.contains(rec.jmap_email_id.as_ref());
@@ -686,7 +677,7 @@ fn try_adopt_remote(
                  {} (maildir_id {}); new JMAP id {} carries the same header. \
                  Skipping adoption to avoid a partial-unique violation -- run \
                  `jma janitor remotededupe` to destroy the duplicate copies.",
-                target_folder, mid, rec.jmap_email_id, maildir_id, email.id
+                target_binding.maildir_folder, mid, rec.jmap_email_id, maildir_id, email.id
             );
             return true;
         }
@@ -723,7 +714,9 @@ fn try_adopt_remote(
     // adopt for the same reason Branch A sub-case ii does -- the
     // partial-unique index would reject the upsert. Warn and skip.
     if let Some(entries) = ctx.local_index.by_message_id.get(mid)
-        && let Some(entry) = entries.iter().find(|e| e.folder == target_folder)
+        && let Some(entry) = entries
+            .iter()
+            .find(|e| e.folder == target_binding.maildir_folder)
     {
         if adopted_maildir_ids.contains(&entry.maildir_id) {
             warn!(
@@ -731,7 +724,7 @@ fn try_adopt_remote(
                  to maildir_id {} earlier in this cycle; new JMAP id {} carries \
                  the same header. Skipping adoption -- run `jma janitor \
                  remotededupe` to destroy the duplicate copies on the server.",
-                target_folder, mid, entry.maildir_id, email.id
+                target_binding.maildir_folder, mid, entry.maildir_id, email.id
             );
             return true;
         }
@@ -756,6 +749,7 @@ fn try_adopt_remote(
 fn process_remote_destroys(
     remote_destroyed: &[JmapEmailId],
     known_by_jmap: &HashMap<JmapEmailId, Arc<MessageRecord>>,
+    mailboxes: &MailboxBindings,
     consumed_remote_destroys: &HashSet<JmapEmailId>,
     plan: &mut SyncPlan,
 ) {
@@ -774,7 +768,8 @@ fn process_remote_destroys(
             continue;
         }
         if let Some(msg) = known_by_jmap.get(jmap_id)
-            && let (Some(maildir_id), Some(folder)) = (&msg.maildir_id, &msg.maildir_folder)
+            && let Some(maildir_id) = &msg.maildir_id
+            && let Some(binding) = mailboxes.by_id(&msg.mailbox_id)
         {
             plan.actions.push(SyncAction::DeleteLocal {
                 id: BoundId {
@@ -782,7 +777,7 @@ fn process_remote_destroys(
                     jmap_email_id: jmap_id.clone(),
                     message_id: msg.message_id.clone(),
                 },
-                maildir_folder: folder.clone(),
+                maildir_folder: binding.maildir_folder.clone(),
             });
         }
     }
@@ -817,51 +812,59 @@ fn process_remote_destroys(
 /// emit `UpdateLocalFlags`; if either is missing, we skip the
 /// reconciliation step and rely on the next sync cycle's
 /// regular flag-update path to catch up.
-#[allow(clippy::too_many_arguments)]
+/// Bundles the per-emit-site context `emit_adoption_flag_
+/// reconciliation` needs. Grouping these here keeps the function
+/// signature under the clippy too_many_arguments ceiling and makes
+/// the two emit sites read identically (each builds one of these
+/// from whatever shape it has -- an `EmailObject` for the remote
+/// adopt path, a `MessageRecord` for the local NewMessage adopt
+/// path).
+struct AdoptionReconciliation<'a> {
+    bound_id: &'a BoundId,
+    binding: &'a Arc<MailboxFolderBinding>,
+    server_keywords: &'a HashMap<String, bool>,
+    jmap_blob_id: Option<&'a JmapBlobId>,
+    jmap_thread_id: Option<&'a JmapThreadId>,
+    on_disk_flags: &'a str,
+}
+
 fn emit_adoption_flag_reconciliation(
     plan: &mut SyncPlan,
     strategy: ConflictStrategy,
-    bound_id: &BoundId,
-    target_folder: &str,
-    target_mailbox_id: &JmapMailboxId,
-    server_keywords: &HashMap<String, bool>,
-    jmap_blob_id: Option<&JmapBlobId>,
-    jmap_thread_id: Option<&JmapThreadId>,
-    on_disk_flags: &str,
+    rec: &AdoptionReconciliation<'_>,
 ) {
-    let server_flags = keywords_to_flags(server_keywords);
-    if on_disk_flags == server_flags {
+    let server_flags = keywords_to_flags(rec.server_keywords);
+    if rec.on_disk_flags == server_flags {
         return;
     }
     match strategy {
         ConflictStrategy::ServerWins => {
-            let (Some(blob_id), Some(thread_id)) = (jmap_blob_id, jmap_thread_id) else {
+            let (Some(blob_id), Some(thread_id)) = (rec.jmap_blob_id, rec.jmap_thread_id) else {
                 debug!(
                     "Adoption flag reconciliation for {} skipped under ServerWins: \
                      missing blob_id/thread_id on the matched record. Next cycle's \
                      regular flag-update path will reconcile.",
-                    bound_id
+                    rec.bound_id
                 );
                 return;
             };
             plan.actions.push(SyncAction::UpdateLocalFlags {
-                id: bound_id.clone(),
-                maildir_folder: target_folder.to_string(),
+                id: rec.bound_id.clone(),
+                binding: Arc::clone(rec.binding),
                 new_flags: server_flags,
-                keywords: server_keywords.clone(),
+                keywords: rec.server_keywords.clone(),
                 jmap_blob_id: blob_id.clone(),
                 jmap_thread_id: thread_id.clone(),
-                mailbox_id: target_mailbox_id.clone(),
             });
         }
         ConflictStrategy::LocalWins => {
             plan.actions.push(SyncAction::UpdateRemoteKeywords {
                 id: RemoteId {
-                    jmap_email_id: bound_id.jmap_email_id.clone(),
-                    message_id: bound_id.message_id.clone(),
+                    jmap_email_id: rec.bound_id.jmap_email_id.clone(),
+                    message_id: rec.bound_id.message_id.clone(),
                 },
-                keywords: flags_to_keyword_patch(on_disk_flags),
-                filename_flags: on_disk_flags.to_string(),
+                keywords: flags_to_keyword_patch(rec.on_disk_flags),
+                filename_flags: rec.on_disk_flags.to_string(),
             });
         }
     }
@@ -913,7 +916,7 @@ fn handle_local_new(
 ) {
     let LocalChange::NewMessage {
         maildir_id,
-        folder,
+        binding,
         flags,
         path,
         message_id,
@@ -927,26 +930,16 @@ fn handle_local_new(
         return;
     }
 
-    let mailbox_id = ctx
-        .mailboxes
-        .iter()
-        .find(|(_, f)| f == folder)
-        .map(|(m, _)| m.clone());
-    let Some(mailbox_id) = mailbox_id else {
-        debug!(
-            "Local new message {} in unsynced folder {}, skipping",
-            maildir_id, folder
-        );
-        return;
-    };
+    // scan resolved the binding at the producer boundary; reconcile
+    // trusts the typed binding it carried in.
+    let folder = binding.maildir_folder.as_str();
+    let mailbox_id = binding.jmap_mailbox_id.clone();
 
     // If we can match the local Message-ID against a known server
     // email (DB index), adopt instead of upload. This is the
     // alreadyExists guard.
     if let Some(recs) = ctx.known_by_message_id.get(message_id)
-        && let Some(rec) = recs
-            .iter()
-            .find(|r| r.maildir_folder.as_deref() == Some(folder))
+        && let Some(rec) = recs.iter().find(|r| r.mailbox_id == mailbox_id)
     {
         let keywords =
             serde_json::from_str::<HashMap<String, bool>>(&rec.jmap_keywords).unwrap_or_default();
@@ -957,10 +950,9 @@ fn handle_local_new(
         };
         plan.actions.push(SyncAction::AdoptLocalMessage {
             id: bound_id.clone(),
-            maildir_folder: folder.to_string(),
+            binding: Arc::clone(binding),
             jmap_blob_id: rec.jmap_blob_id.clone(),
             jmap_thread_id: rec.jmap_thread_id.clone(),
-            mailbox_id: mailbox_id.clone(),
             keywords: keywords.clone(),
             filename_flags: flags.clone(),
             old_maildir_id: None,
@@ -975,19 +967,20 @@ fn handle_local_new(
         emit_adoption_flag_reconciliation(
             plan,
             ctx.strategy,
-            &bound_id,
-            folder,
-            &mailbox_id,
-            &keywords,
-            rec.jmap_blob_id.as_ref(),
-            rec.jmap_thread_id.as_ref(),
-            flags,
+            &AdoptionReconciliation {
+                bound_id: &bound_id,
+                binding,
+                server_keywords: &keywords,
+                jmap_blob_id: rec.jmap_blob_id.as_ref(),
+                jmap_thread_id: rec.jmap_thread_id.as_ref(),
+                on_disk_flags: flags,
+            },
         );
         return;
     }
 
     // Local Message-ID exists upstream but the existing DB record is
-    // bound to a different folder, and there's no matching local
+    // bound to a different mailbox, and there's no matching local
     // delete to pair this NewMessage against (handled in the move
     // pre-pass). This is a duplicate the user introduced manually --
     // either by copying a file across folders or by an external MUA
@@ -1003,7 +996,10 @@ fn handle_local_new(
             maildir_id,
             message_id,
             other.jmap_email_id,
-            other.maildir_folder.as_deref().unwrap_or("?"),
+            ctx.mailboxes
+                .by_id(&other.mailbox_id)
+                .map(|b| b.maildir_folder.as_str())
+                .unwrap_or("?"),
         );
         return;
     }
@@ -1030,9 +1026,8 @@ fn handle_local_new(
             maildir_id: maildir_id.clone(),
             message_id: message_id.clone(),
         },
-        maildir_folder: folder.to_string(),
+        binding: Arc::clone(binding),
         file_path: path.to_path_buf(),
-        mailbox_id,
         flags: flags.to_string(),
     });
 }
@@ -1152,9 +1147,17 @@ fn emit_local_flag_update(
     plan: &mut SyncPlan,
     existing: &MessageRecord,
     email: &EmailObject,
-    target_mailbox_id: &JmapMailboxId,
+    mailboxes: &MailboxBindings,
 ) {
-    let (Some(maildir_id), Some(folder)) = (&existing.maildir_id, &existing.maildir_folder) else {
+    let Some(maildir_id) = &existing.maildir_id else {
+        return;
+    };
+    // The DB row's recorded mailbox is where the file is bound on
+    // disk; the file lives under that binding's folder regardless
+    // of which mailbox the server-side keyword change came from.
+    // The cycle's `mailboxes` table resolves the row's id to its
+    // binding so the executor knows the right on-disk path.
+    let Some(local_binding) = mailboxes.by_id(&existing.mailbox_id) else {
         return;
     };
     let new_flags = keywords_to_flags(&email.keywords);
@@ -1164,26 +1167,35 @@ fn emit_local_flag_update(
             jmap_email_id: email.id.clone(),
             message_id: existing.message_id.clone(),
         },
-        maildir_folder: folder.clone(),
+        binding: Arc::clone(local_binding),
         new_flags,
         keywords: email.keywords.clone(),
         jmap_blob_id: email.blob_id.clone(),
         jmap_thread_id: email.thread_id.clone(),
-        mailbox_id: target_mailbox_id.clone(),
     });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ids::JmapMailboxId;
+    use crate::jmap::types::MailboxFolderBinding;
     use crate::sync::dedupe::{LocalEntry, LocalIndex};
     use std::path::PathBuf;
 
-    fn mailboxes() -> Vec<(JmapMailboxId, String)> {
-        vec![
-            ("MB-INBOX".into(), "INBOX".into()),
-            ("MB-ARCH".into(), "Archive".into()),
-        ]
+    fn mailboxes() -> MailboxBindings {
+        let mut b = MailboxBindings::builder();
+        b.insert(MailboxFolderBinding {
+            jmap_mailbox_id: "MB-INBOX".into(),
+            server_name: "Inbox".to_string(),
+            maildir_folder: "INBOX".to_string(),
+        });
+        b.insert(MailboxFolderBinding {
+            jmap_mailbox_id: "MB-ARCH".into(),
+            server_name: "Archive".to_string(),
+            maildir_folder: "Archive".to_string(),
+        });
+        b.build()
     }
 
     fn email(id: &str, mailbox_id: &str, flags: &str, message_id: Option<&str>) -> EmailObject {
@@ -1519,7 +1531,11 @@ mod tests {
             // is empty so it has no prior binding for it.
             &[LocalChange::NewMessage {
                 maildir_id: "FILE-1".into(),
-                folder: "INBOX".into(),
+                binding: Arc::new(MailboxFolderBinding {
+                    jmap_mailbox_id: "MB-INBOX".into(),
+                    server_name: "INBOX".to_string(),
+                    maildir_folder: "INBOX".to_string(),
+                }),
                 flags: "S".into(),
                 path: PathBuf::from("/tmp/file-1"),
                 message_id: "<a@x>".into(),
@@ -1780,7 +1796,11 @@ mod tests {
         // Local NewMessage with the same Message-ID but `:2,FS` -- no P.
         let new_change = LocalChange::NewMessage {
             maildir_id: "M-NEW".into(),
-            folder: "INBOX".into(),
+            binding: Arc::new(MailboxFolderBinding {
+                jmap_mailbox_id: "MB-INBOX".into(),
+                server_name: "INBOX".to_string(),
+                maildir_folder: "INBOX".to_string(),
+            }),
             flags: "FS".into(),
             path: PathBuf::from("/tmp/m-new"),
             message_id: "<a@x>".into(),
@@ -2191,8 +2211,8 @@ mod tests {
         assert!(plan.actions.iter().any(|a| matches!(
             a,
             SyncAction::MoveLocal {
-                from_folder, to_folder, ..
-            } if from_folder == "INBOX" && to_folder == "Archive"
+                from_folder, to_binding, ..
+            } if from_folder == "INBOX" && to_binding.maildir_folder == "Archive"
         )));
     }
 
@@ -2206,7 +2226,11 @@ mod tests {
             &[],
             &[LocalChange::DeletedMessage {
                 maildir_id: "M-1".into(),
-                folder: "INBOX".into(),
+                binding: Arc::new(MailboxFolderBinding {
+                    jmap_mailbox_id: "MB-INBOX".into(),
+                    server_name: "INBOX".to_string(),
+                    maildir_folder: "INBOX".to_string(),
+                }),
             }],
             &[rec],
             &empty_index(),
@@ -2231,7 +2255,11 @@ mod tests {
             &[],
             &[LocalChange::DeletedMessage {
                 maildir_id: "M-1".into(),
-                folder: "INBOX".into(),
+                binding: Arc::new(MailboxFolderBinding {
+                    jmap_mailbox_id: "MB-INBOX".into(),
+                    server_name: "INBOX".to_string(),
+                    maildir_folder: "INBOX".to_string(),
+                }),
             }],
             &[rec],
             &empty_index(),
@@ -2254,7 +2282,11 @@ mod tests {
             &[],
             &[LocalChange::FlagsChanged {
                 maildir_id: "M-1".into(),
-                folder: "INBOX".into(),
+                binding: Arc::new(MailboxFolderBinding {
+                    jmap_mailbox_id: "MB-INBOX".into(),
+                    server_name: "INBOX".to_string(),
+                    maildir_folder: "INBOX".to_string(),
+                }),
                 old_flags: "".into(),
                 new_flags: "F".into(),
             }],
@@ -2284,7 +2316,11 @@ mod tests {
             &[],
             &[LocalChange::FlagsChanged {
                 maildir_id: "M-1".into(),
-                folder: "INBOX".into(),
+                binding: Arc::new(MailboxFolderBinding {
+                    jmap_mailbox_id: "MB-INBOX".into(),
+                    server_name: "INBOX".to_string(),
+                    maildir_folder: "INBOX".to_string(),
+                }),
                 old_flags: "".into(),
                 new_flags: "F".into(),
             }],
@@ -2326,7 +2362,11 @@ mod tests {
             &[],
             &[LocalChange::FlagsChanged {
                 maildir_id: "M-1".into(),
-                folder: "INBOX".into(),
+                binding: Arc::new(MailboxFolderBinding {
+                    jmap_mailbox_id: "MB-INBOX".into(),
+                    server_name: "INBOX".to_string(),
+                    maildir_folder: "INBOX".to_string(),
+                }),
                 old_flags: "FS".into(),
                 new_flags: "S".into(),
             }],
@@ -2361,7 +2401,11 @@ mod tests {
         let local_index = empty_index();
         let local_changes = [LocalChange::NewMessage {
             maildir_id: "M-BIG".into(),
-            folder: "INBOX".into(),
+            binding: Arc::new(MailboxFolderBinding {
+                jmap_mailbox_id: "MB-INBOX".into(),
+                server_name: "INBOX".to_string(),
+                maildir_folder: "INBOX".to_string(),
+            }),
             flags: "".into(),
             path: PathBuf::from("/tmp/m-big"),
             message_id: "<big@x>".into(),
@@ -2392,7 +2436,11 @@ mod tests {
             &[],
             &[LocalChange::NewMessage {
                 maildir_id: "M-NEW".into(),
-                folder: "INBOX".into(),
+                binding: Arc::new(MailboxFolderBinding {
+                    jmap_mailbox_id: "MB-INBOX".into(),
+                    server_name: "INBOX".to_string(),
+                    maildir_folder: "INBOX".to_string(),
+                }),
                 flags: "S".into(),
                 path: PathBuf::from("/tmp/m-new"),
                 message_id: "<new@x>".into(),
@@ -2415,7 +2463,11 @@ mod tests {
             &[],
             &[LocalChange::NewMessage {
                 maildir_id: "M-DUP".into(),
-                folder: "INBOX".into(),
+                binding: Arc::new(MailboxFolderBinding {
+                    jmap_mailbox_id: "MB-INBOX".into(),
+                    server_name: "INBOX".to_string(),
+                    maildir_folder: "INBOX".to_string(),
+                }),
                 flags: "".into(),
                 path: PathBuf::from("/tmp/m-dup"),
                 message_id: "<a@x>".into(),
@@ -2437,7 +2489,11 @@ mod tests {
             &[],
             &[LocalChange::DeletedMessage {
                 maildir_id: "M-1".into(),
-                folder: "INBOX".into(),
+                binding: Arc::new(MailboxFolderBinding {
+                    jmap_mailbox_id: "MB-INBOX".into(),
+                    server_name: "INBOX".to_string(),
+                    maildir_folder: "INBOX".to_string(),
+                }),
             }],
             &[rec],
             &empty_index(),
@@ -2459,7 +2515,11 @@ mod tests {
             &["E1".into()],
             &[LocalChange::DeletedMessage {
                 maildir_id: "M-1".into(),
-                folder: "INBOX".into(),
+                binding: Arc::new(MailboxFolderBinding {
+                    jmap_mailbox_id: "MB-INBOX".into(),
+                    server_name: "INBOX".to_string(),
+                    maildir_folder: "INBOX".to_string(),
+                }),
             }],
             &[rec],
             &empty_index(),
@@ -2489,11 +2549,19 @@ mod tests {
             &[
                 LocalChange::DeletedMessage {
                     maildir_id: "M-OLD".into(),
-                    folder: "INBOX".into(),
+                    binding: Arc::new(MailboxFolderBinding {
+                        jmap_mailbox_id: "MB-INBOX".into(),
+                        server_name: "INBOX".to_string(),
+                        maildir_folder: "INBOX".to_string(),
+                    }),
                 },
                 LocalChange::NewMessage {
                     maildir_id: "M-NEW".into(),
-                    folder: "Archive".into(),
+                    binding: Arc::new(MailboxFolderBinding {
+                        jmap_mailbox_id: "MB-ARCH".into(),
+                        server_name: "Archive".to_string(),
+                        maildir_folder: "Archive".to_string(),
+                    }),
                     flags: "".into(),
                     path: PathBuf::from("/tmp/m-new"),
                     message_id: "<a@x>".into(),
@@ -2541,11 +2609,19 @@ mod tests {
             &[
                 LocalChange::DeletedMessage {
                     maildir_id: "M-OLD".into(),
-                    folder: "INBOX".into(),
+                    binding: Arc::new(MailboxFolderBinding {
+                        jmap_mailbox_id: "MB-INBOX".into(),
+                        server_name: "INBOX".to_string(),
+                        maildir_folder: "INBOX".to_string(),
+                    }),
                 },
                 LocalChange::NewMessage {
                     maildir_id: "M-NEW".into(),
-                    folder: "Archive".into(),
+                    binding: Arc::new(MailboxFolderBinding {
+                        jmap_mailbox_id: "MB-ARCH".into(),
+                        server_name: "Archive".to_string(),
+                        maildir_folder: "Archive".to_string(),
+                    }),
                     flags: "S".into(),
                     path: PathBuf::from("/tmp/m-new"),
                     message_id: "<a@x>".into(),
@@ -2581,12 +2657,20 @@ mod tests {
             &[
                 LocalChange::DeletedMessage {
                     maildir_id: "M1".into(),
-                    folder: "INBOX".into(),
+                    binding: Arc::new(MailboxFolderBinding {
+                        jmap_mailbox_id: "MB-INBOX".into(),
+                        server_name: "INBOX".to_string(),
+                        maildir_folder: "INBOX".to_string(),
+                    }),
                 },
                 LocalChange::NewMessage {
                     // Same id as the deleted side -- id-preserving move.
                     maildir_id: "M1".into(),
-                    folder: "Archive".into(),
+                    binding: Arc::new(MailboxFolderBinding {
+                        jmap_mailbox_id: "MB-ARCH".into(),
+                        server_name: "Archive".to_string(),
+                        maildir_folder: "Archive".to_string(),
+                    }),
                     flags: "FS".into(),
                     path: PathBuf::from("/tmp/m1"),
                     message_id: "<a@x>".into(),
@@ -2611,10 +2695,10 @@ mod tests {
                 a,
                 SyncAction::AdoptLocalMessage {
                     id: BoundId { maildir_id, .. },
-                    maildir_folder,
+                    binding,
                     old_maildir_id: Some(old),
                     ..
-                } if maildir_id.as_ref() == "M1" && old.as_ref() == "M1" && maildir_folder == "Archive"
+                } if maildir_id.as_ref() == "M1" && old.as_ref() == "M1" && binding.maildir_folder == "Archive"
             )),
             "expected AdoptLocalMessage with old==new maildir_id, got {:?}",
             plan.actions
@@ -2653,11 +2737,19 @@ mod tests {
             &[
                 LocalChange::DeletedMessage {
                     maildir_id: "M-OLD".into(),
-                    folder: "INBOX".into(),
+                    binding: Arc::new(MailboxFolderBinding {
+                        jmap_mailbox_id: "MB-INBOX".into(),
+                        server_name: "INBOX".to_string(),
+                        maildir_folder: "INBOX".to_string(),
+                    }),
                 },
                 LocalChange::NewMessage {
                     maildir_id: "M-NEW".into(),
-                    folder: "Archive".into(),
+                    binding: Arc::new(MailboxFolderBinding {
+                        jmap_mailbox_id: "MB-ARCH".into(),
+                        server_name: "Archive".to_string(),
+                        maildir_folder: "Archive".to_string(),
+                    }),
                     flags: "".into(),
                     path: PathBuf::from("/tmp/m-new"),
                     message_id: "<a@x>".into(),

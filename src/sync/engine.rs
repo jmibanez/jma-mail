@@ -11,12 +11,13 @@ use crate::config::Config;
 use crate::ids::{JmapAccountId, JmapEmailId, JmapMailboxId, MaildirId};
 use crate::jmap::{
     email as jmap_email, limits, mailbox as jmap_mailbox, session,
-    types::{EmailObject, MailboxObject, SessionInfo},
+    types::{EmailObject, MailboxFolderBinding, MailboxObject, SessionInfo},
 };
 use crate::maildir_ops::layout::{FolderLayoutDefinition, resolve_folder_path};
 use crate::maildir_ops::scan::LocalChange;
 use crate::maildir_ops::{scan, store};
 use crate::state::queries;
+use crate::sync::bindings::MailboxBindings;
 use crate::sync::dedupe::{LocalEntry, LocalIndex};
 use crate::sync::execute::Executor;
 use crate::sync::plan::{SyncAction, SyncDirection};
@@ -239,7 +240,8 @@ impl<'a> SyncEngine<'a> {
         // checkpoint row (first sync, post-recovery wipe, freshly
         // added folder) is treated as dirty, so the LocalIndex
         // bridge still gets populated on first sync.
-        let folder_names: Vec<String> = mailboxes.iter().map(|(_, f)| f.clone()).collect();
+        let folder_names: Vec<String> =
+            mailboxes.iter().map(|b| b.maildir_folder.clone()).collect();
         let dedupe_targets: Vec<String> = if matches!(scan_scope, ScanScope::Full) {
             compute_dirty_folders(self.conn, &maildir_root, &folder_names)?
         } else {
@@ -272,12 +274,11 @@ impl<'a> SyncEngine<'a> {
                 ScanScope::Full => {
                     let mut changes = Vec::new();
                     let mut local_flags: HashMap<MaildirId, String> = HashMap::new();
-                    for (_, folder_name) in &mailboxes {
-                        let maildir_path = maildir_root.join(folder_name);
+                    for binding in mailboxes.iter() {
+                        let maildir_path = maildir_root.join(&binding.maildir_folder);
                         let maildir = store::ensure_maildir(&maildir_path)?;
-                        let known_state =
-                            queries::get_local_state_for_folder(self.conn, folder_name)?;
-                        let result = scan::scan_folder(&maildir, folder_name, &known_state)?;
+                        let known_state = hydrate_known_state(self.conn, binding)?;
+                        let result = scan::scan_folder(&maildir, binding, &known_state)?;
                         changes.extend(result.changes);
                         local_flags.extend(result.local_flags);
                     }
@@ -285,16 +286,16 @@ impl<'a> SyncEngine<'a> {
                 }
                 ScanScope::Paths(paths) => {
                     let mut known_states = HashMap::new();
-                    for (_, folder_name) in &mailboxes {
+                    for binding in mailboxes.iter() {
                         // Make sure the maildir on disk exists, matching
                         // the side-effect the Full path used to provide;
                         // some downstream code assumes the directory tree
                         // is in place.
-                        store::ensure_maildir(&maildir_root.join(folder_name))?;
-                        let state = queries::get_local_state_for_folder(self.conn, folder_name)?;
-                        known_states.insert(folder_name.clone(), state);
+                        store::ensure_maildir(&maildir_root.join(&binding.maildir_folder))?;
+                        let state = hydrate_known_state(self.conn, binding)?;
+                        known_states.insert(binding.maildir_folder.clone(), state);
                     }
-                    let result = scan::scan_paths(&maildir_root, paths, &known_states)?;
+                    let result = scan::scan_paths(&maildir_root, paths, &known_states, &mailboxes)?;
                     (result.changes, result.local_flags)
                 }
             }
@@ -319,14 +320,20 @@ impl<'a> SyncEngine<'a> {
                 .filter(|c| {
                     let key = match c {
                         LocalChange::NewMessage {
-                            folder, maildir_id, ..
+                            binding,
+                            maildir_id,
+                            ..
                         }
                         | LocalChange::FlagsChanged {
-                            folder, maildir_id, ..
+                            binding,
+                            maildir_id,
+                            ..
                         }
-                        | LocalChange::DeletedMessage { folder, maildir_id } => {
-                            (folder.clone(), maildir_id.clone())
-                        }
+                        | LocalChange::DeletedMessage {
+                            binding,
+                            maildir_id,
+                            ..
+                        } => (binding.maildir_folder.clone(), maildir_id.clone()),
                     };
                     !suppressed.contains(&key)
                 })
@@ -518,8 +525,13 @@ impl<'a> SyncEngine<'a> {
         Ok(outcome)
     }
 
-    /// Resolve the list of mailboxes to sync, returning (jmap_id, folder_name) pairs.
-    pub async fn resolve_mailboxes(&self) -> Result<Vec<(JmapMailboxId, String)>> {
+    /// Resolve the set of mailboxes to sync, returning a
+    /// [`MailboxBindings`] indexed for O(1) lookup by either id or
+    /// on-disk folder. Every downstream consumer (scan, reconcile,
+    /// execute) takes a reference to the same bundle so the
+    /// `(mailbox_id, folder)` pair never has to be rebuilt from a
+    /// tuple or rediscovered via lookup.
+    pub async fn resolve_mailboxes(&self) -> Result<MailboxBindings> {
         let remote_mailboxes = jmap_mailbox::get_all(&self.client).await?;
 
         // Index by id so the filter and the folder-path resolver can
@@ -530,7 +542,7 @@ impl<'a> SyncEngine<'a> {
             .collect();
 
         let name_cap = limits::max_size_mailbox_name(&self.client);
-        let mut synced = Vec::new();
+        let mut synced = MailboxBindings::builder();
         let layout_definition = FolderLayoutDefinition::from_config(self.config, name_cap);
 
         for mb in &remote_mailboxes {
@@ -570,9 +582,14 @@ impl<'a> SyncEngine<'a> {
             let maildir_path = self.config.maildir_path().join(&folder_name);
             store::ensure_maildir(&maildir_path)?;
 
-            synced.push((mb.id.clone(), folder_name));
+            synced.insert(MailboxFolderBinding {
+                jmap_mailbox_id: mb.id.clone(),
+                server_name: mb.name.clone(),
+                maildir_folder: folder_name,
+            });
         }
 
+        let synced = synced.build();
         crate::notify!("Syncing {} mailboxes", synced.len());
         Ok(synced)
     }
@@ -585,7 +602,7 @@ impl<'a> SyncEngine<'a> {
     /// then Email/get; new_state via get_current_state.
     async fn fetch_remote_state(
         &self,
-        mailboxes: &[(JmapMailboxId, String)],
+        mailboxes: &MailboxBindings,
     ) -> Result<(Vec<EmailObject>, Vec<JmapEmailId>, String, bool)> {
         let cursor = queries::get_jmap_state(self.conn, self.account_id.as_ref(), "Email")?;
 
@@ -640,7 +657,7 @@ impl<'a> SyncEngine<'a> {
 
     async fn initial_remote_state(
         &self,
-        mailboxes: &[(JmapMailboxId, String)],
+        mailboxes: &MailboxBindings,
     ) -> Result<(Vec<EmailObject>, Vec<JmapEmailId>, String, bool)> {
         let mut all_ids: Vec<JmapEmailId> = Vec::new();
         let mut seen: HashSet<JmapEmailId> = HashSet::new();
@@ -659,11 +676,15 @@ impl<'a> SyncEngine<'a> {
         // dedupe) are both order-agnostic.
         let n = limits::concurrent_requests(&self.client, self.config.sync.download_concurrency);
         let client = &self.client;
-        let futures = mailboxes
-            .iter()
-            .map(|(mailbox_id, folder_name)| async move {
-                jmap_email::query_mailbox(client, mailbox_id.as_ref(), folder_name, n).await
-            });
+        let futures = mailboxes.iter().map(|binding| async move {
+            jmap_email::query_mailbox(
+                client,
+                binding.jmap_mailbox_id.as_ref(),
+                &binding.maildir_folder,
+                n,
+            )
+            .await
+        });
         let mut stream = stream::iter(futures).buffer_unordered(n);
 
         while let Some(result) = stream.next().await {
@@ -757,18 +778,36 @@ fn record_folder_checkpoints(
     Ok(())
 }
 
+/// Hydrate one folder's `local_state` rows into the
+/// `(JmapMailboxId, flags)` shape `scan_folder` / `scan_paths` want.
+/// `get_local_state_for_folder` filters its `SELECT` on `maildir_folder
+/// = binding.maildir_folder`, so every row's recorded folder equals
+/// the binding's; substituting `binding.jmap_mailbox_id` for it is
+/// lossless. Pulled out as a helper because the Full and Paths scan
+/// arms ran the same five lines back-to-back.
+fn hydrate_known_state(
+    conn: &Connection,
+    binding: &MailboxFolderBinding,
+) -> Result<HashMap<MaildirId, (JmapMailboxId, String)>> {
+    let raw = queries::get_local_state_for_folder(conn, &binding.maildir_folder)?;
+    Ok(raw
+        .into_iter()
+        .map(|(id, (_folder, flags))| (id, (binding.jmap_mailbox_id.clone(), flags)))
+        .collect())
+}
+
 /// Build the three message_map projections the reconcile step consumes.
 /// Free function rather than a `SyncEngine` method because it only
 /// needs `&Connection` -- keeping it free lets the in-module unit tests
 /// drive it from an in-memory DB without fabricating a JMAP client.
 fn build_known_indices(
     conn: &Connection,
-    mailboxes: &[(JmapMailboxId, String)],
+    mailboxes: &MailboxBindings,
 ) -> Result<MessageRecordIndex> {
     let mut idx = MessageRecordIndex::default();
 
-    for (_, folder_name) in mailboxes {
-        let messages = queries::get_messages_by_folder(conn, folder_name)?;
+    for binding in mailboxes.iter() {
+        let messages = queries::get_messages_by_folder(conn, &binding.maildir_folder)?;
         for msg in messages {
             // Wrap once; the three projections share via Arc
             // refcount instead of cloning the full record into two
@@ -793,11 +832,9 @@ fn build_known_indices(
 fn log_dropped(direction: SyncDirection, dropped: &[SyncAction]) {
     for a in dropped {
         match a {
-            SyncAction::DownloadMessage {
-                id, maildir_folder, ..
-            } => warn!(
+            SyncAction::DownloadMessage { id, binding, .. } => warn!(
                 "{:?}: dropped DownloadMessage {} -> {}",
-                direction, id, maildir_folder
+                direction, id, binding.maildir_folder
             ),
             SyncAction::UpdateLocalFlags { id, new_flags, .. } => warn!(
                 "{:?}: dropped UpdateLocalFlags on {} -> '{}'",
@@ -809,16 +846,14 @@ fn log_dropped(direction: SyncDirection, dropped: &[SyncAction]) {
             SyncAction::MoveLocal {
                 id,
                 from_folder,
-                to_folder,
+                to_binding,
             } => warn!(
                 "{:?}: dropped MoveLocal {} {} -> {}",
-                direction, id, from_folder, to_folder
+                direction, id, from_folder, to_binding.maildir_folder
             ),
-            SyncAction::UploadMessage {
-                id, maildir_folder, ..
-            } => warn!(
+            SyncAction::UploadMessage { id, binding, .. } => warn!(
                 "{:?}: dropped UploadMessage {} from {}",
-                direction, id, maildir_folder
+                direction, id, binding.maildir_folder
             ),
             SyncAction::UpdateRemoteKeywords { id, .. } => {
                 warn!("{:?}: dropped UpdateRemoteKeywords on {}", direction, id)
@@ -874,11 +909,16 @@ mod tests {
         }
     }
 
-    fn mailboxes(folders: &[(&str, &str)]) -> Vec<(JmapMailboxId, String)> {
-        folders
-            .iter()
-            .map(|(id, folder)| ((*id).into(), (*folder).to_string()))
-            .collect()
+    fn mailboxes(folders: &[(&str, &str)]) -> MailboxBindings {
+        let mut b = MailboxBindings::builder();
+        for (id, folder) in folders {
+            b.insert(MailboxFolderBinding {
+                jmap_mailbox_id: (*id).into(),
+                server_name: (*folder).to_string(),
+                maildir_folder: (*folder).to_string(),
+            });
+        }
+        b.build()
     }
 
     /// No mailboxes -> no rows queried -> all three projections empty.
@@ -890,7 +930,7 @@ mod tests {
             &[record("E1", "MB-INBOX", "INBOX", Some("M1"), "<a@x>")],
         );
 
-        let idx = build_known_indices(&conn, &[]).unwrap();
+        let idx = build_known_indices(&conn, &MailboxBindings::builder().build()).unwrap();
 
         assert!(idx.by_jmap.is_empty());
         assert!(idx.by_maildir.is_empty());

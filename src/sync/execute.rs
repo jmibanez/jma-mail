@@ -12,10 +12,11 @@ use tokio::sync::mpsc;
 use tracing::{Instrument, debug, info, warn};
 
 use crate::config::Config;
-use crate::ids::{JmapAccountId, JmapEmailId, JmapMailboxId};
+use crate::ids::{JmapAccountId, JmapEmailId};
 use crate::jmap::email::{self as jmap_email, EmailSetOp};
 use crate::jmap::limits;
 use crate::jmap::retry::is_transient_error;
+use crate::jmap::types::MailboxFolderBinding;
 use crate::maildir_ops::{flags::keywords_to_flags, store};
 use crate::state::queries::{self, MessageRecord};
 use crate::sync::engine::SyncOutcome;
@@ -230,7 +231,7 @@ impl<'a> Executor<'a> {
             let SyncAction::MoveLocal {
                 id,
                 from_folder,
-                to_folder,
+                to_binding,
             } = action
             else {
                 continue;
@@ -242,11 +243,11 @@ impl<'a> Executor<'a> {
                 ..
             } = id;
             let from = store::ensure_maildir(&self.maildir_root.join(&from_folder))?;
-            let to = store::ensure_maildir(&self.maildir_root.join(&to_folder))?;
+            let to = store::ensure_maildir(&self.maildir_root.join(&to_binding.maildir_folder))?;
             if let Err(e) = store::move_message(&from, &to, maildir_id.as_ref()) {
                 warn!(
                     "Failed to move {} from {} to {}: {}",
-                    bound_for_log, from_folder, to_folder, e
+                    bound_for_log, from_folder, to_binding.maildir_folder, e
                 );
                 continue;
             }
@@ -264,7 +265,8 @@ impl<'a> Executor<'a> {
                 queries::upsert_message(
                     &txn,
                     &MessageRecord {
-                        maildir_folder: Some(to_folder.clone()),
+                        mailbox_id: to_binding.jmap_mailbox_id.clone(),
+                        maildir_folder: Some(to_binding.maildir_folder.clone()),
                         ..rec
                     },
                 )?;
@@ -272,12 +274,18 @@ impl<'a> Executor<'a> {
             } else {
                 String::new()
             };
-            queries::upsert_local_state(&txn, &maildir_id, &to_folder, &flags, None)?;
+            queries::upsert_local_state(
+                &txn,
+                &maildir_id,
+                &to_binding.maildir_folder,
+                &flags,
+                None,
+            )?;
             txn.commit()?;
             succeeded += 1;
             info!(
                 "Moved {} from {} to {}",
-                bound_for_log, from_folder, to_folder
+                bound_for_log, from_folder, to_binding.maildir_folder
             );
         }
         Ok(succeeded)
@@ -370,11 +378,7 @@ impl<'a> Executor<'a> {
     ) -> Result<()> {
         for (i, jmap_email_id) in succeeded {
             let SyncAction::UploadMessage {
-                id,
-                maildir_folder,
-                mailbox_id,
-                flags,
-                ..
+                id, binding, flags, ..
             } = &pending[*i]
             else {
                 unreachable!("non-upload in uploads bucket");
@@ -388,15 +392,21 @@ impl<'a> Executor<'a> {
                     jmap_email_id: jmap_email_id.clone(),
                     jmap_blob_id: None,
                     jmap_thread_id: None,
-                    mailbox_id: mailbox_id.clone(),
+                    mailbox_id: binding.jmap_mailbox_id.clone(),
                     maildir_id: Some(id.maildir_id.clone()),
-                    maildir_folder: Some(maildir_folder.clone()),
+                    maildir_folder: Some(binding.maildir_folder.clone()),
                     message_id: id.message_id.clone(),
                     flags: flags.clone(),
                     jmap_keywords: keywords_json,
                 },
             )?;
-            queries::upsert_local_state(&txn, &id.maildir_id, maildir_folder, flags, None)?;
+            queries::upsert_local_state(
+                &txn,
+                &id.maildir_id,
+                &binding.maildir_folder,
+                flags,
+                None,
+            )?;
             txn.commit()?;
             let target = RemoteId {
                 jmap_email_id: jmap_email_id.clone(),
@@ -794,15 +804,14 @@ impl<'a> Executor<'a> {
             id,
             jmap_blob_id,
             jmap_thread_id,
-            mailbox_id,
-            maildir_folder,
+            binding,
             keywords,
         } = action
         else {
             unreachable!("non-download in downloads bucket");
         };
         let flags = keywords_to_flags(keywords);
-        let maildir_path = self.maildir_root.join(maildir_folder);
+        let maildir_path = self.maildir_root.join(&binding.maildir_folder);
         // Producer-side `ensure_maildir` already created `cur/new/tmp`
         // before opening the tmp file; constructing a fresh `Maildir`
         // handle here is just a `PathBuf` wrap.
@@ -841,21 +850,27 @@ impl<'a> Executor<'a> {
                 jmap_email_id: id.jmap_email_id.clone(),
                 jmap_blob_id: Some(jmap_blob_id.clone()),
                 jmap_thread_id: Some(jmap_thread_id.clone()),
-                mailbox_id: mailbox_id.clone(),
+                mailbox_id: binding.jmap_mailbox_id.clone(),
                 maildir_id: Some(mid.clone()),
-                maildir_folder: Some(maildir_folder.clone()),
+                maildir_folder: Some(binding.maildir_folder.clone()),
                 message_id: id.message_id.clone(),
                 flags: flags.clone(),
                 jmap_keywords: keywords_json,
             },
         )?;
-        queries::upsert_local_state(&txn, &mid, maildir_folder, &flags, None)?;
+        queries::upsert_local_state(&txn, &mid, &binding.maildir_folder, &flags, None)?;
         txn.commit()?;
         progress.downloaded += 1;
         if progress.verbose_per_message {
-            info!("Downloaded new email {} -> {}/{}", id, maildir_folder, mid);
+            info!(
+                "Downloaded new email {} -> {}/{}",
+                id, binding.maildir_folder, mid
+            );
         } else {
-            debug!("Downloaded new email {} -> {}/{}", id, maildir_folder, mid);
+            debug!(
+                "Downloaded new email {} -> {}/{}",
+                id, binding.maildir_folder, mid
+            );
             if progress.last_progress.elapsed() >= DOWNLOAD_PROGRESS_INTERVAL {
                 let pct = (progress.downloaded * 100) / progress.total;
                 crate::notify!(
@@ -902,9 +917,9 @@ async fn download_producer(
         let (blob_id, maildir_folder) = match &action {
             SyncAction::DownloadMessage {
                 jmap_blob_id,
-                maildir_folder,
+                binding,
                 ..
-            } => (jmap_blob_id.clone(), maildir_folder.clone()),
+            } => (jmap_blob_id.clone(), binding.maildir_folder.clone()),
             _ => unreachable!("non-download in downloads bucket"),
         };
         async move {
@@ -1044,12 +1059,11 @@ fn apply_update_local_flags(
     for action in actions {
         let SyncAction::UpdateLocalFlags {
             id,
-            maildir_folder,
+            binding,
             new_flags,
             keywords,
             jmap_blob_id,
             jmap_thread_id,
-            mailbox_id,
         } = action
         else {
             continue;
@@ -1060,7 +1074,7 @@ fn apply_update_local_flags(
             jmap_email_id,
             message_id,
         } = id;
-        let maildir_path = maildir_root.join(&maildir_folder);
+        let maildir_path = maildir_root.join(&binding.maildir_folder);
         let maildir = store::ensure_maildir(&maildir_path)?;
         // A `new/` file has never carried a `:2,<flags>` view that
         // the maildir crate's `set_flags` can find. Reaching it from
@@ -1079,7 +1093,7 @@ fn apply_update_local_flags(
         if let Err(e) = store_result {
             warn!(
                 "Failed to set flags for {} in {}: {}",
-                maildir_id, maildir_folder, e
+                maildir_id, binding.maildir_folder, e
             );
             continue;
         }
@@ -1111,15 +1125,15 @@ fn apply_update_local_flags(
                 jmap_email_id,
                 jmap_blob_id: Some(jmap_blob_id),
                 jmap_thread_id: Some(jmap_thread_id),
-                mailbox_id,
+                mailbox_id: binding.jmap_mailbox_id.clone(),
                 maildir_id: Some(maildir_id.clone()),
-                maildir_folder: Some(maildir_folder.clone()),
+                maildir_folder: Some(binding.maildir_folder.clone()),
                 message_id,
                 flags: new_flags.clone(),
                 jmap_keywords: keywords_json,
             },
         )?;
-        queries::upsert_local_state(&txn, &maildir_id, &maildir_folder, &new_flags, None)?;
+        queries::upsert_local_state(&txn, &maildir_id, &binding.maildir_folder, &new_flags, None)?;
         txn.commit()?;
         succeeded += 1;
         info!("Updated local flags for {}: '{}'", bound_for_log, new_flags);
@@ -1184,10 +1198,9 @@ fn apply_keyword_patch(
 fn commit_adopt(conn: &Connection, action: SyncAction) -> Result<()> {
     let SyncAction::AdoptLocalMessage {
         id,
-        maildir_folder,
+        binding,
         jmap_blob_id,
         jmap_thread_id,
-        mailbox_id,
         keywords,
         filename_flags,
         old_maildir_id,
@@ -1234,18 +1247,24 @@ fn commit_adopt(conn: &Connection, action: SyncAction) -> Result<()> {
             jmap_email_id: jmap_email_id.clone(),
             jmap_blob_id,
             jmap_thread_id,
-            mailbox_id,
+            mailbox_id: binding.jmap_mailbox_id.clone(),
             maildir_id: Some(maildir_id.clone()),
-            maildir_folder: Some(maildir_folder.clone()),
+            maildir_folder: Some(binding.maildir_folder.clone()),
             message_id,
             flags: server_flags,
             jmap_keywords: keywords_json,
         },
     )?;
-    queries::upsert_local_state(conn, &maildir_id, &maildir_folder, &filename_flags, None)?;
+    queries::upsert_local_state(
+        conn,
+        &maildir_id,
+        &binding.maildir_folder,
+        &filename_flags,
+        None,
+    )?;
     debug!(
         "Adopted {}/{} as {}",
-        maildir_folder,
+        binding.maildir_folder,
         maildir_id,
         bound_for_log.as_remote()
     );
@@ -1257,9 +1276,8 @@ fn commit_adopt(conn: &Connection, action: SyncAction) -> Result<()> {
 /// borrow on the original `Vec<SyncAction>` alive across awaits.
 struct UploadJob {
     id: LocalId,
-    maildir_folder: String,
+    binding: Arc<MailboxFolderBinding>,
     file_path: PathBuf,
-    mailbox_id: JmapMailboxId,
     flags: String,
 }
 
@@ -1345,9 +1363,8 @@ async fn run_upload_stream(
     let futures = actions.iter().enumerate().map(|(i, action)| {
         let SyncAction::UploadMessage {
             id,
-            maildir_folder,
+            binding,
             file_path,
-            mailbox_id,
             flags,
         } = action
         else {
@@ -1355,9 +1372,8 @@ async fn run_upload_stream(
         };
         let job = UploadJob {
             id: id.clone(),
-            maildir_folder: maildir_folder.clone(),
+            binding: Arc::clone(binding),
             file_path: file_path.clone(),
-            mailbox_id: mailbox_id.clone(),
             flags: flags.clone(),
         };
         async move { (i, upload_one(client, job).await) }
@@ -1408,9 +1424,8 @@ async fn run_upload_stream(
 async fn upload_one(client: &Client, job: UploadJob) -> Result<UploadOutcome> {
     let UploadJob {
         id,
-        maildir_folder,
+        binding,
         file_path,
-        mailbox_id,
         flags,
     } = job;
     let raw_message = match std::fs::read(&file_path) {
@@ -1425,8 +1440,8 @@ async fn upload_one(client: &Client, job: UploadJob) -> Result<UploadOutcome> {
     match jmap_email::import_email(
         client,
         &raw_message,
-        mailbox_id.as_ref(),
-        &maildir_folder,
+        binding.jmap_mailbox_id.as_ref(),
+        &binding.maildir_folder,
         &id,
         &keywords,
     )
@@ -1451,7 +1466,7 @@ async fn upload_one(client: &Client, job: UploadJob) -> Result<UploadOutcome> {
                 // copy and adopts. Don't fail the run.
                 warn!(
                     "Upload of {} from {} hit alreadyExists; skipping. Reconcile will adopt the existing server copy on the next cycle.",
-                    id, maildir_folder
+                    id, binding.maildir_folder
                 );
                 Ok(UploadOutcome::Skipped)
             } else {
@@ -1496,10 +1511,13 @@ mod tests {
                 jmap_email_id: "E1".into(),
                 message_id: "a@x".into(),
             },
-            maildir_folder: "Spam".into(),
+            binding: Arc::new(MailboxFolderBinding {
+                jmap_mailbox_id: "MB-SPAM".into(),
+                server_name: "Spam".to_string(),
+                maildir_folder: "Spam".to_string(),
+            }),
             jmap_blob_id: Some("B1".into()),
             jmap_thread_id: Some("T1".into()),
-            mailbox_id: "MB-SPAM".into(),
             keywords,
             filename_flags: "S".into(),
             old_maildir_id: Some("M-OLD".into()),
@@ -1613,10 +1631,13 @@ mod tests {
                     jmap_email_id: "E1".into(),
                     message_id: "a@x".into(),
                 },
-                maildir_folder: "INBOX".into(),
+                binding: Arc::new(MailboxFolderBinding {
+                    jmap_mailbox_id: "MB-INBOX".into(),
+                    server_name: "INBOX".to_string(),
+                    maildir_folder: "INBOX".to_string(),
+                }),
                 jmap_blob_id: Some("B1".into()),
                 jmap_thread_id: Some("T1".into()),
-                mailbox_id: "MB-INBOX".into(),
                 keywords,
                 filename_flags: "FS".into(),
                 old_maildir_id: None,
@@ -1893,12 +1914,15 @@ mod tests {
                 jmap_email_id: "E1".into(),
                 message_id: "a@x".into(),
             },
-            maildir_folder: "INBOX".into(),
+            binding: Arc::new(MailboxFolderBinding {
+                jmap_mailbox_id: "MB-INBOX".into(),
+                server_name: "INBOX".to_string(),
+                maildir_folder: "INBOX".to_string(),
+            }),
             new_flags: "S".into(),
             keywords,
             jmap_blob_id: "B1".into(),
             jmap_thread_id: "T1".into(),
-            mailbox_id: "MB-INBOX".into(),
         };
 
         let count = apply_update_local_flags(&conn, maildir_root, None, vec![action]).unwrap();
@@ -1984,12 +2008,15 @@ mod tests {
                 jmap_email_id: "E1".into(),
                 message_id: "a@x".into(),
             },
-            maildir_folder: "INBOX".into(),
+            binding: Arc::new(MailboxFolderBinding {
+                jmap_mailbox_id: "MB-INBOX".into(),
+                server_name: "INBOX".to_string(),
+                maildir_folder: "INBOX".to_string(),
+            }),
             new_flags: "S".into(),
             keywords,
             jmap_blob_id: "B1".into(),
             jmap_thread_id: "T1".into(),
-            mailbox_id: "MB-INBOX".into(),
         };
 
         let cache = SelfWriteCache::new(Duration::from_secs(5));

@@ -408,8 +408,10 @@ async fn resolve_mailboxes_applies_inbox_magic_alias() {
         .expect("resolve_mailboxes succeeds");
 
     assert_eq!(resolved.len(), 1);
-    assert_eq!(resolved[0].0, JmapMailboxId::from("MB-INBOX"));
-    assert_eq!(resolved[0].1, "INBOX");
+    let inbox = resolved
+        .by_id(&JmapMailboxId::from("MB-INBOX"))
+        .expect("inbox binding present");
+    assert_eq!(inbox.maildir_folder, "INBOX");
     assert!(temp.path().join("INBOX").join("cur").is_dir());
 
     let rows = queries::get_all_mailboxes(&conn).unwrap();
@@ -468,8 +470,9 @@ async fn resolve_mailboxes_filter_drops_unlisted() {
         .await
         .expect("resolve_mailboxes succeeds");
 
-    let folders: Vec<&str> = resolved.iter().map(|(_, f)| f.as_str()).collect();
-    assert_eq!(folders, vec!["INBOX", "Archive"]);
+    let mut folders: Vec<&str> = resolved.folders().collect();
+    folders.sort();
+    assert_eq!(folders, vec!["Archive", "INBOX"]);
     assert!(temp.path().join("INBOX").join("cur").is_dir());
     assert!(temp.path().join("Archive").join("cur").is_dir());
     assert!(

@@ -2,10 +2,13 @@ use anyhow::Result;
 use maildir::Maildir;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tracing::{debug, error};
 
-use crate::ids::{MaildirId, MessageId};
+use crate::ids::{JmapMailboxId, MaildirId, MessageId};
+use crate::jmap::types::MailboxFolderBinding;
 use crate::maildir_ops::headers::parse_message_id_from_file;
+use crate::sync::bindings::MailboxBindings;
 
 /// One live `cur/` entry passed into `classify_changes`. Both
 /// `scan_folder` (full enumeration via the maildir crate) and
@@ -53,7 +56,14 @@ pub enum LocalChange {
     /// boundary with an `error!` and stays on disk untouched.
     NewMessage {
         maildir_id: MaildirId,
-        folder: String,
+        /// The mailbox this file lives in, as a single typed unit.
+        /// scan resolves the binding at the producer boundary
+        /// (`classify_changes` has it in hand); downstream consumers
+        /// read `binding.maildir_folder` for filesystem ops and
+        /// `binding.jmap_mailbox_id` for DB writes without re-
+        /// resolving via `bindings.by_folder(...)`. `Arc` so emission
+        /// stays a refcount bump rather than a three-String clone.
+        binding: Arc<MailboxFolderBinding>,
         flags: String,
         path: PathBuf,
         message_id: MessageId,
@@ -68,12 +78,12 @@ pub enum LocalChange {
     /// A message file we had recorded is now missing.
     DeletedMessage {
         maildir_id: MaildirId,
-        folder: String,
+        binding: Arc<MailboxFolderBinding>,
     },
     /// The flags on a message file changed.
     FlagsChanged {
         maildir_id: MaildirId,
-        folder: String,
+        binding: Arc<MailboxFolderBinding>,
         old_flags: String,
         new_flags: String,
     },
@@ -107,28 +117,32 @@ pub enum LocalChange {
 /// anchored ids belong in `explicit_deletes`, but classify_changes
 /// itself has no use for them.
 fn classify_changes(
-    folder_name: &str,
+    binding: &Arc<MailboxFolderBinding>,
     cur_entries: &[CurEntry],
     explicit_deletes: &[MaildirId],
-    known_state: &HashMap<MaildirId, (String, String)>,
+    known_state: &HashMap<MaildirId, (JmapMailboxId, String)>,
 ) -> Result<Vec<LocalChange>> {
     let mut changes = Vec::new();
 
     for entry in cur_entries {
         match known_state.get(&entry.maildir_id) {
             // Maildir-id-preserving cross-folder move: same unique part
-            // of the filename, different folder than the DB recorded.
-            // Treat the destination side as a NewMessage so reconcile's
-            // move pre-pass can pair it (by Message-ID) with the
-            // DeletedMessage from the source-folder walk. Without this,
-            // the folder mismatch is silently swallowed and the move
-            // degrades into a destroy + re-upload (or, after partial
-            // state drift, a backwards MoveLocal that undoes the
-            // user's move).
-            Some((known_folder, _)) if known_folder != folder_name => {
+            // of the filename, different mailbox than the DB recorded.
+            // Comparing on `jmap_mailbox_id` rather than the folder
+            // string keeps the check stable when a folder name itself
+            // changes underneath us (e.g. a server-side mailbox rename
+            // applied between cycles), where the same JMAP identity
+            // resolves to a new on-disk path. Treat the destination
+            // side as a NewMessage so reconcile's move pre-pass can
+            // pair it (by Message-ID) with the DeletedMessage from
+            // the source-mailbox walk. Without this, the mismatch is
+            // silently swallowed and the move degrades into a destroy
+            // + re-upload (or, after partial state drift, a backwards
+            // MoveLocal that undoes the user's move).
+            Some((known_mailbox_id, _)) if known_mailbox_id != &binding.jmap_mailbox_id => {
                 debug!(
-                    "Cross-folder rename detected: {} now in {} (was {})",
-                    entry.maildir_id, folder_name, known_folder
+                    "Cross-mailbox rename detected: {} now in {} (was bound to mailbox {})",
+                    entry.maildir_id, binding.maildir_folder, known_mailbox_id
                 );
                 let Some(message_id) = require_message_id(&entry.maildir_id, &entry.path)? else {
                     continue;
@@ -136,7 +150,7 @@ fn classify_changes(
                 let size_bytes = stat_size(&entry.path);
                 changes.push(LocalChange::NewMessage {
                     maildir_id: entry.maildir_id.clone(),
-                    folder: folder_name.to_string(),
+                    binding: Arc::clone(binding),
                     flags: entry.flags.clone(),
                     path: entry.path.clone(),
                     message_id,
@@ -151,7 +165,7 @@ fn classify_changes(
                     );
                     changes.push(LocalChange::FlagsChanged {
                         maildir_id: entry.maildir_id.clone(),
-                        folder: folder_name.to_string(),
+                        binding: Arc::clone(binding),
                         old_flags: known_flags.clone(),
                         new_flags: entry.flags.clone(),
                     });
@@ -165,7 +179,7 @@ fn classify_changes(
                 let size_bytes = stat_size(&entry.path);
                 changes.push(LocalChange::NewMessage {
                     maildir_id: entry.maildir_id.clone(),
-                    folder: folder_name.to_string(),
+                    binding: Arc::clone(binding),
                     flags: entry.flags.clone(),
                     path: entry.path.clone(),
                     message_id,
@@ -176,10 +190,13 @@ fn classify_changes(
     }
 
     for id in explicit_deletes {
-        debug!("Deleted message: {} (was in {})", id, folder_name);
+        debug!(
+            "Deleted message: {} (was in {})",
+            id, binding.maildir_folder
+        );
         changes.push(LocalChange::DeletedMessage {
             maildir_id: id.clone(),
-            folder: folder_name.to_string(),
+            binding: Arc::clone(binding),
         });
     }
 
@@ -193,11 +210,17 @@ fn classify_changes(
 /// commands -- callers that need a full picture without relying on a
 /// running fsevents stream.
 ///
-/// `known_state` maps maildir_id -> (folder, flags) from the DB.
+/// `known_state` maps maildir_id -> (mailbox_id, flags). The
+/// mailbox_id is the DB-recorded binding for the file: cross-mailbox
+/// move detection compares it against `binding.jmap_mailbox_id`
+/// (where the scan is currently walking) rather than against the
+/// folder string, so a server-side mailbox rename that changes the
+/// on-disk path while preserving the JMAP id doesn't read as a
+/// user-driven cross-folder move.
 pub fn scan_folder(
     maildir: &Maildir,
-    folder_name: &str,
-    known_state: &HashMap<MaildirId, (String, String)>,
+    binding: &Arc<MailboxFolderBinding>,
+    known_state: &HashMap<MaildirId, (JmapMailboxId, String)>,
 ) -> Result<ScanResult> {
     let mut cur_entries = Vec::new();
     for entry in maildir.list_cur() {
@@ -242,8 +265,8 @@ pub fn scan_folder(
         .collect();
     let explicit_deletes: Vec<MaildirId> = known_state
         .iter()
-        .filter_map(|(id, (folder, _))| {
-            if folder == folder_name && !observed.contains(id) {
+        .filter_map(|(id, (mailbox_id, _))| {
+            if mailbox_id == &binding.jmap_mailbox_id && !observed.contains(id) {
                 Some(id.clone())
             } else {
                 None
@@ -251,7 +274,7 @@ pub fn scan_folder(
         })
         .collect();
 
-    let changes = classify_changes(folder_name, &cur_entries, &explicit_deletes, known_state)?;
+    let changes = classify_changes(binding, &cur_entries, &explicit_deletes, known_state)?;
     Ok(ScanResult {
         changes,
         local_flags,
@@ -266,8 +289,12 @@ pub fn scan_folder(
 /// change set for the in-flight cycle.
 ///
 /// `known_states` maps each synced folder to its DB-recorded
-/// `(maildir_id -> (folder, flags))` state. Paths whose folder isn't
-/// present are dropped (untracked or stale-watcher noise).
+/// `(maildir_id -> (mailbox_id, flags))` state. Paths whose folder
+/// isn't present are dropped (untracked or stale-watcher noise).
+/// `bindings` resolves event-path folder names to the JMAP mailbox
+/// id of the folder currently being walked, which is what
+/// `classify_changes` compares against the DB-recorded `mailbox_id`
+/// to spot cross-mailbox moves.
 ///
 /// Per `(folder, maildir_id)` group: the on-disk file (if any) is
 /// found by stat'ing the event paths, with `cur/` preferred over
@@ -297,7 +324,8 @@ pub fn scan_folder(
 pub fn scan_paths(
     maildir_root: &Path,
     event_paths: &[PathBuf],
-    known_states: &HashMap<String, HashMap<MaildirId, (String, String)>>,
+    known_states: &HashMap<String, HashMap<MaildirId, (JmapMailboxId, String)>>,
+    bindings: &MailboxBindings,
 ) -> Result<ScanResult> {
     // (subdir, flags, raw on-disk path) for one event hitting a
     // (folder, maildir_id) group. Multiple entries per group cover
@@ -361,8 +389,9 @@ pub fn scan_paths(
                 bucket.1.push(maildir_id);
             }
             None => {
-                if let Some((known_folder, _)) = known_state.get(&maildir_id)
-                    && known_folder == &folder
+                if let Some((known_mailbox_id, _)) = known_state.get(&maildir_id)
+                    && let Some(b) = bindings.by_folder(&folder)
+                    && known_mailbox_id == &b.jmap_mailbox_id
                 {
                     bucket.2.push(maildir_id);
                 }
@@ -392,7 +421,14 @@ pub fn scan_paths(
         for id in &new {
             local_flags.entry(id.clone()).or_default();
         }
-        let changes = classify_changes(&folder, &cur, &deletes, known_state)?;
+        let Some(binding) = bindings.by_folder(&folder) else {
+            debug!(
+                "scan_paths: bindings missing folder {} at classify; skipping",
+                folder
+            );
+            continue;
+        };
+        let changes = classify_changes(binding, &cur, &deletes, known_state)?;
         all_changes.extend(changes);
     }
 
@@ -491,6 +527,33 @@ mod tests {
         fs::write(&path, body).unwrap();
     }
 
+    /// Build a single binding for a scan_folder test call. Tests
+    /// conventionally tag a folder "INBOX" / "Spam" / "Archive" with
+    /// mailbox id "MB-INBOX" / "MB-SPAM" / "MB-ARCH"; the helper
+    /// keeps the assertion sites readable without pulling in the
+    /// full MailboxBindings shape every time. Returns an `Arc` so
+    /// the test sites match `scan_folder`'s `&Arc<...>` signature.
+    fn binding(folder: &str, mailbox_id: &str) -> Arc<MailboxFolderBinding> {
+        Arc::new(MailboxFolderBinding {
+            jmap_mailbox_id: mailbox_id.into(),
+            server_name: folder.to_string(),
+            maildir_folder: folder.to_string(),
+        })
+    }
+
+    /// `MailboxBindings` with the single folder/id pair the
+    /// scan_paths tests need to resolve event-path folders to JMAP
+    /// mailbox ids inside classify_changes.
+    fn bindings_with(folder: &str, mailbox_id: &str) -> MailboxBindings {
+        let mut b = MailboxBindings::builder();
+        b.insert(MailboxFolderBinding {
+            jmap_mailbox_id: mailbox_id.into(),
+            server_name: folder.to_string(),
+            maildir_folder: folder.to_string(),
+        });
+        b.build()
+    }
+
     /// `ScanResult.local_flags` is the contract reconcile reads at
     /// adoption emit sites. Pin its shape here: one entry per
     /// observed cur/ file with the filename's flag suffix, plus
@@ -514,7 +577,7 @@ mod tests {
         write_message(&inbox_path, "new", new_bare, body);
 
         let known = HashMap::new();
-        let result = scan_folder(&inbox, "INBOX", &known).unwrap();
+        let result = scan_folder(&inbox, &binding("INBOX", "MB-INBOX"), &known).unwrap();
 
         assert_eq!(
             result.local_flags.get(&MaildirId::from(cur_seen)),
@@ -567,9 +630,10 @@ mod tests {
         // DB still believes the file lives in INBOX with the same flags
         // (the MUA didn't change them, only the folder).
         let mut known = HashMap::new();
-        known.insert(unique.into(), ("INBOX".to_string(), "FS".to_string()));
+        known.insert(unique.into(), ("MB-INBOX".into(), "FS".to_string()));
 
-        let ScanResult { changes, .. } = scan_folder(&spam, "Spam", &known).unwrap();
+        let ScanResult { changes, .. } =
+            scan_folder(&spam, &binding("Spam", "MB-SPAM"), &known).unwrap();
 
         assert_eq!(
             changes.len(),
@@ -580,16 +644,58 @@ mod tests {
         match &changes[0] {
             LocalChange::NewMessage {
                 maildir_id,
-                folder,
+                binding,
                 message_id,
                 ..
             } => {
                 assert_eq!(maildir_id.as_ref(), unique);
-                assert_eq!(folder, "Spam");
+                assert_eq!(binding.maildir_folder, "Spam");
                 assert_eq!(message_id.as_ref(), "a@x");
             }
             other => panic!("expected NewMessage on destination scan, got {:?}", other),
         }
+    }
+
+    /// Server-side mailbox rename: the JMAP mailbox id is stable, the
+    /// on-disk folder name changes. The DB-recorded mailbox_id agrees
+    /// with the binding's even though the binding's folder is the new
+    /// name. Comparing on mailbox_id (not folder string) is what keeps
+    /// this case quiet -- the old folder-string check would misfire
+    /// here and emit a phantom NewMessage that reconcile would then
+    /// pair into a backwards MoveLocal. Pins the comparison axis the
+    /// new behavior depends on.
+    #[test]
+    fn rename_preserving_mailbox_id_emits_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let folder_path = tmp.path().join("Inbox-renamed");
+        let folder_maildir = ensure_maildir(&folder_path).unwrap();
+
+        let unique = "1700000000.M1.host";
+        let filename = format!("{unique}:2,FS");
+        let body = "Message-ID: <a@x>\r\nSubject: t\r\n\r\nbody\r\n";
+        write_message(&folder_path, "cur", &filename, body);
+
+        // DB recorded the file against MB-INBOX. The binding still
+        // resolves to MB-INBOX but at a different on-disk path (post-
+        // rename). Flags agree, so the only signal a folder-string
+        // check would have to fire is "different folder name."
+        let mut known = HashMap::new();
+        known.insert(unique.into(), ("MB-INBOX".into(), "FS".to_string()));
+
+        let ScanResult { changes, .. } = scan_folder(
+            &folder_maildir,
+            &binding("Inbox-renamed", "MB-INBOX"),
+            &known,
+        )
+        .unwrap();
+
+        assert!(
+            changes.is_empty(),
+            "rename that preserves mailbox identity must not emit any \
+             LocalChange (a NewMessage here would pair into a backwards \
+             MoveLocal in reconcile): {:?}",
+            changes
+        );
     }
 
     /// The source-side scan during the same move: file is gone from
@@ -606,15 +712,20 @@ mod tests {
 
         let unique = "1700000000.M1.host";
         let mut known = HashMap::new();
-        known.insert(unique.into(), ("INBOX".to_string(), "FS".to_string()));
+        known.insert(unique.into(), ("MB-INBOX".into(), "FS".to_string()));
 
-        let ScanResult { changes, .. } = scan_folder(&inbox, "INBOX", &known).unwrap();
+        let ScanResult { changes, .. } =
+            scan_folder(&inbox, &binding("INBOX", "MB-INBOX"), &known).unwrap();
 
         assert_eq!(changes.len(), 1);
         match &changes[0] {
-            LocalChange::DeletedMessage { maildir_id, folder } => {
+            LocalChange::DeletedMessage {
+                maildir_id,
+                binding,
+                ..
+            } => {
                 assert_eq!(maildir_id.as_ref(), unique);
-                assert_eq!(folder, "INBOX");
+                assert_eq!(binding.maildir_folder, "INBOX");
             }
             other => panic!("expected DeletedMessage on source scan, got {:?}", other),
         }
@@ -635,9 +746,10 @@ mod tests {
         write_message(&inbox_path, "cur", &filename, body);
 
         let mut known = HashMap::new();
-        known.insert(unique.into(), ("INBOX".to_string(), "F".to_string()));
+        known.insert(unique.into(), ("MB-INBOX".into(), "F".to_string()));
 
-        let ScanResult { changes, .. } = scan_folder(&inbox, "INBOX", &known).unwrap();
+        let ScanResult { changes, .. } =
+            scan_folder(&inbox, &binding("INBOX", "MB-INBOX"), &known).unwrap();
 
         assert_eq!(changes.len(), 1);
         match &changes[0] {
@@ -681,16 +793,16 @@ mod tests {
 
         // DB still believes the file is in INBOX with its old id.
         let mut known = HashMap::new();
-        known.insert(old_id.into(), ("INBOX".to_string(), "FS".to_string()));
+        known.insert(old_id.into(), ("MB-INBOX".into(), "FS".to_string()));
 
         let ScanResult {
             changes: inbox_changes,
             ..
-        } = scan_folder(&inbox, "INBOX", &known).unwrap();
+        } = scan_folder(&inbox, &binding("INBOX", "MB-INBOX"), &known).unwrap();
         let ScanResult {
             changes: spam_changes,
             ..
-        } = scan_folder(&spam, "Spam", &known).unwrap();
+        } = scan_folder(&spam, &binding("Spam", "MB-SPAM"), &known).unwrap();
 
         assert_eq!(
             inbox_changes.len(),
@@ -698,9 +810,13 @@ mod tests {
             "expected one DeletedMessage on INBOX"
         );
         match &inbox_changes[0] {
-            LocalChange::DeletedMessage { maildir_id, folder } => {
+            LocalChange::DeletedMessage {
+                maildir_id,
+                binding,
+                ..
+            } => {
                 assert_eq!(maildir_id.as_ref(), old_id);
-                assert_eq!(folder, "INBOX");
+                assert_eq!(binding.maildir_folder, "INBOX");
             }
             other => panic!("expected DeletedMessage, got {:?}", other),
         }
@@ -709,12 +825,12 @@ mod tests {
         match &spam_changes[0] {
             LocalChange::NewMessage {
                 maildir_id,
-                folder,
+                binding,
                 message_id,
                 ..
             } => {
                 assert_eq!(maildir_id.as_ref(), new_id);
-                assert_eq!(folder, "Spam");
+                assert_eq!(binding.maildir_folder, "Spam");
                 assert_eq!(message_id.as_ref(), "a@x");
             }
             other => panic!("expected NewMessage, got {:?}", other),
@@ -742,7 +858,8 @@ mod tests {
         write_message(&inbox_path, "new", unique, body);
 
         let known = HashMap::new();
-        let ScanResult { changes, .. } = scan_folder(&inbox, "INBOX", &known).unwrap();
+        let ScanResult { changes, .. } =
+            scan_folder(&inbox, &binding("INBOX", "MB-INBOX"), &known).unwrap();
 
         assert!(
             changes.is_empty(),
@@ -781,13 +898,11 @@ mod tests {
         // must be stripped by the walker so the canonical id matches
         // what the DB indexed at delivery time.
         let mut known = HashMap::new();
-        known.insert(bare.into(), ("INBOX".to_string(), "".to_string()));
-        known.insert(
-            suffixed_unique.into(),
-            ("INBOX".to_string(), "F".to_string()),
-        );
+        known.insert(bare.into(), ("MB-INBOX".into(), "".to_string()));
+        known.insert(suffixed_unique.into(), ("MB-INBOX".into(), "F".to_string()));
 
-        let ScanResult { changes, .. } = scan_folder(&inbox, "INBOX", &known).unwrap();
+        let ScanResult { changes, .. } =
+            scan_folder(&inbox, &binding("INBOX", "MB-INBOX"), &known).unwrap();
 
         // No LocalChange of any kind: not a NewMessage (new/ files
         // don't surface as changes), and crucially not a
@@ -828,9 +943,10 @@ mod tests {
         // its Message-ID -- the file is still on disk and still
         // observed.
         let mut known = HashMap::new();
-        known.insert(unique.into(), ("INBOX".to_string(), "".to_string()));
+        known.insert(unique.into(), ("MB-INBOX".into(), "".to_string()));
 
-        let ScanResult { changes, .. } = scan_folder(&inbox, "INBOX", &known).unwrap();
+        let ScanResult { changes, .. } =
+            scan_folder(&inbox, &binding("INBOX", "MB-INBOX"), &known).unwrap();
 
         assert!(
             changes.is_empty(),
@@ -861,9 +977,10 @@ mod tests {
 
         // DB has the file in the same folder with the same flags.
         let mut known = HashMap::new();
-        known.insert(unique.into(), ("INBOX".to_string(), "FS".to_string()));
+        known.insert(unique.into(), ("MB-INBOX".into(), "FS".to_string()));
 
-        let ScanResult { changes, .. } = scan_folder(&inbox, "INBOX", &known).unwrap();
+        let ScanResult { changes, .. } =
+            scan_folder(&inbox, &binding("INBOX", "MB-INBOX"), &known).unwrap();
 
         assert!(
             changes.is_empty(),
@@ -892,9 +1009,10 @@ mod tests {
 
         // DB believes the file lives in INBOX.
         let mut known = HashMap::new();
-        known.insert(unique.into(), ("INBOX".to_string(), "FS".to_string()));
+        known.insert(unique.into(), ("MB-INBOX".into(), "FS".to_string()));
 
-        let ScanResult { changes, .. } = scan_folder(&spam, "Spam", &known).unwrap();
+        let ScanResult { changes, .. } =
+            scan_folder(&spam, &binding("Spam", "MB-SPAM"), &known).unwrap();
 
         assert!(
             changes.is_empty(),
@@ -904,15 +1022,18 @@ mod tests {
     }
 
     /// Build a single-folder `known_states` map for `scan_paths` tests.
+    /// Each row's second tuple component is the JMAP mailbox id the DB
+    /// recorded the file under -- the value `classify_changes` compares
+    /// against the binding's id to spot a cross-mailbox move.
     fn known_for(
         folder: &str,
         rows: &[(&str, &str, &str)],
-    ) -> HashMap<String, HashMap<MaildirId, (String, String)>> {
+    ) -> HashMap<String, HashMap<MaildirId, (JmapMailboxId, String)>> {
         let mut inner = HashMap::new();
-        for (id, db_folder, flags) in rows {
+        for (id, db_mailbox_id, flags) in rows {
             inner.insert(
                 MaildirId::from(*id),
-                (db_folder.to_string(), flags.to_string()),
+                ((*db_mailbox_id).into(), flags.to_string()),
             );
         }
         let mut outer = HashMap::new();
@@ -997,15 +1118,20 @@ mod tests {
         // already happened before the events were delivered).
         write_message(&inbox_path, "cur", &format!("{unique}:2,FS"), body);
 
-        let known = known_for("INBOX", &[(unique, "INBOX", "F")]);
+        let known = known_for("INBOX", &[(unique, "MB-INBOX", "F")]);
         let event_paths = vec![
             inbox_path.join("cur").join(format!("{unique}:2,F")),
             inbox_path.join("cur").join(format!("{unique}:2,FS")),
         ];
 
-        let changes = scan_paths(tmp.path(), &event_paths, &known)
-            .unwrap()
-            .changes;
+        let changes = scan_paths(
+            tmp.path(),
+            &event_paths,
+            &known,
+            &bindings_with("INBOX", "MB-INBOX"),
+        )
+        .unwrap()
+        .changes;
         assert_eq!(changes.len(), 1);
         match &changes[0] {
             LocalChange::FlagsChanged {
@@ -1037,12 +1163,17 @@ mod tests {
         let body = "Message-ID: <a@x>\r\nSubject: t\r\n\r\nbody\r\n";
         write_message(&inbox_path, "cur", &format!("{unique}:2,S"), body);
 
-        let known = known_for("INBOX", &[(unique, "INBOX", "S")]);
+        let known = known_for("INBOX", &[(unique, "MB-INBOX", "S")]);
         let event_paths = vec![inbox_path.join("cur").join(format!("{unique}:2,S"))];
 
-        let changes = scan_paths(tmp.path(), &event_paths, &known)
-            .unwrap()
-            .changes;
+        let changes = scan_paths(
+            tmp.path(),
+            &event_paths,
+            &known,
+            &bindings_with("INBOX", "MB-INBOX"),
+        )
+        .unwrap()
+        .changes;
         assert!(
             changes.is_empty(),
             "expected no changes for in-sync file, got {:?}",
@@ -1062,17 +1193,26 @@ mod tests {
         // INBOX is empty: the file was removed before scan ran.
 
         let unique = "1700000000.M1.host";
-        let known = known_for("INBOX", &[(unique, "INBOX", "S")]);
+        let known = known_for("INBOX", &[(unique, "MB-INBOX", "S")]);
         let event_paths = vec![inbox_path.join("cur").join(format!("{unique}:2,S"))];
 
-        let changes = scan_paths(tmp.path(), &event_paths, &known)
-            .unwrap()
-            .changes;
+        let changes = scan_paths(
+            tmp.path(),
+            &event_paths,
+            &known,
+            &bindings_with("INBOX", "MB-INBOX"),
+        )
+        .unwrap()
+        .changes;
         assert_eq!(changes.len(), 1);
         match &changes[0] {
-            LocalChange::DeletedMessage { maildir_id, folder } => {
+            LocalChange::DeletedMessage {
+                maildir_id,
+                binding,
+                ..
+            } => {
                 assert_eq!(maildir_id.as_ref(), unique);
-                assert_eq!(folder, "INBOX");
+                assert_eq!(binding.maildir_folder, "INBOX");
             }
             other => panic!("expected DeletedMessage, got {:?}", other),
         }
@@ -1100,33 +1240,47 @@ mod tests {
         let mut inner = HashMap::new();
         inner.insert(
             MaildirId::from(unique),
-            ("INBOX".to_string(), "FS".to_string()),
+            ("MB-INBOX".into(), "FS".to_string()),
         );
-        known_states.insert("INBOX".to_string(), inner.clone());
-        known_states.insert("Spam".to_string(), inner);
+        known_states.insert("INBOX".into(), inner.clone());
+        known_states.insert("Spam".into(), inner);
 
         let event_paths = vec![
             inbox_path.join("cur").join(format!("{unique}:2,FS")),
             spam_path.join("cur").join(format!("{unique}:2,FS")),
         ];
 
-        let mut changes = scan_paths(tmp.path(), &event_paths, &known_states)
+        let mut bindings = MailboxBindings::builder();
+        bindings.insert(MailboxFolderBinding {
+            jmap_mailbox_id: "MB-INBOX".into(),
+            server_name: "INBOX".to_string(),
+            maildir_folder: "INBOX".to_string(),
+        });
+        bindings.insert(MailboxFolderBinding {
+            jmap_mailbox_id: "MB-SPAM".into(),
+            server_name: "Spam".to_string(),
+            maildir_folder: "Spam".to_string(),
+        });
+        let bindings = bindings.build();
+        let mut changes = scan_paths(tmp.path(), &event_paths, &known_states, &bindings)
             .unwrap()
             .changes;
         // Order isn't guaranteed (HashMap iteration), so sort for the
         // assertion.
         changes.sort_by_key(|c| match c {
-            LocalChange::DeletedMessage { folder, .. } => format!("0:{}", folder),
-            LocalChange::NewMessage { folder, .. } => format!("1:{}", folder),
-            LocalChange::FlagsChanged { folder, .. } => format!("2:{}", folder),
+            LocalChange::DeletedMessage { binding, .. } => format!("0:{}", binding.maildir_folder),
+            LocalChange::NewMessage { binding, .. } => format!("1:{}", binding.maildir_folder),
+            LocalChange::FlagsChanged { binding, .. } => format!("2:{}", binding.maildir_folder),
         });
         assert_eq!(changes.len(), 2);
         match &changes[0] {
-            LocalChange::DeletedMessage { folder, .. } => assert_eq!(folder, "INBOX"),
+            LocalChange::DeletedMessage { binding, .. } => {
+                assert_eq!(binding.maildir_folder, "INBOX")
+            }
             other => panic!("expected DeletedMessage on INBOX, got {:?}", other),
         }
         match &changes[1] {
-            LocalChange::NewMessage { folder, .. } => assert_eq!(folder, "Spam"),
+            LocalChange::NewMessage { binding, .. } => assert_eq!(binding.maildir_folder, "Spam"),
             other => panic!("expected NewMessage on Spam, got {:?}", other),
         }
     }
@@ -1148,17 +1302,26 @@ mod tests {
         // INBOX/new/ is empty -- the file was removed.
 
         let unique = "1700000000.M1.host";
-        let known = known_for("INBOX", &[(unique, "INBOX", "")]);
+        let known = known_for("INBOX", &[(unique, "MB-INBOX", "")]);
         let event_paths = vec![inbox_path.join("new").join(unique)];
 
-        let changes = scan_paths(tmp.path(), &event_paths, &known)
-            .unwrap()
-            .changes;
+        let changes = scan_paths(
+            tmp.path(),
+            &event_paths,
+            &known,
+            &bindings_with("INBOX", "MB-INBOX"),
+        )
+        .unwrap()
+        .changes;
         assert_eq!(changes.len(), 1);
         match &changes[0] {
-            LocalChange::DeletedMessage { maildir_id, folder } => {
+            LocalChange::DeletedMessage {
+                maildir_id,
+                binding,
+                ..
+            } => {
                 assert_eq!(maildir_id.as_ref(), unique);
-                assert_eq!(folder, "INBOX");
+                assert_eq!(binding.maildir_folder, "INBOX");
             }
             other => panic!(
                 "expected DeletedMessage for missing new/ path, got {:?}",
@@ -1185,12 +1348,17 @@ mod tests {
         );
 
         // DB already knows about this delivery (jma wrote it itself).
-        let known = known_for("INBOX", &[(unique, "INBOX", "")]);
+        let known = known_for("INBOX", &[(unique, "MB-INBOX", "")]);
         let event_paths = vec![inbox_path.join("new").join(unique)];
 
-        let changes = scan_paths(tmp.path(), &event_paths, &known)
-            .unwrap()
-            .changes;
+        let changes = scan_paths(
+            tmp.path(),
+            &event_paths,
+            &known,
+            &bindings_with("INBOX", "MB-INBOX"),
+        )
+        .unwrap()
+        .changes;
         assert!(
             changes.is_empty(),
             "new/ event must not produce a LocalChange, got {:?}",
@@ -1215,15 +1383,20 @@ mod tests {
         // Only the cur/ destination exists; the new/ source path is gone.
         write_message(&inbox_path, "cur", &format!("{unique}:2,S"), body);
 
-        let known = known_for("INBOX", &[(unique, "INBOX", "")]);
+        let known = known_for("INBOX", &[(unique, "MB-INBOX", "")]);
         let event_paths = vec![
             inbox_path.join("new").join(unique),
             inbox_path.join("cur").join(format!("{unique}:2,S")),
         ];
 
-        let changes = scan_paths(tmp.path(), &event_paths, &known)
-            .unwrap()
-            .changes;
+        let changes = scan_paths(
+            tmp.path(),
+            &event_paths,
+            &known,
+            &bindings_with("INBOX", "MB-INBOX"),
+        )
+        .unwrap()
+        .changes;
         assert_eq!(changes.len(), 1);
         match &changes[0] {
             LocalChange::FlagsChanged {
@@ -1255,7 +1428,7 @@ mod tests {
         let body = "Message-ID: <a@x>\r\nSubject: t\r\n\r\nbody\r\n";
         write_message(&inbox_path, "cur", &format!("{unique}:2,S"), body);
 
-        let known = known_for("INBOX", &[(unique, "INBOX", "")]);
+        let known = known_for("INBOX", &[(unique, "MB-INBOX", "")]);
         let event_paths = vec![
             // No /cur/ or /new/ segment.
             tmp.path().join(".jma.db"),
@@ -1265,9 +1438,14 @@ mod tests {
             inbox_path.join("cur").join(format!("{unique}:2,S")),
         ];
 
-        let changes = scan_paths(tmp.path(), &event_paths, &known)
-            .unwrap()
-            .changes;
+        let changes = scan_paths(
+            tmp.path(),
+            &event_paths,
+            &known,
+            &bindings_with("INBOX", "MB-INBOX"),
+        )
+        .unwrap()
+        .changes;
         assert_eq!(
             changes.len(),
             1,
@@ -1297,9 +1475,14 @@ mod tests {
         let known = known_for("INBOX", &[]);
         let event_paths = vec![other_path.join("cur").join(format!("{unique}:2,"))];
 
-        let changes = scan_paths(tmp.path(), &event_paths, &known)
-            .unwrap()
-            .changes;
+        let changes = scan_paths(
+            tmp.path(),
+            &event_paths,
+            &known,
+            &bindings_with("INBOX", "MB-INBOX"),
+        )
+        .unwrap()
+        .changes;
         assert!(
             changes.is_empty(),
             "events under untracked folder must be dropped, got {:?}",

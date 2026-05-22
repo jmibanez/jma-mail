@@ -34,6 +34,26 @@ pub struct MailboxObject {
     pub unread_emails: u64,
 }
 
+/// The in-memory bundle that pairs a JMAP mailbox id with the
+/// information every consumer of "what mailbox/folder is this"
+/// actually needs: the id itself, the JMAP-side leaf name (matches
+/// `MailboxObject.name` and the sentinel's `server_name`), and the
+/// on-disk folder path under the configured layout.
+///
+/// Lighter than `MailboxObject` (no parent_id, role, sort_order, or
+/// totals) and lighter than `MailboxRecord` -- carries only the
+/// fields the sync pipeline needs to talk about a mailbox.
+/// Computed by `resolve_mailboxes` from a `MailboxObject` plus the
+/// active layout, then threaded through scan, reconcile, and
+/// execute so the (mailbox_id, folder) pair never has to be
+/// reconstructed from a tuple or rebuilt via lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MailboxFolderBinding {
+    pub jmap_mailbox_id: JmapMailboxId,
+    pub server_name: String,
+    pub maildir_folder: String,
+}
+
 /// Result of a JMAP Email/changes call.
 #[derive(Debug)]
 pub struct ChangesResponse {
