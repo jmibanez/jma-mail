@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::ids::{JmapBlobId, JmapEmailId, JmapMailboxId, JmapThreadId, MaildirId, MessageId};
+use crate::jmap::types::MailboxFolderBinding;
 
 /// A message known by its local maildir handle. The Message-ID rides
 /// along so logs can name the message in human-readable form, and so
@@ -70,6 +72,15 @@ impl BoundId {
 }
 
 /// A single action to perform during sync.
+///
+/// Variants that touch a specific mailbox carry an
+/// `Arc<MailboxFolderBinding>` rather than separate `maildir_folder`
+/// and `mailbox_id` fields. The binding is resolved once at the
+/// producer boundary (scan for local-driven actions, reconcile for
+/// remote-driven ones) and propagated through the plan and executor
+/// as a single typed unit; consumers read `binding.maildir_folder`
+/// for filesystem ops and `binding.jmap_mailbox_id` for DB writes
+/// without re-resolving against `MailboxBindings`.
 #[derive(Debug)]
 pub enum SyncAction {
     // Server -> Local
@@ -77,27 +88,40 @@ pub enum SyncAction {
         id: RemoteId,
         jmap_blob_id: JmapBlobId,
         jmap_thread_id: JmapThreadId,
-        mailbox_id: JmapMailboxId,
-        maildir_folder: String,
+        binding: Arc<MailboxFolderBinding>,
         keywords: HashMap<String, bool>,
     },
     UpdateLocalFlags {
         id: BoundId,
-        maildir_folder: String,
+        binding: Arc<MailboxFolderBinding>,
         new_flags: String,
         keywords: HashMap<String, bool>,
         jmap_blob_id: JmapBlobId,
         jmap_thread_id: JmapThreadId,
-        mailbox_id: JmapMailboxId,
     },
     DeleteLocal {
         id: BoundId,
+        /// On-disk folder of the file we're deleting. Plain string
+        /// because the executor only joins the maildir root with this
+        /// path to find the file; the row's `jmap_email_id` for the
+        /// DB delete already lives on `id`, and `local_state` is
+        /// keyed by `maildir_id` (also on `id`), so the source's
+        /// mailbox identity isn't consumed.
         maildir_folder: String,
     },
     MoveLocal {
         id: BoundId,
+        /// Source folder string only -- the executor reads this to
+        /// construct the on-disk path; the source's `jmap_mailbox_id`
+        /// isn't consumed (local_state's row is keyed by `maildir_id`
+        /// and just gets overwritten by the destination write, and
+        /// message_map's `mailbox_id` is updated to `to_binding.
+        /// jmap_mailbox_id` directly). Asymmetric with `to_binding`
+        /// deliberately: carrying a `from_binding` we never read
+        /// would mislead readers into thinking the source's identity
+        /// matters here.
         from_folder: String,
-        to_folder: String,
+        to_binding: Arc<MailboxFolderBinding>,
     },
 
     /// Bind an existing local file to a known server email (no download,
@@ -105,10 +129,9 @@ pub enum SyncAction {
     /// push and the redundant download path on pull.
     AdoptLocalMessage {
         id: BoundId,
-        maildir_folder: String,
+        binding: Arc<MailboxFolderBinding>,
         jmap_blob_id: Option<JmapBlobId>,
         jmap_thread_id: Option<JmapThreadId>,
-        mailbox_id: JmapMailboxId,
         keywords: HashMap<String, bool>,
         /// On-disk maildir filename flag suffix at plan time -- the
         /// filesystem-truth view of flags, as opposed to `keywords`
@@ -146,9 +169,8 @@ pub enum SyncAction {
     // Local -> Server
     UploadMessage {
         id: LocalId,
-        maildir_folder: String,
+        binding: Arc<MailboxFolderBinding>,
         file_path: PathBuf,
-        mailbox_id: JmapMailboxId,
         /// Maildir flags suffix captured at scan time. Plumbed
         /// through from `LocalChange::NewMessage` so the executor
         /// doesn't have to re-parse the on-disk filename, and so
@@ -188,11 +210,14 @@ pub enum SyncAction {
         /// servers like Fastmail correctly reject `false` for a
         /// `Id[Boolean]` set-membership map. Computed at planning
         /// time; for jma's single-mailbox-per-email DB model
-        /// this is just `[to_mailbox_id]`.
+        /// this is just `[<destination jmap_mailbox_id>]`.
         target_mailbox_ids: Vec<JmapMailboxId>,
-        /// Folder names of the source / destination mailboxes,
-        /// plumbed through purely so logs can name folders instead
-        /// of opaque JMAP mailbox ids.
+        /// Folder names of the source and destination mailboxes.
+        /// Plain strings rather than `Arc<MailboxFolderBinding>`
+        /// because the executor never reads the mailbox ids off
+        /// these slots -- the on-wire move is driven by
+        /// `target_mailbox_ids`, and the strings are purely for log
+        /// messages naming the folders in human-readable form.
         from_folder: String,
         to_folder: String,
     },
@@ -341,9 +366,11 @@ impl fmt::Display for SyncPlan {
 
         for action in &self.actions {
             match action {
-                SyncAction::DownloadMessage {
-                    id, maildir_folder, ..
-                } => writeln!(f, "  [PULL]  Download {} -> {}/", id, maildir_folder)?,
+                SyncAction::DownloadMessage { id, binding, .. } => writeln!(
+                    f,
+                    "  [PULL]  Download {} -> {}/",
+                    id, binding.maildir_folder
+                )?,
                 SyncAction::UpdateLocalFlags { id, new_flags, .. } => {
                     writeln!(f, "  [PULL]  Update flags on {}: '{}'", id, new_flags)?
                 }
@@ -351,24 +378,22 @@ impl fmt::Display for SyncPlan {
                 SyncAction::MoveLocal {
                     id,
                     from_folder,
-                    to_folder,
+                    to_binding,
                 } => writeln!(
                     f,
                     "  [PULL]  Move {} from {}/ to {}/",
-                    id, from_folder, to_folder
+                    id, from_folder, to_binding.maildir_folder
                 )?,
-                SyncAction::AdoptLocalMessage {
-                    id, maildir_folder, ..
-                } => writeln!(
+                SyncAction::AdoptLocalMessage { id, binding, .. } => writeln!(
                     f,
                     "  [BOTH]  Adopt {}/{} as {}",
-                    maildir_folder,
+                    binding.maildir_folder,
                     id.maildir_id,
                     id.as_remote()
                 )?,
-                SyncAction::UploadMessage {
-                    id, maildir_folder, ..
-                } => writeln!(f, "  [PUSH] Upload {} from {}/", id, maildir_folder)?,
+                SyncAction::UploadMessage { id, binding, .. } => {
+                    writeln!(f, "  [PUSH] Upload {} from {}/", id, binding.maildir_folder)?
+                }
                 SyncAction::UpdateRemoteKeywords { id, .. } => {
                     writeln!(f, "  [PUSH] Update keywords on {}", id)?
                 }
