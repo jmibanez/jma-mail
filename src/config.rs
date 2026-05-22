@@ -143,6 +143,14 @@ pub struct SyncConfig {
     /// Once reached, all subsequent retries wait this long.
     #[serde(default = "default_retry_max_backoff_ms")]
     pub retry_max_backoff_ms: u64,
+    /// Whether destructive folder-level syncs are permitted, and
+    /// in which direction(s). See [`AllowDestructiveFolderSync`]
+    /// for the full semantics and the composition rules against
+    /// `conflict_strategy`. Default `none` means no destructive
+    /// folder syncs; cleanup of orphan maildirs goes through
+    /// `jma janitor prune`.
+    #[serde(default)]
+    pub allow_destructive_folder_sync: AllowDestructiveFolderSync,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -199,6 +207,83 @@ pub enum ConflictStrategy {
     #[default]
     ServerWins,
     LocalWins,
+}
+
+/// Whether jma is permitted to apply destructive folder-level
+/// syncs, and in which direction(s).
+///
+/// "Destructive" here means deleting an on-disk maildir (when the
+/// server-side mailbox is gone) or destroying a server-side
+/// mailbox (when the local maildir is gone). The default `None`
+/// preserves the orphan-and-rely-on-prune behavior that #5 left
+/// in place: the DB row drops on server-side deletion, the
+/// disk state is untouched, and `jma janitor prune` is the
+/// explicit cleanup path. Users who want strict mirror semantics
+/// in one or both directions opt in.
+///
+/// Variants are named for what they permit doing (deleting the
+/// local or remote side), not for the direction of propagation:
+/// reading `allow_destructive_folder_sync = "delete-local"` in a
+/// config makes the user's commitment ("I'm allowing jma to
+/// delete local mailboxes") immediately obvious without having
+/// to map a directional arrow back to an action.
+///
+/// When destructive is enabled in a direction and the losing
+/// side has unsynced content (e.g. server says the mailbox is
+/// gone but local has new local-only messages in it),
+/// `ConflictStrategy` is the tiebreaker:
+///   - `ServerWins`: proceed; the loser's unsynced content is
+///     lost. Consistent with per-message ServerWins semantics.
+///   - `LocalWins`: refuse the destructive op; preserve the
+///     loser as an orphan; surface via drift.
+///
+/// `ask`-style interactive confirmation is deliberately not a
+/// value here: jma runs unattended under `launchd`, `systemd`,
+/// `cron`, and `jma watch`, where stdin isn't a terminal and a
+/// prompt-bearing config value would silently change behavior
+/// between CLI and daemon contexts. If interactive confirmation
+/// is ever wanted, it belongs as a per-invocation CLI flag, not
+/// a value of this knob.
+#[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AllowDestructiveFolderSync {
+    /// Never apply destructive folder-level syncs in either
+    /// direction. Orphan maildirs whose mailbox vanished
+    /// server-side stay on disk; locally-removed maildirs whose
+    /// mailbox still exists server-side stay server-side. Drift
+    /// is surfaced via `jma status` and cleanup goes through
+    /// `jma janitor prune`. This is the post-#5 behavior.
+    #[default]
+    None,
+    /// Permit deleting the local maildir when the server-side
+    /// mailbox is gone. Mirror server-side deletions to disk,
+    /// subject to the ConflictStrategy tiebreaker if unsynced
+    /// local mail is present. Local maildir removals are still
+    /// ignored.
+    DeleteLocal,
+    /// Permit destroying the server-side mailbox when the local
+    /// maildir is gone. Mirror local maildir removals to the
+    /// server, subject to the ConflictStrategy tiebreaker if
+    /// unsynced server-side mail is present. Server-side
+    /// deletions are still left as orphans on disk.
+    DeleteRemote,
+    /// Both directions enabled.
+    Both,
+}
+
+impl AllowDestructiveFolderSync {
+    /// True iff the configured policy permits deleting a local
+    /// maildir in response to a server-side mailbox deletion.
+    pub fn allows_delete_local(&self) -> bool {
+        matches!(self, Self::DeleteLocal | Self::Both)
+    }
+
+    /// True iff the configured policy permits destroying a
+    /// server-side mailbox in response to a local maildir
+    /// removal.
+    pub fn allows_delete_remote(&self) -> bool {
+        matches!(self, Self::DeleteRemote | Self::Both)
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -746,6 +831,99 @@ mod tests {
     fn effective_self_write_ttl_default_is_2x_pipeline_rounded() {
         let cfg = WatchConfig::default();
         assert_eq!(cfg.effective_self_write_ttl().as_secs(), 5);
+    }
+
+    /// `allow_destructive_folder_sync` defaults to `none`. Pins
+    /// the post-#5 orphan-and-rely-on-prune contract so a future
+    /// default change doesn't silently start deleting maildirs on
+    /// existing configs.
+    #[test]
+    fn allow_destructive_folder_sync_defaults_to_none() {
+        let cfg = SyncConfig::default();
+        assert_eq!(
+            cfg.allow_destructive_folder_sync,
+            AllowDestructiveFolderSync::None
+        );
+        assert!(!cfg.allow_destructive_folder_sync.allows_delete_local());
+        assert!(!cfg.allow_destructive_folder_sync.allows_delete_remote());
+    }
+
+    /// `allow_destructive_folder_sync` accepts the four documented
+    /// kebab-case values from TOML. The accessors expose the
+    /// per-direction permission booleans that downstream
+    /// destructive-sync code branches on.
+    #[test]
+    fn allow_destructive_folder_sync_parses_each_value() {
+        let cases = [
+            ("none", AllowDestructiveFolderSync::None, false, false),
+            (
+                "delete-local",
+                AllowDestructiveFolderSync::DeleteLocal,
+                true,
+                false,
+            ),
+            (
+                "delete-remote",
+                AllowDestructiveFolderSync::DeleteRemote,
+                false,
+                true,
+            ),
+            ("both", AllowDestructiveFolderSync::Both, true, true),
+        ];
+        for (literal, expected, delete_local, delete_remote) in cases {
+            let toml = format!(
+                r#"
+maildir_path = "/tmp/mail"
+allow_destructive_folder_sync = "{literal}"
+"#
+            );
+            let parsed: SyncConfig = toml::from_str(&toml).expect("parse SyncConfig");
+            assert_eq!(parsed.allow_destructive_folder_sync, expected);
+            assert_eq!(
+                parsed.allow_destructive_folder_sync.allows_delete_local(),
+                delete_local,
+                "delete_local for {literal}"
+            );
+            assert_eq!(
+                parsed.allow_destructive_folder_sync.allows_delete_remote(),
+                delete_remote,
+                "delete_remote for {literal}"
+            );
+        }
+    }
+
+    /// An existing user's TOML that doesn't mention
+    /// `allow_destructive_folder_sync` at all must keep parsing
+    /// and resolve to `None`. Pins the `#[serde(default)]` on
+    /// the field itself so a future refactor that drops the
+    /// attribute (and would otherwise require every config to
+    /// add a line) gets caught.
+    #[test]
+    fn allow_destructive_folder_sync_uses_default_when_absent_in_toml() {
+        let toml = r#"maildir_path = "/tmp/mail""#;
+        let parsed: SyncConfig = toml::from_str(toml).expect("parse SyncConfig");
+        assert_eq!(
+            parsed.allow_destructive_folder_sync,
+            AllowDestructiveFolderSync::None
+        );
+    }
+
+    /// An unknown value for `allow_destructive_folder_sync` fails
+    /// parsing rather than silently degrading to a default --
+    /// this is a security-relevant knob and a typo should not
+    /// open or close the destructive path.
+    #[test]
+    fn allow_destructive_folder_sync_rejects_unknown_value() {
+        let toml = r#"
+maildir_path = "/tmp/mail"
+allow_destructive_folder_sync = "yes-please"
+"#;
+        let err = toml::from_str::<SyncConfig>(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("allow_destructive_folder_sync") || msg.contains("yes-please"),
+            "error should name the offending field or value, got: {msg}"
+        );
     }
 
     /// Explicit override wins over the derived default. 0 is a

@@ -59,7 +59,8 @@ use std::time::Duration;
 
 use jma_mail::config::FolderLayout;
 use jma_mail::config::{
-    AccountConfig, Config, ConflictStrategy, StateConfig, SyncConfig, WatchConfig,
+    AccountConfig, AllowDestructiveFolderSync, Config, ConflictStrategy, StateConfig, SyncConfig,
+    WatchConfig,
 };
 use jma_mail::daemon;
 use jma_mail::state::{db, queries};
@@ -367,6 +368,7 @@ fn build_test_config(server_uri: &str, maildir_root: &Path, db_path: &Path) -> C
             retry_max_attempts: 5,
             retry_initial_backoff_ms: 500,
             retry_max_backoff_ms: 8_000,
+            allow_destructive_folder_sync: AllowDestructiveFolderSync::None,
             folder_layout: FolderLayout::Fs,
             hierarchy_separator: '/',
         },

@@ -25,7 +25,8 @@
 mod common;
 
 use jma_mail::config::{
-    AccountConfig, Config, ConflictStrategy, FolderLayout, StateConfig, SyncConfig, WatchConfig,
+    AccountConfig, AllowDestructiveFolderSync, Config, ConflictStrategy, FolderLayout, StateConfig,
+    SyncConfig, WatchConfig,
 };
 use jma_mail::ids::JmapMailboxId;
 use jma_mail::jmap::{email as jmap_email, mailbox as jmap_mailbox, session};
@@ -421,6 +422,7 @@ fn build_config(fx: &common::JmapFixture, maildir_root: &Path, db_path: &Path) -
             retry_max_attempts: 1,
             retry_initial_backoff_ms: 1,
             retry_max_backoff_ms: 1,
+            allow_destructive_folder_sync: AllowDestructiveFolderSync::None,
         },
         state: StateConfig {
             db_path: Some(db_path.to_string_lossy().into_owned()),

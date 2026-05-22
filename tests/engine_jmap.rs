@@ -23,7 +23,8 @@ use std::sync::{Arc, Mutex};
 
 use jma_mail::config::FolderLayout;
 use jma_mail::config::{
-    AccountConfig, CompiledRenameRule, Config, ConflictStrategy, StateConfig, SyncConfig,
+    AccountConfig, AllowDestructiveFolderSync, CompiledRenameRule, Config, ConflictStrategy,
+    StateConfig, SyncConfig,
 };
 use jma_mail::ids::{JmapEmailId, JmapMailboxId};
 use jma_mail::maildir_ops::sentinel;
@@ -525,6 +526,7 @@ fn test_config(
             retry_max_attempts: 1,
             retry_initial_backoff_ms: 1,
             retry_max_backoff_ms: 1,
+            allow_destructive_folder_sync: AllowDestructiveFolderSync::None,
             folder_layout: FolderLayout::Fs,
             hierarchy_separator: '/',
         },
