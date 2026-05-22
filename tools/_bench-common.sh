@@ -320,7 +320,7 @@ aggregate_cell() {
 
 # Untimed pre-warm pull against the testcontainer server so the
 # first measured *-initial cell of the round doesn't bear the full
-# cost of warming the server's OS page cache, RocksDB block cache,
+# cost of warming the server's OS page cache, InnoDB buffer pool,
 # and Stalwart's in-process caches. Without this the BEFORE-initial
 # cell pays that warming cost and AFTER-initial rides on its back --
 # a constant-sign bias that always favors AFTER and doesn't average

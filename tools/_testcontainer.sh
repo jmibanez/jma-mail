@@ -30,45 +30,29 @@
 : "${TESTCONTAINER_CORPUS_SEED:=0}"
 : "${TESTCONTAINER_NEW_PCT:=10}"
 # Number of concurrent IMAP sessions bench-server opens during
-# the APPEND phase. Default 8 -- the empirical sweet spot on the
-# RocksDB fixture (see table below). Exported so bench-server's
-# TESTCONTAINER_SEED_PARALLELISM env-var override picks it up.
+# the APPEND phase. Default 8 -- one MySQL data point so far,
+# 8w/8-CPU/8 GB Colima seeds 100k in ~1036s. Exported so
+# bench-server's TESTCONTAINER_SEED_PARALLELISM env-var override
+# picks it up.
 : "${TESTCONTAINER_SEED_PARALLELISM:=8}"
 export TESTCONTAINER_SEED_PARALLELISM
 
 # IMAP seeding dominates the wall-time for non-trivial corpus
-# sizes. The dominant cost is Stalwart's per-insert work; with
-# the RocksDB backend the post-cliff regime is CPU-bound and
-# scales near-linearly with available cores, so client
-# parallelism past 1 buys real throughput (unlike SQLite, where
-# the single-writer lock caps it).
-#
-# Empirical 100k-corpus wall-times against the RocksDB fixture
-# (measured directly; finer-grained per-batch numbers in the
-# bench-server progress log on each run):
-#
-#   * 1 worker  / 4 CPUs:  ~1138s
-#   * 4 workers / 4 CPUs:   ~700s
-#   * 8 workers / 8 CPUs:   ~422s  <- sweet spot, the default above
-#   * 16 workers / 8 CPUs:  ~392s  (diminishing returns)
-#   * 16 workers / 16 CPUs: ~319s
-#
-# 8 workers on an 8-CPU host VM is where the curve flattens. More
-# workers per CPU saturate the same cores; more CPUs continues to
-# scale but with smaller per-step gains. The recommended Colima
-# allocation for testcontainer-mode bench runs is therefore
-# 8 CPUs / 8 GB.
+# sizes. Stalwart's MySQL backend does several InnoDB row
+# operations per Email/import (counter increments, prefix
+# lookups), and the bottleneck shifts between redo-log capacity,
+# dirty-page flushing, and Stalwart-side per-message work as a
+# seed run progresses. Single-thread (1 worker) is structurally
+# much worse: per-batch throughput collapses as the table grows.
 #
 # TESTCONTAINER_READY_TIMEOUT is computed dynamically in
-# testcontainer_start from a linear model anchored on the
-# 8w/8-CPU RocksDB datapoint: ~5 ms per message average across
-# the full 100k corpus, scaled by 1.5x for headroom plus 60s for
-# container boot. The 1.5x is generous against the recommended
-# config; on smaller hosts (1-4 CPU) seeding takes substantially
-# longer than the model assumes and you'll need to bump
-# TESTCONTAINER_READY_TIMEOUT or override it directly. The
-# estimate is printed at seed-start so you can see what timeout
-# was chosen and why.
+# testcontainer_start from a simple linear model anchored on the
+# 8w/8-CPU MySQL datapoint (~10.4 ms/msg average over 100k),
+# rounded up to 11 ms/msg and scaled by 1.5x for headroom plus
+# 60s for container boot. On smaller hosts the per-message cost
+# is likely higher; override TESTCONTAINER_READY_TIMEOUT directly
+# in that case. The estimate is printed at seed-start so you can
+# see what timeout was chosen and why.
 
 # Build the two example binaries the testcontainer flow depends on.
 # Release builds because bench cells run against the same binaries
@@ -121,19 +105,17 @@ testcontainer_start() {
     local info_file="$bench_dir/server-info.env"
     rm -f "$info_file"
 
-    # Project seed wall-time from a simple linear model anchored on
-    # the RocksDB 8w/8-CPU sweet-spot datapoint (100k corpus in
-    # ~422s, i.e. ~4.22 ms per message average). Rounded up to
-    # 5 ms/msg for ~18% margin even on the anchor itself, then
-    # multiplied by 1.5x for general headroom plus 60s for
-    # container boot. No quadratic term because we don't have data
-    # that supports one against the recommended config -- the
-    # post-cliff regime in the bench-server progress log holds a
-    # roughly constant aggregate rate, and the bench's bound is
-    # CPU-throughput, not anything that grows super-linearly.
+    # Project seed wall-time from a simple linear model anchored
+    # on the MySQL 8w/8-CPU datapoint (100k corpus in ~1036s,
+    # i.e. ~10.4 ms per message average). Rounded up to 11 ms/msg
+    # for ~6% margin, then multiplied by 1.5x for headroom plus
+    # 60s for container boot. The cum msg-per-second rate falls
+    # over the course of a seed (~26 msg/s/worker early to ~12
+    # by the end on the anchor run); the 1.5x covers that drift
+    # but the model isn't exact, especially on smaller hosts.
     local estimated
     estimated=$(awk -v n="$TESTCONTAINER_CORPUS_COUNT" \
-        'BEGIN { printf "%d", int(0.005 * n + 0.5) }')
+        'BEGIN { printf "%d", int(0.011 * n + 0.5) }')
     # 1.5x headroom on the projection + 60s for container boot/seedup,
     # unless the caller pinned a specific timeout.
     if [[ -z "${TESTCONTAINER_READY_TIMEOUT:-}" ]]; then

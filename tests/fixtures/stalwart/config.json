@@ -1,1 +1,1 @@
-{"@type":"RocksDb","path":"/var/lib/stalwart/","blobSize":1024,"bufferSize":536870912,"poolWorkers":null}
+{"@type":"MySql","timeout":15000,"useTls":false,"allowInvalidCerts":false,"maxAllowedPacket":null,"poolMaxConnections":10,"poolMinConnections":5,"readReplicas":{},"host":"mysql","port":3306,"database":"stalwart","authUsername":"stalwart","authSecret":{"@type":"Value","secret":"stalwart-fixture-user"}}

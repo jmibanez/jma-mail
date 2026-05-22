@@ -171,16 +171,14 @@ fn collect_maildir_messages(root: &Path) -> Result<Vec<SeedEntry>> {
 }
 
 /// Default number of concurrent IMAP sessions used for the APPEND
-/// phase. Empirically 8 is the sweet spot against the RocksDB
-/// fixture this binary is built to seed: RocksDB's writer
-/// concurrency scales near-linearly with CPU count, so client
-/// parallelism past 1 buys real throughput. 8 workers on an
-/// 8-CPU host VM completes a 100k-message seed in ~422s; 16
-/// workers on the same VM buys only ~7% more (~392s); 16 workers
-/// on a 16-CPU VM trims further to ~319s. The recommended Colima
-/// allocation is 8 CPU / 8 GB, which matches this default. On
-/// smaller hosts (1-4 CPUs) override with a lower
-/// TESTCONTAINER_SEED_PARALLELISM to avoid CPU over-subscription.
+/// phase. Against the MySQL fixture this binary seeds, 8 workers
+/// on an 8 CPU / 8 GB Colima allocation completes a 100k-message
+/// seed in ~1036s. Single-thread (1 worker) is structurally worse:
+/// per-batch throughput collapses as data grows (151 -> 26 msg/s
+/// over the first 30k messages, with the curve still falling), so
+/// the useful parallelism floor is above 1. The upper end is
+/// uncharacterised against MySQL; raise it via
+/// TESTCONTAINER_SEED_PARALLELISM if a host has more headroom.
 /// `tools/_testcontainer.sh` sets the same default and exports it
 /// so bench-script invocations inherit it; this constant is the
 /// standalone fallback when bench-server is invoked directly.

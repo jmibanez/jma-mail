@@ -1,8 +1,9 @@
-//! Shared fixture for end-to-end JMAP tests. Spawns a Stalwart Mail
-//! container pre-seeded from a checked-in fixture (config.json plus
-//! the RocksDB data directory under `rocksdb/`), waits for JMAP and
-//! IMAP to come up, and returns a `JmapFixture` that tests can
-//! point a real `jma_mail::Config` at.
+//! Shared fixture for end-to-end JMAP tests. Spawns a MySQL
+//! sidecar initialised from `tests/fixtures/stalwart/mysql.sql`,
+//! then a Stalwart Mail container on the same docker network with
+//! `tests/fixtures/stalwart/config.json` pointing at it. Waits for
+//! JMAP and IMAP to come up, and returns a `JmapFixture` that tests
+//! can point a real `jma_mail::Config` at.
 //!
 //! We boot from a checked-in fixture because Stalwart v0.16's
 //! persisted config is a typed JSON blob with `@type` discriminators
@@ -35,8 +36,8 @@
 //! `examples/bench-server.rs` path-includes this module to spawn
 //! the same fixture for the bench scripts' testcontainer mode, so
 //! refactors of the public surface here (`spawn_stalwart`,
-//! `JmapFixture`, `seed_inbox`, `SeedMessage`) need to be checked
-//! against that consumer too.
+//! `spawn_mysql`, `JmapFixture`, `MysqlFixture`, `seed_inbox`,
+//! `SeedMessage`) need to be checked against that consumer too.
 //!
 //! Seeding goes through IMAP APPEND (`seed_inbox`) rather than
 //! `Email/import` so a `jmap-client` breakage can't silently
@@ -47,12 +48,17 @@
 
 use anyhow::{Context, Result, anyhow};
 use async_imap::Client as ImapClient;
-use include_dir::{Dir, include_dir};
 use reqwest::Client as HttpClient;
 use serde_json::Value;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use testcontainers::{
-    ContainerAsync, GenericImage, ImageExt, core::IntoContainerPort, runners::AsyncRunner,
+    ContainerAsync, GenericImage, ImageExt,
+    core::{
+        IntoContainerPort,
+        wait::{LogWaitStrategy, WaitFor},
+    },
+    runners::AsyncRunner,
 };
 use tokio::net::{TcpListener, TcpStream};
 
@@ -66,60 +72,32 @@ const ACCOUNT_EMAIL: &str = "admin@example.org";
 /// Wizard-generated admin password; only used for IMAP authentication
 /// when seeding the inbox. JMAP authentication for the system under
 /// test goes through `FIXTURE_BEARER` instead. Bound to the password
-/// hash committed in tests/fixtures/stalwart/rocksdb/ (regenerate
+/// hash committed in tests/fixtures/stalwart/mysql.sql (regenerate
 /// via tools/regen-stalwart-fixture.sh when changing).
-const ACCOUNT_IMAP_PASSWORD: &str = "QFe7eBz1vEO6EQQS"; // fixture-only
+const ACCOUNT_IMAP_PASSWORD: &str = "iYHO4AGScvDuy5v6"; // fixture-only
 
 /// Pre-minted Stalwart API key whose hash is persisted in the
 /// fixture DB. Stalwart accepts this as `Authorization: Bearer ...`
 /// for any JMAP call against the wizard admin's account, so
 /// jma-mail's standard Bearer flow works end-to-end without any
 /// auth-mode changes. Bound to the API-key hash committed in
-/// tests/fixtures/stalwart/rocksdb/ (regenerate via
+/// tests/fixtures/stalwart/mysql.sql (regenerate via
 /// tools/regen-stalwart-fixture.sh when changing).
-const FIXTURE_BEARER: &str = "API_AAAAAQAAAAFQG84N-GbiAB_AC27jqdsECoy8iw"; // fixture-only
+const FIXTURE_BEARER: &str = "API_AAAAAQAAAAGBjWN9_6ZXfU-BrT4DzzgfLYl9kA"; // fixture-only
 
 /// Path the Stalwart image's default `CMD` reads at boot. Mounting
 /// our fixture here is what tells the server to skip the bootstrap
 /// wizard and start in normal operation.
 const CONTAINER_CONFIG_PATH: &str = "/etc/stalwart/config.json";
 
-/// Where Stalwart's `config.json` points (the data directory).
-/// RocksDB writes its CURRENT/MANIFEST/SST/blob files directly
-/// into this path -- there's no per-engine subdirectory. The
-/// local fixture lives at tests/fixtures/stalwart/rocksdb/ for
-/// human readability, but the contents get copied into this
-/// container path verbatim.
-const CONTAINER_DATA_DIR: &str = "/var/lib/stalwart";
+/// Path inside the MySQL sidecar at which the dump is mounted.
+/// The MySQL official image's entrypoint runs any `.sql` file in
+/// this directory against `MYSQL_DATABASE` on first boot.
+const MYSQL_INITDB_PATH: &str = "/docker-entrypoint-initdb.d/01-stalwart.sql";
 
-/// Compile-time embed of the wizard-generated RocksDB state. Each
-/// file at any depth becomes a separate with_copy_to call into
-/// CONTAINER_DATA_DIR at spawn time. The LOCK file (RocksDB's
-/// flock marker) is stripped at regen time and shouldn't appear
-/// here; the fresh container's RocksDB recreates it on open.
-static ROCKSDB_FIXTURE: Dir<'_> =
-    include_dir!("$CARGO_MANIFEST_DIR/tests/fixtures/stalwart/rocksdb");
-
-/// Recursively collect every file in an include_dir::Dir. The
-/// crate's Dir::files() returns top-level only, so we descend
-/// into subdirectories manually for fixtures that have a nested
-/// tree (the RocksDB blob store under blobfs/<XX>/<Y>/).
-fn collect_fixture_files<'a>(dir: &'a Dir<'a>) -> Vec<&'a include_dir::File<'a>> {
-    let mut out: Vec<&'a include_dir::File<'a>> = dir.files().collect();
-    for sub in dir.dirs() {
-        out.extend(collect_fixture_files(sub));
-    }
-    out
-}
-
-/// Container-side files end up owned by root after `with_copy_to`
-/// (testcontainers builds a tar with uid 0 entries). The Stalwart
-/// image's normal entrypoint runs as the `stalwart` user, which
-/// can't open a root-owned SQLite database for writing. Running
-/// the container as root sidesteps the chown dance entirely; the
-/// resulting Stalwart process is otherwise identical to a normal
-/// boot for the purposes of jma-mail's E2E coverage.
-const RUN_AS_USER: &str = "0:0";
+/// Compile-time embed of the wizard-seeded Stalwart schema and
+/// rows. Applied to the MySQL sidecar at boot via initdb.
+const MYSQL_INIT_SQL: &[u8] = include_bytes!("../fixtures/stalwart/mysql.sql");
 
 pub struct JmapFixture {
     pub session_url: String,
@@ -129,7 +107,13 @@ pub struct JmapFixture {
     pub imap_host: String,
     pub imap_port: u16,
     /// Holding the container handle gates teardown on fixture drop.
+    /// Declared before `_mysql` so the Stalwart container is removed
+    /// first; testcontainers force-kills containers in Drop (no
+    /// graceful-shutdown window), so this ordering only matters to
+    /// keep Stalwart from being the one logging "MySQL gone" errors
+    /// during the teardown race.
     _container: ContainerAsync<GenericImage>,
+    _mysql: MysqlFixture,
 }
 
 pub struct SeedMessage {
@@ -167,6 +151,13 @@ impl SeedMessage {
 }
 
 pub async fn spawn_stalwart() -> Result<JmapFixture> {
+    // Bring up the MySQL sidecar first, with the wizard-seeded
+    // dump applied via initdb. spawn_mysql blocks until the real
+    // mysqld has bound TCP 3306 (see the wait condition there), so
+    // by the time Stalwart starts the data store is already
+    // accepting queries on the shared network.
+    let mysql = spawn_mysql(Some(MYSQL_INIT_SQL)).await?;
+
     // `with_copy_to` takes `Vec<u8>` (via `CopyDataSource::Data`), so
     // each call clones the embedded bytes onto the heap. The
     // alternative `CopyDataSource::File` variant wants a path on
@@ -190,34 +181,13 @@ pub async fn spawn_stalwart() -> Result<JmapFixture> {
     let imap_port = pick_free_port().await?;
     let public_url = format!("http://127.0.0.1:{http_port}");
 
-    let mut image = GenericImage::new(STALWART_IMAGE, STALWART_TAG)
+    let image = GenericImage::new(STALWART_IMAGE, STALWART_TAG)
         .with_mapped_port(http_port, 8080.tcp())
         .with_mapped_port(imap_port, 143.tcp())
         .with_copy_to(CONTAINER_CONFIG_PATH, config_bytes)
         .with_env_var("STALWART_PUBLIC_URL", &public_url)
-        .with_user(RUN_AS_USER)
+        .with_network(&mysql.network)
         .with_startup_timeout(Duration::from_secs(60));
-
-    // Copy every file in the embedded RocksDB fixture into the
-    // container's data directory. The fixture has subdirectories
-    // (the blob-store's sharded blobfs/<XX>/<Y>/ tree); we descend
-    // recursively because include_dir's Dir::files() only walks
-    // the top level. file.path() returns the path relative to the
-    // include_dir root, so it already carries the subdirectory
-    // prefix and we just prefix CONTAINER_DATA_DIR. testcontainers'
-    // with_copy_to creates parent directories on the container
-    // side automatically, so we don't have to materialise empty
-    // dirs ourselves.
-    for file in collect_fixture_files(&ROCKSDB_FIXTURE) {
-        let rel = file.path().to_str().ok_or_else(|| {
-            anyhow!(
-                "RocksDB fixture entry has non-UTF8 path: {}",
-                file.path().display()
-            )
-        })?;
-        let container_path = format!("{CONTAINER_DATA_DIR}/{rel}");
-        image = image.with_copy_to(container_path, file.contents().to_vec());
-    }
 
     let container = image.start().await.context("start Stalwart container")?;
 
@@ -249,6 +219,7 @@ pub async fn spawn_stalwart() -> Result<JmapFixture> {
         imap_host: "127.0.0.1".to_string(),
         imap_port,
         _container: container,
+        _mysql: mysql,
     })
 }
 
@@ -353,6 +324,129 @@ pub async fn seed_inbox(fx: &JmapFixture, msgs: &[SeedMessage]) -> Result<()> {
     // doesn't invalidate the appended messages.
     let _ = session.logout().await;
     Ok(())
+}
+
+const MYSQL_IMAGE: &str = "mysql";
+const MYSQL_TAG: &str = "8.4";
+const MYSQL_INTERNAL_PORT: u16 = 3306;
+
+/// In-network DNS name MySQL is published as via `with_hostname`.
+/// The committed Stalwart config.json references this as `host`,
+/// so it must match: changing one without the other breaks the
+/// e2e boot.
+const MYSQL_NETWORK_HOSTNAME: &str = "mysql";
+
+/// Fixture-only credentials. Must match the values committed in
+/// tests/fixtures/stalwart/config.json (which the wizard wrote from
+/// the same values via tools/regen-stalwart-fixture.sh).
+const MYSQL_ROOT_PASSWORD: &str = "stalwart-fixture-root";
+const MYSQL_DATABASE: &str = "stalwart";
+const MYSQL_USER: &str = "stalwart";
+const MYSQL_PASSWORD: &str = "stalwart-fixture-user";
+
+pub struct MysqlFixture {
+    /// Docker network name. Pass into another container's
+    /// `.with_network(...)` to put it on the same network as the
+    /// MySQL sidecar so it can reach MySQL by hostname.
+    pub network: String,
+    /// Host address (typically 127.0.0.1) for host-side access.
+    pub host: String,
+    /// Host-mapped port for host-side access (e.g. the standalone
+    /// MySQL smoke test in tests/mysql_fixture.rs).
+    pub host_port: u16,
+    /// Holding the container handle gates teardown on fixture drop.
+    _container: ContainerAsync<GenericImage>,
+}
+
+pub async fn spawn_mysql(init_sql: Option<&[u8]>) -> Result<MysqlFixture> {
+    // Per-spawn suffix combining pid and a monotonic counter.
+    // cargo runs tests in a binary in parallel by default, so a
+    // per-process suffix isn't enough -- two concurrent
+    // `spawn_mysql` calls in the same binary would collide on the
+    // network name. The pid disambiguates across test binaries,
+    // the counter disambiguates within one. The in-network
+    // hostname (MYSQL_NETWORK_HOSTNAME) is constant across spawns
+    // because each spawn gets its own network; collisions are
+    // network-scoped in docker DNS, so the same hostname on
+    // different networks is unambiguous.
+    static SPAWN_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id();
+    let seq = SPAWN_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let network = format!("jma-mysql-net-{pid}-{seq}");
+
+    // The MySQL official image's init phase runs a temporary
+    // mysqld on a UNIX socket only (logged as `port: 0`), runs the
+    // init scripts, stops it, then starts the real mysqld bound to
+    // TCP 3306. The substring `ready for connections` matches the
+    // X-Plugin and main-mysqld lines in both phases (four hits
+    // total). Matching `port: 3306` instead pinpoints the one log
+    // line that means "TCP 3306 is now accepting connections" --
+    // the bare `ready for connections` + with_times(2) variant
+    // fires on the init-phase mysqld's socket-only ready line,
+    // which makes peers on the docker network race with the
+    // init->real-server restart and get TCP connection refused.
+    //
+    // The InnoDB CMD args relax durability and right-size memory
+    // for the throwaway test workload. With defaults, large-write
+    // benches against this fixture stall on `Threads are unable
+    // to reserve space in redo log` warnings: the 100 MB default
+    // `redo_log_capacity` fills faster than the checkpointer
+    // drains. Raising it gives the checkpointer more headroom;
+    // `innodb-flush-log-at-trx-commit=0` removes the
+    // per-transaction redo fsync from the critical path; turning
+    // off the double-write buffer halves InnoDB's write volume;
+    // `innodb-buffer-pool-size=512M` (up from the 128 MB default)
+    // keeps more dirty pages in memory for the checkpointer to
+    // coalesce; `innodb-io-capacity{,-max}` raise the IOPS budget
+    // InnoDB assumes the storage can sustain (defaults 200/2000),
+    // which feeds the adaptive-flushing rate; `skip-log-bin`
+    // removes the binary log write stream. Safe because the
+    // container's state is discarded at the end of every test
+    // run.
+    let mut image = GenericImage::new(MYSQL_IMAGE, MYSQL_TAG)
+        .with_wait_for(WaitFor::log(
+            LogWaitStrategy::stderr("port: 3306").with_times(1),
+        ))
+        .with_cmd([
+            "mysqld",
+            "--innodb-redo-log-capacity=2G",
+            "--innodb-flush-log-at-trx-commit=0",
+            "--innodb-doublewrite=OFF",
+            "--innodb-buffer-pool-size=512M",
+            "--innodb-io-capacity=2000",
+            "--innodb-io-capacity-max=4000",
+            "--skip-log-bin",
+        ])
+        .with_env_var("MYSQL_ROOT_PASSWORD", MYSQL_ROOT_PASSWORD)
+        .with_env_var("MYSQL_DATABASE", MYSQL_DATABASE)
+        .with_env_var("MYSQL_USER", MYSQL_USER)
+        .with_env_var("MYSQL_PASSWORD", MYSQL_PASSWORD)
+        .with_network(&network)
+        .with_hostname(MYSQL_NETWORK_HOSTNAME)
+        .with_startup_timeout(Duration::from_secs(120));
+
+    if let Some(sql) = init_sql {
+        image = image.with_copy_to(MYSQL_INITDB_PATH, sql.to_vec());
+    }
+
+    let container = image.start().await.context("start MySQL container")?;
+
+    let host = container
+        .get_host()
+        .await
+        .context("read MySQL container host")?
+        .to_string();
+    let host_port = container
+        .get_host_port_ipv4(MYSQL_INTERNAL_PORT.tcp())
+        .await
+        .context("read MySQL host-mapped port")?;
+
+    Ok(MysqlFixture {
+        network,
+        host,
+        host_port,
+        _container: container,
+    })
 }
 
 fn render_eml(msg: &SeedMessage, msgid: &str) -> String {

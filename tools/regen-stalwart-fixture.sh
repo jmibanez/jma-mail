@@ -1,61 +1,49 @@
 #!/usr/bin/env bash
 # Regenerate the Stalwart fixture pair under tests/fixtures/stalwart/.
 #
-# Stalwart's persisted config is a typed-JSON blob produced by the
-# install wizard. The existing fixture (committed in 69c455a) was
-# walked with the SQLite backend. This script spawns a fresh
-# Stalwart container with no config so the wizard fires, prints
-# instructions for walking it (this time selecting RocksDB), then
-# applies three admin-API tweaks for you given the admin password
-# you set during the wizard:
+# The fixture consists of:
+#   - config.json: Stalwart's persisted typed-JSON config blob,
+#     pointing at a MySQL data store.
+#   - mysql.sql: a mysqldump of the wizard-seeded Stalwart schema
+#     and rows. At e2e test time this gets mounted into the MySQL
+#     sidecar's /docker-entrypoint-initdb.d/ so the schema is
+#     re-applied on first boot.
 #
-#   1. Mint a long-lived API key (Bearer) via x:ApiKey/set.
-#   2. Add a plaintext IMAP listener on 0.0.0.0:143 via
-#      x:NetworkListener/set.
-#   3. Enable allowPlainTextAuth on the IMAP service via
-#      x:Imap/set (the singleton id is the literal "singleton").
-#
-# Listener config doesn't hot-reload -- Stalwart binds all
-# listeners at startup. After (2) the container is restarted so
-# the new IMAP listener actually binds.
-#
-# Once the listener is up, the resulting state is docker-cp'd out
-# into tests/fixtures/stalwart/ (config.json + the rocksdb/
-# directory).
-#
-# The RocksDB switch matters because Stalwart's SQLite backend
-# serializes all writes through a single writer lock, capping
-# IMAP-bulk-seed throughput at ~125 msg/s on a 1-CPU host and
-# producing a non-deterministic cliff on multi-CPU hosts. RocksDB
-# is Stalwart's own published default for single-node installs
-# (see crates/main/Cargo.toml in stalwartlabs/stalwart) and uses
-# an OptimisticTransactionDB on a rayon worker pool with no
-# global writer lock.
+# This script:
+#   1. Creates a private docker network.
+#   2. Spawns a MySQL 8.4 container on it with fixed fixture
+#      credentials (see below), aliased as `mysql` on the network.
+#   3. Spawns a fresh Stalwart container on the same network so
+#      the install wizard fires on its HTTP port.
+#   4. Prints instructions for walking the wizard, including the
+#      MySQL connection details to type. Stalwart writes its initial
+#      schema and rows into MySQL during this step.
+#   5. Applies three admin-API tweaks given the wizard-set admin
+#      password:
+#        a. Mint a long-lived API key (Bearer) via x:ApiKey/set.
+#        b. Add a plaintext IMAP listener on 0.0.0.0:143 via
+#           x:NetworkListener/set.
+#        c. Enable allowPlainTextAuth on the IMAP service via
+#           x:Imap/set (the singleton id is the literal "singleton").
+#      Listener config doesn't hot-reload, so the container is
+#      restarted after step (b) for the new IMAP listener to bind.
+#   6. Captures config.json from Stalwart (docker cp) and a
+#      mysqldump of the MySQL container into tests/fixtures/stalwart/.
 #
 # Requirements: docker, curl, jq.
 #
+# Fixture credentials (must match tests/common/mod.rs constants):
+#   MYSQL_ROOT_PASSWORD = stalwart-fixture-root
+#   MYSQL_DATABASE      = stalwart
+#   MYSQL_USER          = stalwart
+#   MYSQL_PASSWORD      = stalwart-fixture-user
+#   In-network host     = mysql
+#   In-network port     = 3306
+#
 # After this script finishes:
 #   1. Update constants in tests/common/mod.rs:
-#        ACCOUNT_IMAP_PASSWORD   = "<password you set in wizard>"
-#        FIXTURE_BEARER          = "<bearer printed at end here>"
-#        CONTAINER_DB_PATH       = "/var/lib/stalwart/rocksdb"
-#                                  (now a directory, not a file)
-#   2. Update spawn_stalwart() in tests/common/mod.rs to copy the
-#      rocksdb/ directory instead of a single .db file. The
-#      easiest pattern: add the `include_dir` crate to
-#      [dev-dependencies] and iterate:
-#
-#        static ROCKSDB_FIXTURE: Dir =
-#          include_dir!("$CARGO_MANIFEST_DIR/tests/fixtures/stalwart/rocksdb");
-#        for file in ROCKSDB_FIXTURE.files() {
-#            image = image.with_copy_to(
-#                format!("/var/lib/stalwart/rocksdb/{}", file.path().display()),
-#                file.contents().to_vec(),
-#            );
-#        }
-#
-#   3. Delete the old SQLite fixture once the RocksDB one is
-#      verified: rm tests/fixtures/stalwart/stalwart.db
+#        ACCOUNT_IMAP_PASSWORD = <password you set in wizard>
+#        FIXTURE_BEARER        = <bearer printed at end here>
 
 set -euo pipefail
 
@@ -67,8 +55,25 @@ FIXTURE_DIR="$REPO_ROOT/tests/fixtures/stalwart"
 mkdir -p "$FIXTURE_DIR"
 
 STALWART_IMAGE="stalwartlabs/stalwart:v0.16"
+MYSQL_IMAGE="mysql:8.4"
 HTTP_PORT="${WIZARD_HTTP_PORT:-8080}"
 IMAP_PORT="${WIZARD_IMAP_PORT:-1143}"
+
+# Stable resource names. The script tears these down on the happy
+# path; mid-script failures leave them up for debugging.
+MYSQL_NETWORK="jma-stalwart-fixture-net"
+MYSQL_CONTAINER="jma-stalwart-fixture-mysql"
+MYSQL_ALIAS="mysql"
+STALWART_CONTAINER="jma-stalwart-fixture-stalwart"
+
+# Mirror of tests/common/mod.rs:MYSQL_* constants. Keep in sync;
+# the committed config.json's MySQL section captures whatever the
+# user types into the wizard, which must match what spawn_mysql()
+# advertises at test time.
+MYSQL_ROOT_PASSWORD="stalwart-fixture-root"
+MYSQL_DATABASE="stalwart"
+MYSQL_USER="stalwart"
+MYSQL_PASSWORD="stalwart-fixture-user"
 
 for cmd in docker curl jq; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
@@ -77,55 +82,115 @@ for cmd in docker curl jq; do
     fi
 done
 
-if [[ -d "$FIXTURE_DIR/rocksdb" && -z "${FORCE:-}" ]]; then
-    echo "$FIXTURE_DIR/rocksdb already exists; set FORCE=1 to overwrite" >&2
+if [[ -f "$FIXTURE_DIR/mysql.sql" && -z "${FORCE:-}" ]]; then
+    echo "$FIXTURE_DIR/mysql.sql already exists; set FORCE=1 to overwrite" >&2
     exit 1
 fi
 
 echo "=== Stalwart fixture regeneration ==="
-echo "  image:      $STALWART_IMAGE"
-echo "  http port:  $HTTP_PORT (override via WIZARD_HTTP_PORT)"
-echo "  imap port:  $IMAP_PORT (override via WIZARD_IMAP_PORT)"
-echo "  fixture:    $FIXTURE_DIR"
+echo "  stalwart image: $STALWART_IMAGE"
+echo "  mysql image:    $MYSQL_IMAGE"
+echo "  http port:      $HTTP_PORT (override via WIZARD_HTTP_PORT)"
+echo "  imap port:      $IMAP_PORT (override via WIZARD_IMAP_PORT)"
+echo "  fixture dir:    $FIXTURE_DIR"
 echo
 
-echo "Spawning fresh container..."
-CONTAINER=$(docker run -d \
-    -p "${HTTP_PORT}:8080" \
-    -p "${IMAP_PORT}:143" \
-    -e "STALWART_PUBLIC_URL=http://127.0.0.1:${HTTP_PORT}" \
-    -u 0:0 \
-    "$STALWART_IMAGE")
-echo "Container: $CONTAINER"
+# Sweep up any debris from a prior failed run so we don't fight
+# with "name already in use" errors on docker create.
+echo "Sweeping stale containers/network (if any)..."
+docker rm -f "$STALWART_CONTAINER" >/dev/null 2>&1 || true
+docker rm -f "$MYSQL_CONTAINER"    >/dev/null 2>&1 || true
+docker network rm "$MYSQL_NETWORK" >/dev/null 2>&1 || true
 
-# Set SUCCESS=1 just before clean exit so the trap only tears down
-# the container on a happy path. Mid-script failures leave the
-# container running so you can docker exec / docker logs / probe
-# /jmap to figure out what went wrong, then docker rm by hand.
+echo "Creating docker network $MYSQL_NETWORK..."
+docker network create "$MYSQL_NETWORK" >/dev/null
+
+# Set SUCCESS=1 just before clean exit so the trap only tears
+# things down on a happy path. Mid-script failures leave both
+# containers and the network up for inspection.
 SUCCESS=0
 cleanup() {
     if (( SUCCESS )); then
-        echo "Stopping container..."
-        docker stop "$CONTAINER" >/dev/null 2>&1 || true
-        docker rm   "$CONTAINER" >/dev/null 2>&1 || true
+        echo "Stopping containers and removing network..."
+        docker stop "$STALWART_CONTAINER" >/dev/null 2>&1 || true
+        docker rm   "$STALWART_CONTAINER" >/dev/null 2>&1 || true
+        docker stop "$MYSQL_CONTAINER"    >/dev/null 2>&1 || true
+        docker rm   "$MYSQL_CONTAINER"    >/dev/null 2>&1 || true
+        docker network rm "$MYSQL_NETWORK" >/dev/null 2>&1 || true
     else
         cat >&2 <<EOM
 
-Script exited before completion. Container preserved for debugging:
-  container id: $CONTAINER
-  http port:    $HTTP_PORT
-  imap port:    $IMAP_PORT
+Script exited before completion. Containers and network preserved
+for debugging:
+  mysql container:    $MYSQL_CONTAINER
+  stalwart container: $STALWART_CONTAINER
+  docker network:     $MYSQL_NETWORK
+  stalwart http port: $HTTP_PORT
+  stalwart imap port: $IMAP_PORT
 
 Useful probes (run before cleaning up):
-  docker logs $CONTAINER 2>&1 | tail -100
-  curl -i -u 'admin@example.org:<password>' http://127.0.0.1:${HTTP_PORT}/jmap/session
+  docker logs $STALWART_CONTAINER 2>&1 | tail -100
+  docker logs $MYSQL_CONTAINER    2>&1 | tail -100
+  docker exec -it $MYSQL_CONTAINER \\
+      mysql -u${MYSQL_USER} -p${MYSQL_PASSWORD} ${MYSQL_DATABASE}
 
 Clean up when done:
-  docker stop $CONTAINER && docker rm $CONTAINER
+  docker stop $STALWART_CONTAINER $MYSQL_CONTAINER
+  docker rm   $STALWART_CONTAINER $MYSQL_CONTAINER
+  docker network rm $MYSQL_NETWORK
 EOM
     fi
 }
 trap cleanup EXIT INT TERM
+
+echo "Spawning MySQL container..."
+docker run -d \
+    --name "$MYSQL_CONTAINER" \
+    --network "$MYSQL_NETWORK" \
+    --network-alias "$MYSQL_ALIAS" \
+    -e "MYSQL_ROOT_PASSWORD=$MYSQL_ROOT_PASSWORD" \
+    -e "MYSQL_DATABASE=$MYSQL_DATABASE" \
+    -e "MYSQL_USER=$MYSQL_USER" \
+    -e "MYSQL_PASSWORD=$MYSQL_PASSWORD" \
+    "$MYSQL_IMAGE" >/dev/null
+
+# The mysql official image's init phase boots a temporary mysqld
+# on a UNIX socket only (logged as `port: 0`), runs the init
+# scripts, stops it, then starts the real mysqld bound to TCP
+# 3306. We poll the log for the real-server readiness line
+# specifically; matching the bare `ready for connections`
+# substring is ambiguous (four hits per boot: X-Plugin + main
+# mysqld, init phase + real phase) and the init-phase mysqld's
+# `ready` fires before TCP 3306 is bound, so peers race the
+# init->real-server restart and get connection refused. The
+# anchored regex pins us to the `/usr/sbin/mysqld: ready for
+# connections ... port: 3306` line on the real server.
+echo "Waiting for MySQL to bind TCP 3306..."
+mysql_ready=0
+for _ in $(seq 1 120); do
+    if docker logs "$MYSQL_CONTAINER" 2>&1 | \
+        grep -qE '/usr/sbin/mysqld: ready for connections\..*port: 3306'; then
+        mysql_ready=1
+        break
+    fi
+    sleep 1
+done
+if (( ! mysql_ready )); then
+    echo "MySQL never bound TCP 3306" >&2
+    echo "Check 'docker logs $MYSQL_CONTAINER' for diagnostics." >&2
+    exit 1
+fi
+echo "  mysql ready"
+
+echo "Spawning Stalwart container..."
+docker run -d \
+    --name "$STALWART_CONTAINER" \
+    --network "$MYSQL_NETWORK" \
+    -p "${HTTP_PORT}:8080" \
+    -p "${IMAP_PORT}:143" \
+    -e "STALWART_PUBLIC_URL=http://127.0.0.1:${HTTP_PORT}" \
+    -u 0:0 \
+    "$STALWART_IMAGE" >/dev/null
 
 wait_for_http() {
     local label="$1"
@@ -155,7 +220,12 @@ Wizard choices:
                      for it below so the script can drive the
                      three admin tweaks for you
   * Domain:          example.org
-  * Storage backend: RocksDB  (NOT SQLite -- the whole point)
+  * Storage backend: MySQL  (NOT RocksDB / SQLite)
+  * MySQL host:      $MYSQL_ALIAS
+  * MySQL port:      3306
+  * MySQL database:  $MYSQL_DATABASE
+  * MySQL username:  $MYSQL_USER
+  * MySQL password:  $MYSQL_PASSWORD
 
 Press Enter once you have walked the wizard to completion.
 EOF
@@ -174,8 +244,8 @@ echo
 # wizard-created admin email/password isn't accepted on /jmap (you
 # get 401 with the in-memory bootstrap admin still active). A
 # restart picks up the new Principal from the persisted store.
-echo "Restarting container so the wizard admin credentials load..."
-docker restart "$CONTAINER" >/dev/null
+echo "Restarting Stalwart so the wizard admin credentials load..."
+docker restart "$STALWART_CONTAINER" >/dev/null
 wait_for_http "post-wizard" 60
 
 # Sanity-check before we throw three more admin calls at the
@@ -191,7 +261,7 @@ if ! curl -fsS -o /dev/null -u "${ADMIN_EMAIL}:${ADMIN_PASS}" \
     echo "  * Stalwart hasn't picked up the wizard-created Principal yet" >&2
     echo "    (try waiting a few more seconds and re-running)." >&2
     echo >&2
-    echo "Container left running for inspection -- see cleanup trap output below." >&2
+    echo "Containers left running for inspection -- see cleanup trap output below." >&2
     exit 1
 fi
 echo "  admin auth ok"
@@ -229,15 +299,10 @@ if [[ -z "$BEARER" ]]; then
     echo "$APIKEY_RESP" | jq . >&2 || echo "$APIKEY_RESP" >&2
     exit 1
 fi
-# Print the full bearer immediately on mint. Earlier iterations
-# truncated this to ${BEARER:0:16}...${BEARER: -8} as a
-# leak-paranoia measure, but the value has to land in source
-# (tests/common/mod.rs:FIXTURE_BEARER) anyway, so withholding the
-# middle here just forces a re-run if the script later errors out
-# before the final summary block prints it untruncated. The
-# fixture's Stalwart instance is throwaway; the bearer authenticates
-# only against the test fixture's persisted hash and isn't a
-# production credential.
+# Print the full bearer immediately on mint. The fixture's
+# Stalwart instance is throwaway; the bearer authenticates only
+# against the test fixture's persisted hash and isn't a production
+# credential.
 echo "  bearer: $BEARER"
 
 echo "Adding plaintext IMAP listener on [::]:143 via x:NetworkListener/set..."
@@ -283,7 +348,6 @@ IMAP_BODY='{
   ]
 }'
 IMAP_RESP=$(jmap_post "$IMAP_BODY")
-IMAP_UPDATED=$(echo "$IMAP_RESP" | jq -r '.methodResponses[0][1].updated.singleton // empty')
 # Stalwart returns `null` (JSON null) for an updated singleton when
 # there are no server-side changes to relay beyond the requested
 # update -- which is the success case. Treat the absence of an
@@ -295,13 +359,46 @@ if [[ -n "$IMAP_NOT_UPDATED" ]]; then
     exit 1
 fi
 
-echo "Restarting container so the new listener binds..."
+echo "Creating search-config singleton via x:Search/set..."
+# The wizard does not pre-create the x:Search singleton, so this
+# is a `create` (not `update`) with the full indexEmailFields
+# map. Without this the FTS skips headers during indexing, so
+# header-only searches (From:, Subject:, etc.) return empty;
+# enabling the rest of the indexable email fields keeps the FTS
+# behaviour symmetric with what a fully-tuned Stalwart deployment
+# would expose.
+SEARCH_BODY='{
+  "using": ["urn:ietf:params:jmap:core", "urn:stalwart:jmap"],
+  "methodCalls": [
+    ["x:Search/set", {
+       "create": {
+         "singleton": {
+           "indexEmailFields": {
+             "from": true, "to": true, "cc": true, "bcc": true,
+             "subject": true, "body": true, "attachment": true,
+             "receivedAt": true, "sentAt": true, "size": true,
+             "hasAttachment": true, "headers": true
+           }
+         }
+       }
+    }, "c1"]
+  ]
+}'
+SEARCH_RESP=$(jmap_post "$SEARCH_BODY")
+SEARCH_NOT_CREATED=$(echo "$SEARCH_RESP" | jq -r '.methodResponses[0][1].notCreated.singleton.type // empty')
+if [[ -n "$SEARCH_NOT_CREATED" ]]; then
+    echo "Failed to create search-config singleton. Response:" >&2
+    echo "$SEARCH_RESP" | jq . >&2 || echo "$SEARCH_RESP" >&2
+    exit 1
+fi
+
+echo "Restarting Stalwart so the new listener binds..."
 # Stalwart binds all listeners once at startup
 # (crates/main/src/main.rs spawns them in init.servers.spawn).
 # x:Action/set { ReloadSettings } would reload the in-memory
 # registry but doesn't rebind sockets, so a real restart is the
 # only way to make the new imap-plain listener live.
-docker restart "$CONTAINER" >/dev/null
+docker restart "$STALWART_CONTAINER" >/dev/null
 wait_for_http "post-listener-config" 60
 
 echo "Verifying IMAP listener on host port ${IMAP_PORT}..."
@@ -316,79 +413,69 @@ for _ in $(seq 1 30); do
 done
 if [[ -z "$IMAP_BANNER" ]]; then
     echo "IMAP listener never came up on host port ${IMAP_PORT}" >&2
-    echo "Check 'docker logs $CONTAINER' for what went wrong." >&2
+    echo "Check 'docker logs $STALWART_CONTAINER' for what went wrong." >&2
     exit 1
 fi
 echo "  banner: ${IMAP_BANNER}"
 
 echo
-echo "Capturing state from the container..."
+echo "Capturing state from the containers..."
 
-rm -rf "$FIXTURE_DIR/rocksdb"
-docker cp "$CONTAINER:/etc/stalwart/config.json" "$FIXTURE_DIR/config.json"
+docker cp "$STALWART_CONTAINER:/etc/stalwart/config.json" \
+    "$FIXTURE_DIR/config.json"
 
-# Read the RocksDB data path straight from the just-captured
-# config.json. Stalwart writes the RocksDB SST/MANIFEST/CURRENT
-# files directly into the configured path with no further
-# subdirectory, so this is the path we copy out -- typically
-# /var/lib/stalwart/. We keep the local fixture layout at
-# tests/fixtures/stalwart/rocksdb/ (a more descriptive name than
-# whatever the container path happens to be) and translate
-# container-side at copy-back time.
-ROCKSDB_PATH=$(jq -r '.path // empty' "$FIXTURE_DIR/config.json")
-if [[ -z "$ROCKSDB_PATH" ]]; then
-    echo "config.json missing .path; cannot locate the RocksDB directory" >&2
-    exit 1
-fi
-# Trim any trailing slash so docker cp's source/dest semantics
-# stay predictable.
-ROCKSDB_PATH="${ROCKSDB_PATH%/}"
-docker cp "$CONTAINER:$ROCKSDB_PATH/." "$FIXTURE_DIR/rocksdb"
+# --single-transaction for a consistent snapshot without locking
+# the whole database; --routines/--triggers in case Stalwart's
+# schema declares them; --no-tablespaces because the InnoDB
+# tablespace files aren't part of the dump we'd replay.
+#
+# Dump to a temp file and rename into place so a mid-stream
+# mysqldump failure can't leave a half-written fixture on disk
+# that a subsequent `cargo test` would silently consume.
+# MYSQL_PWD (over `-p<password>`) keeps the password out of argv
+# and suppresses mysqldump's "insecure password on the command
+# line" warning on every run.
+tmpsql=$(mktemp "${TMPDIR:-/tmp}/jma-mysql.XXXXXX.sql")
+docker exec -e MYSQL_PWD="$MYSQL_ROOT_PASSWORD" "$MYSQL_CONTAINER" \
+    mysqldump \
+        -uroot \
+        --single-transaction \
+        --routines \
+        --triggers \
+        --no-tablespaces \
+        "$MYSQL_DATABASE" \
+    > "$tmpsql"
+mv "$tmpsql" "$FIXTURE_DIR/mysql.sql"
 
-# RocksDB's per-process flock marker. Shipping a stale one in the
-# fixture risks confusing the next container's RocksDB at open
-# time; it'll be recreated on startup anyway.
-rm -f "$FIXTURE_DIR/rocksdb/LOCK"
-# RocksDB's debug log files. Not load-bearing for correctness;
-# strip them so the fixture stays minimal and reproducible.
-rm -f "$FIXTURE_DIR/rocksdb/LOG" "$FIXTURE_DIR/rocksdb/LOG.old."*
-
-ROCKSDB_FILE_COUNT=$(find "$FIXTURE_DIR/rocksdb" -type f 2>/dev/null | wc -l | tr -d ' ')
-ROCKSDB_SIZE=$(du -sh "$FIXTURE_DIR/rocksdb" 2>/dev/null | awk '{print $1}')
+SQL_SIZE=$(du -sh "$FIXTURE_DIR/mysql.sql" 2>/dev/null | awk '{print $1}')
 
 # Mark the script as having reached completion so the cleanup
-# trap tears the container down. Mid-script failures leave the
-# container running for inspection.
+# trap tears the containers and network down. Mid-script failures
+# leave them running for inspection.
 SUCCESS=1
 
 cat <<EOF
 
 === Fixture regenerated ===
   $FIXTURE_DIR/config.json
-  $FIXTURE_DIR/rocksdb/  ($ROCKSDB_FILE_COUNT files, $ROCKSDB_SIZE)
+  $FIXTURE_DIR/mysql.sql  ($SQL_SIZE)
 
 Captured values for tests/common/mod.rs:
-  ACCOUNT_IMAP_PASSWORD   = <whatever you typed for "Admin password" above>
-  FIXTURE_BEARER          = $BEARER
+  ACCOUNT_IMAP_PASSWORD = <whatever you typed for "Admin password" above>
+  FIXTURE_BEARER        = $BEARER
 
 Next steps:
 
   1. Edit tests/common/mod.rs:
        * ACCOUNT_IMAP_PASSWORD = <password>
        * FIXTURE_BEARER        = "$BEARER"
-       * CONTAINER_DB_PATH     = "/var/lib/stalwart/rocksdb"
-       * Replace the single \`include_bytes!\`/\`with_copy_to\` for the
-         SQLite .db with an include_dir loop over the rocksdb/
-         directory.
 
-  2. Add include_dir to [dev-dependencies] in Cargo.toml:
-       include_dir = "0.7"
+  2. cargo test --test e2e_initial_pull -- --ignored --nocapture
+     (the e2e suite is the canonical "fixture works" smoke test.)
 
-  3. cargo test --lib --ignored e2e_initial_pull
-       (the e2e suite is the canonical "fixture works" smoke test.)
-
-  4. Once verified, delete the old SQLite fixture:
-       rm tests/fixtures/stalwart/stalwart.db
-
-  5. Re-run a bench-server seed to measure RocksDB throughput.
+  3. Commit the regenerated fixture and the mod.rs constants
+     together so the trio stays self-consistent:
+       * tests/common/mod.rs
+       * tests/fixtures/stalwart/config.json
+       * tests/fixtures/stalwart/mysql.sql
 EOF
