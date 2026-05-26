@@ -8,6 +8,7 @@ use tracing::{debug, error};
 use crate::ids::{JmapMailboxId, MaildirId, MessageId};
 use crate::jmap::types::MailboxFolderBinding;
 use crate::maildir_ops::headers::parse_message_id_from_file;
+use crate::maildir_ops::sentinel::MailboxMapping;
 use crate::sync::bindings::MailboxBindings;
 
 /// One live `cur/` entry passed into `classify_changes`. Both
@@ -87,6 +88,53 @@ pub enum LocalChange {
         binding: Arc<MailboxFolderBinding>,
         old_flags: String,
         new_flags: String,
+    },
+    /// A maildir-shaped directory appeared under the configured
+    /// maildir root that no `MailboxBindings` entry covers. No
+    /// `Arc<MailboxFolderBinding>` because the server-side JMAP id
+    /// isn't known yet: a later cycle will resolve it (either
+    /// because the cache lost a binding that the on-disk sentinel
+    /// still pins, or because no prior binding exists and a future
+    /// emit path will push the folder to the server). `sentinel`
+    /// is the result of reading `path/.jma.mapping`: `Some` means
+    /// a past sync wrote a binding here (the consumer can recover
+    /// the bound JMAP id from the sentinel); `None` means the
+    /// folder is unbound on both sides.
+    ///
+    /// No producer or consumer today: the variant lives here so
+    /// the shape is settled before scan grows the folder-discovery
+    /// pass and reconcile grows the arm that turns these into
+    /// server-side mailbox actions.
+    LocalFolderCreated {
+        path: PathBuf,
+        sentinel: Option<MailboxMapping>,
+    },
+    /// A bound folder we expected to see on disk is gone. The
+    /// binding is the cached `Arc<MailboxFolderBinding>` (or one
+    /// hydrated from the sentinel before the folder vanished); the
+    /// consumer pushes the deletion to the server against
+    /// `binding.jmap_mailbox_id`.
+    ///
+    /// No producer or consumer today: the variant lives here so
+    /// the shape is settled before the deletion phase lands.
+    LocalFolderDeleted { binding: Arc<MailboxFolderBinding> },
+    /// A bound folder's on-disk location moved between cycles
+    /// (the same `.jma.mapping` sentinel now sits at a different
+    /// path). `from_binding` is the binding as the cache knows it
+    /// (old `maildir_folder` matches the original path); `to_path`
+    /// is where the sentinel was found this cycle.
+    /// `parent_jmap_mailbox_id` is the server-side id of the new
+    /// parent folder, recovered from the parent dir's sentinel or
+    /// cache lookup at emit time, so the consumer pushing the
+    /// rename to the server doesn't have to re-walk the parent
+    /// chain. `None` means the new parent is top-level.
+    ///
+    /// No producer or consumer today: the variant lives here so
+    /// the shape is settled before the rename phase lands.
+    LocalFolderRenamed {
+        from_binding: Arc<MailboxFolderBinding>,
+        to_path: PathBuf,
+        parent_jmap_mailbox_id: Option<JmapMailboxId>,
     },
 }
 
@@ -1285,6 +1333,15 @@ mod tests {
             LocalChange::DeletedMessage { binding, .. } => format!("0:{}", binding.maildir_folder),
             LocalChange::NewMessage { binding, .. } => format!("1:{}", binding.maildir_folder),
             LocalChange::FlagsChanged { binding, .. } => format!("2:{}", binding.maildir_folder),
+            // Folder-lifecycle variants have no emitter; the test
+            // exercises message-level scan_paths only.
+            LocalChange::LocalFolderCreated { path, .. } => format!("3:{}", path.display()),
+            LocalChange::LocalFolderDeleted { binding, .. } => {
+                format!("3:{}", binding.maildir_folder)
+            }
+            LocalChange::LocalFolderRenamed { from_binding, .. } => {
+                format!("3:{}", from_binding.maildir_folder)
+            }
         });
         assert_eq!(changes.len(), 2);
         match &changes[0] {

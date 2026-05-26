@@ -913,6 +913,12 @@ fn process_local_changes(
                 }
                 handle_local_delete(ctx, maildir_id, deletes_overruled_by_server, plan)
             }
+            // Folder-lifecycle variants have no consumer yet; the
+            // arms that turn them into server-side mailbox actions
+            // land in later commits.
+            LocalChange::LocalFolderCreated { .. }
+            | LocalChange::LocalFolderDeleted { .. }
+            | LocalChange::LocalFolderRenamed { .. } => {}
         }
     }
 }
