@@ -325,7 +325,12 @@ fn emit_detected_moves(moves: &[DetectedMove], plan: &mut SyncPlan) {
             // server-side label rules), this full-replacement strips
             // those memberships -- accepted for now; the alternative
             // is a per-cycle Email/get to read the current set first.
-            target_mailbox_ids: vec![m.to_binding.jmap_mailbox_id.clone()],
+            target_mailbox_ids: vec![
+                m.to_binding
+                    .jmap_mailbox_id
+                    .expect_resolved("reconcile::move_pair -- MoveRemote target")
+                    .clone(),
+            ],
             from_folder: m.from_folder.clone(),
             to_folder: m.to_binding.maildir_folder.clone(),
         });
@@ -370,10 +375,12 @@ fn process_remote_emails(
             continue;
         }
 
-        let mailbox_match = ctx
-            .mailboxes
-            .iter()
-            .find(|b| email.mailbox_ids.contains_key(&b.jmap_mailbox_id));
+        let mailbox_match = ctx.mailboxes.iter().find(|b| {
+            email.mailbox_ids.contains_key(
+                b.jmap_mailbox_id
+                    .expect_resolved("reconcile::process_remote_emails -- mailbox membership"),
+            )
+        });
         let Some(binding) = mailbox_match else {
             debug!(
                 "Remote email {} not in any synced mailbox, skipping",
@@ -543,7 +550,10 @@ fn handle_known_remote(
     // TODO: cross-detect when the local copy was *also* moved
     // (scan emits NewMessage in dest + DeletedMessage in src,
     // not a true Move). For now, blindly follow the server.
-    if existing.mailbox_id != target_binding.jmap_mailbox_id
+    if existing.mailbox_id
+        != *target_binding
+            .jmap_mailbox_id
+            .expect_resolved("reconcile::handle_known_remote -- membership compare")
         && let Some(from_binding) = ctx.mailboxes.by_id(&existing.mailbox_id)
         && let Some(local_maildir_id) = &existing.maildir_id
     {
@@ -660,9 +670,12 @@ fn try_adopt_remote(
     // which is the steady-state contract that `commit_adopt`'s
     // split and `emit_adoption_flag_reconciliation` keep current.
     if let Some(recs) = ctx.known_by_message_id.get(mid)
-        && let Some(rec) = recs
-            .iter()
-            .find(|r| r.mailbox_id == target_binding.jmap_mailbox_id)
+        && let Some(rec) = recs.iter().find(|r| {
+            r.mailbox_id
+                == *target_binding
+                    .jmap_mailbox_id
+                    .expect_resolved("reconcile::try_adopt_known -- target compare")
+        })
         && let Some(maildir_id) = rec.maildir_id.clone()
     {
         let in_destroyed = ctx.destroyed_set.contains(rec.jmap_email_id.as_ref());
@@ -933,7 +946,10 @@ fn handle_local_new(
     // scan resolved the binding at the producer boundary; reconcile
     // trusts the typed binding it carried in.
     let folder = binding.maildir_folder.as_str();
-    let mailbox_id = binding.jmap_mailbox_id.clone();
+    let mailbox_id = binding
+        .jmap_mailbox_id
+        .expect_resolved("reconcile::handle_local_new -- DB write target")
+        .clone();
 
     // If we can match the local Message-ID against a known server
     // email (DB index), adopt instead of upload. This is the
@@ -1179,19 +1195,19 @@ fn emit_local_flag_update(
 mod tests {
     use super::*;
     use crate::ids::JmapMailboxId;
-    use crate::jmap::types::MailboxFolderBinding;
+    use crate::jmap::types::{MailboxFolderBinding, MaybeReference};
     use crate::sync::dedupe::{LocalEntry, LocalIndex};
     use std::path::PathBuf;
 
     fn mailboxes() -> MailboxBindings {
         let mut b = MailboxBindings::builder();
         b.insert(MailboxFolderBinding {
-            jmap_mailbox_id: "MB-INBOX".into(),
+            jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
             server_name: "Inbox".to_string(),
             maildir_folder: "INBOX".to_string(),
         });
         b.insert(MailboxFolderBinding {
-            jmap_mailbox_id: "MB-ARCH".into(),
+            jmap_mailbox_id: MaybeReference::Value("MB-ARCH".into()),
             server_name: "Archive".to_string(),
             maildir_folder: "Archive".to_string(),
         });
@@ -1532,7 +1548,7 @@ mod tests {
             &[LocalChange::NewMessage {
                 maildir_id: "FILE-1".into(),
                 binding: Arc::new(MailboxFolderBinding {
-                    jmap_mailbox_id: "MB-INBOX".into(),
+                    jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
                     server_name: "INBOX".to_string(),
                     maildir_folder: "INBOX".to_string(),
                 }),
@@ -1797,7 +1813,7 @@ mod tests {
         let new_change = LocalChange::NewMessage {
             maildir_id: "M-NEW".into(),
             binding: Arc::new(MailboxFolderBinding {
-                jmap_mailbox_id: "MB-INBOX".into(),
+                jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
                 server_name: "INBOX".to_string(),
                 maildir_folder: "INBOX".to_string(),
             }),
@@ -2227,7 +2243,7 @@ mod tests {
             &[LocalChange::DeletedMessage {
                 maildir_id: "M-1".into(),
                 binding: Arc::new(MailboxFolderBinding {
-                    jmap_mailbox_id: "MB-INBOX".into(),
+                    jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
                     server_name: "INBOX".to_string(),
                     maildir_folder: "INBOX".to_string(),
                 }),
@@ -2256,7 +2272,7 @@ mod tests {
             &[LocalChange::DeletedMessage {
                 maildir_id: "M-1".into(),
                 binding: Arc::new(MailboxFolderBinding {
-                    jmap_mailbox_id: "MB-INBOX".into(),
+                    jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
                     server_name: "INBOX".to_string(),
                     maildir_folder: "INBOX".to_string(),
                 }),
@@ -2283,7 +2299,7 @@ mod tests {
             &[LocalChange::FlagsChanged {
                 maildir_id: "M-1".into(),
                 binding: Arc::new(MailboxFolderBinding {
-                    jmap_mailbox_id: "MB-INBOX".into(),
+                    jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
                     server_name: "INBOX".to_string(),
                     maildir_folder: "INBOX".to_string(),
                 }),
@@ -2317,7 +2333,7 @@ mod tests {
             &[LocalChange::FlagsChanged {
                 maildir_id: "M-1".into(),
                 binding: Arc::new(MailboxFolderBinding {
-                    jmap_mailbox_id: "MB-INBOX".into(),
+                    jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
                     server_name: "INBOX".to_string(),
                     maildir_folder: "INBOX".to_string(),
                 }),
@@ -2363,7 +2379,7 @@ mod tests {
             &[LocalChange::FlagsChanged {
                 maildir_id: "M-1".into(),
                 binding: Arc::new(MailboxFolderBinding {
-                    jmap_mailbox_id: "MB-INBOX".into(),
+                    jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
                     server_name: "INBOX".to_string(),
                     maildir_folder: "INBOX".to_string(),
                 }),
@@ -2402,7 +2418,7 @@ mod tests {
         let local_changes = [LocalChange::NewMessage {
             maildir_id: "M-BIG".into(),
             binding: Arc::new(MailboxFolderBinding {
-                jmap_mailbox_id: "MB-INBOX".into(),
+                jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
                 server_name: "INBOX".to_string(),
                 maildir_folder: "INBOX".to_string(),
             }),
@@ -2437,7 +2453,7 @@ mod tests {
             &[LocalChange::NewMessage {
                 maildir_id: "M-NEW".into(),
                 binding: Arc::new(MailboxFolderBinding {
-                    jmap_mailbox_id: "MB-INBOX".into(),
+                    jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
                     server_name: "INBOX".to_string(),
                     maildir_folder: "INBOX".to_string(),
                 }),
@@ -2464,7 +2480,7 @@ mod tests {
             &[LocalChange::NewMessage {
                 maildir_id: "M-DUP".into(),
                 binding: Arc::new(MailboxFolderBinding {
-                    jmap_mailbox_id: "MB-INBOX".into(),
+                    jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
                     server_name: "INBOX".to_string(),
                     maildir_folder: "INBOX".to_string(),
                 }),
@@ -2490,7 +2506,7 @@ mod tests {
             &[LocalChange::DeletedMessage {
                 maildir_id: "M-1".into(),
                 binding: Arc::new(MailboxFolderBinding {
-                    jmap_mailbox_id: "MB-INBOX".into(),
+                    jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
                     server_name: "INBOX".to_string(),
                     maildir_folder: "INBOX".to_string(),
                 }),
@@ -2516,7 +2532,7 @@ mod tests {
             &[LocalChange::DeletedMessage {
                 maildir_id: "M-1".into(),
                 binding: Arc::new(MailboxFolderBinding {
-                    jmap_mailbox_id: "MB-INBOX".into(),
+                    jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
                     server_name: "INBOX".to_string(),
                     maildir_folder: "INBOX".to_string(),
                 }),
@@ -2550,7 +2566,7 @@ mod tests {
                 LocalChange::DeletedMessage {
                     maildir_id: "M-OLD".into(),
                     binding: Arc::new(MailboxFolderBinding {
-                        jmap_mailbox_id: "MB-INBOX".into(),
+                        jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
                         server_name: "INBOX".to_string(),
                         maildir_folder: "INBOX".to_string(),
                     }),
@@ -2558,7 +2574,7 @@ mod tests {
                 LocalChange::NewMessage {
                     maildir_id: "M-NEW".into(),
                     binding: Arc::new(MailboxFolderBinding {
-                        jmap_mailbox_id: "MB-ARCH".into(),
+                        jmap_mailbox_id: MaybeReference::Value("MB-ARCH".into()),
                         server_name: "Archive".to_string(),
                         maildir_folder: "Archive".to_string(),
                     }),
@@ -2610,7 +2626,7 @@ mod tests {
                 LocalChange::DeletedMessage {
                     maildir_id: "M-OLD".into(),
                     binding: Arc::new(MailboxFolderBinding {
-                        jmap_mailbox_id: "MB-INBOX".into(),
+                        jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
                         server_name: "INBOX".to_string(),
                         maildir_folder: "INBOX".to_string(),
                     }),
@@ -2618,7 +2634,7 @@ mod tests {
                 LocalChange::NewMessage {
                     maildir_id: "M-NEW".into(),
                     binding: Arc::new(MailboxFolderBinding {
-                        jmap_mailbox_id: "MB-ARCH".into(),
+                        jmap_mailbox_id: MaybeReference::Value("MB-ARCH".into()),
                         server_name: "Archive".to_string(),
                         maildir_folder: "Archive".to_string(),
                     }),
@@ -2658,7 +2674,7 @@ mod tests {
                 LocalChange::DeletedMessage {
                     maildir_id: "M1".into(),
                     binding: Arc::new(MailboxFolderBinding {
-                        jmap_mailbox_id: "MB-INBOX".into(),
+                        jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
                         server_name: "INBOX".to_string(),
                         maildir_folder: "INBOX".to_string(),
                     }),
@@ -2667,7 +2683,7 @@ mod tests {
                     // Same id as the deleted side -- id-preserving move.
                     maildir_id: "M1".into(),
                     binding: Arc::new(MailboxFolderBinding {
-                        jmap_mailbox_id: "MB-ARCH".into(),
+                        jmap_mailbox_id: MaybeReference::Value("MB-ARCH".into()),
                         server_name: "Archive".to_string(),
                         maildir_folder: "Archive".to_string(),
                     }),
@@ -2738,7 +2754,7 @@ mod tests {
                 LocalChange::DeletedMessage {
                     maildir_id: "M-OLD".into(),
                     binding: Arc::new(MailboxFolderBinding {
-                        jmap_mailbox_id: "MB-INBOX".into(),
+                        jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
                         server_name: "INBOX".to_string(),
                         maildir_folder: "INBOX".to_string(),
                     }),
@@ -2746,7 +2762,7 @@ mod tests {
                 LocalChange::NewMessage {
                     maildir_id: "M-NEW".into(),
                     binding: Arc::new(MailboxFolderBinding {
-                        jmap_mailbox_id: "MB-ARCH".into(),
+                        jmap_mailbox_id: MaybeReference::Value("MB-ARCH".into()),
                         server_name: "Archive".to_string(),
                         maildir_folder: "Archive".to_string(),
                     }),

@@ -47,11 +47,112 @@ pub struct MailboxObject {
 /// active layout, then threaded through scan, reconcile, and
 /// execute so the (mailbox_id, folder) pair never has to be
 /// reconstructed from a tuple or rebuilt via lookup.
+///
+/// `jmap_mailbox_id` is a `MaybeReference<JmapMailboxId>` so a
+/// binding emitted by reconcile can address a mailbox whose
+/// server-side id is not yet known: a later commit's emit path
+/// will queue chained actions (e.g. an `UploadMessage` whose
+/// target mailbox is being created by an earlier action in the
+/// same plan), and an executor-side resolution step will swap
+/// the resolved id in once the create returns. Today no producer
+/// constructs a `Reference`, so every binding's id is a resolved
+/// `Value`; readers call `expect_resolved("context")` to surface
+/// a leaked `Reference` as a panic rather than a silent wrong DB
+/// write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MailboxFolderBinding {
-    pub jmap_mailbox_id: JmapMailboxId,
+    pub jmap_mailbox_id: MaybeReference<JmapMailboxId>,
     pub server_name: String,
     pub maildir_folder: String,
+}
+
+/// Either an already-resolved value or a symbolic handle that a
+/// later resolution step will swap for a value.
+///
+/// Used inside `MailboxFolderBinding.jmap_mailbox_id` to express
+/// "the target of this action is a mailbox an earlier action in
+/// the same plan will create; the executor will swap the resolved
+/// id in once the create succeeds." The `Reference` handle's
+/// string is the producer action's chosen name; a per-cycle
+/// resolution table populated as create actions complete recovers
+/// the `Value`.
+///
+/// `Reference` values are ephemeral -- they only live between
+/// the moment reconcile emits an action and the moment the
+/// resolution step swaps in the real value. Code outside that
+/// window (scan, DB writes, log lines outside the resolution
+/// moment) calls `expect_resolved("call-site context")` to
+/// assert the value side of the enum; a leaked `Reference`
+/// indicates a bug at the resolution step. Today no producer
+/// constructs a `Reference`, so the resolution path is unused;
+/// it exists so the type boundary is settled before later commits
+/// introduce the first producer.
+///
+/// Eq is structural and `Reference("Archive")` would compare
+/// equal to another `Reference("Archive")` from a different
+/// cycle even though they resolve to different ids. Today no
+/// code compares bindings cross-cycle, so the quirk is latent;
+/// callers that need cross-cycle identity comparison should
+/// only do so over the resolved `Value` variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MaybeReference<T> {
+    /// A symbolic handle the executor's reference table resolves
+    /// at run time. The string is the producer's chosen name.
+    Reference(String),
+    /// An already-resolved value -- no lookup needed.
+    Value(T),
+}
+
+impl<T> MaybeReference<T> {
+    /// Borrow the resolved value or panic with `context` in the
+    /// message. Use at every read site that does not participate
+    /// in the resolution step (which is most of them): scan, DB
+    /// writes, log lines outside the per-action resolution
+    /// moment. A panic here means a `Reference` leaked past the
+    /// resolution boundary -- a bug at the reference's producer
+    /// or consumer, not user input.
+    pub fn expect_resolved(&self, context: &str) -> &T {
+        match self {
+            MaybeReference::Value(v) => v,
+            MaybeReference::Reference(name) => panic!(
+                "unresolved MaybeReference::Reference({:?}) at {}; \
+                 a creation reference leaked past the executor's resolution step",
+                name, context
+            ),
+        }
+    }
+
+    /// `true` if this is a resolved `Value`. Useful for guards
+    /// where the alternative is to call `expect_resolved` and
+    /// the panic would be unhelpful.
+    pub fn is_resolved(&self) -> bool {
+        matches!(self, MaybeReference::Value(_))
+    }
+}
+
+impl<T: Clone> MaybeReference<T> {
+    /// Resolve a `Reference` via the given table; return the
+    /// resolved value (cloned) or the original `Value`. Returns
+    /// `None` if `Reference` is unresolved in the table -- the
+    /// caller decides whether that's a soft skip (warn) or a
+    /// hard error (the producer never ran or never succeeded).
+    /// Unused today; lives here so the resolution-step shape is
+    /// in place before the first producer commit lands.
+    pub fn resolve_with(&self, table: &std::collections::HashMap<String, T>) -> Option<T> {
+        match self {
+            MaybeReference::Reference(name) => table.get(name).cloned(),
+            MaybeReference::Value(v) => Some(v.clone()),
+        }
+    }
+}
+
+impl<T: std::fmt::Display> std::fmt::Display for MaybeReference<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MaybeReference::Reference(name) => write!(f, "#{}", name),
+            MaybeReference::Value(v) => write!(f, "{}", v),
+        }
+    }
 }
 
 /// Result of a JMAP Email/changes call.

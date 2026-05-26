@@ -265,7 +265,10 @@ impl<'a> Executor<'a> {
                 queries::upsert_message(
                     &txn,
                     &MessageRecord {
-                        mailbox_id: to_binding.jmap_mailbox_id.clone(),
+                        mailbox_id: to_binding
+                            .jmap_mailbox_id
+                            .expect_resolved("execute::move_local_messages -- mailbox_id DB write")
+                            .clone(),
                         maildir_folder: Some(to_binding.maildir_folder.clone()),
                         ..rec
                     },
@@ -392,7 +395,10 @@ impl<'a> Executor<'a> {
                     jmap_email_id: jmap_email_id.clone(),
                     jmap_blob_id: None,
                     jmap_thread_id: None,
-                    mailbox_id: binding.jmap_mailbox_id.clone(),
+                    mailbox_id: binding
+                        .jmap_mailbox_id
+                        .expect_resolved("execute::commit_uploaded_messages -- mailbox_id DB write")
+                        .clone(),
                     maildir_id: Some(id.maildir_id.clone()),
                     maildir_folder: Some(binding.maildir_folder.clone()),
                     message_id: id.message_id.clone(),
@@ -850,7 +856,10 @@ impl<'a> Executor<'a> {
                 jmap_email_id: id.jmap_email_id.clone(),
                 jmap_blob_id: Some(jmap_blob_id.clone()),
                 jmap_thread_id: Some(jmap_thread_id.clone()),
-                mailbox_id: binding.jmap_mailbox_id.clone(),
+                mailbox_id: binding
+                    .jmap_mailbox_id
+                    .expect_resolved("execute::store_downloaded_message -- mailbox_id DB write")
+                    .clone(),
                 maildir_id: Some(mid.clone()),
                 maildir_folder: Some(binding.maildir_folder.clone()),
                 message_id: id.message_id.clone(),
@@ -1125,7 +1134,10 @@ fn apply_update_local_flags(
                 jmap_email_id,
                 jmap_blob_id: Some(jmap_blob_id),
                 jmap_thread_id: Some(jmap_thread_id),
-                mailbox_id: binding.jmap_mailbox_id.clone(),
+                mailbox_id: binding
+                    .jmap_mailbox_id
+                    .expect_resolved("execute::apply_update_local_flags -- mailbox_id DB write")
+                    .clone(),
                 maildir_id: Some(maildir_id.clone()),
                 maildir_folder: Some(binding.maildir_folder.clone()),
                 message_id,
@@ -1247,7 +1259,10 @@ fn commit_adopt(conn: &Connection, action: SyncAction) -> Result<()> {
             jmap_email_id: jmap_email_id.clone(),
             jmap_blob_id,
             jmap_thread_id,
-            mailbox_id: binding.jmap_mailbox_id.clone(),
+            mailbox_id: binding
+                .jmap_mailbox_id
+                .expect_resolved("execute::commit_adopt -- mailbox_id DB write")
+                .clone(),
             maildir_id: Some(maildir_id.clone()),
             maildir_folder: Some(binding.maildir_folder.clone()),
             message_id,
@@ -1440,7 +1455,10 @@ async fn upload_one(client: &Client, job: UploadJob) -> Result<UploadOutcome> {
     match jmap_email::import_email(
         client,
         &raw_message,
-        binding.jmap_mailbox_id.as_ref(),
+        binding
+            .jmap_mailbox_id
+            .expect_resolved("execute::upload_one -- JMAP Email/import target mailbox")
+            .as_ref(),
         &binding.maildir_folder,
         &id,
         &keywords,
@@ -1480,6 +1498,7 @@ async fn upload_one(client: &Client, job: UploadJob) -> Result<UploadOutcome> {
 mod tests {
     use super::*;
     use crate::ids::{JmapEmailId, MaildirId};
+    use crate::jmap::types::MaybeReference;
     use crate::state::db;
     use std::collections::HashMap;
 
@@ -1512,7 +1531,7 @@ mod tests {
                 message_id: "a@x".into(),
             },
             binding: Arc::new(MailboxFolderBinding {
-                jmap_mailbox_id: "MB-SPAM".into(),
+                jmap_mailbox_id: MaybeReference::Value("MB-SPAM".into()),
                 server_name: "Spam".to_string(),
                 maildir_folder: "Spam".to_string(),
             }),
@@ -1632,7 +1651,7 @@ mod tests {
                     message_id: "a@x".into(),
                 },
                 binding: Arc::new(MailboxFolderBinding {
-                    jmap_mailbox_id: "MB-INBOX".into(),
+                    jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
                     server_name: "INBOX".to_string(),
                     maildir_folder: "INBOX".to_string(),
                 }),
@@ -1915,7 +1934,7 @@ mod tests {
                 message_id: "a@x".into(),
             },
             binding: Arc::new(MailboxFolderBinding {
-                jmap_mailbox_id: "MB-INBOX".into(),
+                jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
                 server_name: "INBOX".to_string(),
                 maildir_folder: "INBOX".to_string(),
             }),
@@ -2009,7 +2028,7 @@ mod tests {
                 message_id: "a@x".into(),
             },
             binding: Arc::new(MailboxFolderBinding {
-                jmap_mailbox_id: "MB-INBOX".into(),
+                jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
                 server_name: "INBOX".to_string(),
                 maildir_folder: "INBOX".to_string(),
             }),

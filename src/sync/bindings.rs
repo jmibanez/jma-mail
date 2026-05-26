@@ -107,13 +107,19 @@ impl MailboxBindingsBuilder {
     /// Insert a binding, updating both indices. Last writer wins on
     /// collisions (same `jmap_mailbox_id` or same `maildir_folder`
     /// as an existing entry overwrites it on the relevant index).
+    /// The live binding set only ever holds resolved ids -- bindings
+    /// in the cache snapshot come from `resolve_mailboxes` which
+    /// builds them from server-known `MailboxObject`s, and emitted
+    /// bindings (e.g. resurrect-path uploads with `Reference` ids)
+    /// flow through `SyncAction` payloads rather than the live set.
     pub(crate) fn insert(&mut self, binding: MailboxFolderBinding) {
-        self.0.by_folder.insert(
-            binding.maildir_folder.clone(),
-            binding.jmap_mailbox_id.clone(),
-        );
+        let id = binding
+            .jmap_mailbox_id
+            .expect_resolved("MailboxBindings::insert -- live set holds only resolved ids")
+            .clone();
         self.0
-            .by_id
-            .insert(binding.jmap_mailbox_id.clone(), Arc::new(binding));
+            .by_folder
+            .insert(binding.maildir_folder.clone(), id.clone());
+        self.0.by_id.insert(id, Arc::new(binding));
     }
 }
