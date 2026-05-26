@@ -808,6 +808,7 @@ mod tests {
             jmap_mailbox_id: MaybeReference::Value(mailbox_id.into()),
             server_name: folder.to_string(),
             maildir_folder: folder.to_string(),
+            remote_path: folder.to_string(),
         })
     }
 
@@ -820,6 +821,7 @@ mod tests {
             jmap_mailbox_id: MaybeReference::Value(mailbox_id.into()),
             server_name: folder.to_string(),
             maildir_folder: folder.to_string(),
+            remote_path: folder.to_string(),
         });
         b.build()
     }
@@ -1528,11 +1530,13 @@ mod tests {
             jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
             server_name: "INBOX".to_string(),
             maildir_folder: "INBOX".to_string(),
+            remote_path: "INBOX".to_string(),
         });
         bindings.insert(MailboxFolderBinding {
             jmap_mailbox_id: MaybeReference::Value("MB-SPAM".into()),
             server_name: "Spam".to_string(),
             maildir_folder: "Spam".to_string(),
+            remote_path: "Spam".to_string(),
         });
         let bindings = bindings.build();
         let mut changes = scan_paths(
@@ -1954,6 +1958,7 @@ mod tests {
             jmap_mailbox_id: MaybeReference::Value("MB-ARCH".into()),
             server_name: "Archive".to_string(),
             maildir_folder: "Archive".to_string(),
+            remote_path: "Archive".to_string(),
         });
         let bindings = bindings.build();
         let known = known_for("Archive", &[]);

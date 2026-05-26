@@ -630,6 +630,21 @@ impl<'a> SyncEngine<'a> {
         let mut synced = MailboxBindings::builder();
         let layout_definition = FolderLayoutDefinition::from_config(self.config, name_cap);
         let maildir_root = self.config.maildir_path();
+        // remote_path cache: keyed by live JMAP id, populated as
+        // we walk in topological order so a child's lookup of its
+        // parent always finds a populated entry. Computed for
+        // every server-known mailbox before the synced-set filter
+        // applies, so a child included by `[sync].mailboxes`
+        // whose ancestor is excluded still resolves to its full
+        // `Parent/Child` path rather than the bare leaf.
+        let mut remote_paths: HashMap<JmapMailboxId, String> = HashMap::new();
+        for mb in &ordered {
+            let path = match mb.parent_id.as_ref().and_then(|p| remote_paths.get(p)) {
+                Some(parent_path) => format!("{}/{}", parent_path, mb.name),
+                None => mb.name.clone(),
+            };
+            remote_paths.insert(mb.id.clone(), path);
+        }
 
         for mb in ordered {
             // Parent-aware filter: a config entry naming any ancestor
@@ -668,6 +683,13 @@ impl<'a> SyncEngine<'a> {
             let cached_folder =
                 queries::get_mailbox(self.conn, &mb.id)?.map(|cached| cached.maildir_folder);
 
+            // remote_path was computed for every server-known
+            // mailbox above; the synced-set entry must be there.
+            let remote_path = remote_paths
+                .get(&mb.id)
+                .cloned()
+                .expect("remote_paths populated for every server-known mailbox above");
+
             // Store in DB. Cache bookkeeping; not user-state, so
             // it stays inline rather than going through the plan.
             queries::upsert_mailbox(
@@ -679,6 +701,7 @@ impl<'a> SyncEngine<'a> {
                     parent_id: mb.parent_id.clone(),
                     maildir_folder: folder_name.clone(),
                     sort_order: mb.sort_order as i32,
+                    remote_path: Some(remote_path.clone()),
                 },
             )?;
 
@@ -686,6 +709,7 @@ impl<'a> SyncEngine<'a> {
                 jmap_mailbox_id: MaybeReference::Value(mb.id.clone()),
                 server_name: mb.name.clone(),
                 maildir_folder: folder_name,
+                remote_path: remote_path.clone(),
             };
 
             // Decide what action this mailbox needs:
@@ -1129,6 +1153,7 @@ mod tests {
                 jmap_mailbox_id: MaybeReference::Value((*id).into()),
                 server_name: (*folder).to_string(),
                 maildir_folder: (*folder).to_string(),
+                remote_path: (*folder).to_string(),
             });
         }
         b.build()

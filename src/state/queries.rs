@@ -202,19 +202,29 @@ pub struct MailboxRecord {
     pub parent_id: Option<JmapMailboxId>,
     pub maildir_folder: String,
     pub sort_order: i32,
+    /// Slash-joined server-name path; see
+    /// `MailboxFolderBinding::remote_path`. `Option<String>` here
+    /// (not `String`) because the column is nullable: older DBs
+    /// upgraded via the runtime ALTER pick up the column with
+    /// existing rows reading as `NULL` until the next
+    /// `resolve_mailboxes` upsert stamps a value. Reads tolerate
+    /// the gap; writes always supply a value.
+    pub remote_path: Option<String>,
 }
 
 /// Insert or update a mailbox mapping.
 pub fn upsert_mailbox(conn: &Connection, mb: &MailboxRecord) -> Result<()> {
     conn.execute(
-        "INSERT INTO mailbox_map (jmap_mailbox_id, name, role, parent_id, maildir_folder, sort_order)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        "INSERT INTO mailbox_map
+            (jmap_mailbox_id, name, role, parent_id, maildir_folder, sort_order, remote_path)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT(jmap_mailbox_id) DO UPDATE SET
             name = excluded.name,
             role = excluded.role,
             parent_id = excluded.parent_id,
             maildir_folder = excluded.maildir_folder,
-            sort_order = excluded.sort_order",
+            sort_order = excluded.sort_order,
+            remote_path = excluded.remote_path",
         params![
             mb.jmap_mailbox_id,
             mb.name,
@@ -222,6 +232,7 @@ pub fn upsert_mailbox(conn: &Connection, mb: &MailboxRecord) -> Result<()> {
             mb.parent_id,
             mb.maildir_folder,
             mb.sort_order,
+            mb.remote_path,
         ],
     )?;
     Ok(())
@@ -274,7 +285,7 @@ pub fn delete_mailbox(conn: &Connection, id: &JmapMailboxId) -> Result<()> {
 /// folder path).
 pub fn get_mailbox(conn: &Connection, id: &JmapMailboxId) -> Result<Option<MailboxRecord>> {
     let mut stmt = conn.prepare(
-        "SELECT jmap_mailbox_id, name, role, parent_id, maildir_folder, sort_order
+        "SELECT jmap_mailbox_id, name, role, parent_id, maildir_folder, sort_order, remote_path
          FROM mailbox_map WHERE jmap_mailbox_id = ?1",
     )?;
     let result = stmt
@@ -286,6 +297,7 @@ pub fn get_mailbox(conn: &Connection, id: &JmapMailboxId) -> Result<Option<Mailb
                 parent_id: row.get(3)?,
                 maildir_folder: row.get(4)?,
                 sort_order: row.get(5)?,
+                remote_path: row.get(6)?,
             })
         })
         .optional()?;
@@ -295,7 +307,7 @@ pub fn get_mailbox(conn: &Connection, id: &JmapMailboxId) -> Result<Option<Mailb
 /// Get all mailbox mappings.
 pub fn get_all_mailboxes(conn: &Connection) -> Result<Vec<MailboxRecord>> {
     let mut stmt = conn.prepare(
-        "SELECT jmap_mailbox_id, name, role, parent_id, maildir_folder, sort_order
+        "SELECT jmap_mailbox_id, name, role, parent_id, maildir_folder, sort_order, remote_path
          FROM mailbox_map ORDER BY sort_order, name",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -306,6 +318,7 @@ pub fn get_all_mailboxes(conn: &Connection) -> Result<Vec<MailboxRecord>> {
             parent_id: row.get(3)?,
             maildir_folder: row.get(4)?,
             sort_order: row.get(5)?,
+            remote_path: row.get(6)?,
         })
     })?;
     let mut mailboxes = Vec::new();
@@ -611,6 +624,7 @@ mod tests {
             parent_id: None,
             maildir_folder: folder.to_string(),
             sort_order: 0,
+            remote_path: Some(name.to_string()),
         }
     }
 
