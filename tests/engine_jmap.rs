@@ -552,7 +552,7 @@ async fn sync_initial_pull_downloads_email_into_maildir() {
         .unwrap()
         .expect("message_map must hold the downloaded email");
     assert_eq!(rec.message_id.as_ref(), "<msg-1@example.com>");
-    assert_eq!(rec.maildir_folder.as_deref(), Some("INBOX"));
+    assert_eq!(rec.jmap_mailbox_id.as_ref(), "MB-INBOX");
 
     // jmap_state cursor advances so the next cycle takes the
     // Email/changes delta path instead of re-pulling.
@@ -675,7 +675,7 @@ async fn sync_falls_back_when_email_changes_cannot_calculate() {
     let rec = queries::get_message_by_jmap_id(&conn, &JmapEmailId::from("E1"))
         .unwrap()
         .expect("E1 must be in message_map after fallback");
-    assert_eq!(rec.maildir_folder.as_deref(), Some("INBOX"));
+    assert_eq!(rec.jmap_mailbox_id.as_ref(), "MB-INBOX");
 }
 
 /// Two-cycle test: an initial pull followed by a real Email/changes
@@ -783,7 +783,7 @@ async fn sync_delta_cycle_after_initial_pull_picks_up_new_email() {
     let e2 = queries::get_message_by_jmap_id(&conn, &JmapEmailId::from("E2"))
         .unwrap()
         .expect("E2 must be in message_map after the delta cycle");
-    assert_eq!(e2.maildir_folder.as_deref(), Some("INBOX"));
+    assert_eq!(e2.jmap_mailbox_id.as_ref(), "MB-INBOX");
     assert_eq!(e2.message_id.as_ref(), "<msg-2@example.com>");
 
     // E1 from cycle 1 is still bound -- the delta cycle didn't touch
@@ -791,5 +791,5 @@ async fn sync_delta_cycle_after_initial_pull_picks_up_new_email() {
     let e1 = queries::get_message_by_jmap_id(&conn, &JmapEmailId::from("E1"))
         .unwrap()
         .expect("E1 must remain bound across cycles");
-    assert_eq!(e1.maildir_folder.as_deref(), Some("INBOX"));
+    assert_eq!(e1.jmap_mailbox_id.as_ref(), "MB-INBOX");
 }

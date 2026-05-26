@@ -77,9 +77,8 @@ pub struct MessageRecord {
     pub jmap_email_id: JmapEmailId,
     pub jmap_blob_id: Option<JmapBlobId>,
     pub jmap_thread_id: Option<JmapThreadId>,
-    pub mailbox_id: JmapMailboxId,
+    pub jmap_mailbox_id: JmapMailboxId,
     pub maildir_id: Option<MaildirId>,
-    pub maildir_folder: Option<String>,
     pub message_id: MessageId,
     pub flags: String,
     pub jmap_keywords: String,
@@ -89,16 +88,15 @@ pub struct MessageRecord {
 pub fn upsert_message(conn: &Connection, msg: &MessageRecord) -> Result<()> {
     conn.execute(
         "INSERT INTO message_map (
-            jmap_email_id, jmap_blob_id, jmap_thread_id, mailbox_id,
-            maildir_id, maildir_folder, message_id, flags, jmap_keywords,
+            jmap_email_id, jmap_blob_id, jmap_thread_id, jmap_mailbox_id,
+            maildir_id, message_id, flags, jmap_keywords,
             last_synced_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'))
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, datetime('now'))
         ON CONFLICT(jmap_email_id) DO UPDATE SET
             jmap_blob_id = excluded.jmap_blob_id,
             jmap_thread_id = excluded.jmap_thread_id,
-            mailbox_id = excluded.mailbox_id,
+            jmap_mailbox_id = excluded.jmap_mailbox_id,
             maildir_id = excluded.maildir_id,
-            maildir_folder = excluded.maildir_folder,
             message_id = excluded.message_id,
             flags = excluded.flags,
             jmap_keywords = excluded.jmap_keywords,
@@ -107,9 +105,8 @@ pub fn upsert_message(conn: &Connection, msg: &MessageRecord) -> Result<()> {
             msg.jmap_email_id,
             msg.jmap_blob_id,
             msg.jmap_thread_id,
-            msg.mailbox_id,
+            msg.jmap_mailbox_id,
             msg.maildir_id,
-            msg.maildir_folder,
             msg.message_id,
             msg.flags,
             msg.jmap_keywords,
@@ -124,8 +121,8 @@ pub fn get_message_by_jmap_id(
     jmap_email_id: &JmapEmailId,
 ) -> Result<Option<MessageRecord>> {
     let mut stmt = conn.prepare(
-        "SELECT jmap_email_id, jmap_blob_id, jmap_thread_id, mailbox_id,
-                maildir_id, maildir_folder, message_id, flags, jmap_keywords
+        "SELECT jmap_email_id, jmap_blob_id, jmap_thread_id, jmap_mailbox_id,
+                maildir_id, message_id, flags, jmap_keywords
          FROM message_map WHERE jmap_email_id = ?1",
     )?;
     let result = stmt
@@ -134,12 +131,11 @@ pub fn get_message_by_jmap_id(
                 jmap_email_id: row.get(0)?,
                 jmap_blob_id: row.get(1)?,
                 jmap_thread_id: row.get(2)?,
-                mailbox_id: row.get(3)?,
+                jmap_mailbox_id: row.get(3)?,
                 maildir_id: row.get(4)?,
-                maildir_folder: row.get(5)?,
-                message_id: row.get(6)?,
-                flags: row.get(7)?,
-                jmap_keywords: row.get(8)?,
+                message_id: row.get(5)?,
+                flags: row.get(6)?,
+                jmap_keywords: row.get(7)?,
             })
         })
         .optional()?;
@@ -168,24 +164,26 @@ pub fn has_message_map_rows(conn: &Connection) -> Result<bool> {
     Ok(n != 0)
 }
 
-/// Get all messages in a given mailbox folder.
-pub fn get_messages_by_folder(conn: &Connection, folder: &str) -> Result<Vec<MessageRecord>> {
+/// Get all messages in a given mailbox.
+pub fn get_messages_by_jmap_mailbox_id(
+    conn: &Connection,
+    jmap_mailbox_id: &JmapMailboxId,
+) -> Result<Vec<MessageRecord>> {
     let mut stmt = conn.prepare(
-        "SELECT jmap_email_id, jmap_blob_id, jmap_thread_id, mailbox_id,
-                maildir_id, maildir_folder, message_id, flags, jmap_keywords
-         FROM message_map WHERE maildir_folder = ?1",
+        "SELECT jmap_email_id, jmap_blob_id, jmap_thread_id, jmap_mailbox_id,
+                maildir_id, message_id, flags, jmap_keywords
+         FROM message_map WHERE jmap_mailbox_id = ?1",
     )?;
-    let rows = stmt.query_map(params![folder], |row| {
+    let rows = stmt.query_map(params![jmap_mailbox_id], |row| {
         Ok(MessageRecord {
             jmap_email_id: row.get(0)?,
             jmap_blob_id: row.get(1)?,
             jmap_thread_id: row.get(2)?,
-            mailbox_id: row.get(3)?,
+            jmap_mailbox_id: row.get(3)?,
             maildir_id: row.get(4)?,
-            maildir_folder: row.get(5)?,
-            message_id: row.get(6)?,
-            flags: row.get(7)?,
-            jmap_keywords: row.get(8)?,
+            message_id: row.get(5)?,
+            flags: row.get(6)?,
+            jmap_keywords: row.get(7)?,
         })
     })?;
     let mut messages = Vec::new();
@@ -336,6 +334,24 @@ pub fn get_local_state_for_folder(
     Ok(map)
 }
 
+/// Update only the `flags` column for a `local_state` row. Used by
+/// keyword-update mirrors that already know the row exists for this
+/// `maildir_id` and shouldn't have to re-supply the folder. No-op when
+/// the row is missing.
+pub fn update_local_state_flags(
+    conn: &Connection,
+    maildir_id: &MaildirId,
+    flags: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE local_state
+            SET flags = ?2, recorded_at = datetime('now')
+          WHERE maildir_id = ?1",
+        params![maildir_id, flags],
+    )?;
+    Ok(())
+}
+
 /// Delete a local state record.
 pub fn delete_local_state(conn: &Connection, maildir_id: &MaildirId) -> Result<()> {
     conn.execute(
@@ -459,9 +475,8 @@ mod tests {
             jmap_email_id: jmap_email_id.into(),
             jmap_blob_id: None,
             jmap_thread_id: None,
-            mailbox_id: "MB-INBOX".into(),
+            jmap_mailbox_id: "MB-INBOX".into(),
             maildir_id: maildir_id.map(MaildirId::from),
-            maildir_folder: maildir_id.map(|_| "INBOX".to_string()),
             message_id: "msg@x".into(),
             flags: String::new(),
             jmap_keywords: "{}".into(),

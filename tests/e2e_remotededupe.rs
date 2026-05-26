@@ -81,7 +81,14 @@ async fn remotededupe_destroys_server_duplicate_and_preserves_locally_bound_surv
     // bound to the dup-mid maildir file. Snapshot it now so we can
     // assert later that remotededupe destroyed the *other* id, not
     // this one.
-    let bound_messages = queries::get_messages_by_folder(&conn, "INBOX").expect("DB read");
+    let inbox_id = queries::get_all_mailboxes(&conn)
+        .expect("query mailbox_map")
+        .into_iter()
+        .find(|m| m.maildir_folder == "INBOX")
+        .expect("INBOX must be cached in mailbox_map")
+        .jmap_mailbox_id;
+    let bound_messages =
+        queries::get_messages_by_jmap_mailbox_id(&conn, &inbox_id).expect("DB read");
     let survivor_id = bound_messages
         .iter()
         .find(|m| m.message_id.as_ref() == DUP_MID)

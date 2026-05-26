@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 /// of truth, and Message-ID-anchored adoption rebinds existing local
 /// files without re-downloading). Read-only commands refuse instead
 /// of nuking, since they don't hold the state DB lock.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS jmap_state (
@@ -25,16 +25,15 @@ CREATE TABLE IF NOT EXISTS jmap_state (
 );
 
 CREATE TABLE IF NOT EXISTS message_map (
-    jmap_email_id   TEXT NOT NULL,
-    jmap_blob_id    TEXT,
-    jmap_thread_id  TEXT,
-    mailbox_id      TEXT NOT NULL,
-    maildir_id      TEXT,
-    maildir_folder  TEXT,
-    message_id      TEXT NOT NULL,
-    flags           TEXT NOT NULL DEFAULT '',
-    jmap_keywords   TEXT NOT NULL DEFAULT '{}',
-    last_synced_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    jmap_email_id    TEXT NOT NULL,
+    jmap_blob_id     TEXT,
+    jmap_thread_id   TEXT,
+    jmap_mailbox_id  TEXT NOT NULL,
+    maildir_id       TEXT,
+    message_id       TEXT NOT NULL,
+    flags            TEXT NOT NULL DEFAULT '',
+    jmap_keywords    TEXT NOT NULL DEFAULT '{}',
+    last_synced_at   TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (jmap_email_id)
 );
 
@@ -53,7 +52,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_message_map_maildir_id_unique
     ON message_map(maildir_id)
     WHERE maildir_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_message_map_message_id ON message_map(message_id);
-CREATE INDEX IF NOT EXISTS idx_message_map_mailbox_id ON message_map(mailbox_id);
+CREATE INDEX IF NOT EXISTS idx_message_map_jmap_mailbox_id ON message_map(jmap_mailbox_id);
 
 CREATE TABLE IF NOT EXISTS mailbox_map (
     jmap_mailbox_id TEXT NOT NULL PRIMARY KEY,

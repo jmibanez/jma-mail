@@ -68,9 +68,8 @@ pub struct AccountConfig {
 ///   Dovecot deployments commonly behave in practice -- would
 ///   require the rest of the pipeline to accept an empty
 ///   `maildir_folder` string (the SQL schema's `NOT NULL` on
-///   `mailbox_map.maildir_folder`, every `<root>.join(folder)` call,
-///   every `get_messages_by_folder` query), which is more than a
-///   layout helper should drag along.
+///   `mailbox_map.maildir_folder`, every `<root>.join(folder)` call),
+///   which is more than a layout helper should drag along.
 /// - `Fs` -- Dovecot's `LAYOUT=fs` convention. Hierarchy is materialised
 ///   as a recursive directory tree: `<root>/parent/child/{cur,new,tmp}`.
 ///   The Dovecot docs flag the obvious risk -- a mailbox literally
