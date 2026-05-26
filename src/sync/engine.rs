@@ -531,12 +531,20 @@ impl<'a> SyncEngine<'a> {
         );
 
         // Unconditional cache mutations from `resolve_mailboxes`:
-        // metadata refreshes for `Unchanged`/`CacheStale` bindings.
+        // metadata refreshes for `Unchanged`/`CacheStale` bindings,
+        // and `mailbox_map` row drops for cache-route orphans.
         // Applied before the executor so the executor sees a
         // mailbox_map that already reflects the just-fetched server
-        // view. The dry-run early return above ensures this
+        // view -- and so the executor's `DestroyRemoteMailbox`
+        // phase (which itself calls `delete_mailbox` after a
+        // successful server destroy) has the last write on any id
+        // it touches. The dry-run early return above ensures this
         // doesn't fire when the user only asked for a plan.
-        apply_unconditional_mailbox_writes(self.conn, mailboxes.mailbox_metadata_writes())?;
+        apply_unconditional_mailbox_writes(
+            self.conn,
+            mailboxes.mailbox_metadata_writes(),
+            mailboxes.cache_route_orphan_deletes(),
+        )?;
 
         // Phase 5: execute.
         let executor = Executor::new(
@@ -628,6 +636,12 @@ impl<'a> SyncEngine<'a> {
                 .into_iter()
                 .map(|m| (m.jmap_mailbox_id.clone(), m))
                 .collect();
+        // Separate `list_known_mailbox_ids` SQL read preserves
+        // detection order for the cache-vs-server orphan loop --
+        // `cached_records` is a HashMap with non-deterministic
+        // iteration, so iterating it directly would shuffle the
+        // order `local_orphans` entries land in.
+        let known_mailbox_ids = queries::list_known_mailbox_ids(self.conn)?;
 
         // Walk the maildir tree once, building an id -> on-disk
         // path map from `.jma.mapping` sentinels. Used for
@@ -684,6 +698,7 @@ impl<'a> SyncEngine<'a> {
             &MailboxesInput {
                 remote_mailboxes: &remote_mailboxes,
                 cached_records: &cached_records,
+                known_mailbox_ids: &known_mailbox_ids,
                 disk_sentinels: &disk_sentinels,
                 unchanged_disk_states: &unchanged_disk_states,
             },
@@ -891,18 +906,26 @@ fn compute_dirty_folders(
 
 /// Apply the unconditional cache mutations resolved during the
 /// per-cycle decision pass: metadata refreshes for
-/// `Unchanged`/`CacheStale` bindings. The path does not check
-/// disk state -- the metadata writes target rows whose
-/// `maildir_folder` already matches the live binding. The
+/// `Unchanged`/`CacheStale` bindings, and `mailbox_map` row
+/// drops for cache-route orphans. The path does not check disk
+/// state -- the metadata writes target rows whose
+/// `maildir_folder` already matches the live binding, and the
+/// deletes are for ids the server no longer advertises (the
+/// disk side is intentionally left alone here; destructive
+/// folder handling is a separate, policy-gated path). The
 /// caller is responsible for the dry-run short-circuit: this
 /// function unconditionally writes when invoked, matching the
 /// shape of `apply_pending_mailbox_writes`.
 fn apply_unconditional_mailbox_writes(
     conn: &Connection,
     metadata_writes: &[queries::MailboxRecord],
+    deletes: &[JmapMailboxId],
 ) -> Result<()> {
     for record in metadata_writes {
         queries::upsert_mailbox(conn, record)?;
+    }
+    for id in deletes {
+        queries::delete_mailbox(conn, id)?;
     }
     Ok(())
 }
@@ -1093,6 +1116,12 @@ struct UnchangedDiskState {
 struct MailboxesInput<'a> {
     remote_mailboxes: &'a [MailboxObject],
     cached_records: &'a HashMap<JmapMailboxId, queries::MailboxRecord>,
+    /// `mailbox_map.jmap_mailbox_id` rows in SQL order. The core
+    /// iterates this when emitting cache-vs-server orphans so the
+    /// resulting `local_orphans` Vec retains the same order it had
+    /// before the shell/core split (HashMap iteration would
+    /// otherwise shuffle it).
+    known_mailbox_ids: &'a [JmapMailboxId],
     disk_sentinels: &'a HashMap<JmapMailboxId, String>,
     unchanged_disk_states: &'a HashMap<JmapMailboxId, UnchangedDiskState>,
 }
@@ -1384,7 +1413,35 @@ fn compute_mailbox_resolution(
         synced.insert(binding);
     }
 
+    record_cache_route_orphans(&mut synced, input.known_mailbox_ids, &by_id);
+
     Ok(synced)
+}
+
+/// Cache-vs-server orphan detection: queue a `mailbox_map` row
+/// drop for each id in `mailbox_map` that the server no longer
+/// advertises. The actual `delete_mailbox` call lands in
+/// `apply_unconditional_mailbox_writes` when it drains the
+/// `cache_route_orphan_deletes` slot before the executor runs.
+///
+/// The diff is against `by_id` (every mailbox the server
+/// returned), not the filtered/synced set, so a folder the user
+/// dropped from `[sync].mailboxes` -- still on the server, just
+/// unsynced -- is left alone here.
+fn record_cache_route_orphans(
+    synced: &mut MailboxBindingsBuilder,
+    known_mailbox_ids: &[JmapMailboxId],
+    by_id: &HashMap<JmapMailboxId, &MailboxObject>,
+) {
+    for cached_id in known_mailbox_ids {
+        if !by_id.contains_key(cached_id) {
+            info!(
+                "Server-side mailbox deletion detected for id {}; dropping mailbox_map row",
+                cached_id
+            );
+            synced.push_cache_route_orphan_delete(cached_id.clone());
+        }
+    }
 }
 
 /// Three-way diff over `(cached_folder, server_folder, disk_folder)`
