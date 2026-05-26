@@ -13,11 +13,14 @@ use crate::jmap::{
     email as jmap_email, limits, mailbox as jmap_mailbox, session,
     types::{EmailObject, MailboxFolderBinding, MailboxObject, MaybeReference, SessionInfo},
 };
-use crate::maildir_ops::layout::{FolderLayoutDefinition, resolve_folder_path};
+use crate::maildir_ops::layout::{
+    FolderLayoutDefinition, decompose_folder_string, resolve_folder_path,
+};
+use crate::maildir_ops::namespace::is_jma_private;
 use crate::maildir_ops::scan::LocalChange;
 use crate::maildir_ops::{scan, store};
 use crate::state::queries;
-use crate::sync::bindings::MailboxBindings;
+use crate::sync::bindings::{MailboxBindings, MailboxBindingsBuilder};
 use crate::sync::dedupe::{LocalEntry, LocalIndex};
 use crate::sync::execute::Executor;
 use crate::sync::plan::{SyncAction, SyncDirection};
@@ -527,6 +530,14 @@ impl<'a> SyncEngine<'a> {
             direction, filtered
         );
 
+        // Unconditional cache mutations from `resolve_mailboxes`:
+        // metadata refreshes for `Unchanged`/`CacheStale` bindings.
+        // Applied before the executor so the executor sees a
+        // mailbox_map that already reflects the just-fetched server
+        // view. The dry-run early return above ensures this
+        // doesn't fire when the user only asked for a plan.
+        apply_unconditional_mailbox_writes(self.conn, mailboxes.mailbox_metadata_writes())?;
+
         // Phase 5: execute.
         let executor = Executor::new(
             Arc::clone(&self.client),
@@ -606,51 +617,42 @@ impl<'a> SyncEngine<'a> {
     /// `(mailbox_id, folder)` pair never has to be rebuilt from a
     /// tuple or rediscovered via lookup.
     pub async fn resolve_mailboxes(&self) -> Result<MailboxBindings> {
+        // The shell does every I/O read up front and every I/O
+        // write at the end; `compute_mailbox_resolution` is the
+        // pure decision core in between. All reads happen before
+        // any writes so a single upsert mid-cycle can't shift
+        // what the decision loop observes.
         let remote_mailboxes = jmap_mailbox::get_all(&self.client).await?;
+        let cached_records: HashMap<JmapMailboxId, queries::MailboxRecord> =
+            queries::get_all_mailboxes(self.conn)?
+                .into_iter()
+                .map(|m| (m.jmap_mailbox_id.clone(), m))
+                .collect();
 
-        // Index by id so the filter and the folder-path resolver can
-        // walk the parent chain.
+        // Walk the maildir tree once, building an id -> on-disk
+        // path map from `.jma.mapping` sentinels. Used for
+        // local-rename detection: a tracked id whose sentinel
+        // lives at a different path than the cache (and the
+        // server) is the "user `mv`-ed the maildir" case. Empty
+        // for first-cycle syncs (no sentinels exist yet).
+        let maildir_root = self.config.maildir_path();
+        let disk_sentinels = walk_sentinels(&maildir_root);
+
+        let name_cap = limits::max_size_mailbox_name(&self.client);
+        let layout_definition = FolderLayoutDefinition::from_config(self.config, name_cap);
+
+        // Per-synced-mailbox disk-state pre-pass for the Unchanged
+        // arm's `needs_create` check. Reading for every synced
+        // mailbox (not just the ones that land in Unchanged) is
+        // the trade for keeping the decision loop free of I/O;
+        // the cost is per-folder local-FS reads, which scan
+        // already pays many times over each cycle.
         let by_id: HashMap<JmapMailboxId, &MailboxObject> = remote_mailboxes
             .iter()
             .map(|mb| (mb.id.clone(), mb))
             .collect();
-
-        // Process parents before children so a server-side rename
-        // cascades correctly under `LAYOUT=fs`: renaming a parent
-        // moves the entire subtree on disk, after which each
-        // child's queued RenameLocalMailbox sees its own
-        // `from_folder` already gone and recovers via the
-        // executor's source-missing/target-present branch.
-        // Children-first under Fs would try to `fs::rename` a
-        // child into a parent dir that doesn't exist yet.
-        let mut ordered: Vec<&MailboxObject> = remote_mailboxes.iter().collect();
-        ordered.sort_by_key(|mb| parent_chain_depth(mb, &by_id));
-
-        let name_cap = limits::max_size_mailbox_name(&self.client);
-        let mut synced = MailboxBindings::builder();
-        let layout_definition = FolderLayoutDefinition::from_config(self.config, name_cap);
-        let maildir_root = self.config.maildir_path();
-        // remote_path cache: keyed by live JMAP id, populated as
-        // we walk in topological order so a child's lookup of its
-        // parent always finds a populated entry. Computed for
-        // every server-known mailbox before the synced-set filter
-        // applies, so a child included by `[sync].mailboxes`
-        // whose ancestor is excluded still resolves to its full
-        // `Parent/Child` path rather than the bare leaf.
-        let mut remote_paths: HashMap<JmapMailboxId, String> = HashMap::new();
-        for mb in &ordered {
-            let path = match mb.parent_id.as_ref().and_then(|p| remote_paths.get(p)) {
-                Some(parent_path) => format!("{}/{}", parent_path, mb.name),
-                None => mb.name.clone(),
-            };
-            remote_paths.insert(mb.id.clone(), path);
-        }
-
-        for mb in ordered {
-            // Parent-aware filter: a config entry naming any ancestor
-            // (or the mailbox itself) includes this mailbox. So
-            // `mailboxes = ["[Airmail]"]` syncs `[Airmail]` plus every
-            // descendant. Empty filter means "sync everything".
+        let mut unchanged_disk_states: HashMap<JmapMailboxId, UnchangedDiskState> = HashMap::new();
+        for mb in &remote_mailboxes {
             if !jmap_mailbox::is_mailbox_synced(
                 &self.config.sync.mailboxes,
                 mb,
@@ -659,105 +661,35 @@ impl<'a> SyncEngine<'a> {
             ) {
                 continue;
             }
-
-            // Translate the JMAP hierarchy to a single on-disk folder
-            // name under the user-chosen layout. Defaults preserve the
-            // pre-hierarchy behavior: Flat with `.` produces the leaf
-            // name unchanged for depth-1 mailboxes.
-            let folder_name = resolve_folder_path(mb, &by_id, &layout_definition)?;
-
-            // Detect a server-side rename: if the cached mailbox_map
-            // row points at a different folder than what the freshly
-            // computed name resolves to, the mailbox was renamed (or
-            // moved under a new parent that produces a different
-            // path). Queue a RenameLocalMailbox action and let the
-            // executor's rename phase do the on-disk + local_state
-            // catch-up. User-state mutations (fs::rename,
-            // local_state rewrite, sentinel refresh) no longer
-            // happen inline here -- `--dry-run` previews them and
-            // direction filters apply.
-            // Snapshot BEFORE the upsert below overwrites the row
-            // -- rename detection compares the cached folder
-            // against the freshly resolved one, and reading after
-            // the write would always return the new value.
-            let cached_folder =
-                queries::get_mailbox(self.conn, &mb.id)?.map(|cached| cached.maildir_folder);
-
-            // remote_path was computed for every server-known
-            // mailbox above; the synced-set entry must be there.
-            let remote_path = remote_paths
-                .get(&mb.id)
-                .cloned()
-                .expect("remote_paths populated for every server-known mailbox above");
-
-            // Store in DB. Cache bookkeeping; not user-state, so
-            // it stays inline rather than going through the plan.
-            queries::upsert_mailbox(
-                self.conn,
-                &queries::MailboxRecord {
-                    jmap_mailbox_id: mb.id.clone(),
-                    name: mb.name.clone(),
-                    role: mb.role.clone(),
-                    parent_id: mb.parent_id.clone(),
-                    maildir_folder: folder_name.clone(),
-                    sort_order: mb.sort_order as i32,
-                    remote_path: Some(remote_path.clone()),
+            let server_folder = resolve_folder_path(mb, &by_id, &layout_definition)?;
+            let folder_path = maildir_root.join(&server_folder);
+            let maildir_present = store::try_open_maildir(&folder_path).is_some();
+            let sentinel = if maildir_present {
+                crate::maildir_ops::sentinel::read(&folder_path)?
+            } else {
+                None
+            };
+            unchanged_disk_states.insert(
+                mb.id.clone(),
+                UnchangedDiskState {
+                    maildir_present,
+                    sentinel,
                 },
-            )?;
-
-            let binding = MailboxFolderBinding {
-                jmap_mailbox_id: MaybeReference::Value(mb.id.clone()),
-                server_name: mb.name.clone(),
-                maildir_folder: folder_name,
-                remote_path: remote_path.clone(),
-            };
-
-            // Decide what action this mailbox needs:
-            //
-            // - Rename: cached_folder is Some and differs from the
-            //   freshly resolved folder. The executor's rename
-            //   phase moves the on-disk content from old to new
-            //   and refreshes the sentinel at the new path. Rename
-            //   takes priority over create because under a server-
-            //   side rename the new path doesn't exist yet on disk
-            //   -- a needs_create check at the new path would say
-            //   true and an emitted CreateLocalMailbox would
-            //   silently strand the old path's content. Rename
-            //   first; let the executor's fs::rename idempotently
-            //   no-op if the move already happened.
-            //
-            // - Create: cached_folder is None (first sight of this
-            //   id) OR the new path's on-disk state is inconsistent
-            //   with the binding (folder absent, sentinel absent,
-            //   or sentinel content stale -- partial-failure
-            //   recovery). All converge on the executor's
-            //   idempotent `ensure_maildir` + `sentinel::write`.
-            //
-            // - Steady state: cached_folder matches and the new
-            //   path's disk state is consistent. No action.
-            let folder_path = maildir_root.join(&binding.maildir_folder);
-            let needs_create = match (
-                store::try_open_maildir(&folder_path),
-                crate::maildir_ops::sentinel::read(&folder_path)?,
-            ) {
-                (None, _) => true,
-                (Some(_), None) => true,
-                (Some(_), Some(m)) => {
-                    m.jmap_mailbox_id != mb.id
-                        || m.server_name != mb.name
-                        || m.parent_jmap_mailbox_id != mb.parent_id
-                }
-            };
-            if let Some(old) = cached_folder.as_ref()
-                && *old != binding.maildir_folder
-            {
-                synced.push_renamed_mailbox(old.clone(), binding.clone(), mb.parent_id.clone());
-            } else if needs_create {
-                synced.push_new_mailbox(binding.clone(), mb.parent_id.clone(), None);
-            }
-
-            synced.insert(binding);
+            );
         }
+
+        // Pure decision core: takes the I/O snapshot above, emits
+        // a fully-populated builder. No I/O happens inside.
+        let synced = compute_mailbox_resolution(
+            &MailboxesInput {
+                remote_mailboxes: &remote_mailboxes,
+                cached_records: &cached_records,
+                disk_sentinels: &disk_sentinels,
+                unchanged_disk_states: &unchanged_disk_states,
+            },
+            &self.config.sync,
+            &layout_definition,
+        )?;
 
         let synced = synced.build();
         crate::notify!("Syncing {} mailboxes", synced.len());
@@ -957,6 +889,24 @@ fn compute_dirty_folders(
     Ok(dirty)
 }
 
+/// Apply the unconditional cache mutations resolved during the
+/// per-cycle decision pass: metadata refreshes for
+/// `Unchanged`/`CacheStale` bindings. The path does not check
+/// disk state -- the metadata writes target rows whose
+/// `maildir_folder` already matches the live binding. The
+/// caller is responsible for the dry-run short-circuit: this
+/// function unconditionally writes when invoked, matching the
+/// shape of `apply_pending_mailbox_writes`.
+fn apply_unconditional_mailbox_writes(
+    conn: &Connection,
+    metadata_writes: &[queries::MailboxRecord],
+) -> Result<()> {
+    for record in metadata_writes {
+        queries::upsert_mailbox(conn, record)?;
+    }
+    Ok(())
+}
+
 /// Snapshot every synced folder after a successful cycle and upsert
 /// the row that the next cycle's `compute_dirty_folders` will compare
 /// against. Stat'd unconditionally for every synced folder (not just
@@ -1053,6 +1003,614 @@ fn build_known_indices(
     Ok(idx)
 }
 
+/// What `resolve_mailboxes` should do with one cached + server +
+/// disk triple. Decided per mailbox before any DB write; the
+/// caller then applies the cache upsert and bindings push in one
+/// place so the on-disk view, the cache view, and the plan
+/// emitted to reconcile all derive from the same decision.
+#[derive(Debug)]
+enum MailboxDecision {
+    /// All three views agree on the folder (or the cache has no
+    /// row yet and the server is the only signal). Nothing to
+    /// emit; cache upsert advances `mailbox_map.maildir_folder`
+    /// to the server-resolved value (a no-op when they already
+    /// match).
+    Unchanged,
+    /// The cache has no row for this id -- first cycle the user
+    /// has seen this mailbox. Emits `CreateLocalMailbox`.
+    FirstCycle,
+    /// Cache disagrees with server, disk follows cache. Server
+    /// renamed the mailbox; emit `RenameLocalMailbox` to bring
+    /// disk into agreement.
+    ServerRename { from_folder: String },
+    /// Cache and server agree, disk disagrees. User `mv`-ed the
+    /// maildir locally; emit `RenameRemoteMailbox` to push the
+    /// new name (and parent, if reparented) to the server.
+    /// `from_folder` is the pre-rename cached path (the one the
+    /// executor's `local_state` catch-up rewrites from).
+    LocalRename {
+        from_folder: String,
+        new_name: String,
+        new_parent_jmap_mailbox_id: Option<JmapMailboxId>,
+        disk_folder: String,
+    },
+    /// Cache is stale but server and disk already agree on the
+    /// new folder (a prior cycle's rename landed before the
+    /// cache update could). Nothing to emit; the cache upsert
+    /// catches up silently.
+    CacheStale,
+    /// All three views disagree, `conflict_strategy = ServerWins`.
+    /// Server's rename wins; emit `RenameLocalMailbox` to rewrite
+    /// disk from its locally-renamed location to the server's
+    /// view. The user's local rename is overwritten.
+    ConflictServerWins { from_folder: String },
+    /// All three views disagree, `conflict_strategy = LocalWins`.
+    /// User's local rename wins; emit `RenameRemoteMailbox` to
+    /// push the disk's view to the server. The server's rename
+    /// is overwritten. `from_folder` is the pre-rename cached
+    /// path (see `LocalRename`).
+    ConflictLocalWins {
+        from_folder: String,
+        new_name: String,
+        new_parent_jmap_mailbox_id: Option<JmapMailboxId>,
+        disk_folder: String,
+    },
+}
+
+/// Per-cycle, per-mailbox-id inputs threaded into
+/// `decide_mailbox_action` and the decompose helper.
+/// `cached_by_folder` is the reverse index over the pre-cycle
+/// `mailbox_map` snapshot that lets the rename push side
+/// resolve a disk parent path back to a `JmapMailboxId` in O(1).
+struct DecisionCtx<'a> {
+    layout: &'a FolderLayoutDefinition,
+    cached_by_folder: &'a HashMap<&'a str, &'a JmapMailboxId>,
+    conflict_strategy: crate::config::ConflictStrategy,
+}
+
+/// Per-mailbox disk snapshot read by the shell pre-pass and
+/// consumed by the Unchanged-arm's `needs_create` check inside
+/// the pure decision loop. `maildir_present` tracks
+/// `try_open_maildir`'s `Some`/`None` outcome at
+/// `maildir_root.join(server_folder)`. `sentinel` carries the
+/// parsed `.jma.mapping` content when the maildir was present,
+/// or `None` either because the maildir was absent or because
+/// the sentinel was missing / unparseable. Hoisting these into
+/// a per-id map lets the decision loop stay free of I/O.
+struct UnchangedDiskState {
+    maildir_present: bool,
+    sentinel: Option<crate::maildir_ops::sentinel::MailboxMapping>,
+}
+
+/// Bundle of every input the pure mailbox-resolution core reads.
+/// The shell does all the I/O up front (JMAP `Mailbox/get`, the
+/// `mailbox_map` SELECTs, the sentinel walk, per-mailbox disk
+/// state, per-sentinel content) and hands this struct to
+/// `compute_mailbox_resolution`. Keeping the inputs in one place
+/// makes the shell/core boundary obvious: anything the core needs
+/// that isn't in here is a static / pure value (e.g. layout,
+/// sync config) passed as a separate argument.
+struct MailboxesInput<'a> {
+    remote_mailboxes: &'a [MailboxObject],
+    cached_records: &'a HashMap<JmapMailboxId, queries::MailboxRecord>,
+    disk_sentinels: &'a HashMap<JmapMailboxId, String>,
+    unchanged_disk_states: &'a HashMap<JmapMailboxId, UnchangedDiskState>,
+}
+
+/// Join the parent's already-resolved server path with the leaf
+/// `name`, falling back to the bare name when the parent is
+/// absent or not yet in `remote_paths`. Shared between the
+/// topological remote_paths prep-pass and the `LocalRename` /
+/// `ConflictLocalWins` arm's post-rename `push_remote_path`
+/// computation -- both perform the same join.
+fn compose_remote_path(
+    parent_jmap_mailbox_id: Option<&JmapMailboxId>,
+    name: &str,
+    remote_paths: &HashMap<JmapMailboxId, String>,
+) -> String {
+    match parent_jmap_mailbox_id.and_then(|p| remote_paths.get(p)) {
+        Some(parent_path) => format!("{}/{}", parent_path, name),
+        None => name.to_string(),
+    }
+}
+
+/// Translate a `MailboxDecision` into the action-level builder
+/// calls. The first match inside the per-mailbox loop already
+/// emitted the per-id `MailboxRecord` (`push_mailbox_metadata_write`
+/// or `push_pending_mailbox_write`); this helper handles the
+/// second half so the loop body reads as "decide -> record ->
+/// build binding -> dispatch."
+fn dispatch_decision_to_builder(
+    synced: &mut MailboxBindingsBuilder,
+    decision: &MailboxDecision,
+    mb: &MailboxObject,
+    binding: &MailboxFolderBinding,
+    cached_folder: Option<&str>,
+    remote_paths: &HashMap<JmapMailboxId, String>,
+    unchanged_disk_states: &HashMap<JmapMailboxId, UnchangedDiskState>,
+) {
+    use crate::sync::bindings::RenameDirection;
+    match decision {
+        MailboxDecision::FirstCycle => {
+            synced.push_new_mailbox(binding.clone(), mb.parent_id.clone(), None);
+        }
+        MailboxDecision::ServerRename { from_folder } => {
+            // Clean server rename: cache, server, disk all agreed
+            // at cycle start. fs source = DB source = cached
+            // folder = `from_folder`.
+            synced.push_renamed_mailbox(
+                RenameDirection::Pull,
+                from_folder.clone(),
+                from_folder.clone(),
+                binding.clone(),
+                mb.parent_id.clone(),
+            );
+        }
+        MailboxDecision::ConflictServerWins { from_folder } => {
+            // 3-way conflict, server wins. `from_folder` =
+            // disk_folder (where the user mv'd to; fs::rename
+            // reads from there). DB-source = `cached_folder`
+            // (where `local_state` rows were last written -- the
+            // user's `mv` didn't update them). The two diverge,
+            // so the action carries both.
+            let db_src = cached_folder
+                .expect("ConflictServerWins requires a cached row")
+                .to_string();
+            synced.push_renamed_mailbox(
+                RenameDirection::Pull,
+                from_folder.clone(),
+                db_src,
+                binding.clone(),
+                mb.parent_id.clone(),
+            );
+        }
+        MailboxDecision::LocalRename {
+            from_folder,
+            new_name,
+            new_parent_jmap_mailbox_id,
+            disk_folder,
+        }
+        | MailboxDecision::ConflictLocalWins {
+            from_folder,
+            new_name,
+            new_parent_jmap_mailbox_id,
+            disk_folder,
+        } => {
+            // Push side: no fs::rename runs (the user already
+            // `mv`-ed the maildir). fs source is moot; DB source
+            // is the cached folder. Pass the cached folder in
+            // both slots so the executor's
+            // `rename_remote_mailboxes` reads it as the DB-rewrite
+            // source via `action.from_folder`.
+            let push_remote_path =
+                compose_remote_path(new_parent_jmap_mailbox_id.as_ref(), new_name, remote_paths);
+            synced.push_renamed_mailbox(
+                RenameDirection::Push,
+                from_folder.clone(),
+                from_folder.clone(),
+                MailboxFolderBinding {
+                    jmap_mailbox_id: MaybeReference::Value(mb.id.clone()),
+                    server_name: new_name.clone(),
+                    maildir_folder: disk_folder.clone(),
+                    remote_path: push_remote_path,
+                },
+                new_parent_jmap_mailbox_id.clone(),
+            );
+        }
+        MailboxDecision::Unchanged => {
+            // Steady state per the 3-way diff, but disk may still
+            // need attention. The reachable case is: maildir
+            // present, sentinel missing or stale -- recreate so
+            // the executor's idempotent `ensure_maildir +
+            // sentinel::write` rebinds it. Absent-maildir bindings
+            // flow through the scan-side
+            // `LocalChange::LocalFolderDeleted` emission; see the
+            // conversion loop in `run`.
+            let disk_state = unchanged_disk_states
+                .get(&mb.id)
+                .expect("unchanged_disk_states populated for every synced mailbox above");
+            if disk_state.maildir_present {
+                let needs_create = match &disk_state.sentinel {
+                    None => true,
+                    Some(m) => {
+                        m.jmap_mailbox_id != mb.id
+                            || m.server_name != mb.name
+                            || m.parent_jmap_mailbox_id != mb.parent_id
+                    }
+                };
+                if needs_create {
+                    synced.push_new_mailbox(binding.clone(), mb.parent_id.clone(), None);
+                }
+            }
+        }
+        MailboxDecision::CacheStale => {}
+    }
+}
+
+/// Pure-decision core of `resolve_mailboxes`. Takes the upfront
+/// I/O snapshot and produces a fully-populated
+/// `MailboxBindingsBuilder`: the live binding set, the
+/// new/renamed slots, and the `mailbox_metadata_writes` cache-
+/// write slot that the engine's drain pass applies
+/// (`apply_unconditional_mailbox_writes` before the executor).
+/// The shell finalizes with `.build()`; no `mailbox_map` writes
+/// happen in the shell.
+fn compute_mailbox_resolution(
+    input: &MailboxesInput<'_>,
+    sync_config: &crate::config::SyncConfig,
+    layout: &FolderLayoutDefinition,
+) -> Result<MailboxBindingsBuilder> {
+    let by_id: HashMap<JmapMailboxId, &MailboxObject> = input
+        .remote_mailboxes
+        .iter()
+        .map(|mb| (mb.id.clone(), mb))
+        .collect();
+    let cached_by_folder: HashMap<&str, &JmapMailboxId> = input
+        .cached_records
+        .values()
+        .map(|r| (r.maildir_folder.as_str(), &r.jmap_mailbox_id))
+        .collect();
+    let mut ordered: Vec<&MailboxObject> = input.remote_mailboxes.iter().collect();
+    ordered.sort_by_key(|mb| parent_chain_depth(mb, &by_id));
+
+    let mut remote_paths: HashMap<JmapMailboxId, String> = HashMap::new();
+    for mb in &ordered {
+        let path = compose_remote_path(mb.parent_id.as_ref(), &mb.name, &remote_paths);
+        remote_paths.insert(mb.id.clone(), path);
+    }
+
+    let mut synced = MailboxBindings::builder();
+
+    for mb in ordered {
+        // Parent-aware filter: a config entry naming any ancestor
+        // (or the mailbox itself) includes this mailbox. So
+        // `mailboxes = ["[Airmail]"]` syncs `[Airmail]` plus every
+        // descendant. Empty filter means "sync everything".
+        if !jmap_mailbox::is_mailbox_synced(
+            &sync_config.mailboxes,
+            mb,
+            &by_id,
+            sync_config.case_insensitive_match,
+        ) {
+            continue;
+        }
+
+        // Translate the JMAP hierarchy to a single on-disk folder
+        // name under the user-chosen layout. Defaults preserve the
+        // pre-hierarchy behavior: Flat with `.` produces the leaf
+        // name unchanged for depth-1 mailboxes.
+        let server_folder = resolve_folder_path(mb, &by_id, layout)?;
+        let cached_folder = input
+            .cached_records
+            .get(&mb.id)
+            .map(|r| r.maildir_folder.as_str());
+        let disk_folder = input.disk_sentinels.get(&mb.id).map(String::as_str);
+
+        // remote_path was computed for every server-known
+        // mailbox in the pre-pass above; the synced-set entry
+        // must be there.
+        let remote_path = remote_paths
+            .get(&mb.id)
+            .cloned()
+            .expect("remote_paths populated for every server-known mailbox above");
+
+        let path_was_ruled = layout.path_was_resolved_by_rule(mb, &by_id);
+        let decision = decide_mailbox_action(
+            mb,
+            cached_folder,
+            &server_folder,
+            disk_folder,
+            path_was_ruled,
+            &DecisionCtx {
+                layout,
+                cached_by_folder: &cached_by_folder,
+                conflict_strategy: sync_config.conflict_strategy,
+            },
+        );
+
+        // Build the per-id `mailbox_map` row and route it to the
+        // metadata-write slot. `apply_unconditional_mailbox_writes`
+        // drains the slot before the executor runs, so all
+        // server-winning outcomes land their cache row this
+        // cycle. Local-rename arms emit no record at all: the
+        // cache deliberately stays at the pre-rename triple
+        // until `Mailbox/set { update }` lands; writing the
+        // server's stale fields here would leave the cache
+        // half-updated, and on `--dry-run` or per-action failure
+        // the next cycle's sentinel walk re-emits the same
+        // `RenameRemoteMailbox` to converge cleanly.
+        let record = queries::MailboxRecord {
+            jmap_mailbox_id: mb.id.clone(),
+            name: mb.name.clone(),
+            role: mb.role.clone(),
+            parent_id: mb.parent_id.clone(),
+            maildir_folder: server_folder.clone(),
+            sort_order: mb.sort_order as i32,
+            remote_path: Some(remote_path.clone()),
+        };
+        match &decision {
+            MailboxDecision::FirstCycle
+            | MailboxDecision::Unchanged
+            | MailboxDecision::ServerRename { .. }
+            | MailboxDecision::CacheStale
+            | MailboxDecision::ConflictServerWins { .. } => {
+                synced.push_mailbox_metadata_write(record);
+            }
+            MailboxDecision::LocalRename { .. } | MailboxDecision::ConflictLocalWins { .. } => {}
+        }
+
+        // The binding's `maildir_folder` is what scan walks
+        // this cycle. For local-winning outcomes scan walks
+        // the disk path (where the messages actually live);
+        // for server-winning outcomes scan walks the
+        // server-resolved path (which the rename phase will
+        // populate, or is already populated for the
+        // unchanged/first-cycle cases).
+        //
+        // For LocalRename / ConflictLocalWins, the binding
+        // is internally split across server-side and disk-
+        // side views by design: `maildir_folder = disk_folder`
+        // (post-rename disk path, used by scan) while
+        // `server_name = mb.name` and `remote_path` are the
+        // pre-rename server view (`Mailbox/set { update }`
+        // hasn't pushed yet; the cache stays anchored to the
+        // pre-rename triple per the local-wins skip above).
+        // No live consumer reads `server_name` on the
+        // LocalRename code path; the split is harmless today
+        // and converges after the executor's rename phase
+        // lands the JMAP push.
+        let walk_folder = match &decision {
+            MailboxDecision::LocalRename { disk_folder, .. }
+            | MailboxDecision::ConflictLocalWins { disk_folder, .. } => disk_folder.clone(),
+            _ => server_folder.clone(),
+        };
+        let binding = MailboxFolderBinding {
+            jmap_mailbox_id: MaybeReference::Value(mb.id.clone()),
+            server_name: mb.name.clone(),
+            maildir_folder: walk_folder,
+            remote_path: remote_path.clone(),
+        };
+
+        dispatch_decision_to_builder(
+            &mut synced,
+            &decision,
+            mb,
+            &binding,
+            cached_folder,
+            &remote_paths,
+            input.unchanged_disk_states,
+        );
+
+        synced.insert(binding);
+    }
+
+    Ok(synced)
+}
+
+/// Three-way diff over `(cached_folder, server_folder, disk_folder)`
+/// returning the action `resolve_mailboxes` should apply for this
+/// mailbox. Pure -- no I/O, no DB writes -- so the caller can apply
+/// the cache upsert and the bindings push together based on the
+/// returned decision.
+///
+/// When the local-rename path would require deriving a new
+/// `(name, parent_id)` pair from a disk path that the configured
+/// layout cannot decompose, or whose decomposed parent path
+/// doesn't resolve to a cached mailbox id, the decision falls
+/// back to `Unchanged` (silently logging the reason) rather than
+/// emitting a `RenameRemoteMailbox` the executor would reject:
+/// the next cycle's sentinel walk picks the same configuration
+/// back up, so the failure stays surfaced as drift rather than
+/// vanishing into a one-shot warn.
+fn decide_mailbox_action(
+    mb: &MailboxObject,
+    cached_folder: Option<&str>,
+    server_folder: &str,
+    disk_folder: Option<&str>,
+    path_was_ruled: bool,
+    ctx: &DecisionCtx<'_>,
+) -> MailboxDecision {
+    use crate::config::ConflictStrategy::ServerWins;
+
+    // No cached row -> first-cycle case; nothing else to compare.
+    let Some(cached_folder) = cached_folder else {
+        return MailboxDecision::FirstCycle;
+    };
+
+    let cache_vs_server_diverges = cached_folder != server_folder;
+    let disk_diverges = disk_folder.is_some_and(|d| d != cached_folder);
+
+    match (cache_vs_server_diverges, disk_diverges, disk_folder) {
+        // All views agree, or disk has no sentinel (e.g. user
+        // hasn't pulled this mailbox yet on this machine).
+        (false, false, _) => MailboxDecision::Unchanged,
+
+        // Server renamed; disk still at cached path.
+        (true, false, _) => MailboxDecision::ServerRename {
+            from_folder: cached_folder.to_string(),
+        },
+
+        // Disk diverges from cache; resolve who else moved.
+        // Pattern uses `_` so `cache_vs_server_diverges` inside
+        // the body refers to the outer let-binding, not a
+        // pattern-shadowed fresh `bool` (which would compile but
+        // mislead readers into thinking the match guards on it).
+        (_, true, Some(disk)) => {
+            // Cache stale + disk caught up + server caught up
+            // (a prior cycle's rename completed but the cache
+            // update didn't): all three end up with disk ==
+            // server, cache lagging. Silent recovery.
+            if cache_vs_server_diverges && disk == server_folder {
+                return MailboxDecision::CacheStale;
+            }
+
+            // ConflictServerWins skips decomposition entirely --
+            // it only needs the disk path to know where to
+            // fs::rename from, and the server's resolved name is
+            // already correct. Branch before the decompose so a
+            // rule-mapped or layout-undecomposable disk path
+            // still recovers via the executor's
+            // `RenameLocalMailbox`.
+            if cache_vs_server_diverges && matches!(ctx.conflict_strategy, ServerWins) {
+                return MailboxDecision::ConflictServerWins {
+                    from_folder: disk.to_string(),
+                };
+            }
+
+            // Local-winning outcomes (LocalRename + LocalWins)
+            // both push the disk's view back to the server, so
+            // both need (name, parent_id) decomposed from the
+            // disk path. Rule-mapped mailboxes refuse here: the
+            // disk path was produced by a rename rule, and the
+            // rule's inverse is not generally computable;
+            // pushing a naive decomposition would silently
+            // overwrite the JMAP-side name with whatever the
+            // user typed in place of the rule's output, fighting
+            // the rule on every subsequent cycle.
+            if path_was_ruled {
+                warn!(
+                    "mailbox {} disk path {} is produced by a rename rule; \
+                     refusing to push the disk-vs-cache divergence (the rule's \
+                     inverse is not reliably computable, so a push could silently \
+                     overwrite the JMAP-side name). The guard fires for any \
+                     rule-mapped path whose disk view diverges from cache -- \
+                     user-initiated rename, partial-failure recovery, fresh \
+                     rule applied this cycle, etc.",
+                    mb.id, disk
+                );
+                return MailboxDecision::Unchanged;
+            }
+
+            let (new_name, parent_id) =
+                match decompose_disk_path_to_jmap(disk, ctx.layout, ctx.cached_by_folder) {
+                    Ok(decomposed) => decomposed,
+                    Err(e) => {
+                        debug!(
+                            "mailbox {} disk path {} does not decompose to a \
+                             JMAP (name, parent_id) pair: {}; deferring to \
+                             next cycle (self-healing if disk or cache catches up)",
+                            mb.id, disk, e
+                        );
+                        return MailboxDecision::Unchanged;
+                    }
+                };
+
+            if !cache_vs_server_diverges {
+                MailboxDecision::LocalRename {
+                    from_folder: cached_folder.to_string(),
+                    new_name,
+                    new_parent_jmap_mailbox_id: parent_id,
+                    disk_folder: disk.to_string(),
+                }
+            } else {
+                MailboxDecision::ConflictLocalWins {
+                    from_folder: cached_folder.to_string(),
+                    new_name,
+                    new_parent_jmap_mailbox_id: parent_id,
+                    disk_folder: disk.to_string(),
+                }
+            }
+        }
+
+        // disk_diverges = disk_folder.is_some_and(...) so the
+        // pattern (_, true, None) is unreachable.
+        (_, true, None) => unreachable!("disk_diverges true requires Some(disk_folder)"),
+    }
+}
+
+/// Decompose `disk_folder` (relative to `maildir_root`) into the
+/// JMAP (`name`, `parent_id`) pair `Mailbox/set { update }` needs.
+/// The leaf segment is the new `name`; the parent path is
+/// resolved back to a cached `jmap_mailbox_id` via the
+/// `mailbox_map` cache. An untracked parent path (e.g. user nested
+/// under a folder that no mailbox_map row points at) is rejected
+/// with an actionable error; the caller surfaces it as drift.
+fn decompose_disk_path_to_jmap(
+    disk_folder: &str,
+    layout_definition: &FolderLayoutDefinition,
+    cached_by_folder: &HashMap<&str, &JmapMailboxId>,
+) -> Result<(String, Option<JmapMailboxId>)> {
+    let (leaf, parent_path) = decompose_folder_string(
+        disk_folder,
+        layout_definition.layout(),
+        layout_definition.separator(),
+    );
+    if leaf.is_empty() {
+        anyhow::bail!("disk folder {:?} decomposed to empty leaf", disk_folder);
+    }
+    let Some(parent_path) = parent_path else {
+        return Ok((leaf, None));
+    };
+    let parent_id = cached_by_folder
+        .get(parent_path.as_str())
+        .map(|id| (*id).clone())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "disk parent path {:?} does not match any cached mailbox_map row",
+                parent_path
+            )
+        })?;
+    Ok((leaf, Some(parent_id)))
+}
+
+/// Walk `maildir_root` for every directory containing a
+/// `.jma.mapping` sentinel, returning a `jmap_mailbox_id -> folder
+/// path (relative to maildir_root)` map. The walk skips
+/// `cur`/`new`/`tmp` (maildir-internal leaves) and `.jma.*` (jma's
+/// own metadata) so it terminates on a deep tree without
+/// re-reading maildir contents. Read errors are logged at debug
+/// and skipped: a single broken folder shouldn't bring the cycle
+/// down, and the next janitor pass will surface it.
+fn walk_sentinels(maildir_root: &std::path::Path) -> HashMap<JmapMailboxId, String> {
+    let mut out = HashMap::new();
+    walk_sentinels_inner(maildir_root, maildir_root, &mut out);
+    out
+}
+
+fn walk_sentinels_inner(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    out: &mut HashMap<JmapMailboxId, String>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if is_jma_private(name_str.as_ref()) {
+            continue;
+        }
+        if name_str == "cur" || name_str == "new" || name_str == "tmp" {
+            continue;
+        }
+        let path = entry.path();
+        if path.join("cur").is_dir() {
+            match crate::maildir_ops::sentinel::read(&path) {
+                Ok(Some(mapping)) => {
+                    let rel = match path.strip_prefix(root) {
+                        Ok(p) => p.to_string_lossy().into_owned(),
+                        Err(_) => continue,
+                    };
+                    out.insert(mapping.jmap_mailbox_id, rel);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    debug!(
+                        "sentinel walk: read failed at {} ({}); skipping",
+                        path.display(),
+                        e
+                    );
+                }
+            }
+        }
+        walk_sentinels_inner(root, &path, out);
+    }
+}
+
 fn log_dropped(direction: SyncDirection, dropped: &[SyncAction]) {
     for a in dropped {
         match a {
@@ -1109,6 +1667,18 @@ fn log_dropped(direction: SyncDirection, dropped: &[SyncAction]) {
             SyncAction::CreateRemoteMailbox { name, .. } => {
                 warn!("{:?}: dropped CreateRemoteMailbox {:?}", direction, name)
             }
+            SyncAction::RenameRemoteMailbox {
+                from_folder,
+                binding,
+                ..
+            } => warn!(
+                "{:?}: dropped RenameRemoteMailbox {} -> {:?} (disk: {}/ -> {}/)",
+                direction,
+                binding.jmap_mailbox_id,
+                binding.remote_path,
+                from_folder,
+                binding.maildir_folder
+            ),
             // Adoption is always kept; it never appears here.
             SyncAction::AdoptLocalMessage { .. } => {}
         }

@@ -249,6 +249,7 @@ planning; phase 5 is the only place we mutate the maildir or server, and phase 6
 - `DestroyRemote` -- file gone locally and we know the JMAP id. Tell the server to destroy.
 - `MoveRemote` -- paired-delete-plus-new across folders is recognised as a move; emit a single mailbox-membership update instead of destroy+import.
 - `CreateRemoteMailbox` -- folder-level push primitive symmetric with `CreateLocalMailbox`. Issues `Mailbox/set { create }` with name, optional parent, and optional role; the server-assigned id is picked up by the next cycle's `Mailbox/get` and bound through `resolve_mailboxes`.
+- `RenameRemoteMailbox` -- push primitive symmetric with `RenameLocalMailbox`. Emitted when the per-cycle `.jma.mapping` sentinel walk finds a tracked mailbox id at a disk path the cache and server disagree with (user `mv`-ed the maildir locally, or `conflict_strategy = LocalWins` overrules a server-side rename). Issues `Mailbox/set { update }` with the new name and parent_id derived from the disk path by `decompose_disk_path_to_jmap`, which decomposes the layout-formatted path via `layout::decompose_folder_string` and resolves the parent segment against `mailbox_map` via a pre-cycle `cached_by_folder` snapshot. Rule-mapped paths and unresolvable parents are refused with a warn/debug log; the next cycle re-evaluates. The executor advances `mailbox_map` only after the JMAP call succeeds, so under `--dry-run` or per-action failure the cache stays anchored to the pre-rename folder and the next cycle re-emits the action.
 
 #### The hybrid action
 

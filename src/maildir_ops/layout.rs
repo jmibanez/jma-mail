@@ -46,6 +46,62 @@ impl FolderLayoutDefinition {
             rename_rules: config.compiled_rename_rules.clone(),
         }
     }
+
+    pub fn layout(&self) -> FolderLayout {
+        self.layout
+    }
+
+    pub fn separator(&self) -> char {
+        self.separator
+    }
+
+    /// True when `mb`'s JMAP-side hierarchy path matches at least
+    /// one of the configured rename rules -- i.e., the disk folder
+    /// `resolve_folder_path` produced for it is the rule's output,
+    /// not a layout-only transform of the server name. Used by
+    /// the local-rename push side to refuse mailboxes whose disk
+    /// path is rule-mediated: `decompose_folder_string` is rule-
+    /// blind, so pushing a naively-decomposed `(name, parent_id)`
+    /// back to the server would silently overwrite the JMAP-side
+    /// name with whatever the user typed in place of the rule's
+    /// output, fighting the rule on every subsequent cycle.
+    pub fn path_was_resolved_by_rule(
+        &self,
+        mb: &MailboxObject,
+        by_id: &HashMap<JmapMailboxId, &MailboxObject>,
+    ) -> bool {
+        if self.rename_rules.is_empty() {
+            return false;
+        }
+        let mut chain: Vec<&MailboxObject> = Vec::new();
+        let mut seen: HashSet<JmapMailboxId> = HashSet::new();
+        let mut cur: &MailboxObject = mb;
+        loop {
+            if !seen.insert(cur.id.clone()) {
+                return false;
+            }
+            chain.push(cur);
+            match &cur.parent_id {
+                None => break,
+                Some(pid) => match by_id.get(pid) {
+                    Some(parent) => cur = *parent,
+                    None => return false,
+                },
+            }
+        }
+        chain.reverse();
+        let segments: Vec<String> = chain
+            .iter()
+            .map(|m| {
+                if m.role.as_deref() == Some("inbox") {
+                    "INBOX".to_string()
+                } else {
+                    m.name.clone()
+                }
+            })
+            .collect();
+        maybe_match_rename_rules(&segments, &self.rename_rules).is_some()
+    }
 }
 
 /// Per-layout segment rules. Each layout has its own forbidden

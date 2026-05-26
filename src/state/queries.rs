@@ -195,6 +195,7 @@ pub fn get_messages_by_jmap_mailbox_id(
 
 // --- Mailbox Map ---
 
+#[derive(Debug, Clone)]
 pub struct MailboxRecord {
     pub jmap_mailbox_id: JmapMailboxId,
     pub name: String,

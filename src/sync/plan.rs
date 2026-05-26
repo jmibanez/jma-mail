@@ -273,8 +273,21 @@ pub enum SyncAction {
     /// descendant subtree in one call: each descendant's own
     /// queued action then runs its local_state + sentinel
     /// catch-up against the already-moved folder.
+    /// `from_folder` is the filesystem source -- where `fs::rename`
+    /// reads from. `from_db_folder` is the DB-rewrite source --
+    /// where `local_state.maildir_folder` matches the row that
+    /// needs its column rewritten. The two are equal for a clean
+    /// server-side rename (cache, server, disk all agreed at
+    /// cycle start; only the server has moved); they diverge for
+    /// `ConflictServerWins` where the user `mv`-ed locally to a
+    /// third name -- `from_folder` is the disk path the user
+    /// produced, `from_db_folder` is the cached path the row was
+    /// last written at. Mirrors the asymmetric shape of
+    /// `MoveLocal`, where the fs source is a plain string and the
+    /// DB key is a separate identity field.
     RenameLocalMailbox {
         from_folder: String,
+        from_db_folder: String,
         binding: Arc<MailboxFolderBinding>,
         parent_jmap_mailbox_id: Option<JmapMailboxId>,
     },
@@ -318,6 +331,32 @@ pub enum SyncAction {
         role: Option<String>,
         folder: String,
     },
+
+    /// Folder-level push-side primitive: `Mailbox/set { update }`
+    /// rewriting `name` and `parentId` for an existing mailbox.
+    /// Symmetric with `RenameLocalMailbox`. Emitted when the
+    /// `.jma.mapping` sentinel walk finds an already-cached
+    /// mailbox at a disk path other than the one the cache
+    /// (and the server) currently records -- the user renamed
+    /// or reparented the maildir locally, and the server should
+    /// follow.
+    ///
+    /// `from_folder` is the pre-rename `mailbox_map.maildir_
+    /// folder` value (the executor uses it for the `local_state`
+    /// rewrite alongside the cache upsert). `binding` is the
+    /// post-rename state: `binding.server_name` is the name to
+    /// push, `binding.maildir_folder` is where the sentinel
+    /// already is on disk and where the cache should land after
+    /// the JMAP call succeeds.
+    ///
+    /// `parent_jmap_mailbox_id` is `None` for top-level
+    /// mailboxes. A reparent requires the new parent to already
+    /// exist on the server.
+    RenameRemoteMailbox {
+        from_folder: String,
+        binding: Arc<MailboxFolderBinding>,
+        parent_jmap_mailbox_id: Option<JmapMailboxId>,
+    },
 }
 
 impl SyncAction {
@@ -334,7 +373,8 @@ impl SyncAction {
             | SyncAction::UpdateRemoteKeywords { .. }
             | SyncAction::DestroyRemote { .. }
             | SyncAction::MoveRemote { .. }
-            | SyncAction::CreateRemoteMailbox { .. } => ActionDirection::Push,
+            | SyncAction::CreateRemoteMailbox { .. }
+            | SyncAction::RenameRemoteMailbox { .. } => ActionDirection::Push,
             SyncAction::AdoptLocalMessage { .. } => ActionDirection::Both,
         }
     }
@@ -440,6 +480,18 @@ impl SyncPlan {
             .count()
     }
 
+    /// Server-side mailbox renames queued in the plan, one per
+    /// mailbox whose on-disk sentinel folder disagreed with the
+    /// cached folder (user `mv`-ed the maildir, or a LocalWins
+    /// conflict resolved against the server's rename). Symmetric
+    /// with `folder_rename_count` on the push side.
+    pub fn remote_folder_rename_count(&self) -> usize {
+        self.actions
+            .iter()
+            .filter(|a| matches!(a, SyncAction::RenameRemoteMailbox { .. }))
+            .count()
+    }
+
     pub fn adopt_count(&self) -> usize {
         self.actions
             .iter()
@@ -503,6 +555,11 @@ impl fmt::Display for SyncPlan {
             self.remote_folder_create_count()
         )?;
         writeln!(f, "  Local folder renames:  {}", self.folder_rename_count())?;
+        writeln!(
+            f,
+            "  Remote folder renames: {}",
+            self.remote_folder_rename_count()
+        )?;
         writeln!(f)?;
 
         for action in &self.actions {
@@ -575,6 +632,11 @@ impl fmt::Display for SyncPlan {
                     )?,
                     None => writeln!(f, "  [PUSH] Create remote mailbox {:?} (top-level)", name)?,
                 },
+                SyncAction::RenameRemoteMailbox { binding, .. } => writeln!(
+                    f,
+                    "  [PUSH] Rename remote mailbox {} -> {:?} (disk: {}/)",
+                    binding.jmap_mailbox_id, binding.remote_path, binding.maildir_folder
+                )?,
             }
         }
         Ok(())

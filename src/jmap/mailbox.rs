@@ -325,6 +325,53 @@ pub async fn create(
     .await
 }
 
+/// Issue one `Mailbox/set { update }` against the server,
+/// rewriting `name` and `parentId` in a single request so a
+/// pure rename and a reparent-with-rename both land atomically
+/// from the client's side.
+///
+/// `new_name` is validated against the same per-byte cap and
+/// path-syntax rules `get_all` applies on the read side.
+/// `new_parent_id` is `None` for top-level mailboxes; a nested
+/// move requires the parent to already exist on the server.
+///
+/// Wrapped in `with_retry` so transient failures get the same
+/// per-call retry as every other JMAP call. Server-side
+/// rejection (`alreadyExists`, `invalidProperties`, ...) lands
+/// in `not_updated` and surfaces as an error from `updated()`.
+pub async fn update_name_and_parent(
+    client: &Client,
+    id: &JmapMailboxId,
+    new_name: &str,
+    new_parent_id: Option<&JmapMailboxId>,
+) -> Result<()> {
+    let name_cap = limits::max_size_mailbox_name(client);
+    validate_mailbox_name(new_name, name_cap)
+        .with_context(|| format!("rejecting Mailbox/set update for {} -> {:?}", id, new_name))?;
+
+    with_retry("Mailbox/set update", || async {
+        let mut request = client.build();
+        request
+            .set_mailbox()
+            .update(id.as_ref())
+            .name(new_name.to_string())
+            .parent_id(new_parent_id.map(|p| p.as_ref().to_string()));
+        let mut response = request
+            .send_single::<jmap_client::core::response::MailboxSetResponse>()
+            .await
+            .with_context(|| format!("Mailbox/set update for {}", id))?;
+        response
+            .updated(id.as_ref())
+            .with_context(|| format!("Mailbox/set update for {} -> {:?}", id, new_name))?;
+        info!(
+            "Renamed remote mailbox {} -> {:?} (parent: {:?})",
+            id, new_name, new_parent_id
+        );
+        Ok(())
+    })
+    .await
+}
+
 /// Map jma's lowercase `role` string to the jmap-client `Role`
 /// enum. Pairs only with the well-known role names; the
 /// `Role::Other(...)` string that `get_all` emits for unknown
