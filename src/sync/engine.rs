@@ -462,6 +462,9 @@ impl<'a> SyncEngine<'a> {
                 new_email_state: Some(new_state),
                 max_upload_size: limits::max_size_upload(&self.client),
                 used_initial_path,
+                folder_layout: self.config.sync.folder_layout,
+                hierarchy_separator: self.config.sync.hierarchy_separator,
+                maildir_root: &maildir_root,
             })
         };
 
@@ -1003,6 +1006,9 @@ fn log_dropped(direction: SyncDirection, dropped: &[SyncAction]) {
                 "{:?}: dropped CreateLocalMailbox {}/",
                 direction, binding.maildir_folder
             ),
+            SyncAction::CreateRemoteMailbox { name, .. } => {
+                warn!("{:?}: dropped CreateRemoteMailbox {:?}", direction, name)
+            }
             // Adoption is always kept; it never appears here.
             SyncAction::AdoptLocalMessage { .. } => {}
         }

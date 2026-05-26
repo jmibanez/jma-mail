@@ -238,6 +238,7 @@ planning; phase 5 is the only place we mutate the maildir or server, and phase 6
 - `UpdateLocalFlags` -- server keywords differ from our recorded flags; rewrite the maildir filename suffix and update the DB.
 - `DeleteLocal` -- server says the JMAP id is destroyed and we have it locally. Unlink the file and clear DB rows.
 - `MoveLocal` -- server claims the email lives in a different mailbox than our local copy. Move the file across maildirs and update the folder column.
+- `CreateLocalMailbox` -- server has a mailbox we don't have a maildir for. `ensure_maildir` and stamp the `.jma.mapping` sentinel.
 
 #### Push-side actions (local -> server)
 
@@ -245,6 +246,7 @@ planning; phase 5 is the only place we mutate the maildir or server, and phase 6
 - `UpdateRemoteKeywords` -- local flag change, server unchanged. Push keywords via `Email/set`.
 - `DestroyRemote` -- file gone locally and we know the JMAP id. Tell the server to destroy.
 - `MoveRemote` -- paired-delete-plus-new across folders is recognised as a move; emit a single mailbox-membership update instead of destroy+import.
+- `CreateRemoteMailbox` -- folder-level push primitive symmetric with `CreateLocalMailbox`. Issues `Mailbox/set { create }` with name, optional parent, and optional role; the server-assigned id is picked up by the next cycle's `Mailbox/get` and bound through `resolve_mailboxes`.
 
 #### The hybrid action
 

@@ -1,12 +1,14 @@
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 
 use tracing::{debug, error, warn};
 
-use crate::config::ConflictStrategy;
+use crate::config::{ConflictStrategy, FolderLayout};
 use crate::ids::{JmapBlobId, JmapEmailId, JmapThreadId, MaildirId, MessageId};
-use crate::jmap::types::{EmailObject, MailboxFolderBinding};
+use crate::jmap::types::{EmailObject, MailboxFolderBinding, MaybeReference};
 use crate::maildir_ops::flags::{flags_to_keyword_patch, flags_to_keywords, keywords_to_flags};
+use crate::maildir_ops::layout::decompose_folder_string;
 use crate::maildir_ops::scan::LocalChange;
 use crate::state::queries::MessageRecord;
 use crate::sync::bindings::MailboxBindings;
@@ -60,6 +62,17 @@ struct ReconcileCtx<'a> {
     /// Mirror of `ReconcileInput::used_initial_path`. See that field
     /// for the reasoning.
     used_initial_path: bool,
+    /// Mirror of `ReconcileInput::folder_layout`. Drives layout-aware
+    /// decomposition in the `LocalFolderCreated` -> `CreateRemoteMailbox`
+    /// emit path.
+    folder_layout: FolderLayout,
+    /// Mirror of `ReconcileInput::hierarchy_separator`. Paired with
+    /// `folder_layout` for the decomposition.
+    hierarchy_separator: char,
+    /// Mirror of `ReconcileInput::maildir_root`. Used to convert a
+    /// `LocalChange::LocalFolderCreated`'s absolute path back to the
+    /// relative folder string the bindings map uses.
+    maildir_root: &'a Path,
 }
 
 /// One reconcile cycle's inputs, gathered into a single struct so the
@@ -107,6 +120,20 @@ pub struct ReconcileInput<'a> {
     /// mean "alive but unchanged this cycle," and silently rebinding
     /// would lose track of a live duplicate locally.
     pub used_initial_path: bool,
+    /// Configured folder layout. Threaded through so that the
+    /// `LocalFolderCreated` -> `CreateRemoteMailbox` emit path can
+    /// decompose the on-disk folder string into (leaf_name,
+    /// parent_folder) under the right convention.
+    pub folder_layout: FolderLayout,
+    /// Configured hierarchy separator. Same purpose as
+    /// `folder_layout`: drives the per-layout decomposition. Inert
+    /// under `Fs` (which always splits on `/`).
+    pub hierarchy_separator: char,
+    /// Maildir root on disk. Used to convert a
+    /// `LocalChange::LocalFolderCreated`'s absolute `path` back to
+    /// the relative folder string consumers can look up against
+    /// `MailboxBindings::by_folder`.
+    pub maildir_root: &'a Path,
 }
 
 /// Reconcile remote changes and local changes into a sync plan.
@@ -123,6 +150,9 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
         new_email_state,
         max_upload_size,
         used_initial_path,
+        folder_layout,
+        hierarchy_separator,
+        maildir_root,
     } = input;
     let known_by_maildir = &known.by_maildir;
     let known_by_jmap = &known.by_jmap;
@@ -244,6 +274,9 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
         destroyed_set,
         max_upload_size,
         used_initial_path,
+        folder_layout,
+        hierarchy_separator,
+        maildir_root,
     };
 
     // Track local maildir_ids that have been claimed by an adoption emitted
@@ -920,6 +953,15 @@ fn process_local_changes(
     consumed_deletes: &HashSet<JmapEmailId>,
     plan: &mut SyncPlan,
 ) {
+    // Per-cycle dedup set for folders already pushed as a
+    // CreateRemoteMailbox. The chain-walking emitter naturally
+    // hits shared ancestors twice when two `LocalFolderCreated`
+    // events share a parent (e.g. `Foo.Bar` and `Foo.Quux` both
+    // chain through `Foo`), and the executor would otherwise
+    // issue two `Mailbox/set { create }` for `Foo` -- the second
+    // would `alreadyExists`-reject, warn-and-continue, but the
+    // round-trip is wasted and the log line is misleading.
+    let mut emitted_remote_creates: HashSet<String> = HashSet::new();
     for change in local_changes {
         match change {
             LocalChange::NewMessage { maildir_id, .. } => {
@@ -941,13 +983,133 @@ fn process_local_changes(
                 }
                 handle_local_delete(ctx, maildir_id, deletes_overruled_by_server, plan)
             }
-            // Folder-lifecycle variants have no consumer yet; the
-            // arms that turn them into server-side mailbox actions
-            // land in later commits.
-            LocalChange::LocalFolderCreated { .. }
-            | LocalChange::LocalFolderDeleted { .. }
-            | LocalChange::LocalFolderRenamed { .. } => {}
+            LocalChange::LocalFolderCreated { path, sentinel } => {
+                handle_local_folder_created(
+                    ctx,
+                    path,
+                    sentinel.as_ref(),
+                    &mut emitted_remote_creates,
+                    plan,
+                );
+            }
+            // LocalFolderDeleted / LocalFolderRenamed have no consumer
+            // yet; their server-side mirror actions land in later
+            // commits.
+            LocalChange::LocalFolderDeleted { .. } | LocalChange::LocalFolderRenamed { .. } => {}
         }
+    }
+}
+
+/// Decide what to do with a `LocalChange::LocalFolderCreated`:
+///
+/// - If `sentinel` is `Some`, this folder was previously bound to a
+///   JMAP mailbox; the cache lost the binding (state DB nuke, or
+///   the sentinel survived a partial-failure cycle). Recovery is
+///   `janitor::rebindfolders`'s job, not reconcile's. Skip.
+/// - If `sentinel` is `None`, the folder is genuinely new locally.
+///   Walk the parent chain via repeated `decompose_folder_string`
+///   calls, stopping at the first bound ancestor (or the top of
+///   the tree). Each unbound ancestor in the chain becomes its own
+///   `CreateRemoteMailbox` emitted top-down; children whose parent
+///   is being created in the same cycle carry
+///   `Some(MaybeReference::Reference(parent_folder))` so the
+///   executor's `creation_refs` table can resolve the parent id
+///   once the parent's `Mailbox/set { create }` returns.
+///   Already-bound parents flow as
+///   `Some(MaybeReference::Value(parent_id))`. Top-level mailboxes
+///   carry `None`.
+///
+/// Role is always `None`: a locally-created folder has no JMAP
+/// role binding (the inbox/archive/sent/etc. roles only attach
+/// server-side via Mailbox/get).
+fn handle_local_folder_created(
+    ctx: &ReconcileCtx<'_>,
+    path: &Path,
+    sentinel: Option<&crate::maildir_ops::sentinel::MailboxMapping>,
+    emitted: &mut HashSet<String>,
+    plan: &mut SyncPlan,
+) {
+    if let Some(m) = sentinel {
+        debug!(
+            "LocalFolderCreated at {} carries sentinel for {}; rebindfolders owns recovery, \
+             skipping CreateRemoteMailbox",
+            path.display(),
+            m.jmap_mailbox_id
+        );
+        return;
+    }
+    let Ok(rel) = path.strip_prefix(ctx.maildir_root) else {
+        debug!(
+            "LocalFolderCreated path {} is not under maildir_root; skipping",
+            path.display()
+        );
+        return;
+    };
+    let Some(rel_str) = rel.to_str() else {
+        debug!(
+            "LocalFolderCreated path {} is not UTF-8; skipping",
+            path.display()
+        );
+        return;
+    };
+
+    // Walk leaf-to-root collecting (folder, leaf, parent_folder)
+    // for every unbound ancestor. Stop at the first bound parent or
+    // at the top-level (parent_folder is None).
+    let mut chain: Vec<(String, String, Option<String>)> = Vec::new();
+    let mut current = rel_str.to_string();
+    loop {
+        let (leaf_name, parent_folder) =
+            decompose_folder_string(&current, ctx.folder_layout, ctx.hierarchy_separator);
+        if leaf_name.is_empty() {
+            debug!(
+                "LocalFolderCreated decomposed to empty leaf name at {}; skipping",
+                path.display()
+            );
+            return;
+        }
+        chain.push((current.clone(), leaf_name, parent_folder.clone()));
+        match parent_folder {
+            None => break,
+            Some(pf) => {
+                if ctx.mailboxes.by_folder(&pf).is_some() {
+                    break;
+                }
+                current = pf;
+            }
+        }
+    }
+
+    // Reverse to root-to-leaf order so the executor processes the
+    // parent before the child fires.
+    chain.reverse();
+    for (folder, leaf, parent_folder) in chain {
+        if !emitted.insert(folder.clone()) {
+            // A prior LocalFolderCreated in this cycle already
+            // queued a Create for this ancestor. Skip the
+            // duplicate -- the executor's `creation_refs` will
+            // resolve a child's Reference against the first
+            // emission.
+            continue;
+        }
+        let parent_ref = match parent_folder {
+            None => None,
+            Some(pf) => match ctx.mailboxes.by_folder(&pf) {
+                Some(binding) => Some(MaybeReference::Value(
+                    binding
+                        .jmap_mailbox_id
+                        .expect_resolved("reconcile::handle_local_folder_created -- parent lookup")
+                        .clone(),
+                )),
+                None => Some(MaybeReference::Reference(pf)),
+            },
+        };
+        plan.actions.push(SyncAction::CreateRemoteMailbox {
+            name: leaf,
+            parent_jmap_mailbox_id: parent_ref,
+            role: None,
+            folder,
+        });
     }
 }
 
@@ -1357,6 +1519,9 @@ mod tests {
             // tests that need to exercise the incremental-mode
             // disambiguation set up via `run_incremental` instead.
             used_initial_path: true,
+            folder_layout: FolderLayout::Flat,
+            hierarchy_separator: '.',
+            maildir_root: std::path::Path::new("/tmp/jma-test-maildir-root"),
         })
     }
 
@@ -1388,6 +1553,9 @@ mod tests {
             new_email_state: None,
             max_upload_size: usize::MAX,
             used_initial_path: false,
+            folder_layout: FolderLayout::Flat,
+            hierarchy_separator: '.',
+            maildir_root: std::path::Path::new("/tmp/jma-test-maildir-root"),
         })
     }
 
@@ -2456,6 +2624,9 @@ mod tests {
             new_email_state: None,
             max_upload_size: 1_000,
             used_initial_path: true,
+            folder_layout: FolderLayout::Flat,
+            hierarchy_separator: '.',
+            maildir_root: std::path::Path::new("/tmp/jma-test-maildir-root"),
         });
         assert_eq!(plan.upload_count(), 0);
         assert!(plan.actions.is_empty());
@@ -2887,5 +3058,368 @@ mod tests {
         }
         seen_ids.sort();
         assert_eq!(seen_ids, vec!["MB-CHILD", "MB-INBOX"]);
+    }
+
+    /// Run reconcile through a custom (folder_layout, separator,
+    /// maildir_root) so the LocalFolderCreated emit path can exercise
+    /// per-layout decomposition. Keeps every other input minimal so
+    /// the only thing in the plan is what the LocalFolderCreated arm
+    /// produced.
+    fn run_with_layout(
+        local_changes: &[LocalChange],
+        mailboxes: &MailboxBindings,
+        folder_layout: FolderLayout,
+        hierarchy_separator: char,
+        maildir_root: &Path,
+    ) -> SyncPlan {
+        let local_index = LocalIndex::default();
+        let local_flags = HashMap::new();
+        let known = indices(&[]);
+        reconcile(ReconcileInput {
+            remote_emails: &[],
+            remote_destroyed: &[],
+            local_changes,
+            known: &known,
+            local_index: &local_index,
+            local_flags: &local_flags,
+            mailboxes,
+            strategy: ConflictStrategy::ServerWins,
+            new_email_state: None,
+            max_upload_size: usize::MAX,
+            used_initial_path: true,
+            folder_layout,
+            hierarchy_separator,
+            maildir_root,
+        })
+    }
+
+    /// LocalFolderCreated with `sentinel: None` and no parent
+    /// (top-level Flat folder) emits one `CreateRemoteMailbox` with
+    /// the folder's leaf name, no parent, and no role.
+    #[test]
+    fn local_folder_created_flat_top_level_emits_create_remote_mailbox() {
+        let mailboxes = mailboxes();
+        let root = PathBuf::from("/tmp/jma-test-root");
+        let folder = root.join("Projects");
+        let local_changes = vec![LocalChange::LocalFolderCreated {
+            path: folder,
+            sentinel: None,
+        }];
+        let plan = run_with_layout(&local_changes, &mailboxes, FolderLayout::Flat, '.', &root);
+        assert_eq!(plan.remote_folder_create_count(), 1);
+        match &plan.actions[0] {
+            SyncAction::CreateRemoteMailbox {
+                name,
+                parent_jmap_mailbox_id,
+                role,
+                ..
+            } => {
+                assert_eq!(name, "Projects");
+                assert!(parent_jmap_mailbox_id.is_none());
+                assert!(role.is_none());
+            }
+            other => panic!("expected CreateRemoteMailbox, got {:?}", other),
+        }
+    }
+
+    /// LocalFolderCreated under Flat with a separator-joined name
+    /// decomposes into (leaf, parent), looks up the parent folder
+    /// against bindings, and emits CreateRemoteMailbox with the
+    /// resolved parent id.
+    #[test]
+    fn local_folder_created_flat_with_bound_parent_emits_with_parent_id() {
+        let mut mailboxes = MailboxBindings::builder();
+        mailboxes.insert(MailboxFolderBinding {
+            jmap_mailbox_id: MaybeReference::Value("MB-PARENT".into()),
+            server_name: "Parent".to_string(),
+            maildir_folder: "Parent".to_string(),
+        });
+        let mailboxes = mailboxes.build();
+        let root = PathBuf::from("/tmp/jma-test-root");
+        let folder = root.join("Parent.Child");
+        let local_changes = vec![LocalChange::LocalFolderCreated {
+            path: folder,
+            sentinel: None,
+        }];
+        let plan = run_with_layout(&local_changes, &mailboxes, FolderLayout::Flat, '.', &root);
+        assert_eq!(plan.remote_folder_create_count(), 1);
+        match &plan.actions[0] {
+            SyncAction::CreateRemoteMailbox {
+                name,
+                parent_jmap_mailbox_id,
+                ..
+            } => {
+                assert_eq!(name, "Child");
+                let parent_id = parent_jmap_mailbox_id
+                    .as_ref()
+                    .expect("parent must be present")
+                    .expect_resolved("test -- parent must be resolved");
+                assert_eq!(parent_id.as_ref(), "MB-PARENT");
+            }
+            other => panic!("expected CreateRemoteMailbox, got {:?}", other),
+        }
+    }
+
+    /// Minimum chain: `Parent.Child` under Flat with neither
+    /// Parent nor Child bound emits two CreateRemoteMailbox
+    /// actions -- Parent (top-level) and Child (parent=
+    /// Reference("Parent")). The executor's creation_refs table
+    /// will resolve the Reference once Parent's create returns.
+    #[test]
+    fn local_folder_created_flat_emits_two_creates_for_one_missing_parent() {
+        let mailboxes = MailboxBindings::builder().build();
+        let root = PathBuf::from("/tmp/jma-test-root");
+        let folder = root.join("Parent.Child");
+        let local_changes = vec![LocalChange::LocalFolderCreated {
+            path: folder,
+            sentinel: None,
+        }];
+        let plan = run_with_layout(&local_changes, &mailboxes, FolderLayout::Flat, '.', &root);
+        assert_eq!(plan.remote_folder_create_count(), 2);
+        match &plan.actions[0] {
+            SyncAction::CreateRemoteMailbox {
+                name,
+                parent_jmap_mailbox_id,
+                ..
+            } => {
+                assert_eq!(name, "Parent");
+                assert!(parent_jmap_mailbox_id.is_none());
+            }
+            other => panic!("expected CreateRemoteMailbox at [0], got {:?}", other),
+        }
+        match &plan.actions[1] {
+            SyncAction::CreateRemoteMailbox {
+                name,
+                parent_jmap_mailbox_id,
+                ..
+            } => {
+                assert_eq!(name, "Child");
+                match parent_jmap_mailbox_id {
+                    Some(MaybeReference::Reference(s)) => assert_eq!(s, "Parent"),
+                    other => panic!("expected Reference(\"Parent\"), got {:?}", other),
+                }
+            }
+            other => panic!("expected CreateRemoteMailbox at [1], got {:?}", other),
+        }
+    }
+
+    /// LocalFolderCreated with `sentinel: Some(...)` is rebindfolders'
+    /// territory (cache lost a binding the disk still pins). Reconcile
+    /// must skip rather than emit a duplicate-creating
+    /// CreateRemoteMailbox.
+    #[test]
+    fn local_folder_created_with_sentinel_skips_emission() {
+        let mailboxes = mailboxes();
+        let root = PathBuf::from("/tmp/jma-test-root");
+        let folder = root.join("Projects");
+        let local_changes = vec![LocalChange::LocalFolderCreated {
+            path: folder,
+            sentinel: Some(crate::maildir_ops::sentinel::MailboxMapping {
+                jmap_mailbox_id: JmapMailboxId::from("MB-LOST"),
+                parent_jmap_mailbox_id: None,
+                server_name: "Projects".to_string(),
+            }),
+        }];
+        let plan = run_with_layout(&local_changes, &mailboxes, FolderLayout::Flat, '.', &root);
+        assert_eq!(plan.remote_folder_create_count(), 0);
+    }
+
+    /// Under MaildirPP, a dot-prefixed nested folder decomposes
+    /// correctly: `.Parent.Child` -> name=Child, parent=".Parent".
+    /// With `.Parent` bound, CreateRemoteMailbox carries the
+    /// resolved parent id.
+    #[test]
+    fn local_folder_created_maildir_pp_decomposes_dot_prefixed_nested() {
+        let mut mailboxes = MailboxBindings::builder();
+        mailboxes.insert(MailboxFolderBinding {
+            jmap_mailbox_id: MaybeReference::Value("MB-PARENT".into()),
+            server_name: "Parent".to_string(),
+            maildir_folder: ".Parent".to_string(),
+        });
+        let mailboxes = mailboxes.build();
+        let root = PathBuf::from("/tmp/jma-test-root");
+        let folder = root.join(".Parent.Child");
+        let local_changes = vec![LocalChange::LocalFolderCreated {
+            path: folder,
+            sentinel: None,
+        }];
+        let plan = run_with_layout(
+            &local_changes,
+            &mailboxes,
+            FolderLayout::MaildirPP,
+            '.',
+            &root,
+        );
+        assert_eq!(plan.remote_folder_create_count(), 1);
+        match &plan.actions[0] {
+            SyncAction::CreateRemoteMailbox {
+                name,
+                parent_jmap_mailbox_id,
+                ..
+            } => {
+                assert_eq!(name, "Child");
+                let parent_id = parent_jmap_mailbox_id
+                    .as_ref()
+                    .expect("parent must be present")
+                    .expect_resolved("test -- parent must be resolved");
+                assert_eq!(parent_id.as_ref(), "MB-PARENT");
+            }
+            other => panic!("expected CreateRemoteMailbox, got {:?}", other),
+        }
+    }
+
+    /// Two LocalFolderCreated events that share an ancestor under
+    /// Flat (`Foo.Alpha` and `Foo.Beta`, neither bound, `Foo` also
+    /// unbound) must dedupe the shared `Foo` create -- the chain
+    /// emitter would naturally walk it twice, but the executor
+    /// only needs (and should only issue) one Mailbox/set { create }
+    /// for `Foo`.
+    #[test]
+    fn local_folder_created_dedupes_shared_ancestor_across_chains() {
+        let mailboxes = MailboxBindings::builder().build();
+        let root = PathBuf::from("/tmp/jma-test-root");
+        let local_changes = vec![
+            LocalChange::LocalFolderCreated {
+                path: root.join("Foo.Alpha"),
+                sentinel: None,
+            },
+            LocalChange::LocalFolderCreated {
+                path: root.join("Foo.Beta"),
+                sentinel: None,
+            },
+        ];
+        let plan = run_with_layout(&local_changes, &mailboxes, FolderLayout::Flat, '.', &root);
+        // Expect three creates: Foo (once), Foo.Alpha, Foo.Beta.
+        assert_eq!(
+            plan.remote_folder_create_count(),
+            3,
+            "Foo must dedupe across both chains, got {:?}",
+            plan.actions
+        );
+        let folders: Vec<String> = plan
+            .actions
+            .iter()
+            .filter_map(|a| match a {
+                SyncAction::CreateRemoteMailbox { folder, .. } => Some(folder.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(folders.contains(&"Foo".to_string()));
+        assert!(folders.contains(&"Foo.Alpha".to_string()));
+        assert!(folders.contains(&"Foo.Beta".to_string()));
+        let foo_count = folders.iter().filter(|f| *f == "Foo").count();
+        assert_eq!(
+            foo_count, 1,
+            "Foo must appear exactly once, got {folders:?}"
+        );
+    }
+
+    /// Under Flat with separator `.`, a user-created `Foo.Bar.Baz`
+    /// where neither `Foo` nor `Foo.Bar` exist server-side must
+    /// emit a chain of three CreateRemoteMailbox actions, top-down:
+    /// `Foo` (top-level), `Foo.Bar` (parent=Reference("Foo")), and
+    /// `Foo.Bar.Baz` (parent=Reference("Foo.Bar")). The executor's
+    /// creation_refs table resolves the Reference parents in order
+    /// as each parent's create returns.
+    #[test]
+    fn local_folder_created_flat_emits_chained_creates_for_missing_parents() {
+        let mailboxes = MailboxBindings::builder().build();
+        let root = PathBuf::from("/tmp/jma-test-root");
+        let folder = root.join("Foo.Bar.Baz");
+        let local_changes = vec![LocalChange::LocalFolderCreated {
+            path: folder,
+            sentinel: None,
+        }];
+        let plan = run_with_layout(&local_changes, &mailboxes, FolderLayout::Flat, '.', &root);
+        assert_eq!(
+            plan.remote_folder_create_count(),
+            3,
+            "expected three chained creates"
+        );
+
+        // Top-down order: Foo (top-level), then Foo.Bar (refers to
+        // Foo), then Foo.Bar.Baz (refers to Foo.Bar).
+        match &plan.actions[0] {
+            SyncAction::CreateRemoteMailbox {
+                name,
+                parent_jmap_mailbox_id,
+                folder,
+                ..
+            } => {
+                assert_eq!(name, "Foo");
+                assert!(parent_jmap_mailbox_id.is_none(), "top-level has no parent");
+                assert_eq!(folder, "Foo");
+            }
+            other => panic!("expected CreateRemoteMailbox at [0], got {:?}", other),
+        }
+        match &plan.actions[1] {
+            SyncAction::CreateRemoteMailbox {
+                name,
+                parent_jmap_mailbox_id,
+                folder,
+                ..
+            } => {
+                assert_eq!(name, "Bar");
+                match parent_jmap_mailbox_id {
+                    Some(MaybeReference::Reference(s)) => assert_eq!(s, "Foo"),
+                    other => panic!("expected Reference(\"Foo\"), got {:?}", other),
+                }
+                assert_eq!(folder, "Foo.Bar");
+            }
+            other => panic!("expected CreateRemoteMailbox at [1], got {:?}", other),
+        }
+        match &plan.actions[2] {
+            SyncAction::CreateRemoteMailbox {
+                name,
+                parent_jmap_mailbox_id,
+                folder,
+                ..
+            } => {
+                assert_eq!(name, "Baz");
+                match parent_jmap_mailbox_id {
+                    Some(MaybeReference::Reference(s)) => assert_eq!(s, "Foo.Bar"),
+                    other => panic!("expected Reference(\"Foo.Bar\"), got {:?}", other),
+                }
+                assert_eq!(folder, "Foo.Bar.Baz");
+            }
+            other => panic!("expected CreateRemoteMailbox at [2], got {:?}", other),
+        }
+    }
+
+    /// Under Fs, `Parent/Child` decomposes on `/` regardless of
+    /// the configured separator. With `Parent` bound, the parent
+    /// id resolves.
+    #[test]
+    fn local_folder_created_fs_decomposes_slash_nested() {
+        let mut mailboxes = MailboxBindings::builder();
+        mailboxes.insert(MailboxFolderBinding {
+            jmap_mailbox_id: MaybeReference::Value("MB-ARCH".into()),
+            server_name: "Archive".to_string(),
+            maildir_folder: "Archive".to_string(),
+        });
+        let mailboxes = mailboxes.build();
+        let root = PathBuf::from("/tmp/jma-test-root");
+        let folder = root.join("Archive").join("2024");
+        let local_changes = vec![LocalChange::LocalFolderCreated {
+            path: folder,
+            sentinel: None,
+        }];
+        let plan = run_with_layout(&local_changes, &mailboxes, FolderLayout::Fs, '.', &root);
+        assert_eq!(plan.remote_folder_create_count(), 1);
+        match &plan.actions[0] {
+            SyncAction::CreateRemoteMailbox {
+                name,
+                parent_jmap_mailbox_id,
+                ..
+            } => {
+                assert_eq!(name, "2024");
+                let parent_id = parent_jmap_mailbox_id
+                    .as_ref()
+                    .expect("parent must be present")
+                    .expect_resolved("test -- parent must be resolved");
+                assert_eq!(parent_id.as_ref(), "MB-ARCH");
+            }
+            other => panic!("expected CreateRemoteMailbox, got {:?}", other),
+        }
     }
 }
