@@ -334,6 +334,12 @@ impl<'a> SyncEngine<'a> {
                             maildir_id,
                             ..
                         } => (binding.maildir_folder.clone(), maildir_id.clone()),
+                        // Folder-lifecycle variants are not message-level
+                        // and don't participate in dedupe; always pass
+                        // through.
+                        LocalChange::LocalFolderCreated { .. }
+                        | LocalChange::LocalFolderDeleted { .. }
+                        | LocalChange::LocalFolderRenamed { .. } => return true,
                     };
                     !suppressed.contains(&key)
                 })
