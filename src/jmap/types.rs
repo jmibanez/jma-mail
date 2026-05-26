@@ -64,6 +64,17 @@ pub struct MailboxFolderBinding {
     pub jmap_mailbox_id: MaybeReference<JmapMailboxId>,
     pub server_name: String,
     pub maildir_folder: String,
+    /// Slash-joined server-name path walking up the parent chain
+    /// ("Personal/Archive" for a child of "Personal"; "Inbox" for
+    /// a top-level). Distinct from `maildir_folder`, which
+    /// follows the configured `folder_layout` +
+    /// `hierarchy_separator`. Computed by `resolve_mailboxes` in
+    /// a single topological pass and cached on
+    /// `mailbox_map.remote_path` for between-cycle reads. JMAP
+    /// scopes its mailbox uniqueness to `(parent_id, name)` per
+    /// RFC 8621 section 2, so the bare `server_name` is ambiguous
+    /// across the hierarchy while this path is not.
+    pub remote_path: String,
 }
 
 /// Either an already-resolved value or a symbolic handle that a

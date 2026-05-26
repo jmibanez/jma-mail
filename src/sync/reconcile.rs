@@ -1422,11 +1422,13 @@ mod tests {
             jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
             server_name: "Inbox".to_string(),
             maildir_folder: "INBOX".to_string(),
+            remote_path: "INBOX".to_string(),
         });
         b.insert(MailboxFolderBinding {
             jmap_mailbox_id: MaybeReference::Value("MB-ARCH".into()),
             server_name: "Archive".to_string(),
             maildir_folder: "Archive".to_string(),
+            remote_path: "Archive".to_string(),
         });
         b.build()
     }
@@ -1772,6 +1774,7 @@ mod tests {
                     jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
                     server_name: "INBOX".to_string(),
                     maildir_folder: "INBOX".to_string(),
+                    remote_path: "INBOX".to_string(),
                 }),
                 flags: "S".into(),
                 path: PathBuf::from("/tmp/file-1"),
@@ -2036,6 +2039,7 @@ mod tests {
                 jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
                 server_name: "INBOX".to_string(),
                 maildir_folder: "INBOX".to_string(),
+                remote_path: "INBOX".to_string(),
             }),
             flags: "FS".into(),
             path: PathBuf::from("/tmp/m-new"),
@@ -2452,6 +2456,7 @@ mod tests {
                     jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
                     server_name: "INBOX".to_string(),
                     maildir_folder: "INBOX".to_string(),
+                    remote_path: "INBOX".to_string(),
                 }),
             }],
             &[rec],
@@ -2481,6 +2486,7 @@ mod tests {
                     jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
                     server_name: "INBOX".to_string(),
                     maildir_folder: "INBOX".to_string(),
+                    remote_path: "INBOX".to_string(),
                 }),
             }],
             &[rec],
@@ -2508,6 +2514,7 @@ mod tests {
                     jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
                     server_name: "INBOX".to_string(),
                     maildir_folder: "INBOX".to_string(),
+                    remote_path: "INBOX".to_string(),
                 }),
                 old_flags: "".into(),
                 new_flags: "F".into(),
@@ -2542,6 +2549,7 @@ mod tests {
                     jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
                     server_name: "INBOX".to_string(),
                     maildir_folder: "INBOX".to_string(),
+                    remote_path: "INBOX".to_string(),
                 }),
                 old_flags: "".into(),
                 new_flags: "F".into(),
@@ -2588,6 +2596,7 @@ mod tests {
                     jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
                     server_name: "INBOX".to_string(),
                     maildir_folder: "INBOX".to_string(),
+                    remote_path: "INBOX".to_string(),
                 }),
                 old_flags: "FS".into(),
                 new_flags: "S".into(),
@@ -2627,6 +2636,7 @@ mod tests {
                 jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
                 server_name: "INBOX".to_string(),
                 maildir_folder: "INBOX".to_string(),
+                remote_path: "INBOX".to_string(),
             }),
             flags: "".into(),
             path: PathBuf::from("/tmp/m-big"),
@@ -2665,6 +2675,7 @@ mod tests {
                     jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
                     server_name: "INBOX".to_string(),
                     maildir_folder: "INBOX".to_string(),
+                    remote_path: "INBOX".to_string(),
                 }),
                 flags: "S".into(),
                 path: PathBuf::from("/tmp/m-new"),
@@ -2692,6 +2703,7 @@ mod tests {
                     jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
                     server_name: "INBOX".to_string(),
                     maildir_folder: "INBOX".to_string(),
+                    remote_path: "INBOX".to_string(),
                 }),
                 flags: "".into(),
                 path: PathBuf::from("/tmp/m-dup"),
@@ -2718,6 +2730,7 @@ mod tests {
                     jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
                     server_name: "INBOX".to_string(),
                     maildir_folder: "INBOX".to_string(),
+                    remote_path: "INBOX".to_string(),
                 }),
             }],
             &[rec],
@@ -2744,6 +2757,7 @@ mod tests {
                     jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
                     server_name: "INBOX".to_string(),
                     maildir_folder: "INBOX".to_string(),
+                    remote_path: "INBOX".to_string(),
                 }),
             }],
             &[rec],
@@ -2778,6 +2792,7 @@ mod tests {
                         jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
                         server_name: "INBOX".to_string(),
                         maildir_folder: "INBOX".to_string(),
+                        remote_path: "INBOX".to_string(),
                     }),
                 },
                 LocalChange::NewMessage {
@@ -2786,6 +2801,7 @@ mod tests {
                         jmap_mailbox_id: MaybeReference::Value("MB-ARCH".into()),
                         server_name: "Archive".to_string(),
                         maildir_folder: "Archive".to_string(),
+                        remote_path: "Archive".to_string(),
                     }),
                     flags: "".into(),
                     path: PathBuf::from("/tmp/m-new"),
@@ -2838,6 +2854,7 @@ mod tests {
                         jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
                         server_name: "INBOX".to_string(),
                         maildir_folder: "INBOX".to_string(),
+                        remote_path: "INBOX".to_string(),
                     }),
                 },
                 LocalChange::NewMessage {
@@ -2846,6 +2863,7 @@ mod tests {
                         jmap_mailbox_id: MaybeReference::Value("MB-ARCH".into()),
                         server_name: "Archive".to_string(),
                         maildir_folder: "Archive".to_string(),
+                        remote_path: "Archive".to_string(),
                     }),
                     flags: "S".into(),
                     path: PathBuf::from("/tmp/m-new"),
@@ -2886,6 +2904,7 @@ mod tests {
                         jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
                         server_name: "INBOX".to_string(),
                         maildir_folder: "INBOX".to_string(),
+                        remote_path: "INBOX".to_string(),
                     }),
                 },
                 LocalChange::NewMessage {
@@ -2895,6 +2914,7 @@ mod tests {
                         jmap_mailbox_id: MaybeReference::Value("MB-ARCH".into()),
                         server_name: "Archive".to_string(),
                         maildir_folder: "Archive".to_string(),
+                        remote_path: "Archive".to_string(),
                     }),
                     flags: "FS".into(),
                     path: PathBuf::from("/tmp/m1"),
@@ -2966,6 +2986,7 @@ mod tests {
                         jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
                         server_name: "INBOX".to_string(),
                         maildir_folder: "INBOX".to_string(),
+                        remote_path: "INBOX".to_string(),
                     }),
                 },
                 LocalChange::NewMessage {
@@ -2974,6 +2995,7 @@ mod tests {
                         jmap_mailbox_id: MaybeReference::Value("MB-ARCH".into()),
                         server_name: "Archive".to_string(),
                         maildir_folder: "Archive".to_string(),
+                        remote_path: "Archive".to_string(),
                     }),
                     flags: "".into(),
                     path: PathBuf::from("/tmp/m-new"),
@@ -3041,11 +3063,13 @@ mod tests {
             jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
             server_name: "Inbox".to_string(),
             maildir_folder: "INBOX".to_string(),
+            remote_path: "Inbox".to_string(),
         };
         let child = MailboxFolderBinding {
             jmap_mailbox_id: MaybeReference::Value("MB-CHILD".into()),
             server_name: "Notes".to_string(),
             maildir_folder: "Notes".to_string(),
+            remote_path: "Inbox/Notes".to_string(),
         };
         mailboxes.insert(inbox.clone());
         mailboxes.insert(child.clone());
@@ -3154,6 +3178,7 @@ mod tests {
             jmap_mailbox_id: MaybeReference::Value("MB-PARENT".into()),
             server_name: "Parent".to_string(),
             maildir_folder: "Parent".to_string(),
+            remote_path: "Parent".to_string(),
         });
         let mailboxes = mailboxes.build();
         let root = PathBuf::from("/tmp/jma-test-root");
@@ -3256,6 +3281,7 @@ mod tests {
             jmap_mailbox_id: MaybeReference::Value("MB-PARENT".into()),
             server_name: "Parent".to_string(),
             maildir_folder: ".Parent".to_string(),
+            remote_path: "Parent".to_string(),
         });
         let mailboxes = mailboxes.build();
         let root = PathBuf::from("/tmp/jma-test-root");
@@ -3417,6 +3443,7 @@ mod tests {
             jmap_mailbox_id: MaybeReference::Value("MB-ARCH".into()),
             server_name: "Archive".to_string(),
             maildir_folder: "Archive".to_string(),
+            remote_path: "Archive".to_string(),
         });
         let mailboxes = mailboxes.build();
         let root = PathBuf::from("/tmp/jma-test-root");

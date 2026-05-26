@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -60,7 +60,17 @@ CREATE TABLE IF NOT EXISTS mailbox_map (
     role            TEXT,
     parent_id       TEXT,
     maildir_folder  TEXT NOT NULL,
-    sort_order      INTEGER DEFAULT 0
+    sort_order      INTEGER DEFAULT 0,
+    -- Slash-joined server-name path walking up `parent_id`
+    -- ("Personal/Archive"), distinct from `maildir_folder`
+    -- which follows the configured layout + hierarchy_separator.
+    -- JMAP scopes mailbox uniqueness to `(parent_id, name)` per
+    -- RFC 8621 section 2, so the bare `name` column is ambiguous
+    -- across the hierarchy while this path is not. Nullable so
+    -- older DBs upgraded by the runtime ALTER pick up the column
+    -- without a schema bump; populated on the next
+    -- `resolve_mailboxes` upsert.
+    remote_path     TEXT
 );
 
 CREATE TABLE IF NOT EXISTS local_state (
@@ -101,6 +111,17 @@ CREATE TABLE IF NOT EXISTS folder_checkpoint (
 /// command -- those hold the state DB lock and can safely nuke + recreate.
 /// Read-only paths can't, since nuking under a concurrently running
 /// `sync`/`watch` would yank the DB out from under it.
+///
+/// `apply_additive_migrations` is deliberately not run here: schema-
+/// mutating DDL belongs on the mutator path that holds the state DB
+/// lock. The read-only path reads against whatever column shape the
+/// last mutator open established. Today no read-only command issues a
+/// `SELECT` against an additive-migrated column, so a pre-migration
+/// DB opens cleanly through this entrypoint. If a future read-only
+/// caller grows that need, switch to probing each additive column at
+/// open and bailing with the same "run `jma sync`" message used for
+/// schema-version mismatches above -- raw `no such column` SQLite
+/// errors are not a friendly user experience.
 pub fn open(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| {
@@ -157,7 +178,14 @@ pub fn open_or_recreate(path: &Path) -> Result<Connection> {
         unlink_state_db(path)?;
     }
 
-    open_and_apply_schema(path)
+    let conn = open_and_apply_schema(path)?;
+    // Schema-mutating additive ALTERs only run on the mutator path
+    // -- the caller holds the state DB lock, so the PRAGMA-then-
+    // ALTER pair is serialised against concurrent opens. The
+    // read-only `open` deliberately does not run these and reads
+    // against the column shape the last mutator open established.
+    apply_additive_migrations(&conn)?;
+    Ok(conn)
 }
 
 /// Inspect the on-disk DB at `path` and decide whether it's compatible
@@ -224,6 +252,40 @@ fn open_and_apply_schema(path: &Path) -> Result<Connection> {
 
     info!("State database opened at {}", path.display());
     Ok(conn)
+}
+
+/// Idempotent column-add migrations for columns whose addition is
+/// backwards-compatible (nullable, additive only). The runtime
+/// applies them on every open so older DBs pick up new columns
+/// without a `SCHEMA_VERSION` bump and the corresponding nuke.
+/// `CREATE TABLE IF NOT EXISTS` doesn't `ALTER` an existing
+/// table, so the schema SQL alone won't add the column to a DB
+/// that already has the older table shape -- we walk
+/// `PRAGMA table_info(...)` and issue `ALTER TABLE ADD COLUMN`
+/// for any missing column.
+fn apply_additive_migrations(conn: &Connection) -> Result<()> {
+    for (table, column, ddl) in [(
+        "mailbox_map",
+        "remote_path",
+        "ALTER TABLE mailbox_map ADD COLUMN remote_path TEXT",
+    )] {
+        if !column_exists(conn, table, column)? {
+            conn.execute_batch(ddl)
+                .with_context(|| format!("Failed to add {}.{}", table, column))?;
+            debug!("Migrated state DB: added {}.{}", table, column);
+        }
+    }
+    Ok(())
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn
+        .prepare("SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2")
+        .with_context(|| format!("Failed to prepare table_info probe for {}", table))?;
+    let exists: bool = stmt
+        .exists(params![table, column])
+        .with_context(|| format!("Failed to probe {}.{}", table, column))?;
+    Ok(exists)
 }
 
 /// Remove `state.db` and its SQLite auxiliary files (`-wal`, `-shm`).
@@ -550,6 +612,76 @@ mod tests {
 
         let _ = open(&db).expect("missing DB should be created");
 
+        assert_eq!(user_version(&db), SCHEMA_VERSION);
+    }
+
+    /// Hand-build a DB whose `mailbox_map` lacks the
+    /// `remote_path` column (simulating a pre-foundation
+    /// binary writing the table); the additive migration on
+    /// `open_or_recreate` must add the column without bumping
+    /// `SCHEMA_VERSION` or nuking the DB. Pins the
+    /// additive-ALTER contract.
+    #[test]
+    fn open_adds_missing_remote_path_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+
+        // Seed: create a `mailbox_map` shape matching the
+        // pre-foundation schema (no remote_path column), stamp
+        // the current SCHEMA_VERSION so `open_or_recreate`
+        // takes the "current-version, just open" path instead
+        // of the nuke path.
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE mailbox_map (
+                    jmap_mailbox_id TEXT NOT NULL PRIMARY KEY,
+                    name            TEXT NOT NULL,
+                    role            TEXT,
+                    parent_id       TEXT,
+                    maildir_folder  TEXT NOT NULL,
+                    sort_order      INTEGER DEFAULT 0
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO mailbox_map (jmap_mailbox_id, name, maildir_folder)
+                 VALUES ('MB-1', 'Inbox', 'INBOX')",
+                [],
+            )
+            .unwrap();
+            conn.execute_batch(&format!("PRAGMA user_version = {};", SCHEMA_VERSION))
+                .unwrap();
+        }
+
+        // Re-open via the mutating path: the additive migration
+        // adds the column.
+        let conn = open_or_recreate(&db).expect("re-open must succeed and add the column");
+        let has_col: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('mailbox_map') WHERE name = 'remote_path')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(has_col, "remote_path must be added by the additive ALTER");
+        // Pre-existing row must survive -- the ALTER is additive, not destructive.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM mailbox_map", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        // And the existing row's new column reads as NULL until the
+        // next upsert rewrites it.
+        let path: Option<String> = conn
+            .query_row(
+                "SELECT remote_path FROM mailbox_map WHERE jmap_mailbox_id = 'MB-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(path, None);
+        // Schema version stays put -- this is an additive
+        // migration, not a version bump.
         assert_eq!(user_version(&db), SCHEMA_VERSION);
     }
 }
