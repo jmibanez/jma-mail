@@ -51,7 +51,8 @@ pub enum Command {
     Push,
     /// Daemon mode: continuous sync on server + local changes
     Watch,
-    /// Initialize config file and local maildir structure
+    /// Initialize config file. Maildirs are created on the first
+    /// sync (preview with `sync --dry-run`).
     Init,
     /// List remote mailboxes and their local mapping
     Mailboxes,

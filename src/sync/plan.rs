@@ -225,6 +225,32 @@ pub enum SyncAction {
         from_folder: String,
         to_folder: String,
     },
+
+    /// Folder-level constructive action mirroring a server-side
+    /// mailbox creation on disk: `ensure_maildir` (create
+    /// `cur/`/`new/`/`tmp/` under `maildir_root/binding.maildir_
+    /// folder`) plus `sentinel::write` (`.jma.mapping` TOML
+    /// carrying the JMAP id triple). Emitted by reconcile for
+    /// every server-known mailbox whose on-disk state is
+    /// inconsistent with the binding (folder absent, sentinel
+    /// absent, or sentinel content stale).
+    ///
+    /// `parent_jmap_mailbox_id` is the JMAP parent the server
+    /// returned for this mailbox; the executor stamps it into
+    /// the sentinel so the parent chain can be reconstructed
+    /// from disk after a state-DB nuke. `None` for top-level
+    /// mailboxes.
+    CreateLocalMailbox {
+        binding: Arc<MailboxFolderBinding>,
+        parent_jmap_mailbox_id: Option<JmapMailboxId>,
+        /// `Some(dead_id)` when this create represents a resurrect
+        /// of a mailbox the user previously deleted locally: the
+        /// executor must drop stale `message_map` rows pointing at
+        /// `dead_id` before downstream `DownloadMessage` actions
+        /// write fresh rows for the same id. `None` for ordinary
+        /// first-cycle creates (no cached rows exist for the id).
+        replaces_orphan_id: Option<JmapMailboxId>,
+    },
 }
 
 impl SyncAction {
@@ -234,7 +260,8 @@ impl SyncAction {
             SyncAction::DownloadMessage { .. }
             | SyncAction::UpdateLocalFlags { .. }
             | SyncAction::DeleteLocal { .. }
-            | SyncAction::MoveLocal { .. } => ActionDirection::Pull,
+            | SyncAction::MoveLocal { .. }
+            | SyncAction::CreateLocalMailbox { .. } => ActionDirection::Pull,
             SyncAction::UploadMessage { .. }
             | SyncAction::UpdateRemoteKeywords { .. }
             | SyncAction::DestroyRemote { .. }
@@ -310,6 +337,17 @@ impl SyncPlan {
             .count()
     }
 
+    /// Folder-level constructive actions in the plan. Called out
+    /// in the dry-run summary so a first-cycle pull (which
+    /// creates one per synced mailbox) doesn't read as a wall of
+    /// generic downloads.
+    pub fn folder_create_count(&self) -> usize {
+        self.actions
+            .iter()
+            .filter(|a| matches!(a, SyncAction::CreateLocalMailbox { .. }))
+            .count()
+    }
+
     pub fn adopt_count(&self) -> usize {
         self.actions
             .iter()
@@ -361,11 +399,12 @@ impl fmt::Display for SyncPlan {
             return writeln!(f, "Nothing to do.");
         }
         writeln!(f, "Sync plan:")?;
-        writeln!(f, "  Downloads:    {}", self.download_count())?;
-        writeln!(f, "  Uploads:      {}", self.upload_count())?;
-        writeln!(f, "  Adoptions:    {}", self.adopt_count())?;
-        writeln!(f, "  Flag updates: {}", self.flag_update_count())?;
-        writeln!(f, "  Deletes:      {}", self.delete_count())?;
+        writeln!(f, "  Downloads:      {}", self.download_count())?;
+        writeln!(f, "  Uploads:        {}", self.upload_count())?;
+        writeln!(f, "  Adoptions:      {}", self.adopt_count())?;
+        writeln!(f, "  Flag updates:   {}", self.flag_update_count())?;
+        writeln!(f, "  Deletes:        {}", self.delete_count())?;
+        writeln!(f, "  Folder creates: {}", self.folder_create_count())?;
         writeln!(f)?;
 
         for action in &self.actions {
@@ -411,6 +450,11 @@ impl fmt::Display for SyncPlan {
                     f,
                     "  [PUSH] Move {} from {}/ to {}/",
                     id, from_folder, to_folder
+                )?,
+                SyncAction::CreateLocalMailbox { binding, .. } => writeln!(
+                    f,
+                    "  [PULL] Create local mailbox {}/ (server mailbox {})",
+                    binding.maildir_folder, binding.jmap_mailbox_id
                 )?,
             }
         }

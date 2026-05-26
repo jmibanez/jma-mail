@@ -271,6 +271,14 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
         &mut plan,
     );
 
+    // Folder-level creation runs first in the emit order so the
+    // plan reads top-down: maildirs come into being before any
+    // action that writes into them. The executor's bucket order
+    // already runs CreateLocalMailbox before everything else, so
+    // wire ordering doesn't change semantics -- only the dry-run
+    // display order.
+    emit_create_local_mailboxes(ctx.mailboxes, &mut plan);
+
     process_remote_destroys(
         remote_destroyed,
         ctx.known_by_jmap,
@@ -310,6 +318,26 @@ struct DetectedMove {
     /// compared against new_flags to decide whether the move should
     /// also push keyword changes.
     prior_flags: String,
+}
+
+/// Emit one `CreateLocalMailbox` action per binding that
+/// `resolve_mailboxes` flagged as first-cycle-new (server-known
+/// but absent from the pre-upsert `mailbox_map` cache). The
+/// executor's first phase translates each into `ensure_maildir`
+/// plus `sentinel::write` before any downstream phase assumes
+/// the folder is present on disk.
+///
+/// Empty in steady state -- once a mailbox has been synced
+/// once, its `mailbox_map` row sticks around across cycles and
+/// the helper has nothing to emit.
+fn emit_create_local_mailboxes(mailboxes: &MailboxBindings, plan: &mut SyncPlan) {
+    for new in mailboxes.new_mailboxes() {
+        plan.actions.push(SyncAction::CreateLocalMailbox {
+            binding: Arc::new(new.binding.clone()),
+            parent_jmap_mailbox_id: new.parent_jmap_mailbox_id.clone(),
+            replaces_orphan_id: new.replaces_orphan_id.clone(),
+        });
+    }
 }
 
 fn emit_detected_moves(moves: &[DetectedMove], plan: &mut SyncPlan) {
@@ -2798,5 +2826,66 @@ mod tests {
             plan.actions[0],
             SyncAction::DeleteLocal { id: BoundId { ref maildir_id, .. }, .. } if maildir_id.as_ref() == "M-1"
         ));
+    }
+
+    /// Empty `new_mailboxes()` on bindings: reconcile emits no
+    /// `CreateLocalMailbox` actions. Pins steady-state behavior
+    /// where every mailbox already has a `mailbox_map` row from a
+    /// prior cycle.
+    #[test]
+    fn emit_create_local_mailboxes_no_op_in_steady_state() {
+        let mailboxes = mailboxes();
+        let mut plan = SyncPlan::default();
+        emit_create_local_mailboxes(&mailboxes, &mut plan);
+        assert_eq!(plan.folder_create_count(), 0);
+    }
+
+    /// New-mailbox bindings produce one `CreateLocalMailbox` each
+    /// with the binding + parent jmap mailbox id carried through.
+    #[test]
+    fn emit_create_local_mailboxes_emits_one_per_new_binding() {
+        let mut mailboxes = MailboxBindings::builder();
+        let inbox = MailboxFolderBinding {
+            jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
+            server_name: "Inbox".to_string(),
+            maildir_folder: "INBOX".to_string(),
+        };
+        let child = MailboxFolderBinding {
+            jmap_mailbox_id: MaybeReference::Value("MB-CHILD".into()),
+            server_name: "Notes".to_string(),
+            maildir_folder: "Notes".to_string(),
+        };
+        mailboxes.insert(inbox.clone());
+        mailboxes.insert(child.clone());
+        mailboxes.push_new_mailbox(inbox.clone(), None, None);
+        mailboxes.push_new_mailbox(child.clone(), Some("MB-INBOX".into()), None);
+        let mailboxes = mailboxes.build();
+        let mut plan = SyncPlan::default();
+        emit_create_local_mailboxes(&mailboxes, &mut plan);
+
+        assert_eq!(plan.folder_create_count(), 2);
+        let mut seen_ids: Vec<String> = Vec::new();
+        for a in &plan.actions {
+            if let SyncAction::CreateLocalMailbox {
+                binding,
+                parent_jmap_mailbox_id,
+                ..
+            } = a
+            {
+                let id = binding
+                    .jmap_mailbox_id
+                    .expect_resolved("test -- CreateLocalMailbox binding id");
+                seen_ids.push(id.as_ref().to_string());
+                if id.as_ref() == "MB-CHILD" {
+                    assert_eq!(
+                        parent_jmap_mailbox_id.as_ref().map(|p| p.as_ref()),
+                        Some("MB-INBOX"),
+                        "child parent id must round-trip into the action"
+                    );
+                }
+            }
+        }
+        seen_ids.sort();
+        assert_eq!(seen_ids, vec!["MB-CHILD", "MB-INBOX"]);
     }
 }

@@ -105,6 +105,7 @@ impl<'a> Executor<'a> {
             new_email_state,
         } = plan;
 
+        let mut local_creates = Vec::new();
         let mut unconditional_adopts = Vec::new();
         let mut move_pair_adopts = Vec::new();
         let mut downloads = Vec::new();
@@ -118,6 +119,7 @@ impl<'a> Executor<'a> {
 
         for action in actions {
             match action {
+                SyncAction::CreateLocalMailbox { .. } => local_creates.push(action),
                 // A move-pair adopt mirrors the DB half of a local cross-folder
                 // move and is paired with a MoveRemote in the same plan. Defer
                 // it until after the MoveRemote has actually landed on the
@@ -141,6 +143,12 @@ impl<'a> Executor<'a> {
             }
         }
 
+        // CreateLocalMailbox runs first so every downstream phase
+        // can assume the maildir tree and sentinel are in place
+        // for any newly synced mailbox: Download writes into
+        // cur/, UpdateLocalFlags renames within it, MoveLocal's
+        // destination has to exist, and so on.
+        self.create_local_mailboxes(local_creates)?;
         adopt_messages(self.conn, unconditional_adopts)?;
         let downloaded = self.download_messages(downloads).await?;
         let local_flag_updates = self.update_local_flags(local_flags)?;
@@ -331,6 +339,71 @@ impl<'a> Executor<'a> {
             info!("Deleted local copy of destroyed {}", bound_for_log);
         }
         Ok(succeeded)
+    }
+
+    /// Execute `CreateLocalMailbox` actions: `ensure_maildir`
+    /// on the resolved path (creates `cur/`/`new/`/`tmp/` if
+    /// missing) and stamp the `.jma.mapping` sentinel so the
+    /// local-folder -> JMAP-mailbox binding survives a state-DB
+    /// nuke. Idempotent: re-running against an already-created
+    /// folder is harmless (both helpers are idempotent), so a
+    /// partial-failure retry the next cycle is safe -- the
+    /// emitter in `resolve_mailboxes` re-fires whenever the
+    /// on-disk state is inconsistent with the server-known
+    /// binding.
+    ///
+    /// Per-folder failures are logged at warn and skipped so a
+    /// single broken create doesn't cascade into the rest of
+    /// the cycle.
+    fn create_local_mailboxes(&self, actions: Vec<SyncAction>) -> Result<()> {
+        for action in actions {
+            let SyncAction::CreateLocalMailbox {
+                binding,
+                parent_jmap_mailbox_id,
+                ..
+            } = action
+            else {
+                continue;
+            };
+            let folder_path = self.maildir_root.join(&binding.maildir_folder);
+            if let Err(e) = store::ensure_maildir(&folder_path) {
+                warn!(
+                    "Failed to create maildir for new mailbox {} at {}: {}; \
+                     subsequent actions targeting this folder will likely also fail",
+                    binding.jmap_mailbox_id,
+                    folder_path.display(),
+                    e
+                );
+                continue;
+            }
+            if let Err(e) = crate::maildir_ops::sentinel::write(
+                &folder_path,
+                &crate::maildir_ops::sentinel::MailboxMapping {
+                    jmap_mailbox_id: binding
+                        .jmap_mailbox_id
+                        .expect_resolved("execute::create_local_mailboxes -- sentinel write")
+                        .clone(),
+                    parent_jmap_mailbox_id: parent_jmap_mailbox_id.clone(),
+                    server_name: binding.server_name.clone(),
+                },
+            ) {
+                warn!(
+                    "Created maildir for new mailbox {} but sentinel write failed at {}: {}; \
+                     the next sync will detect the missing sentinel and retry the write",
+                    binding.jmap_mailbox_id,
+                    folder_path.display(),
+                    e
+                );
+                // Folder exists; downstream actions can land. The
+                // sentinel is recoverable; the folder is the
+                // load-bearing part.
+            }
+            info!(
+                "Created local maildir for new mailbox: {}",
+                binding.maildir_folder
+            );
+        }
+        Ok(())
     }
 
     async fn upload_messages(&self, actions: Vec<SyncAction>) -> Result<UploadResults> {

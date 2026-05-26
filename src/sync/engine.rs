@@ -194,6 +194,33 @@ impl<'a> SyncEngine<'a> {
         let mailboxes = self.resolve_mailboxes().await?;
         let maildir_root = self.config.maildir_path();
 
+        // Push-only on a fresh config has nothing local to upload:
+        // CreateLocalMailbox actions would be dropped by the
+        // direction filter and the cycle would burn through scan,
+        // remote-state fetch, and reconcile only to plan zero work.
+        // Bail upfront with an actionable message so the user knows
+        // a pull-side cycle is the prerequisite. Only fires when
+        // resolve_mailboxes returned at least one synced binding --
+        // an empty bindings set has its own failure modes (filter
+        // excludes everything, server returned no mailboxes) and is
+        // not this commit's concern. Fires under `--dry-run` too:
+        // the preview of zero work is no more useful than the
+        // error, and the error is actionable.
+        if matches!(direction, SyncDirection::PushOnly) && !mailboxes.is_empty() {
+            let provisioned = mailboxes
+                .iter()
+                .filter(|b| {
+                    store::try_open_maildir(&maildir_root.join(&b.maildir_folder)).is_some()
+                })
+                .count();
+            if provisioned == 0 {
+                return Err(anyhow::anyhow!(
+                    "No local maildirs are provisioned yet; run `jma sync` or `jma pull` \
+                     first to land them, then push will have something to upload."
+                ));
+            }
+        }
+
         // Phase 0: classify duplicates and (conditionally) index. Always
         // before scan so newly-introduced duplicates from a prior aborted
         // run don't get treated as local changes to push.
@@ -276,7 +303,17 @@ impl<'a> SyncEngine<'a> {
                     let mut local_flags: HashMap<MaildirId, String> = HashMap::new();
                     for binding in mailboxes.iter() {
                         let maildir_path = maildir_root.join(&binding.maildir_folder);
-                        let maildir = store::ensure_maildir(&maildir_path)?;
+                        // A live binding whose maildir doesn't yet
+                        // exist on disk is the first-cycle case for
+                        // a server-known mailbox; the
+                        // `CreateLocalMailbox` action emitted by
+                        // reconcile will create it in the executor's
+                        // first phase. Skip the walk here -- no
+                        // local files to classify -- without side-
+                        // effecting the folder into existence.
+                        let Some(maildir) = store::try_open_maildir(&maildir_path) else {
+                            continue;
+                        };
                         let known_state = hydrate_known_state(self.conn, binding)?;
                         let result = scan::scan_folder(&maildir, binding, &known_state)?;
                         changes.extend(result.changes);
@@ -287,11 +324,18 @@ impl<'a> SyncEngine<'a> {
                 ScanScope::Paths(paths) => {
                     let mut known_states = HashMap::new();
                     for binding in mailboxes.iter() {
-                        // Make sure the maildir on disk exists, matching
-                        // the side-effect the Full path used to provide;
-                        // some downstream code assumes the directory tree
-                        // is in place.
-                        store::ensure_maildir(&maildir_root.join(&binding.maildir_folder))?;
+                        // Path-driven cycles only fire for fsevent
+                        // paths the watcher already saw, so a
+                        // maildir-shaped folder absent at this
+                        // point means no events referenced it.
+                        // Skip the state hydration for absent
+                        // folders rather than creating them as a
+                        // side effect.
+                        if store::try_open_maildir(&maildir_root.join(&binding.maildir_folder))
+                            .is_none()
+                        {
+                            continue;
+                        }
                         let state = hydrate_known_state(self.conn, binding)?;
                         known_states.insert(binding.maildir_folder.clone(), state);
                     }
@@ -550,6 +594,7 @@ impl<'a> SyncEngine<'a> {
         let name_cap = limits::max_size_mailbox_name(&self.client);
         let mut synced = MailboxBindings::builder();
         let layout_definition = FolderLayoutDefinition::from_config(self.config, name_cap);
+        let maildir_root = self.config.maildir_path();
 
         for mb in &remote_mailboxes {
             // Parent-aware filter: a config entry naming any ancestor
@@ -571,7 +616,8 @@ impl<'a> SyncEngine<'a> {
             // name unchanged for depth-1 mailboxes.
             let folder_name = resolve_folder_path(mb, &by_id, &layout_definition)?;
 
-            // Store in DB
+            // Store in DB. Cache bookkeeping; not user-state, so
+            // it stays inline rather than going through the plan.
             queries::upsert_mailbox(
                 self.conn,
                 &queries::MailboxRecord {
@@ -584,15 +630,44 @@ impl<'a> SyncEngine<'a> {
                 },
             )?;
 
-            // Ensure local maildir exists
-            let maildir_path = self.config.maildir_path().join(&folder_name);
-            store::ensure_maildir(&maildir_path)?;
-
-            synced.insert(MailboxFolderBinding {
+            let binding = MailboxFolderBinding {
                 jmap_mailbox_id: MaybeReference::Value(mb.id.clone()),
                 server_name: mb.name.clone(),
                 maildir_folder: folder_name,
-            });
+            };
+
+            // Emit CreateLocalMailbox whenever the on-disk state
+            // is inconsistent with the server-known binding:
+            // folder absent (first sync, post-DB-nuke catch-up
+            // with the maildir tree also gone), sentinel absent
+            // (folder present but partial-write left no sentinel),
+            // or sentinel content stale (server-side rename or
+            // hand-edit). All three converge on the executor's
+            // first phase, whose `ensure_maildir` + `sentinel::
+            // write` are idempotent. Disk-derived rather than
+            // cache-derived so a partial-failure retry next cycle
+            // picks the gap back up automatically. User-state
+            // mutations (the maildir tree, the sentinel file) no
+            // longer happen inline here -- `--dry-run` previews
+            // them and direction filters apply.
+            let folder_path = maildir_root.join(&binding.maildir_folder);
+            let needs_create = match (
+                store::try_open_maildir(&folder_path),
+                crate::maildir_ops::sentinel::read(&folder_path)?,
+            ) {
+                (None, _) => true,
+                (Some(_), None) => true,
+                (Some(_), Some(m)) => {
+                    m.jmap_mailbox_id != mb.id
+                        || m.server_name != mb.name
+                        || m.parent_jmap_mailbox_id != mb.parent_id
+                }
+            };
+            if needs_create {
+                synced.push_new_mailbox(binding.clone(), mb.parent_id.clone(), None);
+            }
+
+            synced.insert(binding);
         }
 
         let synced = synced.build();
@@ -751,10 +826,17 @@ fn compute_dirty_folders(
     let mut dirty = Vec::new();
     for folder in folder_names {
         let path = maildir_root.join(folder);
-        // ensure_maildir runs again in Phase 1 (scan), but snapshot
-        // needs cur/ and new/ to exist now. The call is cheap and
-        // idempotent.
-        crate::maildir_ops::store::ensure_maildir(&path)?;
+        // First-cycle folders haven't been created on disk yet --
+        // `CreateLocalMailbox` lands in the executor, not in
+        // resolve_mailboxes. Treat the absent case as
+        // "trivially clean" (no files, no dedupe needed) without
+        // a side-effecting `ensure_maildir`. The snapshot below
+        // reads `cur/`/`new/`; a maildir-shaped folder absent at
+        // this point can't have grown duplicates since the last
+        // checkpoint (it has no files at all).
+        if !path.join("cur").is_dir() {
+            continue;
+        }
         let current = crate::maildir_ops::snapshot::snapshot_folder(&path)?;
         let recorded = queries::get_folder_checkpoint(conn, folder)?;
         match recorded {
@@ -781,6 +863,16 @@ fn record_folder_checkpoints(
 ) -> Result<()> {
     for folder in folder_names {
         let path = maildir_root.join(folder);
+        // Skip folders that don't yet have a maildir shape on
+        // disk -- a first-cycle mailbox whose
+        // `CreateLocalMailbox` phase hasn't actually landed
+        // (dry-run, or pull-only mode with no plan execution)
+        // has nothing to checkpoint. The next cycle's
+        // `compute_dirty_folders` will treat the still-absent
+        // folder as trivially clean too.
+        if !path.join("cur").is_dir() {
+            continue;
+        }
         let snapshot = crate::maildir_ops::snapshot::snapshot_folder(&path)?;
         queries::upsert_folder_checkpoint(conn, folder, &snapshot)?;
     }
@@ -885,6 +977,10 @@ fn log_dropped(direction: SyncDirection, dropped: &[SyncAction]) {
             } => warn!(
                 "{:?}: dropped MoveRemote {} ({} -> {})",
                 direction, id, from_folder, to_folder
+            ),
+            SyncAction::CreateLocalMailbox { binding, .. } => warn!(
+                "{:?}: dropped CreateLocalMailbox {}/",
+                direction, binding.maildir_folder
             ),
             // Adoption is always kept; it never appears here.
             SyncAction::AdoptLocalMessage { .. } => {}
