@@ -319,6 +319,21 @@ impl<'a> SyncEngine<'a> {
                         changes.extend(result.changes);
                         local_flags.extend(result.local_flags);
                     }
+                    // Folder-discovery pass: enumerate maildir-shaped
+                    // directories under `maildir_root` that no binding
+                    // covers and emit a `LocalFolderCreated` for each.
+                    // Walk strategy is layout-aware -- see
+                    // `scan::discover_unbound_folders`. Full-scope is
+                    // the comprehensive sweep that catches folders
+                    // created while the daemon wasn't running (or
+                    // missed by fsevents); `scan_paths` emits the same
+                    // variant per-event for folders the watcher saw
+                    // live, so both scopes converge on the same shape.
+                    changes.extend(scan::discover_unbound_folders(
+                        &maildir_root,
+                        self.config.sync.folder_layout,
+                        &mailboxes,
+                    ));
                     (changes, local_flags)
                 }
                 ScanScope::Paths(paths) => {
@@ -339,7 +354,13 @@ impl<'a> SyncEngine<'a> {
                         let state = hydrate_known_state(self.conn, binding)?;
                         known_states.insert(binding.maildir_folder.clone(), state);
                     }
-                    let result = scan::scan_paths(&maildir_root, paths, &known_states, &mailboxes)?;
+                    let result = scan::scan_paths(
+                        &maildir_root,
+                        paths,
+                        &known_states,
+                        &mailboxes,
+                        self.config.sync.folder_layout,
+                    )?;
                     (result.changes, result.local_flags)
                 }
             }

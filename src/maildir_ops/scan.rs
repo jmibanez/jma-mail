@@ -5,9 +5,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{debug, error};
 
+use crate::config::FolderLayout;
 use crate::ids::{JmapMailboxId, MaildirId, MessageId};
 use crate::jmap::types::MailboxFolderBinding;
 use crate::maildir_ops::headers::parse_message_id_from_file;
+use crate::maildir_ops::namespace::is_jma_private;
 use crate::maildir_ops::sentinel::MailboxMapping;
 use crate::sync::bindings::MailboxBindings;
 
@@ -385,6 +387,7 @@ pub fn scan_paths(
     event_paths: &[PathBuf],
     known_states: &HashMap<String, HashMap<MaildirId, (JmapMailboxId, String)>>,
     bindings: &MailboxBindings,
+    layout: FolderLayout,
 ) -> Result<ScanResult> {
     // (subdir, flags, raw on-disk path) for one event hitting a
     // (folder, maildir_id) group. Multiple entries per group cover
@@ -394,14 +397,47 @@ pub fn scan_paths(
     // and ids that disappeared (live path missing).
     type FolderBucket = (Vec<CurEntry>, Vec<MaildirId>, Vec<MaildirId>);
 
-    // Group events by (folder, maildir_id) so the source + destination
-    // sides of a single rename collapse into one classification.
+    // Per-event dispatch, in order:
+    //   1. Parse the path; drop if it doesn't fit the
+    //      `<root>/<folder>/(cur|new)/<file>` shape.
+    //   2. Bound folder: group by (folder, maildir_id) so the source
+    //      + destination sides of a single rename collapse into one
+    //      classification (forwarded to classify_changes below).
+    //   3. Unbound but layout-eligible folder: emit one
+    //      `LocalFolderCreated` per folder per call (deduped via
+    //      `discovered_folders`), then drop the message-level event
+    //      since there's no binding to classify against.
+    //   4. Unbound and layout-ineligible (e.g. an event at depth 2
+    //      under Flat where mailboxes are depth 1): drop entirely.
     let mut groups: HashMap<(String, MaildirId), Vec<GroupEntry>> = HashMap::new();
+    let mut discovered_folders: HashSet<String> = HashSet::new();
+    let mut discovery_changes: Vec<LocalChange> = Vec::new();
     for raw in event_paths {
         let Some((folder, subdir, id, flags)) = parse_event_path(maildir_root, raw) else {
             continue;
         };
         if !known_states.contains_key(&folder) {
+            if bindings.by_folder(&folder).is_none()
+                && layout_eligible_folder(&folder, layout)
+                && discovered_folders.insert(folder.clone())
+            {
+                let folder_path = maildir_root.join(&folder);
+                let sentinel = match crate::maildir_ops::sentinel::read(&folder_path) {
+                    Ok(opt) => opt,
+                    Err(e) => {
+                        debug!(
+                            "scan_paths: sentinel read failed at {} ({e}); \
+                             emitting LocalFolderCreated with sentinel=None",
+                            folder_path.display()
+                        );
+                        None
+                    }
+                };
+                discovery_changes.push(LocalChange::LocalFolderCreated {
+                    path: folder_path,
+                    sentinel,
+                });
+            }
             continue;
         }
         groups
@@ -460,7 +496,7 @@ pub fn scan_paths(
         }
     }
 
-    let mut all_changes = Vec::new();
+    let mut all_changes = discovery_changes;
     // Path-driven scans cover only the maildir_ids in the event set,
     // so `local_flags` here is intentionally partial -- callers fall
     // back to the state DB for everything not in this map.
@@ -497,6 +533,178 @@ pub fn scan_paths(
         changes: all_changes,
         local_flags,
     })
+}
+
+/// Walk `maildir_root` for maildir-shaped directories not covered by
+/// `bindings`. Each one becomes a `LocalChange::LocalFolderCreated`
+/// carrying the on-disk path and the sentinel read result (so a
+/// consumer can fork between "cache lost a binding the sentinel still
+/// pins" and "genuinely new local folder").
+///
+/// "Maildir-shaped" means `<dir>/cur/` exists -- the same predicate
+/// `store::try_open_maildir` uses elsewhere.
+///
+/// Walk strategy is `layout`-dependent so we don't pay for traversal
+/// that the layout's naming convention rules out:
+///
+/// - `Flat`: candidates are first-level children of `maildir_root`
+///   (every folder, including nested-on-server ones, lives at depth 1
+///   under a joined name like `[Airmail].Sent`). No recursion.
+/// - `MaildirPP`: candidates are first-level children whose name
+///   starts with `.` (the spec's hidden-dot convention). Non-hidden
+///   first-level dirs are not mailboxes under this layout.
+/// - `Fs`: full recursion through every subdirectory that isn't a
+///   `cur`/`new`/`tmp` leaf or a `.jma.*` namespace dir.
+///
+/// Returned paths are absolute. Consumers wanting the
+/// `mailbox_map.maildir_folder` representation should `strip_prefix`
+/// `maildir_root` and convert to a `String`. The set is sorted by
+/// path so the change stream is deterministic across invocations.
+///
+/// Sentinel read failures are treated as `None` and logged at debug:
+/// the variant's job is to surface the folder for downstream
+/// classification, and a torn sentinel falls into the same bucket as
+/// a missing one.
+pub fn discover_unbound_folders(
+    maildir_root: &Path,
+    layout: FolderLayout,
+    bindings: &MailboxBindings,
+) -> Vec<LocalChange> {
+    let mut found = Vec::new();
+    match layout {
+        FolderLayout::Flat => collect_flat(maildir_root, &mut found),
+        FolderLayout::MaildirPP => collect_maildir_pp(maildir_root, &mut found),
+        FolderLayout::Fs => walk_for_maildir_dirs_recursive(maildir_root, &mut found),
+    }
+    found.sort();
+    found
+        .into_iter()
+        .filter_map(|abs_path| {
+            let rel = abs_path.strip_prefix(maildir_root).ok()?;
+            let rel_str = rel.to_string_lossy();
+            if bindings.by_folder(rel_str.as_ref()).is_some() {
+                return None;
+            }
+            let sentinel = match crate::maildir_ops::sentinel::read(&abs_path) {
+                Ok(opt) => opt,
+                Err(e) => {
+                    debug!(
+                        "discover_unbound_folders: sentinel read failed at {} ({e}); \
+                         emitting with sentinel=None",
+                        abs_path.display()
+                    );
+                    None
+                }
+            };
+            Some(LocalChange::LocalFolderCreated {
+                path: abs_path,
+                sentinel,
+            })
+        })
+        .collect()
+}
+
+/// First-level only: every non-`.jma.*` child of `dir` whose own
+/// `cur/` subdirectory exists is a candidate. Used under `Flat`,
+/// where the layout collapses hierarchy into separator-joined names
+/// so every mailbox sits at depth 1.
+fn collect_flat(dir: &Path, found: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if is_jma_private(name_str.as_ref()) {
+            continue;
+        }
+        let path = entry.path();
+        if path.join("cur").is_dir() {
+            found.push(path);
+        }
+    }
+}
+
+/// First-level hidden-dot children only: every child of `dir`
+/// starting with `.` (and not `.jma.*`) whose own `cur/`
+/// subdirectory exists is a candidate. Used under `MaildirPP`,
+/// where the spec reserves the dot prefix for mailbox folders.
+fn collect_maildir_pp(dir: &Path, found: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if !name_str.starts_with('.') || is_jma_private(name_str.as_ref()) {
+            continue;
+        }
+        let path = entry.path();
+        if path.join("cur").is_dir() {
+            found.push(path);
+        }
+    }
+}
+
+/// `true` iff `rel` (a maildir-root-relative folder string of the
+/// shape stored in `mailbox_map.maildir_folder`) is a valid mailbox
+/// name under `layout`. Mirrors the shape constraint each layout's
+/// folder-discovery walk applies, so `scan_paths`'s
+/// `LocalFolderCreated` emission and `discover_unbound_folders`
+/// agree on what counts as a folder.
+///
+/// - `Flat`: single segment (no `/`).
+/// - `MaildirPP`: single segment starting with `.` (excluding the
+///   `.jma.*` namespace reserved for jma's own state files).
+/// - `Fs`: any depth; only `.jma.*` is excluded -- the layout's
+///   own validator forbids dot-prefixed segments at write time,
+///   but we don't re-check that here, so a stray `.hidden/cur/`
+///   would surface (the consumer can drop it on its own).
+fn layout_eligible_folder(rel: &str, layout: FolderLayout) -> bool {
+    if rel.is_empty() {
+        return false;
+    }
+    match layout {
+        FolderLayout::Flat => !rel.contains('/') && !is_jma_private(rel),
+        FolderLayout::MaildirPP => {
+            !rel.contains('/') && rel.starts_with('.') && !is_jma_private(rel)
+        }
+        FolderLayout::Fs => !rel.split('/').any(is_jma_private),
+    }
+}
+
+/// Recursive walk: collect absolute paths of every directory below
+/// `dir` that holds a `cur/` subdirectory. Skips the `cur/`/`new/`/
+/// `tmp/` triple and any `.jma.*` namespace dir so we don't recurse
+/// into sentinel/lock/db neighbours. Used under `Fs`.
+fn walk_for_maildir_dirs_recursive(dir: &Path, found: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if is_jma_private(name_str.as_ref()) {
+            continue;
+        }
+        if name_str == "cur" || name_str == "new" || name_str == "tmp" {
+            continue;
+        }
+        let path = entry.path();
+        if path.join("cur").is_dir() {
+            found.push(path.clone());
+        }
+        walk_for_maildir_dirs_recursive(&path, found);
+    }
 }
 
 /// Strip the maildir root prefix off an event path and split out the
@@ -1191,6 +1399,7 @@ mod tests {
             &event_paths,
             &known,
             &bindings_with("INBOX", "MB-INBOX"),
+            FolderLayout::Flat,
         )
         .unwrap()
         .changes;
@@ -1233,6 +1442,7 @@ mod tests {
             &event_paths,
             &known,
             &bindings_with("INBOX", "MB-INBOX"),
+            FolderLayout::Flat,
         )
         .unwrap()
         .changes;
@@ -1263,6 +1473,7 @@ mod tests {
             &event_paths,
             &known,
             &bindings_with("INBOX", "MB-INBOX"),
+            FolderLayout::Flat,
         )
         .unwrap()
         .changes;
@@ -1324,9 +1535,15 @@ mod tests {
             maildir_folder: "Spam".to_string(),
         });
         let bindings = bindings.build();
-        let mut changes = scan_paths(tmp.path(), &event_paths, &known_states, &bindings)
-            .unwrap()
-            .changes;
+        let mut changes = scan_paths(
+            tmp.path(),
+            &event_paths,
+            &known_states,
+            &bindings,
+            FolderLayout::Flat,
+        )
+        .unwrap()
+        .changes;
         // Order isn't guaranteed (HashMap iteration), so sort for the
         // assertion.
         changes.sort_by_key(|c| match c {
@@ -1381,6 +1598,7 @@ mod tests {
             &event_paths,
             &known,
             &bindings_with("INBOX", "MB-INBOX"),
+            FolderLayout::Flat,
         )
         .unwrap()
         .changes;
@@ -1427,6 +1645,7 @@ mod tests {
             &event_paths,
             &known,
             &bindings_with("INBOX", "MB-INBOX"),
+            FolderLayout::Flat,
         )
         .unwrap()
         .changes;
@@ -1465,6 +1684,7 @@ mod tests {
             &event_paths,
             &known,
             &bindings_with("INBOX", "MB-INBOX"),
+            FolderLayout::Flat,
         )
         .unwrap()
         .changes;
@@ -1514,6 +1734,7 @@ mod tests {
             &event_paths,
             &known,
             &bindings_with("INBOX", "MB-INBOX"),
+            FolderLayout::Flat,
         )
         .unwrap()
         .changes;
@@ -1525,11 +1746,16 @@ mod tests {
         );
     }
 
-    /// Path in a folder that isn't synced: dropped silently. The
-    /// daemon only feeds known_states for synced folders, and we
-    /// shouldn't fabricate changes for paths under untracked folders.
+    /// Path in a folder that isn't synced but IS a layout-eligible
+    /// shape: emit `LocalFolderCreated` for it (once per folder),
+    /// then drop the message-level event (no binding to classify
+    /// against). The folder-discovery emission gives downstream
+    /// reconcile the option to push the unbound folder to the
+    /// server; the message under it can't be classified until the
+    /// folder is bound, and the next Full-scope cycle picks it up
+    /// once binding lands.
     #[test]
-    fn scan_paths_drops_unknown_folder() {
+    fn scan_paths_emits_local_folder_created_for_eligible_unbound_folder() {
         let tmp = TempDir::new().unwrap();
         let other_path = tmp.path().join("Untracked");
         let _other = ensure_maildir(&other_path).unwrap();
@@ -1551,13 +1777,437 @@ mod tests {
             &event_paths,
             &known,
             &bindings_with("INBOX", "MB-INBOX"),
+            FolderLayout::Flat,
+        )
+        .unwrap()
+        .changes;
+        assert_eq!(changes.len(), 1, "expected one folder discovery emission");
+        match &changes[0] {
+            LocalChange::LocalFolderCreated { path, sentinel } => {
+                assert_eq!(path, &other_path);
+                assert!(sentinel.is_none());
+            }
+            other => panic!("expected LocalFolderCreated, got {:?}", other),
+        }
+    }
+
+    /// Multiple events under the same unbound folder dedupe to a
+    /// single `LocalFolderCreated` -- the variant is folder-level,
+    /// not message-level.
+    #[test]
+    fn scan_paths_dedupes_local_folder_created_across_events() {
+        let tmp = TempDir::new().unwrap();
+        let other_path = tmp.path().join("Untracked");
+        let _other = ensure_maildir(&other_path).unwrap();
+
+        write_message(
+            &other_path,
+            "cur",
+            "1.x:2,",
+            "Message-ID: <a@x>\r\n\r\nbody\r\n",
+        );
+        write_message(
+            &other_path,
+            "cur",
+            "2.x:2,",
+            "Message-ID: <b@x>\r\n\r\nbody\r\n",
+        );
+
+        let known = known_for("INBOX", &[]);
+        let event_paths = vec![
+            other_path.join("cur").join("1.x:2,"),
+            other_path.join("cur").join("2.x:2,"),
+        ];
+
+        let changes = scan_paths(
+            tmp.path(),
+            &event_paths,
+            &known,
+            &bindings_with("INBOX", "MB-INBOX"),
+            FolderLayout::Flat,
+        )
+        .unwrap()
+        .changes;
+        assert_eq!(
+            changes.len(),
+            1,
+            "two events on the same folder must dedupe, got {:?}",
+            changes
+        );
+    }
+
+    /// Under `Flat`, the layout pins mailbox names at depth 1.
+    /// A path two levels deep (`Outer/Inner/cur/file`) is not a
+    /// valid mailbox shape, so its folder string `Outer/Inner` is
+    /// dropped at the layout-eligibility check rather than
+    /// surfacing as a `LocalFolderCreated`.
+    #[test]
+    fn scan_paths_drops_layout_ineligible_unbound_folder() {
+        let tmp = TempDir::new().unwrap();
+        let nested = tmp.path().join("Outer").join("Inner");
+        let _nested = ensure_maildir(&nested).unwrap();
+        write_message(
+            &nested,
+            "cur",
+            "1.x:2,",
+            "Message-ID: <a@x>\r\n\r\nbody\r\n",
+        );
+
+        let known = known_for("INBOX", &[]);
+        let event_paths = vec![nested.join("cur").join("1.x:2,")];
+
+        let changes = scan_paths(
+            tmp.path(),
+            &event_paths,
+            &known,
+            &bindings_with("INBOX", "MB-INBOX"),
+            FolderLayout::Flat,
         )
         .unwrap()
         .changes;
         assert!(
             changes.is_empty(),
-            "events under untracked folder must be dropped, got {:?}",
+            "Flat must not emit LocalFolderCreated for depth-2 paths, got {:?}",
             changes
         );
+    }
+
+    /// Under `MaildirPP`, only first-level dot-prefixed folders
+    /// are mailboxes. A non-hidden first-level dir (`Notes/cur/`)
+    /// is not a valid MaildirPP mailbox shape and must be dropped
+    /// rather than emitting `LocalFolderCreated`.
+    #[test]
+    fn scan_paths_maildir_pp_drops_non_dot_prefixed_unbound_folder() {
+        let tmp = TempDir::new().unwrap();
+        let stray = tmp.path().join("Notes");
+        let _stray = ensure_maildir(&stray).unwrap();
+        write_message(&stray, "cur", "1.x:2,", "Message-ID: <a@x>\r\n\r\nbody\r\n");
+
+        let known = known_for(".INBOX", &[]);
+        let event_paths = vec![stray.join("cur").join("1.x:2,")];
+
+        let changes = scan_paths(
+            tmp.path(),
+            &event_paths,
+            &known,
+            &bindings_with(".INBOX", "MB-INBOX"),
+            FolderLayout::MaildirPP,
+        )
+        .unwrap()
+        .changes;
+        assert!(
+            changes.is_empty(),
+            "MaildirPP must skip non-dot-prefixed unbound folders, got {:?}",
+            changes
+        );
+    }
+
+    /// Under `MaildirPP`, a dot-prefixed first-level folder is a
+    /// valid mailbox shape and surfaces as `LocalFolderCreated`.
+    #[test]
+    fn scan_paths_maildir_pp_emits_for_dot_prefixed_unbound_folder() {
+        let tmp = TempDir::new().unwrap();
+        let dotted = tmp.path().join(".Archive.2024");
+        let _dotted = ensure_maildir(&dotted).unwrap();
+        write_message(
+            &dotted,
+            "cur",
+            "1.x:2,",
+            "Message-ID: <a@x>\r\n\r\nbody\r\n",
+        );
+
+        let known = known_for(".INBOX", &[]);
+        let event_paths = vec![dotted.join("cur").join("1.x:2,")];
+
+        let changes = scan_paths(
+            tmp.path(),
+            &event_paths,
+            &known,
+            &bindings_with(".INBOX", "MB-INBOX"),
+            FolderLayout::MaildirPP,
+        )
+        .unwrap()
+        .changes;
+        assert_eq!(changes.len(), 1);
+        match &changes[0] {
+            LocalChange::LocalFolderCreated { path, .. } => assert_eq!(path, &dotted),
+            other => panic!("expected LocalFolderCreated, got {:?}", other),
+        }
+    }
+
+    /// Under `Fs`, a path at any depth is a valid mailbox shape
+    /// (subject to the layout's own segment validator, which
+    /// `layout_eligible_folder` does not re-check here). A
+    /// `Parent/Child/cur/file` event whose folder is unbound
+    /// surfaces as `LocalFolderCreated` for the deepest folder.
+    #[test]
+    fn scan_paths_fs_emits_for_nested_unbound_folder() {
+        let tmp = TempDir::new().unwrap();
+        let parent = tmp.path().join("Archive");
+        let child = parent.join("2024");
+        ensure_maildir(&parent).unwrap();
+        let _child = ensure_maildir(&child).unwrap();
+        write_message(&child, "cur", "1.x:2,", "Message-ID: <a@x>\r\n\r\nbody\r\n");
+
+        let mut bindings = MailboxBindings::builder();
+        bindings.insert(MailboxFolderBinding {
+            jmap_mailbox_id: MaybeReference::Value("MB-ARCH".into()),
+            server_name: "Archive".to_string(),
+            maildir_folder: "Archive".to_string(),
+        });
+        let bindings = bindings.build();
+        let known = known_for("Archive", &[]);
+        let event_paths = vec![child.join("cur").join("1.x:2,")];
+
+        let changes = scan_paths(
+            tmp.path(),
+            &event_paths,
+            &known,
+            &bindings,
+            FolderLayout::Fs,
+        )
+        .unwrap()
+        .changes;
+        assert_eq!(changes.len(), 1);
+        match &changes[0] {
+            LocalChange::LocalFolderCreated { path, .. } => assert_eq!(path, &child),
+            other => panic!("expected LocalFolderCreated, got {:?}", other),
+        }
+    }
+
+    /// Empty maildir root: nothing to discover, no LocalFolderCreated
+    /// emitted. Behavior is independent of layout.
+    #[test]
+    fn discover_unbound_folders_empty_root() {
+        let tmp = TempDir::new().unwrap();
+        let bindings = MailboxBindings::builder().build();
+        for layout in [
+            FolderLayout::Flat,
+            FolderLayout::MaildirPP,
+            FolderLayout::Fs,
+        ] {
+            let changes = discover_unbound_folders(tmp.path(), layout, &bindings);
+            assert!(
+                changes.is_empty(),
+                "layout {:?} should emit nothing",
+                layout
+            );
+        }
+    }
+
+    /// Flat layout: an unbound first-level folder with no sentinel
+    /// surfaces as a single LocalFolderCreated whose `sentinel` is
+    /// `None`. The flat-name convention puts every mailbox at depth
+    /// 1.
+    #[test]
+    fn discover_unbound_folders_flat_emits_for_orphan() {
+        let tmp = TempDir::new().unwrap();
+        let folder = tmp.path().join("[Airmail].Sent");
+        ensure_maildir(&folder).unwrap();
+        let bindings = MailboxBindings::builder().build();
+        let changes = discover_unbound_folders(tmp.path(), FolderLayout::Flat, &bindings);
+        assert_eq!(changes.len(), 1);
+        match &changes[0] {
+            LocalChange::LocalFolderCreated { path, sentinel } => {
+                assert_eq!(path, &folder);
+                assert!(sentinel.is_none());
+            }
+            other => panic!("expected LocalFolderCreated, got {:?}", other),
+        }
+    }
+
+    /// Carrying a sentinel: emit LocalFolderCreated whose `sentinel`
+    /// is `Some(_)` (so a consumer can fork "cache lost a binding
+    /// the disk pins" from "genuinely new local folder").
+    #[test]
+    fn discover_unbound_folders_flat_carries_sentinel_when_present() {
+        let tmp = TempDir::new().unwrap();
+        let folder = tmp.path().join("Recovered");
+        ensure_maildir(&folder).unwrap();
+        crate::maildir_ops::sentinel::write(
+            &folder,
+            &crate::maildir_ops::sentinel::MailboxMapping {
+                jmap_mailbox_id: JmapMailboxId::from("MB-RECOVERED"),
+                parent_jmap_mailbox_id: None,
+                server_name: "Recovered".to_string(),
+            },
+        )
+        .unwrap();
+        let bindings = MailboxBindings::builder().build();
+        let changes = discover_unbound_folders(tmp.path(), FolderLayout::Flat, &bindings);
+        assert_eq!(changes.len(), 1);
+        match &changes[0] {
+            LocalChange::LocalFolderCreated { sentinel, .. } => {
+                let m = sentinel.as_ref().expect("sentinel should be Some");
+                assert_eq!(m.jmap_mailbox_id, JmapMailboxId::from("MB-RECOVERED"));
+                assert_eq!(m.server_name, "Recovered");
+            }
+            other => panic!("expected LocalFolderCreated, got {:?}", other),
+        }
+    }
+
+    /// A folder already covered by `MailboxBindings` is excluded
+    /// from discovery -- the per-binding scan loop handles it.
+    /// Layout-agnostic behaviour; exercise under Flat where the
+    /// `bindings_with` helper is already set up.
+    #[test]
+    fn discover_unbound_folders_flat_skips_bound_folders() {
+        let tmp = TempDir::new().unwrap();
+        let bound = tmp.path().join("INBOX");
+        let orphan = tmp.path().join("Projects");
+        ensure_maildir(&bound).unwrap();
+        ensure_maildir(&orphan).unwrap();
+        let bindings = bindings_with("INBOX", "MB-INBOX");
+        let changes = discover_unbound_folders(tmp.path(), FolderLayout::Flat, &bindings);
+        assert_eq!(changes.len(), 1, "only Projects is unbound");
+        match &changes[0] {
+            LocalChange::LocalFolderCreated { path, .. } => {
+                assert_eq!(path, &orphan);
+            }
+            other => panic!("expected LocalFolderCreated, got {:?}", other),
+        }
+    }
+
+    /// Flat layout doesn't recurse: a maildir-shaped directory
+    /// nested under another mailbox at depth 2 is NOT a candidate
+    /// under Flat (the convention is that hierarchy collapses into
+    /// the leaf name via separator-joining, so anything at depth 2
+    /// is a misconfiguration this task doesn't try to recover).
+    #[test]
+    fn discover_unbound_folders_flat_does_not_recurse() {
+        let tmp = TempDir::new().unwrap();
+        let outer = tmp.path().join("Archive");
+        let nested = outer.join("Inner");
+        ensure_maildir(&outer).unwrap();
+        ensure_maildir(&nested).unwrap();
+        let bindings = bindings_with("Archive", "MB-ARCH");
+        let changes = discover_unbound_folders(tmp.path(), FolderLayout::Flat, &bindings);
+        assert!(
+            changes.is_empty(),
+            "Flat must not recurse into bound folders, got {:?}",
+            changes
+        );
+    }
+
+    /// MaildirPP layout: only first-level children whose name
+    /// starts with `.` are candidates. A non-hidden first-level
+    /// dir (like a stray `INBOX/cur/` left over from a Flat
+    /// migration) is not a mailbox under MaildirPP and must be
+    /// ignored.
+    #[test]
+    fn discover_unbound_folders_maildir_pp_only_dot_prefixed() {
+        let tmp = TempDir::new().unwrap();
+        let dotted = tmp.path().join(".Archive.2024");
+        let stray = tmp.path().join("INBOX");
+        ensure_maildir(&dotted).unwrap();
+        ensure_maildir(&stray).unwrap();
+        let bindings = MailboxBindings::builder().build();
+        let changes = discover_unbound_folders(tmp.path(), FolderLayout::MaildirPP, &bindings);
+        assert_eq!(
+            changes.len(),
+            1,
+            "MaildirPP picks only the dotted folder, got {:?}",
+            changes
+        );
+        match &changes[0] {
+            LocalChange::LocalFolderCreated { path, .. } => assert_eq!(path, &dotted),
+            other => panic!("expected LocalFolderCreated, got {:?}", other),
+        }
+    }
+
+    /// Fs layout: discovery surfaces every depth that holds a
+    /// `cur/` subdirectory, so a `Parent/Child` tree where only the
+    /// child is unbound emits exactly one LocalFolderCreated for
+    /// the child.
+    #[test]
+    fn discover_unbound_folders_fs_recurses_into_nested_dirs() {
+        let tmp = TempDir::new().unwrap();
+        let parent = tmp.path().join("Archive");
+        let child = parent.join("2024");
+        ensure_maildir(&parent).unwrap();
+        ensure_maildir(&child).unwrap();
+        let bindings = bindings_with("Archive", "MB-ARCH");
+        let changes = discover_unbound_folders(tmp.path(), FolderLayout::Fs, &bindings);
+        assert_eq!(changes.len(), 1);
+        match &changes[0] {
+            LocalChange::LocalFolderCreated { path, .. } => {
+                assert_eq!(path, &child);
+            }
+            other => panic!("expected LocalFolderCreated, got {:?}", other),
+        }
+    }
+
+    /// Non-maildir-shaped directories (no `cur/` subdir) are
+    /// ignored across all layouts. A plain `mkdir Projects`
+    /// without the maildir triplet doesn't produce a candidate.
+    #[test]
+    fn discover_unbound_folders_ignores_non_maildir_dirs() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("Projects")).unwrap();
+        let bindings = MailboxBindings::builder().build();
+        for layout in [
+            FolderLayout::Flat,
+            FolderLayout::MaildirPP,
+            FolderLayout::Fs,
+        ] {
+            let changes = discover_unbound_folders(tmp.path(), layout, &bindings);
+            assert!(
+                changes.is_empty(),
+                "layout {:?} should ignore non-maildir dirs",
+                layout
+            );
+        }
+    }
+
+    /// A malformed sentinel (bytes that don't parse as TOML, or
+    /// valid TOML missing the required fields) is indistinguishable
+    /// from "no sentinel" at the discovery layer: emit
+    /// LocalFolderCreated with `sentinel: None` and let a future
+    /// consumer choose between treating the folder as new or
+    /// recovering its binding by other means.
+    #[test]
+    fn discover_unbound_folders_treats_malformed_sentinel_as_none() {
+        let tmp = TempDir::new().unwrap();
+        let folder = tmp.path().join("Trash");
+        ensure_maildir(&folder).unwrap();
+        std::fs::write(folder.join(".jma.mapping"), b"this is not toml { broken")
+            .expect("plant malformed sentinel");
+        let bindings = MailboxBindings::builder().build();
+        let changes = discover_unbound_folders(tmp.path(), FolderLayout::Flat, &bindings);
+        assert_eq!(changes.len(), 1);
+        match &changes[0] {
+            LocalChange::LocalFolderCreated { path, sentinel } => {
+                assert_eq!(path, &folder);
+                assert!(
+                    sentinel.is_none(),
+                    "malformed sentinel must surface as None, got {:?}",
+                    sentinel
+                );
+            }
+            other => panic!("expected LocalFolderCreated, got {:?}", other),
+        }
+    }
+
+    /// `.jma.*` namespace dirs (locks, db, sentinel siblings) are
+    /// never folder candidates under any layout, even under
+    /// MaildirPP where they happen to share the dot-prefix
+    /// convention.
+    #[test]
+    fn discover_unbound_folders_skips_jma_namespace() {
+        let tmp = TempDir::new().unwrap();
+        ensure_maildir(&tmp.path().join(".jma.something")).unwrap();
+        let bindings = MailboxBindings::builder().build();
+        for layout in [
+            FolderLayout::Flat,
+            FolderLayout::MaildirPP,
+            FolderLayout::Fs,
+        ] {
+            let changes = discover_unbound_folders(tmp.path(), layout, &bindings);
+            assert!(
+                changes.is_empty(),
+                "layout {:?} must skip .jma.* dirs",
+                layout
+            );
+        }
     }
 }
