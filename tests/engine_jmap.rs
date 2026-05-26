@@ -78,6 +78,7 @@ struct MockMailbox {
     id: String,
     name: String,
     role: Option<String>,
+    parent_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -228,7 +229,7 @@ fn mailbox_get(_args: &Value, call_id: &str, state: &mut MockState) -> Value {
             json!({
                 "id": mb.id,
                 "name": mb.name,
-                "parentId": null,
+                "parentId": mb.parent_id,
                 "role": mb.role,
                 "sortOrder": 0,
                 "totalEmails": 0,
@@ -289,6 +290,7 @@ fn mailbox_set(args: &Value, call_id: &str, state: &mut MockState) -> Value {
                 id: new_id.clone(),
                 name: name.clone(),
                 role: role.clone(),
+                parent_id: parent.clone(),
             });
             state.mailbox_set_creates.push((name, parent, role));
             created_resp.insert(creation_id.clone(), json!({ "id": new_id }));
@@ -510,6 +512,7 @@ async fn sync_applies_inbox_magic_alias() {
             id: "MB-INBOX".to_string(),
             name: "Indbakke".to_string(), // localized display name
             role: Some("inbox".to_string()),
+            parent_id: None,
         }],
         ..Default::default()
     }));
@@ -550,16 +553,19 @@ async fn sync_filter_drops_unlisted() {
                 id: "MB-INBOX".to_string(),
                 name: "Inbox".to_string(),
                 role: Some("inbox".to_string()),
+                parent_id: None,
             },
             MockMailbox {
                 id: "MB-ARCH".to_string(),
                 name: "Archive".to_string(),
                 role: Some("archive".to_string()),
+                parent_id: None,
             },
             MockMailbox {
                 id: "MB-SPAM".to_string(),
                 name: "Spam".to_string(),
                 role: Some("junk".to_string()),
+                parent_id: None,
             },
         ],
         ..Default::default()
@@ -615,11 +621,13 @@ async fn sync_writes_identity_sentinels() {
                 id: "MB-INBOX".to_string(),
                 name: "Indbakke".to_string(),
                 role: Some("inbox".to_string()),
+                parent_id: None,
             },
             MockMailbox {
                 id: "MB-ARCH".to_string(),
                 name: "Archive".to_string(),
                 role: Some("archive".to_string()),
+                parent_id: None,
             },
         ],
         ..Default::default()
@@ -695,6 +703,7 @@ async fn sync_re_stamps_sentinel_when_folder_exists_without_one() {
             id: "MB-INBOX".to_string(),
             name: "Inbox".to_string(),
             role: Some("inbox".to_string()),
+            parent_id: None,
         }],
         ..Default::default()
     }));
@@ -751,11 +760,13 @@ async fn push_only_errors_on_fresh_config_without_local_maildirs() {
                 id: "MB-INBOX".to_string(),
                 name: "Inbox".to_string(),
                 role: Some("inbox".to_string()),
+                parent_id: None,
             },
             MockMailbox {
                 id: "MB-ARCH".to_string(),
                 name: "Archive".to_string(),
                 role: Some("archive".to_string()),
+                parent_id: None,
             },
         ],
         ..Default::default()
@@ -811,6 +822,7 @@ async fn push_only_succeeds_when_some_local_maildirs_are_provisioned() {
             id: "MB-INBOX".to_string(),
             name: "Inbox".to_string(),
             role: Some("inbox".to_string()),
+            parent_id: None,
         }],
         ..Default::default()
     }));
@@ -835,6 +847,7 @@ async fn push_only_succeeds_when_some_local_maildirs_are_provisioned() {
             id: "MB-NEW".to_string(),
             name: "Projects".to_string(),
             role: None,
+            parent_id: None,
         });
         st.mailbox_state = "mb-2".to_string();
     }
@@ -872,11 +885,13 @@ async fn sync_dry_run_does_not_create_local_maildir_on_first_cycle() {
                 id: "MB-INBOX".to_string(),
                 name: "Inbox".to_string(),
                 role: Some("inbox".to_string()),
+                parent_id: None,
             },
             MockMailbox {
                 id: "MB-ARCH".to_string(),
                 name: "Archive".to_string(),
                 role: Some("archive".to_string()),
+                parent_id: None,
             },
         ],
         ..Default::default()
@@ -901,6 +916,355 @@ async fn sync_dry_run_does_not_create_local_maildir_on_first_cycle() {
     );
 }
 
+/// Server-side mailbox rename: the JMAP id is stable, the `name`
+/// changes, and the resolved on-disk folder follows. `resolve_
+/// mailboxes` must rename the maildir directory, rewrite the
+/// `local_state.maildir_folder` rows that pointed at the old
+/// path, and refresh the sentinel + mailbox_map row at the new
+/// path. The file content inside the folder must survive the
+/// move byte-identical.
+#[tokio::test]
+async fn sync_follows_server_side_rename_on_disk() {
+    let server = MockServer::start().await;
+    mount_session(&server).await;
+
+    let state = Arc::new(Mutex::new(MockState {
+        mailbox_state: "mb-1".to_string(),
+        email_state: "e-1".to_string(),
+        mailboxes: vec![
+            MockMailbox {
+                id: "MB-INBOX".to_string(),
+                name: "Inbox".to_string(),
+                role: Some("inbox".to_string()),
+                parent_id: None,
+            },
+            MockMailbox {
+                id: "MB-ARCH".to_string(),
+                name: "Archive".to_string(),
+                role: Some("archive".to_string()),
+                parent_id: None,
+            },
+        ],
+        ..Default::default()
+    }));
+    mount_jmap(&server, state.clone()).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let conn = fresh_db(&temp);
+    let config = test_config(&server, temp.path(), vec![]);
+
+    // First cycle: both mailboxes synced and cached. Drop a
+    // sentinel file and a local_state row under Archive so we can
+    // verify both follow the rename.
+    SyncEngine::sync(&conn, &config, false)
+        .await
+        .expect("first sync");
+    let archive_old = temp.path().join("Archive");
+    assert!(archive_old.join("cur").is_dir());
+    // Drop one stub message file so we can prove the rename moved
+    // the folder content byte-identical, not recreated an empty
+    // shell. Maildir filename shape so scan accepts it on the
+    // post-rename walk.
+    std::fs::write(
+        archive_old.join("cur").join("1.host:2,S"),
+        b"sentinel-payload",
+    )
+    .expect("write stub");
+    // Seed local_state with a row pointing at Archive so we can
+    // confirm the rename rewrites the column.
+    queries::upsert_local_state(
+        &conn,
+        &jma_mail::ids::MaildirId::from("M-OLD"),
+        "Archive",
+        "",
+        None,
+    )
+    .expect("seed local_state");
+
+    // Server-side rename: Archive's display name flips to Archives;
+    // the id stays MB-ARCH.
+    {
+        let mut st = state.lock().unwrap();
+        st.mailboxes
+            .iter_mut()
+            .find(|m| m.id == "MB-ARCH")
+            .unwrap()
+            .name = "Archives".to_string();
+        st.mailbox_state = "mb-2".to_string();
+    }
+
+    // Second cycle: resolve_mailboxes must rename Archive to
+    // Archives on disk, rewrite the local_state row, and refresh
+    // the cached mailbox_map row + sentinel at the new path.
+    SyncEngine::sync(&conn, &config, false)
+        .await
+        .expect("second sync");
+
+    let archive_new = temp.path().join("Archives");
+    assert!(
+        archive_new.join("cur").is_dir(),
+        "the renamed folder must exist at the new on-disk path"
+    );
+    assert!(
+        !archive_old.exists(),
+        "the old on-disk path must be gone after the rename"
+    );
+    // File content inside the folder must survive the move
+    // byte-identical -- the rename was an `fs::rename`, not a
+    // recreate.
+    let stub_bytes =
+        std::fs::read(archive_new.join("cur").join("1.host:2,S")).expect("read stub from new path");
+    assert_eq!(stub_bytes, b"sentinel-payload");
+    // mailbox_map row's maildir_folder now points at Archives.
+    let cached = queries::get_mailbox(&conn, &jma_mail::ids::JmapMailboxId::from("MB-ARCH"))
+        .unwrap()
+        .expect("MB-ARCH row must still exist");
+    assert_eq!(cached.maildir_folder, "Archives");
+    assert_eq!(cached.name, "Archives");
+    // local_state row was rewritten.
+    let state_rows = queries::get_local_state_for_folder(&conn, "Archives").unwrap();
+    assert!(
+        state_rows.contains_key("M-OLD"),
+        "local_state row must follow the rename to the new folder"
+    );
+    let state_old = queries::get_local_state_for_folder(&conn, "Archive").unwrap();
+    assert!(
+        !state_old.contains_key("M-OLD"),
+        "local_state must not still anchor the row to the old folder"
+    );
+    // Sentinel at the new path carries the same JMAP id.
+    let mapping = sentinel::read(&archive_new)
+        .expect("sentinel read")
+        .expect("sentinel must exist at the new path");
+    assert_eq!(mapping.jmap_mailbox_id.as_ref(), "MB-ARCH");
+    assert_eq!(mapping.server_name, "Archives");
+}
+
+/// `--dry-run` over a server-side rename emits a
+/// `RenameLocalMailbox` action without applying any of its
+/// user-state mutations: the maildir is not renamed on disk, the
+/// `local_state.maildir_folder` rows that pointed at the old
+/// path stay where they are, and the sentinel at the old path
+/// keeps its pre-rename `server_name`. The
+/// `mailbox_map.maildir_folder` cache advance is a known
+/// follow-up shared with the CreateLocalMailbox dry-run case
+/// and not pinned here.
+#[tokio::test]
+async fn sync_dry_run_does_not_rename_local_maildir() {
+    let server = MockServer::start().await;
+    mount_session(&server).await;
+
+    let state = Arc::new(Mutex::new(MockState {
+        mailbox_state: "mb-1".to_string(),
+        email_state: "e-1".to_string(),
+        mailboxes: vec![
+            MockMailbox {
+                id: "MB-INBOX".to_string(),
+                name: "Inbox".to_string(),
+                role: Some("inbox".to_string()),
+                parent_id: None,
+            },
+            MockMailbox {
+                id: "MB-ARCH".to_string(),
+                name: "Archive".to_string(),
+                role: Some("archive".to_string()),
+                parent_id: None,
+            },
+        ],
+        ..Default::default()
+    }));
+    mount_jmap(&server, state.clone()).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let conn = fresh_db(&temp);
+    let config = test_config(&server, temp.path(), vec![]);
+
+    // First cycle: real, so the maildirs land and mailbox_map gets
+    // populated.
+    SyncEngine::sync(&conn, &config, false)
+        .await
+        .expect("first sync");
+    let archive_old = temp.path().join("Archive");
+    assert!(archive_old.join("cur").is_dir());
+    queries::upsert_local_state(
+        &conn,
+        &jma_mail::ids::MaildirId::from("M-OLD"),
+        "Archive",
+        "",
+        None,
+    )
+    .expect("seed local_state");
+
+    // Server renames Archive -> Archives.
+    {
+        let mut st = state.lock().unwrap();
+        st.mailboxes
+            .iter_mut()
+            .find(|m| m.id == "MB-ARCH")
+            .unwrap()
+            .name = "Archives".to_string();
+        st.mailbox_state = "mb-2".to_string();
+    }
+
+    // Second cycle: --dry-run. The rename action must be emitted
+    // through the plan but its executor handler must not run.
+    SyncEngine::sync(&conn, &config, true)
+        .await
+        .expect("dry-run second sync");
+
+    let archive_new = temp.path().join("Archives");
+    assert!(
+        archive_old.join("cur").is_dir(),
+        "the old maildir path must still exist under --dry-run"
+    );
+    assert!(
+        !archive_new.exists(),
+        "the new maildir path must not be created under --dry-run"
+    );
+    let state_rows = queries::get_local_state_for_folder(&conn, "Archive").unwrap();
+    assert!(
+        state_rows.contains_key("M-OLD"),
+        "local_state row must stay anchored to the old folder under --dry-run"
+    );
+    let mapping = sentinel::read(&archive_old)
+        .expect("sentinel read at old path")
+        .expect("sentinel must still be present at the old path");
+    assert_eq!(
+        mapping.server_name, "Archive",
+        "sentinel at the old path must keep the pre-rename server_name under --dry-run"
+    );
+}
+
+/// Cascading rename: a parent mailbox is renamed in the same
+/// cycle that the engine must also reconcile a child mailbox.
+/// The default test config uses the Fs layout with `/` as the
+/// hierarchy separator, so the child lives at `<parent>/<child>`
+/// on disk -- renaming "Personal" to "Private" moves the entire
+/// subtree including "Personal/Notes" to "Private/Notes" in a
+/// single `fs::rename`, and the child's iteration then sees its
+/// old path already absent (the parent rename swept it along)
+/// while the new path is present.
+///
+/// This pins the shallowest-first ordering in `resolve_mailboxes`:
+/// under naive insertion order, processing the child first would
+/// `fs::rename` against a parent dir that no longer exists; with
+/// the depth sort, the parent's rename completes first, the
+/// child's queued `RenameLocalMailbox` then recovers via the
+/// executor's source-missing/target-present branch in
+/// `rename_local_mailboxes`, where DB catch-up lands.
+#[tokio::test]
+async fn sync_follows_cascading_parent_child_rename() {
+    let server = MockServer::start().await;
+    mount_session(&server).await;
+
+    let state = Arc::new(Mutex::new(MockState {
+        mailbox_state: "mb-1".to_string(),
+        email_state: "e-1".to_string(),
+        mailboxes: vec![
+            MockMailbox {
+                id: "MB-INBOX".to_string(),
+                name: "Inbox".to_string(),
+                role: Some("inbox".to_string()),
+                parent_id: None,
+            },
+            MockMailbox {
+                id: "MB-PARENT".to_string(),
+                name: "Personal".to_string(),
+                role: None,
+                parent_id: None,
+            },
+            MockMailbox {
+                id: "MB-CHILD".to_string(),
+                name: "Notes".to_string(),
+                role: None,
+                parent_id: Some("MB-PARENT".to_string()),
+            },
+        ],
+        ..Default::default()
+    }));
+    mount_jmap(&server, state.clone()).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let conn = fresh_db(&temp);
+    let config = test_config(&server, temp.path(), vec![]);
+
+    // First cycle: parent + child land at their Fs-layout paths.
+    SyncEngine::sync(&conn, &config, false)
+        .await
+        .expect("first sync");
+    let parent_old = temp.path().join("Personal");
+    let child_old = parent_old.join("Notes");
+    assert!(
+        parent_old.join("cur").is_dir(),
+        "parent must exist at Personal"
+    );
+    assert!(
+        child_old.join("cur").is_dir(),
+        "child must exist at Personal/Notes under Fs layout"
+    );
+    // Drop stub files in both so we can verify the rename moved
+    // content rather than recreating empty shells. Maildir
+    // filename shape so scan accepts them on the post-rename
+    // walk.
+    std::fs::write(parent_old.join("cur").join("1.host:2,S"), b"parent-payload")
+        .expect("write parent stub");
+    std::fs::write(child_old.join("cur").join("2.host:2,S"), b"child-payload")
+        .expect("write child stub");
+
+    // Server-side rename: parent's name changes. Under Fs layout
+    // the child's folder path is the parent's path joined with
+    // the child's name, so renaming Personal to Private moves
+    // Personal/Notes to Private/Notes in the same `fs::rename`.
+    {
+        let mut st = state.lock().unwrap();
+        st.mailboxes
+            .iter_mut()
+            .find(|m| m.id == "MB-PARENT")
+            .unwrap()
+            .name = "Private".to_string();
+        st.mailbox_state = "mb-2".to_string();
+    }
+
+    // Second cycle: both folders must land at their new paths.
+    SyncEngine::sync(&conn, &config, false)
+        .await
+        .expect("second sync");
+
+    let parent_new = temp.path().join("Private");
+    let child_new = parent_new.join("Notes");
+    assert!(
+        parent_new.join("cur").is_dir(),
+        "parent must have moved to Private"
+    );
+    assert!(
+        child_new.join("cur").is_dir(),
+        "child must have moved to Private/Notes alongside the parent rename"
+    );
+    assert!(!parent_old.exists(), "old parent path must be gone");
+    assert!(!child_old.exists(), "old child path must be gone");
+
+    // Both stub files must survive byte-identical, proving the
+    // rename moved the folder content rather than recreating
+    // empty shells.
+    let parent_bytes = std::fs::read(parent_new.join("cur").join("1.host:2,S"))
+        .expect("read parent stub from new path");
+    assert_eq!(parent_bytes, b"parent-payload");
+    let child_bytes = std::fs::read(child_new.join("cur").join("2.host:2,S"))
+        .expect("read child stub from new path");
+    assert_eq!(child_bytes, b"child-payload");
+
+    // mailbox_map rows for both ids carry the new folders.
+    let parent_cached =
+        queries::get_mailbox(&conn, &jma_mail::ids::JmapMailboxId::from("MB-PARENT"))
+            .unwrap()
+            .expect("MB-PARENT row must exist");
+    assert_eq!(parent_cached.maildir_folder, "Private");
+    let child_cached = queries::get_mailbox(&conn, &jma_mail::ids::JmapMailboxId::from("MB-CHILD"))
+        .unwrap()
+        .expect("MB-CHILD row must exist");
+    assert_eq!(child_cached.maildir_folder, "Private/Notes");
+}
+
 /// End-to-end rebindfolders: an on-disk folder with no sentinel and
 /// no mailbox_map row gets rebound to the JMAP mailbox its sample
 /// Message-IDs all live in. Pins the full plumbing (Mailbox/get,
@@ -919,11 +1283,13 @@ async fn rebindfolders_rebinds_orphan_folder_from_message_ids() {
                 id: "MB-INBOX".to_string(),
                 name: "Inbox".to_string(),
                 role: Some("inbox".to_string()),
+                parent_id: None,
             },
             MockMailbox {
                 id: "MB-SENT".to_string(),
                 name: "Sent".to_string(),
                 role: Some("sent".to_string()),
+                parent_id: None,
             },
         ],
         emails: vec![
@@ -1030,6 +1396,7 @@ async fn sync_initial_pull_downloads_email_into_maildir() {
             id: "MB-INBOX".to_string(),
             name: "Inbox".to_string(),
             role: Some("inbox".to_string()),
+            parent_id: None,
         }],
         emails: vec![MockEmail {
             id: "E1".to_string(),
@@ -1104,6 +1471,7 @@ async fn sync_already_in_sync_is_a_noop() {
             id: "MB-INBOX".to_string(),
             name: "Inbox".to_string(),
             role: Some("inbox".to_string()),
+            parent_id: None,
         }],
         ..Default::default()
     }));
@@ -1149,6 +1517,7 @@ async fn sync_falls_back_when_email_changes_cannot_calculate() {
             id: "MB-INBOX".to_string(),
             name: "Inbox".to_string(),
             role: Some("inbox".to_string()),
+            parent_id: None,
         }],
         emails: vec![MockEmail {
             id: "E1".to_string(),
@@ -1231,6 +1600,7 @@ async fn sync_delta_cycle_after_initial_pull_picks_up_new_email() {
             id: "MB-INBOX".to_string(),
             name: "Inbox".to_string(),
             role: Some("inbox".to_string()),
+            parent_id: None,
         }],
         emails: vec![MockEmail {
             id: "E1".to_string(),
@@ -1345,6 +1715,7 @@ async fn create_remote_mailbox_issues_mailbox_set_per_action() {
             id: "MB-INBOX".to_string(),
             name: "Inbox".to_string(),
             role: Some("inbox".to_string()),
+            parent_id: None,
         }],
         ..Default::default()
     }));

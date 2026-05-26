@@ -48,13 +48,17 @@ use crate::jmap::types::MailboxFolderBinding;
 /// live set: any server-known mailbox absent from the pre-upsert
 /// `mailbox_map` snapshot is the user's first cycle seeing that
 /// mailbox, and reconcile turns each into a `CreateLocalMailbox`
-/// action. Consumers that only care about the live set ignore
-/// the slot.
+/// action. The `renamed_mailboxes` slot is the analogous output
+/// for the rename case: any cached `mailbox_map` row whose folder
+/// disagrees with the freshly resolved one becomes a
+/// `RenameLocalMailbox` action. Consumers that only care about
+/// the live set ignore both slots.
 #[derive(Debug, Default)]
 pub struct MailboxBindings {
     by_id: HashMap<JmapMailboxId, Arc<MailboxFolderBinding>>,
     by_folder: HashMap<String, JmapMailboxId>,
     new_mailboxes: Vec<NewMailboxRecord>,
+    renamed_mailboxes: Vec<RenamedMailboxRecord>,
 }
 
 /// A mailbox whose on-disk state `resolve_mailboxes` found
@@ -77,6 +81,22 @@ pub struct NewMailboxRecord {
     /// same mailbox id. `None` for ordinary first-cycle creates
     /// (no cached rows exist for the id).
     pub replaces_orphan_id: Option<JmapMailboxId>,
+}
+
+/// A mailbox whose cached `mailbox_map.maildir_folder`
+/// disagrees with the freshly resolved folder name -- the
+/// server renamed it, or moved it under a new parent that
+/// resolves to a different path. Reconcile emits a
+/// `SyncAction::RenameLocalMailbox` for each; the executor's
+/// rename phase moves the maildir, rewrites `local_state` rows,
+/// and refreshes the sentinel at the new path. `from_folder` is
+/// the pre-rename path that the rename moves from;
+/// `binding.maildir_folder` is the post-rename target.
+#[derive(Debug, Clone)]
+pub struct RenamedMailboxRecord {
+    pub from_folder: String,
+    pub binding: MailboxFolderBinding,
+    pub parent_jmap_mailbox_id: Option<JmapMailboxId>,
 }
 
 impl MailboxBindings {
@@ -112,6 +132,14 @@ impl MailboxBindings {
     /// `CreateLocalMailbox` per entry. Empty in steady state.
     pub fn new_mailboxes(&self) -> &[NewMailboxRecord] {
         &self.new_mailboxes
+    }
+
+    /// Server-known bindings whose cached `mailbox_map.maildir_folder`
+    /// disagreed with the freshly resolved path at cycle start.
+    /// Reconcile emits one `RenameLocalMailbox` per entry. Empty in
+    /// steady state.
+    pub fn renamed_mailboxes(&self) -> &[RenamedMailboxRecord] {
+        &self.renamed_mailboxes
     }
 
     pub fn len(&self) -> usize {
@@ -177,6 +205,29 @@ impl MailboxBindingsBuilder {
             binding,
             parent_jmap_mailbox_id,
             replaces_orphan_id,
+        });
+    }
+
+    /// Record a server-side rename: the cached `mailbox_map` row
+    /// for this id points at `from_folder`, but the freshly
+    /// resolved path lives at `binding.maildir_folder`. Reconcile
+    /// emits a `RenameLocalMailbox` action; the executor moves
+    /// the maildir, rewrites `local_state` rows, and refreshes
+    /// the sentinel. Push order is significant: under `LAYOUT=fs`
+    /// a parent rename moves the descendant subtree in one
+    /// `fs::rename` call, and each descendant's own iteration
+    /// recovers via the source-missing/target-present idempotent
+    /// branch -- so the caller must enqueue shallowest-first.
+    pub fn push_renamed_mailbox(
+        &mut self,
+        from_folder: String,
+        binding: MailboxFolderBinding,
+        parent_jmap_mailbox_id: Option<JmapMailboxId>,
+    ) {
+        self.0.renamed_mailboxes.push(RenamedMailboxRecord {
+            from_folder,
+            binding,
+            parent_jmap_mailbox_id,
         });
     }
 }
