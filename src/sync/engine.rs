@@ -615,12 +615,23 @@ impl<'a> SyncEngine<'a> {
             .map(|mb| (mb.id.clone(), mb))
             .collect();
 
+        // Process parents before children so a server-side rename
+        // cascades correctly under `LAYOUT=fs`: renaming a parent
+        // moves the entire subtree on disk, after which each
+        // child's queued RenameLocalMailbox sees its own
+        // `from_folder` already gone and recovers via the
+        // executor's source-missing/target-present branch.
+        // Children-first under Fs would try to `fs::rename` a
+        // child into a parent dir that doesn't exist yet.
+        let mut ordered: Vec<&MailboxObject> = remote_mailboxes.iter().collect();
+        ordered.sort_by_key(|mb| parent_chain_depth(mb, &by_id));
+
         let name_cap = limits::max_size_mailbox_name(&self.client);
         let mut synced = MailboxBindings::builder();
         let layout_definition = FolderLayoutDefinition::from_config(self.config, name_cap);
         let maildir_root = self.config.maildir_path();
 
-        for mb in &remote_mailboxes {
+        for mb in ordered {
             // Parent-aware filter: a config entry naming any ancestor
             // (or the mailbox itself) includes this mailbox. So
             // `mailboxes = ["[Airmail]"]` syncs `[Airmail]` plus every
@@ -639,6 +650,23 @@ impl<'a> SyncEngine<'a> {
             // pre-hierarchy behavior: Flat with `.` produces the leaf
             // name unchanged for depth-1 mailboxes.
             let folder_name = resolve_folder_path(mb, &by_id, &layout_definition)?;
+
+            // Detect a server-side rename: if the cached mailbox_map
+            // row points at a different folder than what the freshly
+            // computed name resolves to, the mailbox was renamed (or
+            // moved under a new parent that produces a different
+            // path). Queue a RenameLocalMailbox action and let the
+            // executor's rename phase do the on-disk + local_state
+            // catch-up. User-state mutations (fs::rename,
+            // local_state rewrite, sentinel refresh) no longer
+            // happen inline here -- `--dry-run` previews them and
+            // direction filters apply.
+            // Snapshot BEFORE the upsert below overwrites the row
+            // -- rename detection compares the cached folder
+            // against the freshly resolved one, and reading after
+            // the write would always return the new value.
+            let cached_folder =
+                queries::get_mailbox(self.conn, &mb.id)?.map(|cached| cached.maildir_folder);
 
             // Store in DB. Cache bookkeeping; not user-state, so
             // it stays inline rather than going through the plan.
@@ -660,20 +688,29 @@ impl<'a> SyncEngine<'a> {
                 maildir_folder: folder_name,
             };
 
-            // Emit CreateLocalMailbox whenever the on-disk state
-            // is inconsistent with the server-known binding:
-            // folder absent (first sync, post-DB-nuke catch-up
-            // with the maildir tree also gone), sentinel absent
-            // (folder present but partial-write left no sentinel),
-            // or sentinel content stale (server-side rename or
-            // hand-edit). All three converge on the executor's
-            // first phase, whose `ensure_maildir` + `sentinel::
-            // write` are idempotent. Disk-derived rather than
-            // cache-derived so a partial-failure retry next cycle
-            // picks the gap back up automatically. User-state
-            // mutations (the maildir tree, the sentinel file) no
-            // longer happen inline here -- `--dry-run` previews
-            // them and direction filters apply.
+            // Decide what action this mailbox needs:
+            //
+            // - Rename: cached_folder is Some and differs from the
+            //   freshly resolved folder. The executor's rename
+            //   phase moves the on-disk content from old to new
+            //   and refreshes the sentinel at the new path. Rename
+            //   takes priority over create because under a server-
+            //   side rename the new path doesn't exist yet on disk
+            //   -- a needs_create check at the new path would say
+            //   true and an emitted CreateLocalMailbox would
+            //   silently strand the old path's content. Rename
+            //   first; let the executor's fs::rename idempotently
+            //   no-op if the move already happened.
+            //
+            // - Create: cached_folder is None (first sight of this
+            //   id) OR the new path's on-disk state is inconsistent
+            //   with the binding (folder absent, sentinel absent,
+            //   or sentinel content stale -- partial-failure
+            //   recovery). All converge on the executor's
+            //   idempotent `ensure_maildir` + `sentinel::write`.
+            //
+            // - Steady state: cached_folder matches and the new
+            //   path's disk state is consistent. No action.
             let folder_path = maildir_root.join(&binding.maildir_folder);
             let needs_create = match (
                 store::try_open_maildir(&folder_path),
@@ -687,7 +724,11 @@ impl<'a> SyncEngine<'a> {
                         || m.parent_jmap_mailbox_id != mb.parent_id
                 }
             };
-            if needs_create {
+            if let Some(old) = cached_folder.as_ref()
+                && *old != binding.maildir_folder
+            {
+                synced.push_renamed_mailbox(old.clone(), binding.clone(), mb.parent_id.clone());
+            } else if needs_create {
                 synced.push_new_mailbox(binding.clone(), mb.parent_id.clone(), None);
             }
 
@@ -834,6 +875,25 @@ impl<'a> SyncEngine<'a> {
     }
 }
 
+/// Walk a mailbox's parent chain through `by_id` and return how
+/// many ancestors it has. Used to order `resolve_mailboxes`'s loop
+/// shallowest-first so a parent rename under `LAYOUT=fs` runs
+/// before any descendant rename in the same cycle. The 1024 cap is
+/// a guard against pathological cyclic input -- a real account
+/// nesting that deep would already be unworkable in MUAs.
+fn parent_chain_depth(mb: &MailboxObject, by_id: &HashMap<JmapMailboxId, &MailboxObject>) -> usize {
+    let mut depth = 0usize;
+    let mut current = mb.parent_id.as_ref();
+    while let Some(pid) = current {
+        depth += 1;
+        if depth > 1024 {
+            break;
+        }
+        current = by_id.get(pid).and_then(|p| p.parent_id.as_ref());
+    }
+    depth
+}
+
 /// Compare each synced folder's current `(cur, new)` snapshot
 /// against the row written by the last successful cycle. Returns
 /// the folders whose snapshot differs (or whose checkpoint row is
@@ -929,6 +989,14 @@ fn hydrate_known_state(
 /// Free function rather than a `SyncEngine` method because it only
 /// needs `&Connection` -- keeping it free lets the in-module unit tests
 /// drive it from an in-memory DB without fabricating a JMAP client.
+///
+/// Lookup is keyed by `jmap_mailbox_id`, not `maildir_folder`: the id
+/// is stable across a server-side rename whose `local_state` /
+/// `message_map.maildir_folder` catch-up hasn't run yet, so a renamed
+/// mailbox's in-flight cycle still finds its rows. Without this an
+/// in-flight rename made every known row invisible to reconcile,
+/// which then treated the freshly-walked files at the new path as
+/// unbound and emitted redundant Adopt or Upload actions.
 fn build_known_indices(
     conn: &Connection,
     mailboxes: &MailboxBindings,
@@ -1005,6 +1073,14 @@ fn log_dropped(direction: SyncDirection, dropped: &[SyncAction]) {
             SyncAction::CreateLocalMailbox { binding, .. } => warn!(
                 "{:?}: dropped CreateLocalMailbox {}/",
                 direction, binding.maildir_folder
+            ),
+            SyncAction::RenameLocalMailbox {
+                from_folder,
+                binding,
+                ..
+            } => warn!(
+                "{:?}: dropped RenameLocalMailbox {}/ -> {}/",
+                direction, from_folder, binding.maildir_folder
             ),
             SyncAction::CreateRemoteMailbox { name, .. } => {
                 warn!("{:?}: dropped CreateRemoteMailbox {:?}", direction, name)

@@ -252,6 +252,33 @@ pub enum SyncAction {
         replaces_orphan_id: Option<JmapMailboxId>,
     },
 
+    /// Folder-level pull-side action mirroring a server-side
+    /// mailbox rename on disk: `fs::rename` the maildir from
+    /// `from_folder` to `binding.maildir_folder` under
+    /// `maildir_root`, rewrite every `local_state.maildir_folder`
+    /// row that pointed at the old folder, and refresh the
+    /// `.jma.mapping` sentinel at the new path (the server name
+    /// may have changed alongside the path). Emitted by reconcile
+    /// when the cached `mailbox_map.maildir_folder` for an
+    /// already-known mailbox id disagrees with the freshly
+    /// resolved name -- either a direct rename or a parent move
+    /// that changed the resolved path under the configured layout.
+    ///
+    /// `parent_jmap_mailbox_id` rides along for the sentinel
+    /// refresh, mirroring `CreateLocalMailbox`. `None` for
+    /// top-level mailboxes.
+    ///
+    /// Same-cycle idempotency on the source-missing/target-
+    /// present shape lets a parent's `fs::rename` move the
+    /// descendant subtree in one call: each descendant's own
+    /// queued action then runs its local_state + sentinel
+    /// catch-up against the already-moved folder.
+    RenameLocalMailbox {
+        from_folder: String,
+        binding: Arc<MailboxFolderBinding>,
+        parent_jmap_mailbox_id: Option<JmapMailboxId>,
+    },
+
     /// Folder-level push-side primitive: `Mailbox/set { create }`
     /// with the given `name`, optional `parent_jmap_mailbox_id`,
     /// and optional `role`. Symmetric with `CreateLocalMailbox`.
@@ -301,7 +328,8 @@ impl SyncAction {
             | SyncAction::UpdateLocalFlags { .. }
             | SyncAction::DeleteLocal { .. }
             | SyncAction::MoveLocal { .. }
-            | SyncAction::CreateLocalMailbox { .. } => ActionDirection::Pull,
+            | SyncAction::CreateLocalMailbox { .. }
+            | SyncAction::RenameLocalMailbox { .. } => ActionDirection::Pull,
             SyncAction::UploadMessage { .. }
             | SyncAction::UpdateRemoteKeywords { .. }
             | SyncAction::DestroyRemote { .. }
@@ -398,6 +426,20 @@ impl SyncPlan {
             .count()
     }
 
+    /// Local-side mailbox renames queued in the plan, one per
+    /// mailbox whose cached folder name disagreed with the
+    /// freshly resolved one (direct server rename or a parent
+    /// move that re-resolved the path under the configured
+    /// layout). Called out in the dry-run summary so a cascade
+    /// of N entries reads as "the server renamed N folders we
+    /// were tracking" rather than as opaque action noise.
+    pub fn folder_rename_count(&self) -> usize {
+        self.actions
+            .iter()
+            .filter(|a| matches!(a, SyncAction::RenameLocalMailbox { .. }))
+            .count()
+    }
+
     pub fn adopt_count(&self) -> usize {
         self.actions
             .iter()
@@ -460,6 +502,7 @@ impl fmt::Display for SyncPlan {
             "  Remote folder creates: {}",
             self.remote_folder_create_count()
         )?;
+        writeln!(f, "  Local folder renames:  {}", self.folder_rename_count())?;
         writeln!(f)?;
 
         for action in &self.actions {
@@ -510,6 +553,15 @@ impl fmt::Display for SyncPlan {
                     f,
                     "  [PULL] Create local mailbox {}/ (server mailbox {})",
                     binding.maildir_folder, binding.jmap_mailbox_id
+                )?,
+                SyncAction::RenameLocalMailbox {
+                    from_folder,
+                    binding,
+                    ..
+                } => writeln!(
+                    f,
+                    "  [PULL] Rename local mailbox {}/ -> {}/ (server mailbox {})",
+                    from_folder, binding.maildir_folder, binding.jmap_mailbox_id
                 )?,
                 SyncAction::CreateRemoteMailbox {
                     name,

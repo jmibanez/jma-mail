@@ -311,6 +311,7 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
     // wire ordering doesn't change semantics -- only the dry-run
     // display order.
     emit_create_local_mailboxes(ctx.mailboxes, &mut plan);
+    emit_rename_local_mailboxes(ctx.mailboxes, &mut plan);
 
     process_remote_destroys(
         remote_destroyed,
@@ -369,6 +370,26 @@ fn emit_create_local_mailboxes(mailboxes: &MailboxBindings, plan: &mut SyncPlan)
             binding: Arc::new(new.binding.clone()),
             parent_jmap_mailbox_id: new.parent_jmap_mailbox_id.clone(),
             replaces_orphan_id: new.replaces_orphan_id.clone(),
+        });
+    }
+}
+
+/// Emit one `RenameLocalMailbox` action per binding that
+/// `resolve_mailboxes` flagged with a changed folder name -- the
+/// cached `mailbox_map.maildir_folder` disagreed with the freshly
+/// resolved path. The executor's rename phase walks them in push
+/// order, which `resolve_mailboxes` already sorts shallowest-first
+/// so a parent rename's `fs::rename` of the subtree lets each
+/// descendant's iteration recover via the source-missing/target-
+/// present branch.
+///
+/// Empty in steady state.
+fn emit_rename_local_mailboxes(mailboxes: &MailboxBindings, plan: &mut SyncPlan) {
+    for renamed in mailboxes.renamed_mailboxes() {
+        plan.actions.push(SyncAction::RenameLocalMailbox {
+            from_folder: renamed.from_folder.clone(),
+            binding: Arc::new(renamed.binding.clone()),
+            parent_jmap_mailbox_id: renamed.parent_jmap_mailbox_id.clone(),
         });
     }
 }

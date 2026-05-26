@@ -266,6 +266,32 @@ pub fn delete_mailbox(conn: &Connection, id: &JmapMailboxId) -> Result<()> {
     Ok(())
 }
 
+/// Get a single mailbox mapping by JMAP id, or `None` if no
+/// row is cached. Used by `resolve_mailboxes` to detect a
+/// server-side rename: when the freshly-computed `maildir_folder`
+/// disagrees with the cached row's value, the mailbox was
+/// renamed (or moved under a new parent that produces a different
+/// folder path).
+pub fn get_mailbox(conn: &Connection, id: &JmapMailboxId) -> Result<Option<MailboxRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT jmap_mailbox_id, name, role, parent_id, maildir_folder, sort_order
+         FROM mailbox_map WHERE jmap_mailbox_id = ?1",
+    )?;
+    let result = stmt
+        .query_row(params![id], |row| {
+            Ok(MailboxRecord {
+                jmap_mailbox_id: row.get(0)?,
+                name: row.get(1)?,
+                role: row.get(2)?,
+                parent_id: row.get(3)?,
+                maildir_folder: row.get(4)?,
+                sort_order: row.get(5)?,
+            })
+        })
+        .optional()?;
+    Ok(result)
+}
+
 /// Get all mailbox mappings.
 pub fn get_all_mailboxes(conn: &Connection) -> Result<Vec<MailboxRecord>> {
     let mut stmt = conn.prepare(
@@ -350,6 +376,29 @@ pub fn update_local_state_flags(
         params![maildir_id, flags],
     )?;
     Ok(())
+}
+
+/// Update every `local_state` row whose `maildir_folder` matches
+/// `old_folder`, rewriting the column to `new_folder`. Returns the
+/// number of rows touched. Called after a server-side mailbox
+/// rename so the next scan resolves the now-renamed on-disk path
+/// to the right rows.
+///
+/// No-op on zero matching rows: a rename detected before any
+/// messages were ever bound to the mailbox is normal (e.g., user
+/// renamed an empty folder server-side between cycles).
+pub fn rename_local_state_folder(
+    conn: &Connection,
+    old_folder: &str,
+    new_folder: &str,
+) -> Result<usize> {
+    let n = conn.execute(
+        "UPDATE local_state
+            SET maildir_folder = ?2, recorded_at = datetime('now')
+          WHERE maildir_folder = ?1",
+        params![old_folder, new_folder],
+    )?;
+    Ok(n)
 }
 
 /// Delete a local state record.

@@ -106,6 +106,7 @@ impl<'a> Executor<'a> {
         } = plan;
 
         let mut local_creates = Vec::new();
+        let mut local_renames = Vec::new();
         let mut unconditional_adopts = Vec::new();
         let mut move_pair_adopts = Vec::new();
         let mut downloads = Vec::new();
@@ -121,6 +122,7 @@ impl<'a> Executor<'a> {
         for action in actions {
             match action {
                 SyncAction::CreateLocalMailbox { .. } => local_creates.push(action),
+                SyncAction::RenameLocalMailbox { .. } => local_renames.push(action),
                 // A move-pair adopt mirrors the DB half of a local cross-folder
                 // move and is paired with a MoveRemote in the same plan. Defer
                 // it until after the MoveRemote has actually landed on the
@@ -151,6 +153,17 @@ impl<'a> Executor<'a> {
         // cur/, UpdateLocalFlags renames within it, MoveLocal's
         // destination has to exist, and so on.
         self.create_local_mailboxes(local_creates)?;
+        // RenameLocalMailbox runs right after creates so the
+        // tree settles into its final per-cycle shape before any
+        // phase that addresses folders by path. Download writes
+        // into `binding.maildir_folder`, UpdateLocalFlags reads
+        // `local_state.maildir_folder` (which the rename rewrites
+        // in place), MoveLocal resolves both `from_folder` and
+        // `to_binding.maildir_folder`. Reconcile pushes renames
+        // shallowest-first so a parent's `fs::rename` of the
+        // subtree lets each descendant's own action recover via
+        // the source-missing/target-present branch.
+        self.rename_local_mailboxes(local_renames)?;
         adopt_messages(self.conn, unconditional_adopts)?;
         let downloaded = self.download_messages(downloads).await?;
         let local_flag_updates = self.update_local_flags(local_flags)?;
@@ -408,6 +421,134 @@ impl<'a> Executor<'a> {
                 "Created local maildir for new mailbox: {}",
                 binding.maildir_folder
             );
+        }
+        Ok(())
+    }
+
+    /// Execute `RenameLocalMailbox` actions: `fs::rename` the
+    /// maildir from `from_folder` to `binding.maildir_folder`,
+    /// rewrite every `local_state` row whose folder column was
+    /// the pre-rename path, and refresh the sentinel at the new
+    /// path so its `server_name` and `parent` reflect the
+    /// current `Mailbox/get` view.
+    ///
+    /// Same-cycle idempotency on the source-missing/target-
+    /// present shape: under `LAYOUT=fs` a parent's rename moves
+    /// the descendant subtree in one `fs::rename`, so each
+    /// descendant's own queued action sees its `from_folder`
+    /// already absent and the destination already present and
+    /// runs the local_state + sentinel catch-up against the
+    /// already-moved folder.
+    ///
+    /// Cross-mountpoint renames (`EXDEV`) are logged at warn
+    /// and skipped: jma assumes a single-mountpoint maildir
+    /// tree (see project_jma_folder_lifecycle_plan memory),
+    /// and a copy-with-fsync fallback is out of scope until a
+    /// real user report surfaces. The failed rename surfaces
+    /// as drift -- the next cycle's diff against the cache
+    /// will not re-emit it, so the user must resolve the
+    /// mountpoint split or migrate the folder by hand for
+    /// catch-up to resume.
+    ///
+    /// Per-folder failures are logged at warn and skipped so a
+    /// single broken rename doesn't cascade into the rest of
+    /// the cycle.
+    fn rename_local_mailboxes(&self, actions: Vec<SyncAction>) -> Result<()> {
+        for action in actions {
+            let SyncAction::RenameLocalMailbox {
+                from_folder,
+                binding,
+                parent_jmap_mailbox_id,
+            } = action
+            else {
+                continue;
+            };
+            let old_path = self.maildir_root.join(&from_folder);
+            let new_path = self.maildir_root.join(&binding.maildir_folder);
+
+            match std::fs::rename(&old_path, &new_path) {
+                Ok(()) => {
+                    info!(
+                        "Server-side mailbox rename followed on disk: {} -> {}",
+                        from_folder, binding.maildir_folder
+                    );
+                }
+                // `ErrorKind::CrossesDevices` is the portable kind; the
+                // `raw_os_error() == EXDEV` fallback covers any platform
+                // whose error mapping doesn't lift the errno into the
+                // typed kind yet.
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::CrossesDevices
+                        || e.raw_os_error() == Some(libc::EXDEV) =>
+                {
+                    warn!(
+                        "Server-side mailbox rename {} -> {} crosses mountpoints; \
+                         jma assumes a single-mountpoint maildir tree and refuses \
+                         the move. Place both paths on the same filesystem (or \
+                         migrate the folder manually and rerun sync) to proceed.",
+                        from_folder, binding.maildir_folder
+                    );
+                    continue;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && new_path.exists() => {
+                    debug!(
+                        "Rename source {} already absent and destination {} present; \
+                         assuming a prior cycle completed the rename, applying DB catch-up",
+                        from_folder, binding.maildir_folder
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to rename mailbox folder on disk {} -> {}: {}",
+                        from_folder, binding.maildir_folder, e
+                    );
+                    continue;
+                }
+            }
+
+            match queries::rename_local_state_folder(
+                self.conn,
+                &from_folder,
+                &binding.maildir_folder,
+            ) {
+                Ok(rows) if rows > 0 => debug!(
+                    "Rewrote {} local_state rows from {} to {}",
+                    rows, from_folder, binding.maildir_folder
+                ),
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(
+                        "FS rename {} -> {} landed but local_state catch-up failed: {}; \
+                         the local_state row stays anchored to the old folder; the next \
+                         sync will see the same cached/resolved disagreement and retry \
+                         the rewrite",
+                        from_folder, binding.maildir_folder, e
+                    );
+                    continue;
+                }
+            }
+
+            // Refresh the sentinel at the new path: the pre-rename
+            // sentinel travels with the maildir under fs::rename,
+            // but its `server_name` may be stale if the server
+            // also renamed the display name alongside the path.
+            if let Err(e) = crate::maildir_ops::sentinel::write(
+                &new_path,
+                &crate::maildir_ops::sentinel::MailboxMapping {
+                    jmap_mailbox_id: binding
+                        .jmap_mailbox_id
+                        .expect_resolved("execute::rename_local_mailboxes -- sentinel refresh")
+                        .clone(),
+                    parent_jmap_mailbox_id,
+                    server_name: binding.server_name.clone(),
+                },
+            ) {
+                warn!(
+                    "Server-side rename {} -> {} landed but sentinel refresh failed: {}; \
+                     the next sync will detect the stale sentinel and retry the write",
+                    from_folder, binding.maildir_folder, e
+                );
+            }
         }
         Ok(())
     }

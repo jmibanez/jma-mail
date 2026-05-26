@@ -239,6 +239,7 @@ planning; phase 5 is the only place we mutate the maildir or server, and phase 6
 - `DeleteLocal` -- server says the JMAP id is destroyed and we have it locally. Unlink the file and clear DB rows.
 - `MoveLocal` -- server claims the email lives in a different mailbox than our local copy. Move the file across maildirs and update the folder column.
 - `CreateLocalMailbox` -- server has a mailbox we don't have a maildir for. `ensure_maildir` and stamp the `.jma.mapping` sentinel.
+- `RenameLocalMailbox` -- cached `mailbox_map.maildir_folder` disagrees with the freshly resolved name (server rename or parent move). `fs::rename` the maildir, rewrite `local_state.maildir_folder`, refresh the sentinel at the new path. Idempotent on the source-missing/target-present recovery branch.
 
 #### Push-side actions (local -> server)
 
