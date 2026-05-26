@@ -11,7 +11,7 @@ use crate::config::Config;
 use crate::ids::{JmapAccountId, JmapEmailId, JmapMailboxId, MaildirId};
 use crate::jmap::{
     email as jmap_email, limits, mailbox as jmap_mailbox, session,
-    types::{EmailObject, MailboxFolderBinding, MailboxObject, SessionInfo},
+    types::{EmailObject, MailboxFolderBinding, MailboxObject, MaybeReference, SessionInfo},
 };
 use crate::maildir_ops::layout::{FolderLayoutDefinition, resolve_folder_path};
 use crate::maildir_ops::scan::LocalChange;
@@ -583,7 +583,7 @@ impl<'a> SyncEngine<'a> {
             store::ensure_maildir(&maildir_path)?;
 
             synced.insert(MailboxFolderBinding {
-                jmap_mailbox_id: mb.id.clone(),
+                jmap_mailbox_id: MaybeReference::Value(mb.id.clone()),
                 server_name: mb.name.clone(),
                 maildir_folder: folder_name,
             });
@@ -679,7 +679,10 @@ impl<'a> SyncEngine<'a> {
         let futures = mailboxes.iter().map(|binding| async move {
             jmap_email::query_mailbox(
                 client,
-                binding.jmap_mailbox_id.as_ref(),
+                binding
+                    .jmap_mailbox_id
+                    .expect_resolved("engine::initial_remote_state -- per-mailbox JMAP query")
+                    .as_ref(),
                 &binding.maildir_folder,
                 n,
             )
@@ -790,9 +793,13 @@ fn hydrate_known_state(
     binding: &MailboxFolderBinding,
 ) -> Result<HashMap<MaildirId, (JmapMailboxId, String)>> {
     let raw = queries::get_local_state_for_folder(conn, &binding.maildir_folder)?;
+    let mailbox_id = binding
+        .jmap_mailbox_id
+        .expect_resolved("hydrate_known_state -- DB-derived state needs a resolved id")
+        .clone();
     Ok(raw
         .into_iter()
-        .map(|(id, (_folder, flags))| (id, (binding.jmap_mailbox_id.clone(), flags)))
+        .map(|(id, (_folder, flags))| (id, (mailbox_id.clone(), flags)))
         .collect())
 }
 
@@ -913,7 +920,7 @@ mod tests {
         let mut b = MailboxBindings::builder();
         for (id, folder) in folders {
             b.insert(MailboxFolderBinding {
-                jmap_mailbox_id: (*id).into(),
+                jmap_mailbox_id: MaybeReference::Value((*id).into()),
                 server_name: (*folder).to_string(),
                 maildir_folder: (*folder).to_string(),
             });

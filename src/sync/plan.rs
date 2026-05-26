@@ -79,8 +79,12 @@ impl BoundId {
 /// producer boundary (scan for local-driven actions, reconcile for
 /// remote-driven ones) and propagated through the plan and executor
 /// as a single typed unit; consumers read `binding.maildir_folder`
-/// for filesystem ops and `binding.jmap_mailbox_id` for DB writes
-/// without re-resolving against `MailboxBindings`.
+/// for filesystem ops and
+/// `binding.jmap_mailbox_id.expect_resolved("...")` for DB writes
+/// without re-resolving against `MailboxBindings`. The
+/// `expect_resolved` step unwraps the `MaybeReference<JmapMailboxId>`
+/// wrapper -- see `MaybeReference` for why the field carries that
+/// discriminator.
 #[derive(Debug)]
 pub enum SyncAction {
     // Server -> Local

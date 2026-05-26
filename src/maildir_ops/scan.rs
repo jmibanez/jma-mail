@@ -60,9 +60,10 @@ pub enum LocalChange {
         /// scan resolves the binding at the producer boundary
         /// (`classify_changes` has it in hand); downstream consumers
         /// read `binding.maildir_folder` for filesystem ops and
-        /// `binding.jmap_mailbox_id` for DB writes without re-
-        /// resolving via `bindings.by_folder(...)`. `Arc` so emission
-        /// stays a refcount bump rather than a three-String clone.
+        /// `binding.jmap_mailbox_id.expect_resolved(...)` for DB
+        /// writes without re-resolving via `bindings.by_folder(...)`.
+        /// `Arc` so emission stays a refcount bump rather than a
+        /// three-String clone.
         binding: Arc<MailboxFolderBinding>,
         flags: String,
         path: PathBuf,
@@ -139,7 +140,12 @@ fn classify_changes(
             // silently swallowed and the move degrades into a destroy
             // + re-upload (or, after partial state drift, a backwards
             // MoveLocal that undoes the user's move).
-            Some((known_mailbox_id, _)) if known_mailbox_id != &binding.jmap_mailbox_id => {
+            Some((known_mailbox_id, _))
+                if known_mailbox_id
+                    != binding.jmap_mailbox_id.expect_resolved(
+                        "scan::classify_changes -- cross-mailbox rename compare",
+                    ) =>
+            {
                 debug!(
                     "Cross-mailbox rename detected: {} now in {} (was bound to mailbox {})",
                     entry.maildir_id, binding.maildir_folder, known_mailbox_id
@@ -266,7 +272,12 @@ pub fn scan_folder(
     let explicit_deletes: Vec<MaildirId> = known_state
         .iter()
         .filter_map(|(id, (mailbox_id, _))| {
-            if mailbox_id == &binding.jmap_mailbox_id && !observed.contains(id) {
+            if mailbox_id
+                == binding
+                    .jmap_mailbox_id
+                    .expect_resolved("scan::scan_folder -- explicit deletes compare")
+                && !observed.contains(id)
+            {
                 Some(id.clone())
             } else {
                 None
@@ -391,7 +402,9 @@ pub fn scan_paths(
             None => {
                 if let Some((known_mailbox_id, _)) = known_state.get(&maildir_id)
                     && let Some(b) = bindings.by_folder(&folder)
-                    && known_mailbox_id == &b.jmap_mailbox_id
+                    && known_mailbox_id
+                        == b.jmap_mailbox_id
+                            .expect_resolved("scan::scan_paths -- known state compare")
                 {
                     bucket.2.push(maildir_id);
                 }
@@ -517,6 +530,7 @@ fn require_message_id(maildir_id: &MaildirId, path: &Path) -> Result<Option<Mess
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jmap::types::MaybeReference;
     use crate::maildir_ops::store::ensure_maildir;
     use std::fs;
     use std::path::Path;
@@ -535,7 +549,7 @@ mod tests {
     /// the test sites match `scan_folder`'s `&Arc<...>` signature.
     fn binding(folder: &str, mailbox_id: &str) -> Arc<MailboxFolderBinding> {
         Arc::new(MailboxFolderBinding {
-            jmap_mailbox_id: mailbox_id.into(),
+            jmap_mailbox_id: MaybeReference::Value(mailbox_id.into()),
             server_name: folder.to_string(),
             maildir_folder: folder.to_string(),
         })
@@ -547,7 +561,7 @@ mod tests {
     fn bindings_with(folder: &str, mailbox_id: &str) -> MailboxBindings {
         let mut b = MailboxBindings::builder();
         b.insert(MailboxFolderBinding {
-            jmap_mailbox_id: mailbox_id.into(),
+            jmap_mailbox_id: MaybeReference::Value(mailbox_id.into()),
             server_name: folder.to_string(),
             maildir_folder: folder.to_string(),
         });
@@ -1252,12 +1266,12 @@ mod tests {
 
         let mut bindings = MailboxBindings::builder();
         bindings.insert(MailboxFolderBinding {
-            jmap_mailbox_id: "MB-INBOX".into(),
+            jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
             server_name: "INBOX".to_string(),
             maildir_folder: "INBOX".to_string(),
         });
         bindings.insert(MailboxFolderBinding {
-            jmap_mailbox_id: "MB-SPAM".into(),
+            jmap_mailbox_id: MaybeReference::Value("MB-SPAM".into()),
             server_name: "Spam".to_string(),
             maildir_folder: "Spam".to_string(),
         });
