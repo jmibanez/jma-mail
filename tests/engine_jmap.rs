@@ -2594,3 +2594,92 @@ async fn sync_skips_local_rename_when_path_was_resolved_by_rule() {
         "cache must stay at the rule's output, ignoring the user's local rename"
     );
 }
+
+/// `resolve_mailboxes` drops the `mailbox_map` row for any id the
+/// server no longer advertises. Pins three properties of the
+/// deletion-detection path:
+///
+/// 1. After a server-side deletion (id removed from the next
+///    `Mailbox/get` response), the cached row goes away.
+/// 2. The on-disk maildir for the deleted mailbox is left alone.
+/// 3. Mailboxes the server still has are untouched.
+#[tokio::test]
+async fn resolve_mailboxes_drops_row_for_server_side_deletion() {
+    let server = MockServer::start().await;
+    mount_session(&server).await;
+
+    let state = Arc::new(Mutex::new(MockState {
+        mailbox_state: "mb-1".to_string(),
+        email_state: "e-1".to_string(),
+        mailboxes: vec![
+            MockMailbox {
+                id: "MB-INBOX".to_string(),
+                name: "Inbox".to_string(),
+                role: Some("inbox".to_string()),
+                parent_id: None,
+            },
+            MockMailbox {
+                id: "MB-ARCH".to_string(),
+                name: "Archive".to_string(),
+                role: Some("archive".to_string()),
+                parent_id: None,
+            },
+        ],
+        ..Default::default()
+    }));
+    mount_jmap(&server, state.clone()).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let conn = fresh_db(&temp);
+    let config = test_config(&server, temp.path(), vec![]);
+
+    // First cycle: both mailboxes resolved, cached, and provisioned
+    // on disk via the executor's `create_local_mailboxes` phase
+    // (a separate phase from `resolve_mailboxes` since 781d8cb).
+    SyncEngine::sync(&conn, &config, false)
+        .await
+        .expect("first sync");
+    let ids_first: Vec<_> = queries::list_known_mailbox_ids(&conn)
+        .unwrap()
+        .into_iter()
+        .map(|id| id.as_ref().to_string())
+        .collect();
+    assert_eq!(ids_first, vec!["MB-ARCH", "MB-INBOX"]);
+    assert!(temp.path().join("Archive").join("cur").is_dir());
+
+    // Server-side deletion: Archive vanishes from the server's
+    // Mailbox/get response. The on-disk maildir is intentionally
+    // left in place by the test -- the deletion-detection path's
+    // contract is to drop the cache row only; disk state is not
+    // touched (destructive resolution is opt-in elsewhere).
+    {
+        let mut st = state.lock().unwrap();
+        st.mailboxes.retain(|m| m.id != "MB-ARCH");
+        st.mailbox_state = "mb-2".to_string();
+    }
+
+    // Second cycle: only INBOX comes back from the server, and the
+    // engine should drop MB-ARCH from mailbox_map.
+    SyncEngine::sync(&conn, &config, false)
+        .await
+        .expect("second sync");
+
+    let ids_second: Vec<_> = queries::list_known_mailbox_ids(&conn)
+        .unwrap()
+        .into_iter()
+        .map(|id| id.as_ref().to_string())
+        .collect();
+    assert_eq!(
+        ids_second,
+        vec!["MB-INBOX"],
+        "Archive row must be dropped; Inbox must survive"
+    );
+    assert!(
+        temp.path().join("Archive").join("cur").is_dir(),
+        "on-disk maildir for the deleted mailbox must survive the cache cleanup"
+    );
+    assert!(
+        temp.path().join("INBOX").join("cur").is_dir(),
+        "Inbox maildir must still be present"
+    );
+}

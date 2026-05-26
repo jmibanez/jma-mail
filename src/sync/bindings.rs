@@ -52,8 +52,15 @@ use crate::state::queries::MailboxRecord;
 /// action. The `renamed_mailboxes` slot is the analogous output
 /// for the rename case: any cached `mailbox_map` row whose folder
 /// disagrees with the freshly resolved one becomes a
-/// `RenameLocalMailbox` action. Consumers that only care about
-/// the live set ignore both slots.
+/// `RenameLocalMailbox` action. The `cache_route_orphan_deletes`
+/// slot is the inverse of the cache-vs-server diff: ids in the
+/// pre-cycle `mailbox_map` snapshot the fresh `Mailbox/get` no
+/// longer advertises. `apply_unconditional_mailbox_writes`
+/// drains the slot before the executor runs, dropping the stale
+/// `mailbox_map` row and leaving the on-disk maildir alone
+/// (destructive folder resolution is a separate, policy-gated
+/// path). Consumers that only care about the live set ignore
+/// all three slots.
 #[derive(Debug, Default)]
 pub struct MailboxBindings {
     by_id: HashMap<JmapMailboxId, Arc<MailboxFolderBinding>>,
@@ -61,6 +68,7 @@ pub struct MailboxBindings {
     new_mailboxes: Vec<NewMailboxRecord>,
     renamed_mailboxes: Vec<RenamedMailboxRecord>,
     mailbox_metadata_writes: Vec<MailboxRecord>,
+    cache_route_orphan_deletes: Vec<JmapMailboxId>,
 }
 
 /// A mailbox whose on-disk state `resolve_mailboxes` found
@@ -187,6 +195,14 @@ impl MailboxBindings {
         &self.mailbox_metadata_writes
     }
 
+    /// Ids whose `mailbox_map` row should be dropped this cycle
+    /// (cache-route orphans). Applied by
+    /// `apply_unconditional_mailbox_writes` alongside
+    /// `mailbox_metadata_writes`.
+    pub fn cache_route_orphan_deletes(&self) -> &[JmapMailboxId] {
+        &self.cache_route_orphan_deletes
+    }
+
     pub fn len(&self) -> usize {
         self.by_id.len()
     }
@@ -297,5 +313,16 @@ impl MailboxBindingsBuilder {
     /// without the disk-state recheck.
     pub(crate) fn push_mailbox_metadata_write(&mut self, record: MailboxRecord) {
         self.0.mailbox_metadata_writes.push(record);
+    }
+
+    /// Queue the `mailbox_map` row delete for a cache-route
+    /// orphan: an id present in `mailbox_map` at cycle start
+    /// that the fresh `Mailbox/get` no longer advertises.
+    /// `apply_unconditional_mailbox_writes` drains the slot
+    /// alongside `mailbox_metadata_writes` before the executor
+    /// runs. The on-disk maildir is intentionally left alone
+    /// here; destructive resolution lives elsewhere.
+    pub(crate) fn push_cache_route_orphan_delete(&mut self, dead_id: JmapMailboxId) {
+        self.0.cache_route_orphan_deletes.push(dead_id);
     }
 }
