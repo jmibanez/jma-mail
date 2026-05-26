@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use tracing::{debug, error, warn};
 
-use crate::config::{ConflictStrategy, FolderLayout};
+use crate::config::{AllowDestructiveFolderSync, ConflictStrategy, FolderLayout, SyncConfig};
 use crate::ids::{JmapBlobId, JmapEmailId, JmapThreadId, MaildirId, MessageId};
 use crate::jmap::types::{EmailObject, MailboxFolderBinding, MaybeReference};
 use crate::maildir_ops::flags::{flags_to_keyword_patch, flags_to_keywords, keywords_to_flags};
@@ -14,6 +14,28 @@ use crate::state::queries::MessageRecord;
 use crate::sync::bindings::MailboxBindings;
 use crate::sync::dedupe::LocalIndex;
 use crate::sync::plan::{BoundId, LocalId, RemoteId, SyncAction, SyncPlan};
+
+/// Tunables that govern reconcile's decision-making, bundled so the
+/// caller threads one parameter instead of two parallel slots that
+/// every helper would otherwise have to forward in lockstep. Both
+/// fields come straight off `SyncConfig`; `from_sync_config` is the
+/// canonical lift.
+#[derive(Debug, Clone, Copy)]
+pub struct SyncPolicy {
+    pub conflict_strategy: ConflictStrategy,
+    pub allow_destructive_folder_sync: AllowDestructiveFolderSync,
+}
+
+impl SyncPolicy {
+    /// Lift the policy slots out of a `SyncConfig` so reconcile's
+    /// caller doesn't have to thread two parallel parameters.
+    pub fn from_sync_config(sync: &SyncConfig) -> Self {
+        Self {
+            conflict_strategy: sync.conflict_strategy,
+            allow_destructive_folder_sync: sync.allow_destructive_folder_sync,
+        }
+    }
+}
 
 /// Look up a `MessageRecord` (or records) by whichever ID kind you
 /// happen to hold: a maildir basename, a JMAP email id, or an RFC
@@ -40,7 +62,7 @@ pub struct MessageRecordIndex {
 struct ReconcileCtx<'a> {
     remote_emails: &'a [EmailObject],
     mailboxes: &'a MailboxBindings,
-    strategy: ConflictStrategy,
+    policy: SyncPolicy,
     known_by_maildir: &'a HashMap<MaildirId, Arc<MessageRecord>>,
     known_by_jmap: &'a HashMap<JmapEmailId, Arc<MessageRecord>>,
     known_by_message_id: &'a HashMap<MessageId, Vec<Arc<MessageRecord>>>,
@@ -86,7 +108,8 @@ struct ReconcileCtx<'a> {
 /// `known`: bundled indices of message_map for fast lookup.
 /// `local_index`: dedupe-pass index of on-disk Message-IDs.
 /// `mailboxes`: synced (jmap_mailbox_id, folder_name) pairs.
-/// `strategy`: how to break local-vs-remote ties.
+/// `policy`: bundled tiebreaker (`conflict_strategy`) plus the
+/// destructive-folder-sync gate; see `SyncPolicy`.
 /// `new_email_state`: cursor to stamp into the resulting plan; `None`
 /// for tests that don't care about state advancement.
 pub struct ReconcileInput<'a> {
@@ -100,7 +123,7 @@ pub struct ReconcileInput<'a> {
     /// for the read-side contract.
     pub local_flags: &'a HashMap<MaildirId, String>,
     pub mailboxes: &'a MailboxBindings,
-    pub strategy: ConflictStrategy,
+    pub policy: SyncPolicy,
     pub new_email_state: Option<String>,
     /// Effective `maxSizeUpload` cap for this cycle. Resolved by the
     /// caller (engine) via `limits::max_size_upload(client)` so
@@ -146,7 +169,7 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
         local_index,
         local_flags,
         mailboxes,
-        strategy,
+        policy,
         new_email_state,
         max_upload_size,
         used_initial_path,
@@ -263,7 +286,7 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
     let ctx = ReconcileCtx {
         remote_emails,
         mailboxes,
-        strategy,
+        policy,
         known_by_maildir,
         known_by_jmap,
         known_by_message_id,
@@ -603,7 +626,7 @@ fn handle_known_remote(
     // it. Resolve before any flag/move emission, since the local
     // copy is gone either way.
     if ctx.local_deletes.contains(&email.id) {
-        match resolve_delete_conflict(&email.id, ctx.strategy) {
+        match resolve_delete_conflict(&email.id, ctx.policy.conflict_strategy) {
             DeleteWinner::Server => {
                 deletes_overruled_by_server.insert(email.id.clone());
                 // Re-download to restore the deleted local file.
@@ -639,7 +662,7 @@ fn handle_known_remote(
             existing,
             email,
             ctx.local_flag_changes.get(&email.id).copied(),
-            ctx.strategy,
+            ctx.policy.conflict_strategy,
         );
         match resolved {
             FlagWinner::Server => {
@@ -724,7 +747,7 @@ fn try_adopt_remote(
         });
         emit_adoption_flag_reconciliation(
             plan,
-            ctx.strategy,
+            ctx.policy.conflict_strategy,
             &AdoptionReconciliation {
                 bound_id: &bound_id,
                 binding: target_binding,
@@ -1236,7 +1259,7 @@ fn handle_local_new(
         // when filename and server-derived flags already agree.
         emit_adoption_flag_reconciliation(
             plan,
-            ctx.strategy,
+            ctx.policy.conflict_strategy,
             &AdoptionReconciliation {
                 bound_id: &bound_id,
                 binding,
@@ -1569,7 +1592,10 @@ mod tests {
             local_index,
             local_flags,
             mailboxes: &mailboxes,
-            strategy,
+            policy: SyncPolicy {
+                conflict_strategy: strategy,
+                allow_destructive_folder_sync: AllowDestructiveFolderSync::None,
+            },
             new_email_state: None,
             // Tests pass usize::MAX so the size cap never bites
             // unless a test explicitly opts in to it.
@@ -1609,7 +1635,10 @@ mod tests {
             local_index,
             local_flags: &local_flags,
             mailboxes: &mailboxes,
-            strategy,
+            policy: SyncPolicy {
+                conflict_strategy: strategy,
+                allow_destructive_folder_sync: AllowDestructiveFolderSync::None,
+            },
             new_email_state: None,
             max_upload_size: usize::MAX,
             used_initial_path: false,
@@ -2688,7 +2717,10 @@ mod tests {
             local_index: &local_index,
             local_flags: &HashMap::new(),
             mailboxes: &mailboxes,
-            strategy: ConflictStrategy::ServerWins,
+            policy: SyncPolicy {
+                conflict_strategy: ConflictStrategy::ServerWins,
+                allow_destructive_folder_sync: AllowDestructiveFolderSync::None,
+            },
             new_email_state: None,
             max_upload_size: 1_000,
             used_initial_path: true,
@@ -3165,7 +3197,10 @@ mod tests {
             local_index: &local_index,
             local_flags: &local_flags,
             mailboxes,
-            strategy: ConflictStrategy::ServerWins,
+            policy: SyncPolicy {
+                conflict_strategy: ConflictStrategy::ServerWins,
+                allow_destructive_folder_sync: AllowDestructiveFolderSync::None,
+            },
             new_email_state: None,
             max_upload_size: usize::MAX,
             used_initial_path: true,

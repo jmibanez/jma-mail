@@ -461,7 +461,7 @@ impl<'a> SyncEngine<'a> {
                 local_index: &local_index,
                 local_flags: &local_flags,
                 mailboxes: &mailboxes,
-                strategy: self.config.sync.conflict_strategy,
+                policy: reconcile::SyncPolicy::from_sync_config(&self.config.sync),
                 new_email_state: Some(new_state),
                 max_upload_size: limits::max_size_upload(&self.client),
                 used_initial_path,
