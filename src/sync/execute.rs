@@ -265,11 +265,12 @@ impl<'a> Executor<'a> {
                 queries::upsert_message(
                     &txn,
                     &MessageRecord {
-                        mailbox_id: to_binding
+                        jmap_mailbox_id: to_binding
                             .jmap_mailbox_id
-                            .expect_resolved("execute::move_local_messages -- mailbox_id DB write")
+                            .expect_resolved(
+                                "execute::move_local_messages -- jmap_mailbox_id DB write",
+                            )
                             .clone(),
-                        maildir_folder: Some(to_binding.maildir_folder.clone()),
                         ..rec
                     },
                 )?;
@@ -395,12 +396,13 @@ impl<'a> Executor<'a> {
                     jmap_email_id: jmap_email_id.clone(),
                     jmap_blob_id: None,
                     jmap_thread_id: None,
-                    mailbox_id: binding
+                    jmap_mailbox_id: binding
                         .jmap_mailbox_id
-                        .expect_resolved("execute::commit_uploaded_messages -- mailbox_id DB write")
+                        .expect_resolved(
+                            "execute::commit_uploaded_messages -- jmap_mailbox_id DB write",
+                        )
                         .clone(),
                     maildir_id: Some(id.maildir_id.clone()),
-                    maildir_folder: Some(binding.maildir_folder.clone()),
                     message_id: id.message_id.clone(),
                     flags: flags.clone(),
                     jmap_keywords: keywords_json,
@@ -524,7 +526,6 @@ impl<'a> Executor<'a> {
                 let keywords_json = serde_json::to_string(&merged)?;
                 let server_flags = keywords_to_flags(&merged);
                 let maildir_id = rec.maildir_id.clone();
-                let maildir_folder = rec.maildir_folder.clone();
                 queries::upsert_message(
                     &txn,
                     &MessageRecord {
@@ -533,8 +534,8 @@ impl<'a> Executor<'a> {
                         ..rec
                     },
                 )?;
-                if let (Some(mid), Some(folder)) = (maildir_id, maildir_folder) {
-                    queries::upsert_local_state(&txn, &mid, &folder, &filename_flags, None)?;
+                if let Some(mid) = maildir_id {
+                    queries::update_local_state_flags(&txn, &mid, &filename_flags)?;
                 }
             }
             counts.keyword_updates += 1;
@@ -856,12 +857,13 @@ impl<'a> Executor<'a> {
                 jmap_email_id: id.jmap_email_id.clone(),
                 jmap_blob_id: Some(jmap_blob_id.clone()),
                 jmap_thread_id: Some(jmap_thread_id.clone()),
-                mailbox_id: binding
+                jmap_mailbox_id: binding
                     .jmap_mailbox_id
-                    .expect_resolved("execute::store_downloaded_message -- mailbox_id DB write")
+                    .expect_resolved(
+                        "execute::store_downloaded_message -- jmap_mailbox_id DB write",
+                    )
                     .clone(),
                 maildir_id: Some(mid.clone()),
-                maildir_folder: Some(binding.maildir_folder.clone()),
                 message_id: id.message_id.clone(),
                 flags: flags.clone(),
                 jmap_keywords: keywords_json,
@@ -1134,12 +1136,13 @@ fn apply_update_local_flags(
                 jmap_email_id,
                 jmap_blob_id: Some(jmap_blob_id),
                 jmap_thread_id: Some(jmap_thread_id),
-                mailbox_id: binding
+                jmap_mailbox_id: binding
                     .jmap_mailbox_id
-                    .expect_resolved("execute::apply_update_local_flags -- mailbox_id DB write")
+                    .expect_resolved(
+                        "execute::apply_update_local_flags -- jmap_mailbox_id DB write",
+                    )
                     .clone(),
                 maildir_id: Some(maildir_id.clone()),
-                maildir_folder: Some(binding.maildir_folder.clone()),
                 message_id,
                 flags: new_flags.clone(),
                 jmap_keywords: keywords_json,
@@ -1259,12 +1262,11 @@ fn commit_adopt(conn: &Connection, action: SyncAction) -> Result<()> {
             jmap_email_id: jmap_email_id.clone(),
             jmap_blob_id,
             jmap_thread_id,
-            mailbox_id: binding
+            jmap_mailbox_id: binding
                 .jmap_mailbox_id
-                .expect_resolved("execute::commit_adopt -- mailbox_id DB write")
+                .expect_resolved("execute::commit_adopt -- jmap_mailbox_id DB write")
                 .clone(),
             maildir_id: Some(maildir_id.clone()),
-            maildir_folder: Some(binding.maildir_folder.clone()),
             message_id,
             flags: server_flags,
             jmap_keywords: keywords_json,
@@ -1509,9 +1511,8 @@ mod tests {
                 jmap_email_id: "E1".into(),
                 jmap_blob_id: Some("B1".into()),
                 jmap_thread_id: Some("T1".into()),
-                mailbox_id: "MB-INBOX".into(),
+                jmap_mailbox_id: "MB-INBOX".into(),
                 maildir_id: Some("M-OLD".into()),
-                maildir_folder: Some("INBOX".into()),
                 message_id: "a@x".into(),
                 flags: "S".into(),
                 jmap_keywords: r#"{"$seen":true}"#.into(),
@@ -1564,9 +1565,9 @@ mod tests {
             .unwrap()
             .expect("E1 must still exist in message_map");
         assert_eq!(
-            rec.maildir_folder.as_deref(),
-            Some("INBOX"),
-            "DB folder must remain INBOX -- server still has it there"
+            rec.jmap_mailbox_id.as_ref(),
+            "MB-INBOX",
+            "DB mailbox binding must remain INBOX -- server still has it there"
         );
         assert_eq!(
             rec.maildir_id.as_ref().map(AsRef::as_ref),
@@ -1605,7 +1606,7 @@ mod tests {
         let rec = queries::get_message_by_jmap_id(&conn, &JmapEmailId::from("E1"))
             .unwrap()
             .expect("E1 must still exist in message_map");
-        assert_eq!(rec.maildir_folder.as_deref(), Some("Spam"));
+        assert_eq!(rec.jmap_mailbox_id.as_ref(), "MB-SPAM");
         assert_eq!(rec.maildir_id.as_ref().map(AsRef::as_ref), Some("M-NEW"));
 
         let inbox_state = queries::get_local_state_for_folder(&conn, "INBOX").unwrap();
@@ -1914,9 +1915,8 @@ mod tests {
                 jmap_email_id: "E1".into(),
                 jmap_blob_id: Some("B1".into()),
                 jmap_thread_id: Some("T1".into()),
-                mailbox_id: "MB-INBOX".into(),
+                jmap_mailbox_id: "MB-INBOX".into(),
                 maildir_id: Some(mid.clone()),
-                maildir_folder: Some("INBOX".into()),
                 message_id: "a@x".into(),
                 flags: "".into(),
                 jmap_keywords: "{}".into(),
@@ -2008,9 +2008,8 @@ mod tests {
                 jmap_email_id: "E1".into(),
                 jmap_blob_id: Some("B1".into()),
                 jmap_thread_id: Some("T1".into()),
-                mailbox_id: "MB-INBOX".into(),
+                jmap_mailbox_id: "MB-INBOX".into(),
                 maildir_id: Some(mid.clone()),
-                maildir_folder: Some("INBOX".into()),
                 message_id: "a@x".into(),
                 flags: "".into(),
                 jmap_keywords: "{}".into(),

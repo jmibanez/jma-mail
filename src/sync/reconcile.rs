@@ -550,11 +550,11 @@ fn handle_known_remote(
     // TODO: cross-detect when the local copy was *also* moved
     // (scan emits NewMessage in dest + DeletedMessage in src,
     // not a true Move). For now, blindly follow the server.
-    if existing.mailbox_id
+    if existing.jmap_mailbox_id
         != *target_binding
             .jmap_mailbox_id
             .expect_resolved("reconcile::handle_known_remote -- membership compare")
-        && let Some(from_binding) = ctx.mailboxes.by_id(&existing.mailbox_id)
+        && let Some(from_binding) = ctx.mailboxes.by_id(&existing.jmap_mailbox_id)
         && let Some(local_maildir_id) = &existing.maildir_id
     {
         plan.actions.push(SyncAction::MoveLocal {
@@ -671,7 +671,7 @@ fn try_adopt_remote(
     // split and `emit_adoption_flag_reconciliation` keep current.
     if let Some(recs) = ctx.known_by_message_id.get(mid)
         && let Some(rec) = recs.iter().find(|r| {
-            r.mailbox_id
+            r.jmap_mailbox_id
                 == *target_binding
                     .jmap_mailbox_id
                     .expect_resolved("reconcile::try_adopt_known -- target compare")
@@ -782,7 +782,7 @@ fn process_remote_destroys(
         }
         if let Some(msg) = known_by_jmap.get(jmap_id)
             && let Some(maildir_id) = &msg.maildir_id
-            && let Some(binding) = mailboxes.by_id(&msg.mailbox_id)
+            && let Some(binding) = mailboxes.by_id(&msg.jmap_mailbox_id)
         {
             plan.actions.push(SyncAction::DeleteLocal {
                 id: BoundId {
@@ -961,7 +961,7 @@ fn handle_local_new(
     // email (DB index), adopt instead of upload. This is the
     // alreadyExists guard.
     if let Some(recs) = ctx.known_by_message_id.get(message_id)
-        && let Some(rec) = recs.iter().find(|r| r.mailbox_id == mailbox_id)
+        && let Some(rec) = recs.iter().find(|r| r.jmap_mailbox_id == mailbox_id)
     {
         let keywords =
             serde_json::from_str::<HashMap<String, bool>>(&rec.jmap_keywords).unwrap_or_default();
@@ -1019,7 +1019,7 @@ fn handle_local_new(
             message_id,
             other.jmap_email_id,
             ctx.mailboxes
-                .by_id(&other.mailbox_id)
+                .by_id(&other.jmap_mailbox_id)
                 .map(|b| b.maildir_folder.as_str())
                 .unwrap_or("?"),
         );
@@ -1179,7 +1179,7 @@ fn emit_local_flag_update(
     // of which mailbox the server-side keyword change came from.
     // The cycle's `mailboxes` table resolves the row's id to its
     // binding so the executor knows the right on-disk path.
-    let Some(local_binding) = mailboxes.by_id(&existing.mailbox_id) else {
+    let Some(local_binding) = mailboxes.by_id(&existing.jmap_mailbox_id) else {
         return;
     };
     let new_flags = keywords_to_flags(&email.keywords);
@@ -1238,7 +1238,6 @@ mod tests {
     fn record(
         jmap_id: &str,
         mailbox_id: &str,
-        folder: &str,
         maildir_id: Option<&str>,
         flags: &str,
         message_id: &str,
@@ -1248,9 +1247,8 @@ mod tests {
             jmap_email_id: jmap_id.into(),
             jmap_blob_id: Some(format!("blob-{jmap_id}").into()),
             jmap_thread_id: Some(format!("thr-{jmap_id}").into()),
-            mailbox_id: mailbox_id.into(),
+            jmap_mailbox_id: mailbox_id.into(),
             maildir_id: maildir_id.map(Into::into),
-            maildir_folder: Some(folder.into()),
             message_id: message_id.into(),
             flags: flags.into(),
             jmap_keywords: serde_json::to_string(&kw).unwrap(),
@@ -1417,7 +1415,7 @@ mod tests {
     /// that strips Message-ID from updates breaks flag sync forever.
     #[test]
     fn known_remote_email_without_message_id_still_updates_flags() {
-        let rec = record("E1", "MB-INBOX", "INBOX", Some("M-1"), "", "<a@x>");
+        let rec = record("E1", "MB-INBOX", Some("M-1"), "", "<a@x>");
         let plan = run(
             &[email("E1", "MB-INBOX", "S", None)],
             &[],
@@ -1456,7 +1454,7 @@ mod tests {
     /// exercises the carry-over-from-stale-DB path.
     #[test]
     fn adopt_via_known_message_id_in_db() {
-        let rec = record("STALE-ID", "MB-INBOX", "INBOX", Some("MID-1"), "S", "<a@x>");
+        let rec = record("STALE-ID", "MB-INBOX", Some("MID-1"), "S", "<a@x>");
         let plan = run(
             &[email("E1", "MB-INBOX", "S", Some("<a@x>"))],
             &[],
@@ -1808,9 +1806,8 @@ mod tests {
             jmap_email_id: "E1".into(),
             jmap_blob_id: Some("B1".into()),
             jmap_thread_id: Some("T1".into()),
-            mailbox_id: "MB-INBOX".into(),
+            jmap_mailbox_id: "MB-INBOX".into(),
             maildir_id: Some("M-EXISTING".into()),
-            maildir_folder: Some("INBOX".into()),
             message_id: "<a@x>".into(),
             flags: "FPS".into(),
             jmap_keywords: serde_json::to_string(&keywords_map).unwrap(),
@@ -1883,7 +1880,7 @@ mod tests {
     #[test]
     fn destroy_plus_create_with_shared_message_id_rebinds_atomically() {
         // DB anchors the old email A under maildir_id FILE-1 in INBOX.
-        let rec_a = record("A", "MB-INBOX", "INBOX", Some("FILE-1"), "S", "<a@x>");
+        let rec_a = record("A", "MB-INBOX", Some("FILE-1"), "S", "<a@x>");
         // Server destroys A and creates B with the same Message-ID.
         let plan = run(
             &[email("B", "MB-INBOX", "S", Some("<a@x>"))],
@@ -1943,7 +1940,7 @@ mod tests {
     /// AdoptLocalMessage, no DownloadMessage, no DeleteLocal.
     #[test]
     fn shared_message_id_with_old_id_alive_skips_adoption() {
-        let rec_a = record("A", "MB-INBOX", "INBOX", Some("FILE-1"), "S", "<a@x>");
+        let rec_a = record("A", "MB-INBOX", Some("FILE-1"), "S", "<a@x>");
         let plan = run(
             &[
                 // A still alive on the server in this cycle's view.
@@ -1999,14 +1996,7 @@ mod tests {
     /// partial-unique index.
     #[test]
     fn shared_message_id_with_old_id_absent_rebinds_on_initial_path() {
-        let rec = record(
-            "STALE-ID",
-            "MB-INBOX",
-            "INBOX",
-            Some("FILE-1"),
-            "S",
-            "<a@x>",
-        );
+        let rec = record("STALE-ID", "MB-INBOX", Some("FILE-1"), "S", "<a@x>");
         let plan = run(
             // Only E1 in this cycle; STALE-ID is not in remote_emails.
             &[email("E1", "MB-INBOX", "S", Some("<a@x>"))],
@@ -2052,14 +2042,7 @@ mod tests {
     /// warn so a live duplicate isn't silently rebound away.
     #[test]
     fn shared_message_id_with_old_id_absent_in_incremental_mode_skips_adoption() {
-        let rec = record(
-            "STALE-ID",
-            "MB-INBOX",
-            "INBOX",
-            Some("FILE-1"),
-            "S",
-            "<a@x>",
-        );
+        let rec = record("STALE-ID", "MB-INBOX", Some("FILE-1"), "S", "<a@x>");
         let plan = run_incremental(
             &[email("E1", "MB-INBOX", "S", Some("<a@x>"))],
             &[],
@@ -2149,7 +2132,7 @@ mod tests {
     #[test]
     fn rebind_also_reconciles_flag_drift_server_wins() {
         // DB has A bound to FILE-1 in INBOX with flags "S".
-        let rec_a = record("A", "MB-INBOX", "INBOX", Some("FILE-1"), "S", "<a@x>");
+        let rec_a = record("A", "MB-INBOX", Some("FILE-1"), "S", "<a@x>");
         // B's server keywords include $forwarded => derived "PS".
         let server = email("B", "MB-INBOX", "PS", Some("<a@x>"));
         // On-disk file is still ":2,S" (no P) -- the divergence.
@@ -2203,7 +2186,7 @@ mod tests {
     /// pull-side flag update, no upload.
     #[test]
     fn server_keyword_change_emits_update_local_flags() {
-        let rec = record("E1", "MB-INBOX", "INBOX", Some("M-1"), "", "<a@x>");
+        let rec = record("E1", "MB-INBOX", Some("M-1"), "", "<a@x>");
         let plan = run(
             &[email("E1", "MB-INBOX", "S", Some("<a@x>"))],
             &[],
@@ -2221,7 +2204,7 @@ mod tests {
     /// Server reports the email has moved between mailboxes: emit MoveLocal.
     #[test]
     fn server_mailbox_change_emits_move_local() {
-        let rec = record("E1", "MB-INBOX", "INBOX", Some("M-1"), "S", "<a@x>");
+        let rec = record("E1", "MB-INBOX", Some("M-1"), "S", "<a@x>");
         let plan = run(
             &[email("E1", "MB-ARCH", "S", Some("<a@x>"))],
             &[],
@@ -2242,7 +2225,7 @@ mod tests {
     /// restore the file; do not emit DestroyRemote.
     #[test]
     fn delete_vs_update_server_wins_redownloads() {
-        let rec = record("E1", "MB-INBOX", "INBOX", Some("M-1"), "", "<a@x>");
+        let rec = record("E1", "MB-INBOX", Some("M-1"), "", "<a@x>");
         let plan = run(
             &[email("E1", "MB-INBOX", "S", Some("<a@x>"))],
             &[],
@@ -2271,7 +2254,7 @@ mod tests {
     /// suppress the redownload.
     #[test]
     fn delete_vs_update_local_wins_destroys_remote() {
-        let rec = record("E1", "MB-INBOX", "INBOX", Some("M-1"), "", "<a@x>");
+        let rec = record("E1", "MB-INBOX", Some("M-1"), "", "<a@x>");
         let plan = run(
             &[email("E1", "MB-INBOX", "S", Some("<a@x>"))],
             &[],
@@ -2298,7 +2281,7 @@ mod tests {
     /// down the server flags, drop the local push.
     #[test]
     fn flag_conflict_server_wins() {
-        let rec = record("E1", "MB-INBOX", "INBOX", Some("M-1"), "", "<a@x>");
+        let rec = record("E1", "MB-INBOX", Some("M-1"), "", "<a@x>");
         let plan = run(
             &[email("E1", "MB-INBOX", "S", Some("<a@x>"))],
             &[],
@@ -2332,7 +2315,7 @@ mod tests {
     /// server-side flag update.
     #[test]
     fn flag_conflict_local_wins() {
-        let rec = record("E1", "MB-INBOX", "INBOX", Some("M-1"), "", "<a@x>");
+        let rec = record("E1", "MB-INBOX", Some("M-1"), "", "<a@x>");
         let plan = run(
             &[email("E1", "MB-INBOX", "S", Some("<a@x>"))],
             &[],
@@ -2377,7 +2360,7 @@ mod tests {
     #[test]
     fn handle_local_flags_carries_filename_flags_for_mirror() {
         // DB has the message with $flagged + $seen (server view).
-        let rec = record("E1", "MB-INBOX", "INBOX", Some("M-1"), "FS", "<a@x>");
+        let rec = record("E1", "MB-INBOX", Some("M-1"), "FS", "<a@x>");
         // User removed $flagged: on-disk filename is now ":2,S".
         let plan = run(
             &[email("E1", "MB-INBOX", "FS", Some("<a@x>"))],
@@ -2479,7 +2462,7 @@ mod tests {
     /// folder, with no paired delete: skip upload (alreadyExists guard).
     #[test]
     fn local_new_dup_message_id_in_other_folder_skips_upload() {
-        let rec = record("E1", "MB-ARCH", "Archive", Some("M-EXISTING"), "", "<a@x>");
+        let rec = record("E1", "MB-ARCH", Some("M-EXISTING"), "", "<a@x>");
         let plan = run(
             &[],
             &[],
@@ -2505,7 +2488,7 @@ mod tests {
     /// Local DeletedMessage for a known JMAP id: emit DestroyRemote.
     #[test]
     fn local_delete_emits_destroy_remote() {
-        let rec = record("E1", "MB-INBOX", "INBOX", Some("M-1"), "", "<a@x>");
+        let rec = record("E1", "MB-INBOX", Some("M-1"), "", "<a@x>");
         let plan = run(
             &[],
             &[],
@@ -2531,7 +2514,7 @@ mod tests {
     /// only DeleteLocal (from the destroy pass), not DestroyRemote.
     #[test]
     fn local_delete_paired_with_remote_destroy_collapses() {
-        let rec = record("E1", "MB-INBOX", "INBOX", Some("M-1"), "", "<a@x>");
+        let rec = record("E1", "MB-INBOX", Some("M-1"), "", "<a@x>");
         let plan = run(
             &[],
             &["E1".into()],
@@ -2564,7 +2547,7 @@ mod tests {
     /// a Message-ID becomes one MoveRemote + Adopt, not Destroy + Upload.
     #[test]
     fn cross_folder_local_move_emits_move_remote_and_adopt() {
-        let rec = record("E1", "MB-INBOX", "INBOX", Some("M-OLD"), "", "<a@x>");
+        let rec = record("E1", "MB-INBOX", Some("M-OLD"), "", "<a@x>");
         let plan = run(
             &[],
             &[],
@@ -2624,7 +2607,7 @@ mod tests {
     /// expect MoveRemote + Adopt + UpdateRemoteKeywords.
     #[test]
     fn cross_folder_move_with_flag_change_pushes_keywords() {
-        let rec = record("E1", "MB-INBOX", "INBOX", Some("M-OLD"), "", "<a@x>");
+        let rec = record("E1", "MB-INBOX", Some("M-OLD"), "", "<a@x>");
         let plan = run(
             &[],
             &[],
@@ -2672,7 +2655,7 @@ mod tests {
     /// folder updated.
     #[test]
     fn cross_folder_move_with_preserved_maildir_id_pairs_correctly() {
-        let rec = record("E1", "MB-INBOX", "INBOX", Some("M1"), "FS", "<a@x>");
+        let rec = record("E1", "MB-INBOX", Some("M1"), "FS", "<a@x>");
         let plan = run(
             &[],
             &[],
@@ -2750,7 +2733,7 @@ mod tests {
     /// folder and effectively undoes the user's move.
     #[test]
     fn cross_folder_move_with_concurrent_remote_update_does_not_redownload() {
-        let rec = record("E1", "MB-INBOX", "INBOX", Some("M-OLD"), "", "<a@x>");
+        let rec = record("E1", "MB-INBOX", Some("M-OLD"), "", "<a@x>");
         let plan = run(
             // Server's view still has the email in INBOX (the local
             // move hasn't been pushed yet).
@@ -2802,7 +2785,7 @@ mod tests {
     /// resolved maildir_id and folder.
     #[test]
     fn remote_destroy_emits_delete_local() {
-        let rec = record("E1", "MB-INBOX", "INBOX", Some("M-1"), "", "<a@x>");
+        let rec = record("E1", "MB-INBOX", Some("M-1"), "", "<a@x>");
         let plan = run(
             &[],
             &["E1".into()],

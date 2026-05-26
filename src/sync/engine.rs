@@ -820,7 +820,10 @@ fn build_known_indices(
     let mut idx = MessageRecordIndex::default();
 
     for binding in mailboxes.iter() {
-        let messages = queries::get_messages_by_folder(conn, &binding.maildir_folder)?;
+        let mailbox_id = binding
+            .jmap_mailbox_id
+            .expect_resolved("build_known_indices -- live bindings must be resolved");
+        let messages = queries::get_messages_by_jmap_mailbox_id(conn, mailbox_id)?;
         for msg in messages {
             // Wrap once; the three projections share via Arc
             // refcount instead of cloning the full record into two
@@ -899,7 +902,6 @@ mod tests {
     fn record(
         jmap_id: &str,
         mailbox_id: &str,
-        folder: &str,
         maildir_id: Option<&str>,
         message_id: &str,
     ) -> MessageRecord {
@@ -907,9 +909,8 @@ mod tests {
             jmap_email_id: jmap_id.into(),
             jmap_blob_id: Some(format!("blob-{jmap_id}").into()),
             jmap_thread_id: Some(format!("thr-{jmap_id}").into()),
-            mailbox_id: mailbox_id.into(),
+            jmap_mailbox_id: mailbox_id.into(),
             maildir_id: maildir_id.map(Into::into),
-            maildir_folder: Some(folder.into()),
             message_id: message_id.into(),
             flags: "S".into(),
             jmap_keywords: r#"{"$seen":true}"#.into(),
@@ -938,10 +939,7 @@ mod tests {
     #[test]
     fn build_known_indices_with_no_mailboxes_returns_empty() {
         let conn = db::open_in_memory().unwrap();
-        seed(
-            &conn,
-            &[record("E1", "MB-INBOX", "INBOX", Some("M1"), "<a@x>")],
-        );
+        seed(&conn, &[record("E1", "MB-INBOX", Some("M1"), "<a@x>")]);
 
         let idx = build_known_indices(&conn, &MailboxBindings::builder().build()).unwrap();
 
@@ -956,10 +954,7 @@ mod tests {
     #[test]
     fn build_known_indices_single_record_in_all_three_projections() {
         let conn = db::open_in_memory().unwrap();
-        seed(
-            &conn,
-            &[record("E1", "MB-INBOX", "INBOX", Some("M1"), "<a@x>")],
-        );
+        seed(&conn, &[record("E1", "MB-INBOX", Some("M1"), "<a@x>")]);
 
         let idx = build_known_indices(&conn, &mailboxes(&[("MB-INBOX", "INBOX")])).unwrap();
 
@@ -982,7 +977,7 @@ mod tests {
     #[test]
     fn build_known_indices_skips_by_maildir_when_maildir_id_is_none() {
         let conn = db::open_in_memory().unwrap();
-        seed(&conn, &[record("E1", "MB-INBOX", "INBOX", None, "<a@x>")]);
+        seed(&conn, &[record("E1", "MB-INBOX", None, "<a@x>")]);
 
         let idx = build_known_indices(&conn, &mailboxes(&[("MB-INBOX", "INBOX")])).unwrap();
 
@@ -1007,8 +1002,8 @@ mod tests {
         seed(
             &conn,
             &[
-                record("E1", "MB-INBOX", "INBOX", Some("M1"), "<a@x>"),
-                record("E2", "MB-ARCH", "Archive", Some("M2"), "<a@x>"),
+                record("E1", "MB-INBOX", Some("M1"), "<a@x>"),
+                record("E2", "MB-ARCH", Some("M2"), "<a@x>"),
             ],
         );
 
@@ -1030,20 +1025,21 @@ mod tests {
         assert!(jmap_ids.contains(&JmapEmailId::from("E2")));
     }
 
-    /// `mailboxes` is the folder filter: rows whose `maildir_folder`
-    /// isn't in the listed folders are not indexed. `get_messages_by_folder`
-    /// queries only the listed folders; nothing enumerates the table.
-    /// Pinning this prevents a refactor from accidentally widening the
-    /// scope to "every row in message_map".
+    /// `mailboxes` is the binding filter: rows whose `jmap_mailbox_id`
+    /// isn't in the listed bindings are not indexed.
+    /// `get_messages_by_jmap_mailbox_id` queries only the listed
+    /// mailboxes; nothing enumerates the table. Pinning this prevents
+    /// a refactor from accidentally widening the scope to "every row
+    /// in message_map".
     #[test]
     fn build_known_indices_only_indexes_listed_folders() {
         let conn = db::open_in_memory().unwrap();
         seed(
             &conn,
             &[
-                record("E1", "MB-INBOX", "INBOX", Some("M1"), "<a@x>"),
-                record("E2", "MB-ARCH", "Archive", Some("M2"), "<b@x>"),
-                record("E3", "MB-SPAM", "Spam", Some("M3"), "<c@x>"),
+                record("E1", "MB-INBOX", Some("M1"), "<a@x>"),
+                record("E2", "MB-ARCH", Some("M2"), "<b@x>"),
+                record("E3", "MB-SPAM", Some("M3"), "<c@x>"),
             ],
         );
 
@@ -1063,10 +1059,7 @@ mod tests {
     #[test]
     fn build_known_indices_shares_arc_across_projections() {
         let conn = db::open_in_memory().unwrap();
-        seed(
-            &conn,
-            &[record("E1", "MB-INBOX", "INBOX", Some("M1"), "<a@x>")],
-        );
+        seed(&conn, &[record("E1", "MB-INBOX", Some("M1"), "<a@x>")]);
 
         let idx = build_known_indices(&conn, &mailboxes(&[("MB-INBOX", "INBOX")])).unwrap();
 

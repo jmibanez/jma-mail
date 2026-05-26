@@ -97,7 +97,13 @@ async fn state_wipe_re_pull_adopts_existing_files_by_message_id() {
 /// row in INBOX. Used to compare the binding before and after a
 /// state-DB wipe.
 fn snapshot_inbox(conn: &rusqlite::Connection) -> HashMap<String, (String, String)> {
-    queries::get_messages_by_folder(conn, "INBOX")
+    let inbox_id = queries::get_all_mailboxes(conn)
+        .expect("query mailbox_map")
+        .into_iter()
+        .find(|m| m.maildir_folder == "INBOX")
+        .expect("INBOX must be cached in mailbox_map")
+        .jmap_mailbox_id;
+    queries::get_messages_by_jmap_mailbox_id(conn, &inbox_id)
         .expect("query message_map")
         .into_iter()
         .map(|r| {
