@@ -25,4 +25,5 @@
 //! or feed to follow-on logic.
 
 pub mod dedupe;
+pub mod rebindfolders;
 pub mod remotededupe;

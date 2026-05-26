@@ -246,14 +246,64 @@ fn mailbox_get(_args: &Value, call_id: &str, state: &MockState) -> Value {
 }
 
 fn email_query(args: &Value, call_id: &str, state: &MockState) -> Value {
-    // Filter is `{ "inMailbox": "<id>" }` per the engine's call shape.
-    let mailbox_id = args["filter"]["inMailbox"].as_str().unwrap_or_default();
-    let ids: Vec<String> = state
-        .emails
-        .iter()
-        .filter(|e| e.mailbox_ids.iter().any(|m| m == mailbox_id))
-        .map(|e| e.id.clone())
-        .collect();
+    // Two filter shapes are supported, matching the two callers
+    // in the engine + janitor today:
+    //   - `{ "inMailbox": "<id>" }`: SyncEngine's per-mailbox query
+    //   - `{ "operator": "OR", "conditions": [{ "header": ["Message-ID", "<id>"] }, ...] }`:
+    //     rebindfolders' Message-ID probe
+    // Anything else returns an empty result; tests using new
+    // filter shapes need to extend this dispatcher.
+    let filter = &args["filter"];
+    let ids: Vec<String> = if let Some(mailbox_id) = filter["inMailbox"].as_str() {
+        state
+            .emails
+            .iter()
+            .filter(|e| e.mailbox_ids.iter().any(|m| m == mailbox_id))
+            .map(|e| e.id.clone())
+            .collect()
+    } else if filter["operator"].as_str() == Some("OR") {
+        // OR-of-headers: collect every `header[0]: header[1]`
+        // pair, match emails whose `messageId` contains the value
+        // (with our angle brackets stripped to compare against the
+        // server's stored bracket-stripped form).
+        let mut wanted: Vec<String> = Vec::new();
+        if let Some(conditions) = filter["conditions"].as_array() {
+            for cond in conditions {
+                let Some(header) = cond["header"].as_array() else {
+                    continue;
+                };
+                if header.len() != 2 {
+                    continue;
+                }
+                let Some(name) = header[0].as_str() else {
+                    continue;
+                };
+                let Some(value) = header[1].as_str() else {
+                    continue;
+                };
+                if !name.eq_ignore_ascii_case("Message-ID") {
+                    continue;
+                }
+                let stripped = value
+                    .strip_prefix('<')
+                    .and_then(|s| s.strip_suffix('>'))
+                    .unwrap_or(value);
+                wanted.push(stripped.to_string());
+            }
+        }
+        state
+            .emails
+            .iter()
+            .filter(|e| {
+                e.message_id
+                    .as_ref()
+                    .is_some_and(|m| wanted.iter().any(|w| w == m))
+            })
+            .map(|e| e.id.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
     json!([
         "Email/query",
         {
@@ -781,6 +831,119 @@ async fn sync_dry_run_does_not_create_local_maildir_on_first_cycle() {
         !temp.path().join("Archive").exists(),
         "Archive maildir must not be created under --dry-run"
     );
+}
+
+/// End-to-end rebindfolders: an on-disk folder with no sentinel and
+/// no mailbox_map row gets rebound to the JMAP mailbox its sample
+/// Message-IDs all live in. Pins the full plumbing (Mailbox/get,
+/// Email/query with OR-of-headers, Email/get, intersection,
+/// sentinel write).
+#[tokio::test]
+async fn rebindfolders_rebinds_orphan_folder_from_message_ids() {
+    let server = MockServer::start().await;
+    mount_session(&server).await;
+
+    let state = Arc::new(Mutex::new(MockState {
+        mailbox_state: "mb-1".to_string(),
+        email_state: "e-1".to_string(),
+        mailboxes: vec![
+            MockMailbox {
+                id: "MB-INBOX".to_string(),
+                name: "Inbox".to_string(),
+                role: Some("inbox".to_string()),
+            },
+            MockMailbox {
+                id: "MB-SENT".to_string(),
+                name: "Sent".to_string(),
+                role: Some("sent".to_string()),
+            },
+        ],
+        emails: vec![
+            MockEmail {
+                id: "E1".to_string(),
+                blob_id: "B1".to_string(),
+                thread_id: "T1".to_string(),
+                mailbox_ids: vec!["MB-SENT".to_string()],
+                keywords: vec!["$seen".to_string()],
+                message_id: Some("a@x".to_string()),
+            },
+            MockEmail {
+                id: "E2".to_string(),
+                blob_id: "B2".to_string(),
+                thread_id: "T2".to_string(),
+                mailbox_ids: vec!["MB-SENT".to_string()],
+                keywords: vec!["$seen".to_string()],
+                message_id: Some("b@x".to_string()),
+            },
+            // Inbox-only email; its Message-ID is NOT in the
+            // sampled set so it shouldn't influence the result.
+            MockEmail {
+                id: "E3".to_string(),
+                blob_id: "B3".to_string(),
+                thread_id: "T3".to_string(),
+                mailbox_ids: vec!["MB-INBOX".to_string()],
+                keywords: vec![],
+                message_id: Some("c@x".to_string()),
+            },
+        ],
+        ..Default::default()
+    }));
+    mount_jmap(&server, state.clone()).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let conn = fresh_db(&temp);
+    let config = test_config(&server, temp.path(), vec![]);
+
+    // Plant an unbound folder on disk holding messages a@x and b@x
+    // (both live server-side under MB-SENT). No sentinel, no
+    // mailbox_map row.
+    let orphan = temp.path().join("MysterySent");
+    std::fs::create_dir_all(orphan.join("cur")).unwrap();
+    std::fs::create_dir_all(orphan.join("new")).unwrap();
+    std::fs::create_dir_all(orphan.join("tmp")).unwrap();
+    std::fs::write(
+        orphan.join("cur").join("1.x:2,S"),
+        b"Message-ID: <a@x>\r\nSubject: t1\r\n\r\nbody",
+    )
+    .unwrap();
+    std::fs::write(
+        orphan.join("cur").join("2.x:2,S"),
+        b"Message-ID: <b@x>\r\nSubject: t2\r\n\r\nbody",
+    )
+    .unwrap();
+
+    let client = jma_mail::jmap::session::connect(&config.account, &conn)
+        .await
+        .expect("connect");
+
+    let plan = jma_mail::janitor::rebindfolders::plan(
+        &client,
+        &conn,
+        temp.path(),
+        jma_mail::janitor::rebindfolders::DEFAULT_SAMPLE_SIZE,
+    )
+    .await
+    .expect("plan");
+
+    assert_eq!(plan.candidates.len(), 1, "expected one rebind candidate");
+    let c = &plan.candidates[0];
+    assert_eq!(c.folder_path, orphan);
+    assert_eq!(c.jmap_mailbox_id, JmapMailboxId::from("MB-SENT"));
+    assert_eq!(c.server_name, "Sent");
+    assert_eq!(c.sample_count, 2);
+    assert!(plan.skipped.is_empty(), "no folders should be skipped");
+
+    // No sentinel until apply runs -- plan() is pure.
+    assert!(
+        sentinel::read(&orphan).expect("read").is_none(),
+        "plan() must not write the sentinel"
+    );
+
+    let n = jma_mail::janitor::rebindfolders::apply(&plan).expect("apply");
+    assert_eq!(n, 1);
+    let written = sentinel::read(&orphan).expect("read").expect("present");
+    assert_eq!(written.jmap_mailbox_id, JmapMailboxId::from("MB-SENT"));
+    assert_eq!(written.server_name, "Sent");
 }
 
 /// End-to-end initial pull. State DB starts empty so engine routes to

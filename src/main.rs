@@ -578,6 +578,9 @@ async fn cmd_janitor(cli: &Cli, action: Option<JanitorAction>) -> Result<()> {
         JanitorAction::Remotededupe { mailbox, yes } => {
             cmd_janitor_remotededupe(cli, mailbox, yes).await
         }
+        JanitorAction::Rebindfolders { sample_size, apply } => {
+            cmd_janitor_rebindfolders(cli, sample_size, apply).await
+        }
     }
 }
 
@@ -720,6 +723,85 @@ async fn cmd_janitor_remotededupe(cli: &Cli, mailbox: Option<String>, yes: bool)
         }
     }
     Ok(())
+}
+
+async fn cmd_janitor_rebindfolders(cli: &Cli, sample_size: Option<u32>, apply: bool) -> Result<()> {
+    let config = load_config(cli)?;
+    // Same lock posture as remotededupe: rebindfolders hits the
+    // network and can write sentinels, so the honest stance is
+    // "this does not co-exist with sync." Acquire both.
+    acquire_mutator_locks(&config)?;
+    let conn = state::db::open_or_recreate(&config.db_path())?;
+
+    let client = session::connect(&config.account, &conn).await?;
+    let maildir_root = config.maildir_path();
+    let n = sample_size
+        .map(|n| n as usize)
+        .unwrap_or(jma_mail::janitor::rebindfolders::DEFAULT_SAMPLE_SIZE);
+
+    // Sentinel writes require explicit --apply; otherwise treat as
+    // a dry run. --dry-run also forces dry; --apply is the only
+    // affirmative gate so a probe that landed on the wrong mailbox
+    // requires explicit acknowledgement before disk changes.
+    let effective_dry_run = cli.dry_run || !apply;
+    let plan =
+        jma_mail::janitor::rebindfolders::run(&client, &conn, &maildir_root, n, effective_dry_run)
+            .await?;
+
+    render_rebindfolders_plan(&plan);
+
+    if plan.candidates.is_empty() && plan.skipped.is_empty() {
+        jma_mail::notify!("Rebindfolders: no orphan folders found.");
+        return Ok(());
+    }
+
+    if cli.dry_run {
+        jma_mail::notify!(
+            "Rebindfolders (dry-run): would rebind {} folder(s); {} skipped.",
+            plan.candidates.len(),
+            plan.skipped.len(),
+        );
+    } else if !apply {
+        jma_mail::notify!(
+            "Rebindfolders: {} folder(s) eligible for rebind; {} skipped. Re-run with --apply to write sentinels.",
+            plan.candidates.len(),
+            plan.skipped.len(),
+        );
+    } else {
+        jma_mail::notify!(
+            "Rebindfolders: rebound {} folder(s); {} skipped.",
+            plan.candidates.len(),
+            plan.skipped.len(),
+        );
+    }
+    Ok(())
+}
+
+fn render_rebindfolders_plan(plan: &jma_mail::janitor::rebindfolders::RebindFoldersPlan) {
+    for c in &plan.candidates {
+        println!(
+            "  [REBIND] {} -> {} ({}, {} sample(s))",
+            c.folder_path.display(),
+            c.jmap_mailbox_id,
+            c.server_name,
+            c.sample_count,
+        );
+    }
+    for s in &plan.skipped {
+        let detail = match &s.reason {
+            jma_mail::janitor::rebindfolders::SkipReason::NoMessageIds => {
+                "no parseable Message-IDs".to_string()
+            }
+            jma_mail::janitor::rebindfolders::SkipReason::NoServerMatches => {
+                "no server-side match for any sample".to_string()
+            }
+            jma_mail::janitor::rebindfolders::SkipReason::AmbiguousMailboxes(union) => {
+                let names: Vec<&str> = union.iter().map(|id| id.as_ref()).collect();
+                format!("ambiguous (candidates: {})", names.join(","))
+            }
+        };
+        println!("  [REBIND-SKIP] {} -- {}", s.folder_path.display(), detail);
+    }
 }
 
 fn render_remotededupe_plan(plan: &jma_mail::janitor::remotededupe::RemoteDedupePlan) {
