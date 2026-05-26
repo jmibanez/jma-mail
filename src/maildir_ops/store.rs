@@ -14,6 +14,26 @@ pub fn ensure_maildir(path: &Path) -> Result<Maildir> {
     Ok(md)
 }
 
+/// Return a `Maildir` handle iff the folder is shaped like a
+/// maildir: specifically, `<path>/cur/` exists. `None` when
+/// either the folder itself is missing or its `cur/` subdir
+/// hasn't been provisioned yet -- the caller (typically scan)
+/// should treat the folder as having no local files this cycle.
+///
+/// Differs from `ensure_maildir` in not creating anything: the
+/// dry-run / pre-`CreateLocalMailbox` path needs to inspect the
+/// filesystem without leaving side effects. `cur/` is the
+/// load-bearing subdir for the scan walk; a bare directory
+/// (no `cur/`) isn't a maildir even if it happens to exist,
+/// and walking it would fail downstream at `read_dir(cur/)`.
+pub fn try_open_maildir(path: &Path) -> Option<Maildir> {
+    if path.join("cur").is_dir() {
+        Some(Maildir::from(path.to_path_buf()))
+    } else {
+        None
+    }
+}
+
 /// Store a raw email message into a maildir, routing unseen messages
 /// (no `S` in `flags`) to `new/` and seen messages to `cur/`. The
 /// `:2,<flags>` info suffix is appended in both subfolders so that

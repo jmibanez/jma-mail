@@ -203,60 +203,9 @@ async fn cmd_init(cli: &Cli) -> Result<()> {
         println!("Created config file: {}", config_path.display());
     }
 
-    match Config::load(&config_path) {
-        Ok(config) => provision_maildirs(&config)?,
-        Err(e) => {
-            println!(
-                "Skipping maildir provisioning: could not load config ({})",
-                e
-            );
-        }
-    }
-
     println!("Edit the config file and set your JMAP API token.");
     println!("For Fastmail, generate one at: https://www.fastmail.com/settings/security/tokens");
-
-    Ok(())
-}
-
-/// Pre-create maildir folders for each entry in `[sync].mailboxes` so users
-/// can hand them to other tools (notmuch, mu, an MUA) before the first sync.
-/// Folder names are taken verbatim from the config -- including the literal
-/// `INBOX`, which matches mbsync's on-disk convention and is what the sync
-/// engine writes the inbox-role mailbox into.
-///
-/// Safe to re-run: a folder is only created when its path does not exist or
-/// exists but is empty. Already-populated maildirs are left untouched.
-fn provision_maildirs(config: &Config) -> Result<()> {
-    if config.sync.mailboxes.is_empty() {
-        return Ok(());
-    }
-
-    let root = config.maildir_path();
-    if !root.exists() {
-        std::fs::create_dir_all(&root)
-            .with_context(|| format!("Failed to create maildir root {}", root.display()))?;
-        println!("Created maildir root: {}", root.display());
-    }
-
-    for name in &config.sync.mailboxes {
-        let path = root.join(name);
-        let should_create = match std::fs::read_dir(&path) {
-            Ok(mut iter) => iter.next().is_none(),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
-            Err(e) => {
-                println!("Skipping {}: {}", path.display(), e);
-                continue;
-            }
-        };
-
-        if should_create {
-            jma_mail::maildir_ops::store::ensure_maildir(&path)?;
-            println!("Provisioned maildir: {}", path.display());
-        } else {
-            println!("Skipping non-empty maildir: {}", path.display());
-        }
-    }
+    println!("Then run `jma sync` to provision your local maildirs and pull existing messages.");
 
     Ok(())
 }

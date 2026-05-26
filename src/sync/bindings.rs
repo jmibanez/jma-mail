@@ -42,10 +42,41 @@ use crate::jmap::types::MailboxFolderBinding;
 /// `(JmapMailboxId, String, String)` triple per emission. The Arc
 /// also lets `by_id` and `by_folder` share the same allocation
 /// rather than keeping parallel copies.
+///
+/// The `new_mailboxes` slot rides along as a byproduct of the
+/// cache-vs-server diff `resolve_mailboxes` performs to build the
+/// live set: any server-known mailbox absent from the pre-upsert
+/// `mailbox_map` snapshot is the user's first cycle seeing that
+/// mailbox, and reconcile turns each into a `CreateLocalMailbox`
+/// action. Consumers that only care about the live set ignore
+/// the slot.
 #[derive(Debug, Default)]
 pub struct MailboxBindings {
     by_id: HashMap<JmapMailboxId, Arc<MailboxFolderBinding>>,
     by_folder: HashMap<String, JmapMailboxId>,
+    new_mailboxes: Vec<NewMailboxRecord>,
+}
+
+/// A mailbox whose on-disk state `resolve_mailboxes` found
+/// inconsistent with the server-known binding (folder absent,
+/// sentinel absent, or sentinel content stale). Reconcile emits
+/// a `SyncAction::CreateLocalMailbox` for each, so the
+/// executor's pre-everything-else phase creates the maildir +
+/// sentinel before any downstream action assumes the folder
+/// exists. `parent_jmap_mailbox_id` rides along because the
+/// sentinel embeds it so the parent chain can be reconstructed
+/// from disk after a state-DB nuke.
+#[derive(Debug, Clone)]
+pub struct NewMailboxRecord {
+    pub binding: MailboxFolderBinding,
+    pub parent_jmap_mailbox_id: Option<JmapMailboxId>,
+    /// `Some(dead_id)` when the binding represents a resurrect:
+    /// the executor's `CreateLocalMailbox` phase must drop stale
+    /// `message_map` rows pointing at `dead_id` before any
+    /// downstream `DownloadMessage` writes fresh rows for the
+    /// same mailbox id. `None` for ordinary first-cycle creates
+    /// (no cached rows exist for the id).
+    pub replaces_orphan_id: Option<JmapMailboxId>,
 }
 
 impl MailboxBindings {
@@ -74,6 +105,13 @@ impl MailboxBindings {
 
     pub fn folders(&self) -> impl Iterator<Item = &str> {
         self.by_folder.keys().map(String::as_str)
+    }
+
+    /// Server-known bindings that had no cached `mailbox_map`
+    /// row at cycle start. Reconcile emits one
+    /// `CreateLocalMailbox` per entry. Empty in steady state.
+    pub fn new_mailboxes(&self) -> &[NewMailboxRecord] {
+        &self.new_mailboxes
     }
 
     pub fn len(&self) -> usize {
@@ -121,5 +159,24 @@ impl MailboxBindingsBuilder {
             .by_folder
             .insert(binding.maildir_folder.clone(), id.clone());
         self.0.by_id.insert(id, Arc::new(binding));
+    }
+
+    /// Record a server-known binding that had no `mailbox_map` row
+    /// at cycle start (first cycle the user has seen this mailbox).
+    /// Reconcile turns each entry into a `CreateLocalMailbox`
+    /// action; the executor then creates the on-disk maildir and
+    /// stamps the sentinel before any downstream phase that needs
+    /// to write into the folder.
+    pub fn push_new_mailbox(
+        &mut self,
+        binding: MailboxFolderBinding,
+        parent_jmap_mailbox_id: Option<JmapMailboxId>,
+        replaces_orphan_id: Option<JmapMailboxId>,
+    ) {
+        self.0.new_mailboxes.push(NewMailboxRecord {
+            binding,
+            parent_jmap_mailbox_id,
+            replaces_orphan_id,
+        });
     }
 }

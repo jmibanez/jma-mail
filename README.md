@@ -13,7 +13,7 @@ This project is in a very early state, though I'm using it for my own mail. **Us
 
 ```console
 
-# Pre-populate the config file, and initialize a Maildir structure in ~/Mail/Fastmail (the default) if it doesn't exist
+# Pre-populate the config file (the Maildir tree is created on the first sync)
 $ jma init
 
 # Edit the config file in ~/.config/jma/config.toml
@@ -109,7 +109,7 @@ Other `[account]` keys:
 
 ### Sync `[sync]`
 
-This section configures which Maildirs `jma` will sync to, and how it syncs. The important knobs here are `maildir_path` which should point to the root of your Maildir mailboxes that you want to sync (e.g. `~/Mail/Fastmail`, or `~/Mail/my-provider`). By default `jma init` will also populate `mailboxes` with the common IMAP/JMAP mailboxes (INBOX, Archive, Sent, Drafts, Trash) and none of your custom folders/mailboxes -- if you want to populate _all_ mailboxes from upstream, unset this key or set it to an empty list.
+This section configures which Maildirs `jma` will sync to, and how it syncs. The important knobs here are `maildir_path` which should point to the root of your Maildir mailboxes that you want to sync (e.g. `~/Mail/Fastmail`, or `~/Mail/my-provider`). By default `jma init` populates `mailboxes` with the common IMAP/JMAP mailboxes (INBOX, Archive, Sent, Drafts, Trash) and none of your custom folders/mailboxes -- if you want to populate _all_ mailboxes from upstream, unset this key or set it to an empty list. The Maildir tree itself is created on the first sync, one folder per server-known mailbox.
 
   * `maildir_path`: The path to the Maildir root you want to sync. Required.
   * `mailboxes`: The specific mailboxes you want to sync. Set this to `[]` (an empty list) or leave this empty to sync all mailboxes. Note that this respects the inbox role; if your upstream mailbox with the inbox role is named e.g. `Posteingang` (DE) it will be synced to the local folder `INBOX`.
@@ -183,7 +183,7 @@ Commands:
   pull       One-way sync: server -> local only
   push       One-way sync: local -> server only
   watch      Daemon mode: continuous sync on server + local changes
-  init       Initialize config file and local maildir structure
+  init       Initialize config file
   mailboxes  List remote mailboxes and their local mapping
   status     Show sync staleness, cursor health, and maildir drift
   auth       Manage account credentials and the JMAP discovery cache
@@ -202,7 +202,7 @@ Options:
 
 ### init : Initialize config
 
-`init` is what you should run first to both create a default config on disk and create the local Maildir structure for your mailboxes (if you don't already have it). See [Configuration](#configuration) above for more details on the config.
+`init` is what you should run first to create a default config on disk. The Maildir tree itself is created on the first sync, one folder per server-known mailbox, through plan-visible `CreateLocalMailbox` actions (so a `jma sync --dry-run` after `init` previews exactly which folders would land). See [Configuration](#configuration) above for more details on the config.
 
 ### pull : Pull upstream changes into your local Maildir
 

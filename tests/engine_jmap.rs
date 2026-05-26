@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex};
 use jma_mail::config::FolderLayout;
 use jma_mail::config::{AccountConfig, Config, ConflictStrategy, StateConfig, SyncConfig};
 use jma_mail::ids::{JmapEmailId, JmapMailboxId};
+use jma_mail::maildir_ops::sentinel;
 use jma_mail::state::{db, queries};
 use jma_mail::sync::engine::SyncEngine;
 use rusqlite::Connection;
@@ -380,7 +381,7 @@ fn test_config(
 /// is created under that alias and the mailbox_map row records the same
 /// folder name. Pins the mbsync-convention magic alias.
 #[tokio::test]
-async fn resolve_mailboxes_applies_inbox_magic_alias() {
+async fn sync_applies_inbox_magic_alias() {
     let server = MockServer::start().await;
     mount_session(&server).await;
 
@@ -400,18 +401,10 @@ async fn resolve_mailboxes_applies_inbox_magic_alias() {
     let conn = fresh_db(&temp);
     let config = test_config(&server, temp.path(), vec![]);
 
-    let resolved = SyncEngine::connect(&conn, &config)
+    SyncEngine::sync(&conn, &config, false)
         .await
-        .expect("connect")
-        .resolve_mailboxes()
-        .await
-        .expect("resolve_mailboxes succeeds");
+        .expect("sync succeeds");
 
-    assert_eq!(resolved.len(), 1);
-    let inbox = resolved
-        .by_id(&JmapMailboxId::from("MB-INBOX"))
-        .expect("inbox binding present");
-    assert_eq!(inbox.maildir_folder, "INBOX");
     assert!(temp.path().join("INBOX").join("cur").is_dir());
 
     let rows = queries::get_all_mailboxes(&conn).unwrap();
@@ -427,7 +420,7 @@ async fn resolve_mailboxes_applies_inbox_magic_alias() {
 /// directory on disk. Pins both the filter and the fact that we don't
 /// pre-create directories for unsynced mailboxes.
 #[tokio::test]
-async fn resolve_mailboxes_filter_drops_unlisted() {
+async fn sync_filter_drops_unlisted() {
     let server = MockServer::start().await;
     mount_session(&server).await;
 
@@ -463,16 +456,10 @@ async fn resolve_mailboxes_filter_drops_unlisted() {
         vec!["INBOX".to_string(), "Archive".to_string()],
     );
 
-    let resolved = SyncEngine::connect(&conn, &config)
+    SyncEngine::sync(&conn, &config, false)
         .await
-        .expect("connect")
-        .resolve_mailboxes()
-        .await
-        .expect("resolve_mailboxes succeeds");
+        .expect("sync succeeds");
 
-    let mut folders: Vec<&str> = resolved.folders().collect();
-    folders.sort();
-    assert_eq!(folders, vec!["Archive", "INBOX"]);
     assert!(temp.path().join("INBOX").join("cur").is_dir());
     assert!(temp.path().join("Archive").join("cur").is_dir());
     assert!(
@@ -486,6 +473,314 @@ async fn resolve_mailboxes_filter_drops_unlisted() {
     assert!(names.contains("INBOX"));
     assert!(names.contains("Archive"));
     assert!(!names.contains("Spam"));
+}
+
+/// Sync writes a `.jma.mapping` sentinel inside every synced
+/// maildir folder so the local-folder -> JMAP-mailbox binding
+/// survives a state DB nuke. Pins three properties:
+///
+/// 1. The sentinel is created from scratch on first sync.
+/// 2. `server_name` records the JMAP leaf name (e.g. `"Indbakke"`),
+///    not the layout-flattened on-disk folder name (`"INBOX"`).
+/// 3. A pre-existing stale sentinel (wrong jmap_mailbox_id) is
+///    overwritten with the resolved truth on the next cycle.
+#[tokio::test]
+async fn sync_writes_identity_sentinels() {
+    let server = MockServer::start().await;
+    mount_session(&server).await;
+
+    let state = Arc::new(Mutex::new(MockState {
+        mailbox_state: "mb-1".to_string(),
+        email_state: "e-1".to_string(),
+        mailboxes: vec![
+            MockMailbox {
+                id: "MB-INBOX".to_string(),
+                name: "Indbakke".to_string(),
+                role: Some("inbox".to_string()),
+            },
+            MockMailbox {
+                id: "MB-ARCH".to_string(),
+                name: "Archive".to_string(),
+                role: Some("archive".to_string()),
+            },
+        ],
+        ..Default::default()
+    }));
+    mount_jmap(&server, state.clone()).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let conn = fresh_db(&temp);
+    let config = test_config(&server, temp.path(), vec![]);
+
+    // Plant a stale sentinel under Archive before the first resolve.
+    // Under the test config (Fs layout, '/' separator) a top-level
+    // mailbox named "Archive" lands at the literal `Archive/` path,
+    // and INBOX-role lands at the `INBOX` alias; both folder names
+    // are pinned by the existing tests above.
+    let archive_dir = temp.path().join("Archive");
+    std::fs::create_dir_all(&archive_dir).expect("create archive dir");
+    sentinel::write(
+        &archive_dir,
+        &sentinel::MailboxMapping {
+            jmap_mailbox_id: JmapMailboxId::from("MB-WRONG"),
+            parent_jmap_mailbox_id: None,
+            server_name: "ForeignName".to_string(),
+        },
+    )
+    .expect("write stale sentinel");
+
+    SyncEngine::sync(&conn, &config, false)
+        .await
+        .expect("sync succeeds");
+
+    // INBOX: written from scratch. server_name carries the JMAP
+    // leaf name, not the local INBOX alias.
+    let inbox_sentinel = sentinel::read(&temp.path().join("INBOX"))
+        .expect("inbox sentinel readable")
+        .expect("inbox sentinel present");
+    assert_eq!(
+        inbox_sentinel.jmap_mailbox_id,
+        JmapMailboxId::from("MB-INBOX")
+    );
+    assert_eq!(inbox_sentinel.parent_jmap_mailbox_id, None);
+    assert_eq!(inbox_sentinel.server_name, "Indbakke");
+
+    // Archive: the stale `MB-WRONG` binding gets overwritten to
+    // match what `Mailbox/get` reported.
+    let archive_sentinel = sentinel::read(&archive_dir)
+        .expect("archive sentinel readable")
+        .expect("archive sentinel present");
+    assert_eq!(
+        archive_sentinel.jmap_mailbox_id,
+        JmapMailboxId::from("MB-ARCH")
+    );
+    assert_eq!(archive_sentinel.server_name, "Archive");
+}
+
+/// On-disk folder exists but its sentinel went missing (partial
+/// write the previous cycle, or a hand-edit). `resolve_mailboxes`
+/// must detect the gap and re-emit `CreateLocalMailbox` so the
+/// executor re-stamps the sentinel. Without this, a one-time
+/// sentinel write failure would leave the binding unrecoverable
+/// from disk indefinitely (the mailbox_map row landed on the
+/// prior cycle, so a cache-snapshot-based newness check would
+/// say "steady-state, nothing to do").
+#[tokio::test]
+async fn sync_re_stamps_sentinel_when_folder_exists_without_one() {
+    let server = MockServer::start().await;
+    mount_session(&server).await;
+
+    let state = Arc::new(Mutex::new(MockState {
+        mailbox_state: "mb-1".to_string(),
+        email_state: "e-1".to_string(),
+        mailboxes: vec![MockMailbox {
+            id: "MB-INBOX".to_string(),
+            name: "Inbox".to_string(),
+            role: Some("inbox".to_string()),
+        }],
+        ..Default::default()
+    }));
+    mount_jmap(&server, state.clone()).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let conn = fresh_db(&temp);
+    let config = test_config(&server, temp.path(), vec![]);
+
+    // First cycle: lands INBOX maildir + sentinel + mailbox_map
+    // row.
+    SyncEngine::sync(&conn, &config, false)
+        .await
+        .expect("first sync");
+    let sentinel_path = temp.path().join("INBOX").join(".jma.mapping");
+    assert!(sentinel_path.exists(), "first sync writes the sentinel");
+
+    // Simulate the partial-failure case: folder stays, sentinel
+    // is gone.
+    std::fs::remove_file(&sentinel_path).expect("delete sentinel");
+    assert!(!sentinel_path.exists());
+
+    SyncEngine::sync(&conn, &config, false)
+        .await
+        .expect("second sync");
+
+    assert!(
+        sentinel_path.exists(),
+        "second sync must re-detect the missing sentinel and re-stamp it"
+    );
+    let restored = sentinel::read(&temp.path().join("INBOX"))
+        .expect("readable")
+        .expect("present");
+    assert_eq!(restored.jmap_mailbox_id, JmapMailboxId::from("MB-INBOX"));
+    assert_eq!(restored.server_name, "Inbox");
+}
+
+/// `jma push` on a fresh config (no prior sync, no maildirs)
+/// has nothing local to upload -- CreateLocalMailbox is Pull-only,
+/// so the cycle would burn through scan + fetch + reconcile only
+/// to plan zero work. Bail upfront with an actionable error that
+/// points the user at sync/pull, and leave the filesystem
+/// untouched.
+#[tokio::test]
+async fn push_only_errors_on_fresh_config_without_local_maildirs() {
+    let server = MockServer::start().await;
+    mount_session(&server).await;
+
+    let state = Arc::new(Mutex::new(MockState {
+        mailbox_state: "mb-1".to_string(),
+        email_state: "e-1".to_string(),
+        mailboxes: vec![
+            MockMailbox {
+                id: "MB-INBOX".to_string(),
+                name: "Inbox".to_string(),
+                role: Some("inbox".to_string()),
+            },
+            MockMailbox {
+                id: "MB-ARCH".to_string(),
+                name: "Archive".to_string(),
+                role: Some("archive".to_string()),
+            },
+        ],
+        ..Default::default()
+    }));
+    mount_jmap(&server, state.clone()).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let conn = fresh_db(&temp);
+    let config = test_config(&server, temp.path(), vec![]);
+
+    let err = SyncEngine::push_only(&conn, &config, false)
+        .await
+        .expect_err("push-only on fresh config must error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("jma sync") || msg.contains("jma pull"),
+        "error must point at sync/pull as the prerequisite, got: {msg}"
+    );
+
+    assert!(
+        !temp.path().join("INBOX").exists(),
+        "push-only must not create INBOX"
+    );
+    assert!(
+        !temp.path().join("Archive").exists(),
+        "push-only must not create Archive"
+    );
+}
+
+/// Steady-state `jma push` with one new server-side mailbox the
+/// user hasn't pulled yet must NOT error: the user has existing
+/// maildirs with messages to push, and the new remote mailbox is
+/// irrelevant to that work. The CreateLocalMailbox action for
+/// the new folder gets dropped by the direction filter; the rest
+/// of the push proceeds normally.
+///
+/// Asserts the post-conditions (push completes, Projects/ not
+/// provisioned) rather than positively pinning the
+/// emit-then-drop path. Reconcile's unit tests
+/// (`emit_create_local_mailboxes_emits_one_per_new_binding`)
+/// cover the emission side; the assertion here is that the
+/// direction filter does the right thing with whatever reconcile
+/// produces.
+#[tokio::test]
+async fn push_only_succeeds_when_some_local_maildirs_are_provisioned() {
+    let server = MockServer::start().await;
+    mount_session(&server).await;
+
+    let state = Arc::new(Mutex::new(MockState {
+        mailbox_state: "mb-1".to_string(),
+        email_state: "e-1".to_string(),
+        mailboxes: vec![MockMailbox {
+            id: "MB-INBOX".to_string(),
+            name: "Inbox".to_string(),
+            role: Some("inbox".to_string()),
+        }],
+        ..Default::default()
+    }));
+    mount_jmap(&server, state.clone()).await;
+    mount_blob_downloads(&server, state.clone()).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let conn = fresh_db(&temp);
+    let config = test_config(&server, temp.path(), vec![]);
+
+    // Cycle 1: full sync provisions INBOX maildir + sentinel.
+    SyncEngine::sync(&conn, &config, false)
+        .await
+        .expect("first full sync");
+    assert!(temp.path().join("INBOX").join("cur").is_dir());
+
+    // Server grows a new mailbox between cycles -- the user
+    // hasn't pulled it yet, so its maildir doesn't exist locally.
+    {
+        let mut st = state.lock().unwrap();
+        st.mailboxes.push(MockMailbox {
+            id: "MB-NEW".to_string(),
+            name: "Projects".to_string(),
+            role: None,
+        });
+        st.mailbox_state = "mb-2".to_string();
+    }
+
+    // Push-only must not error here: INBOX is provisioned, and
+    // the dropped CreateLocalMailbox for Projects is not the
+    // user's concern in a push cycle.
+    SyncEngine::push_only(&conn, &config, false)
+        .await
+        .expect("push-only with at least one provisioned maildir must succeed");
+
+    assert!(
+        !temp.path().join("Projects").exists(),
+        "push-only must not provision the new server-side mailbox as a side effect"
+    );
+}
+
+/// First-cycle `--dry-run` must not provision maildirs. Before
+/// the `CreateLocalMailbox` extraction, `resolve_mailboxes`
+/// `ensure_maildir`'d every synced mailbox unconditionally,
+/// which left empty `cur/`/`new/`/`tmp/` trees on disk even when
+/// the user asked only for a preview. Now the maildir is created
+/// by an executor phase that dry-run skips, so the preview
+/// leaves the filesystem untouched.
+#[tokio::test]
+async fn sync_dry_run_does_not_create_local_maildir_on_first_cycle() {
+    let server = MockServer::start().await;
+    mount_session(&server).await;
+
+    let state = Arc::new(Mutex::new(MockState {
+        mailbox_state: "mb-1".to_string(),
+        email_state: "e-1".to_string(),
+        mailboxes: vec![
+            MockMailbox {
+                id: "MB-INBOX".to_string(),
+                name: "Inbox".to_string(),
+                role: Some("inbox".to_string()),
+            },
+            MockMailbox {
+                id: "MB-ARCH".to_string(),
+                name: "Archive".to_string(),
+                role: Some("archive".to_string()),
+            },
+        ],
+        ..Default::default()
+    }));
+    mount_jmap(&server, state.clone()).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let conn = fresh_db(&temp);
+    let config = test_config(&server, temp.path(), vec![]);
+
+    SyncEngine::sync(&conn, &config, true)
+        .await
+        .expect("dry-run first sync");
+
+    assert!(
+        !temp.path().join("INBOX").exists(),
+        "INBOX maildir must not be created under --dry-run"
+    );
+    assert!(
+        !temp.path().join("Archive").exists(),
+        "Archive maildir must not be created under --dry-run"
+    );
 }
 
 /// End-to-end initial pull. State DB starts empty so engine routes to
