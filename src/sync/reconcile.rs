@@ -311,7 +311,7 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
     // wire ordering doesn't change semantics -- only the dry-run
     // display order.
     emit_create_local_mailboxes(ctx.mailboxes, &mut plan);
-    emit_rename_local_mailboxes(ctx.mailboxes, &mut plan);
+    emit_rename_mailboxes(ctx.mailboxes, &mut plan);
 
     process_remote_destroys(
         remote_destroyed,
@@ -374,23 +374,60 @@ fn emit_create_local_mailboxes(mailboxes: &MailboxBindings, plan: &mut SyncPlan)
     }
 }
 
-/// Emit one `RenameLocalMailbox` action per binding that
-/// `resolve_mailboxes` flagged with a changed folder name -- the
-/// cached `mailbox_map.maildir_folder` disagreed with the freshly
-/// resolved path. The executor's rename phase walks them in push
-/// order, which `resolve_mailboxes` already sorts shallowest-first
-/// so a parent rename's `fs::rename` of the subtree lets each
-/// descendant's iteration recover via the source-missing/target-
-/// present branch.
+/// Emit one rename action per binding that `resolve_mailboxes`
+/// flagged with a changed folder name, dispatching on the
+/// `RenameDirection` discriminator the record carries:
+/// `Pull` -> `RenameLocalMailbox` (server renamed; bring disk
+/// into agreement); `Push` -> `RenameRemoteMailbox` (user
+/// `mv`-ed locally or a `LocalWins` conflict resolved that way;
+/// push the new name + parent to the server). The executor walks
+/// each direction's phase in push order, which
+/// `resolve_mailboxes` already sorts shallowest-first. The
+/// ordering matters for different reasons on each side:
+///
+/// - Pull: under `LAYOUT=fs` a parent's single `fs::rename`
+///   moves the descendant subtree, and each descendant's own
+///   iteration then runs against the already-moved target via
+///   the executor's source-missing/target-present branch.
+/// - Push: a child's `decompose_disk_path_to_jmap` resolves its
+///   new parent_id by looking the new parent path up in the
+///   pre-cycle `cached_by_folder` snapshot, which is computed
+///   once before the loop and never advanced mid-cycle.
+///   Single-leaf renames (only the child moved on disk; its
+///   parent path is unchanged) converge this cycle: the disk
+///   parent path equals the cached parent path, decompose
+///   hits the snapshot, and shallowest-first ordering ensures
+///   the parent's `RenameRemoteMailbox` lands first under the
+///   executor so the JMAP-level parent_id resolves correctly.
+///   Recursive renames (parent and child both moved on disk
+///   as a unit) take one cycle per level: the child's disk
+///   parent path is the NEW path, absent from the pre-cycle
+///   snapshot, so decompose returns "untracked parent" and the
+///   decision falls to `Unchanged`. The parent's executor-
+///   phase upsert advances `mailbox_map` for the next cycle's
+///   snapshot, and the child decomposes successfully there.
 ///
 /// Empty in steady state.
-fn emit_rename_local_mailboxes(mailboxes: &MailboxBindings, plan: &mut SyncPlan) {
+fn emit_rename_mailboxes(mailboxes: &MailboxBindings, plan: &mut SyncPlan) {
+    use crate::sync::bindings::RenameDirection;
     for renamed in mailboxes.renamed_mailboxes() {
-        plan.actions.push(SyncAction::RenameLocalMailbox {
-            from_folder: renamed.from_folder.clone(),
-            binding: Arc::new(renamed.binding.clone()),
-            parent_jmap_mailbox_id: renamed.parent_jmap_mailbox_id.clone(),
-        });
+        match renamed.direction {
+            RenameDirection::Pull => {
+                plan.actions.push(SyncAction::RenameLocalMailbox {
+                    from_folder: renamed.from_folder.clone(),
+                    from_db_folder: renamed.from_db_folder.clone(),
+                    binding: Arc::new(renamed.binding.clone()),
+                    parent_jmap_mailbox_id: renamed.parent_jmap_mailbox_id.clone(),
+                });
+            }
+            RenameDirection::Push => {
+                plan.actions.push(SyncAction::RenameRemoteMailbox {
+                    from_folder: renamed.from_db_folder.clone(),
+                    binding: Arc::new(renamed.binding.clone()),
+                    parent_jmap_mailbox_id: renamed.parent_jmap_mailbox_id.clone(),
+                });
+            }
+        }
     }
 }
 

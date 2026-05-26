@@ -22,7 +22,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use jma_mail::config::FolderLayout;
-use jma_mail::config::{AccountConfig, Config, ConflictStrategy, StateConfig, SyncConfig};
+use jma_mail::config::{
+    AccountConfig, CompiledRenameRule, Config, ConflictStrategy, StateConfig, SyncConfig,
+};
 use jma_mail::ids::{JmapEmailId, JmapMailboxId};
 use jma_mail::maildir_ops::sentinel;
 use jma_mail::state::{db, queries};
@@ -64,6 +66,17 @@ struct MockState {
     /// `invalidProperties` and is not appended to
     /// `mailbox_set_creates`. Pins the warn-and-continue path.
     mailbox_set_reject_names: Vec<String>,
+    /// Mailbox/set { update } requests recorded in the order
+    /// they arrived. Each entry is the (id, new_name,
+    /// new_parent_id) triple the client sent; the handler
+    /// rewrites the matching `MockMailbox` so a follow-up
+    /// `Mailbox/get` reflects the rename.
+    mailbox_set_updates: Vec<(String, String, Option<String>)>,
+    /// Ids that `Mailbox/set { update }` must reject. Each
+    /// matching update goes into `notUpdated` with
+    /// `invalidProperties` and is not appended to
+    /// `mailbox_set_updates` / does not rewrite the mailbox.
+    mailbox_set_reject_update_ids: Vec<String>,
 }
 
 #[derive(Default, Clone)]
@@ -258,12 +271,12 @@ fn mailbox_get(_args: &Value, call_id: &str, state: &mut MockState) -> Value {
     ])
 }
 
-/// Minimal `Mailbox/set { create }` dispatcher. Records each
-/// create into `state.mailbox_set_creates`, appends a stub
-/// `MockMailbox` so a follow-up `Mailbox/get` sees it, and
-/// returns the server-assigned id back to the caller. `update`
-/// and `destroy` are unimplemented -- tests that need them have
-/// to extend this handler.
+/// Minimal `Mailbox/set { create | update }` dispatcher. Records
+/// each create into `state.mailbox_set_creates` and each update
+/// into `state.mailbox_set_updates`, rewriting / appending the
+/// matching `MockMailbox` so a follow-up `Mailbox/get` reflects
+/// the change. `destroy` is unimplemented -- tests that need it
+/// have to extend this handler.
 fn mailbox_set(args: &Value, call_id: &str, state: &mut MockState) -> Value {
     let mut created_resp = serde_json::Map::new();
     let mut not_created_resp = serde_json::Map::new();
@@ -296,6 +309,32 @@ fn mailbox_set(args: &Value, call_id: &str, state: &mut MockState) -> Value {
             created_resp.insert(creation_id.clone(), json!({ "id": new_id }));
         }
     }
+    let mut updated_resp = serde_json::Map::new();
+    let mut not_updated_resp = serde_json::Map::new();
+    if let Some(updates) = args["update"].as_object() {
+        for (id, props) in updates {
+            if state.mailbox_set_reject_update_ids.iter().any(|x| x == id) {
+                not_updated_resp.insert(
+                    id.clone(),
+                    json!({
+                        "type": "invalidProperties",
+                        "description": format!("rigged rejection for {}", id),
+                    }),
+                );
+                continue;
+            }
+            let new_name = props["name"].as_str().unwrap_or_default().to_string();
+            let new_parent = props["parentId"].as_str().map(|s| s.to_string());
+            if let Some(mb) = state.mailboxes.iter_mut().find(|m| m.id == *id) {
+                mb.name = new_name.clone();
+                mb.parent_id = new_parent.clone();
+            }
+            state
+                .mailbox_set_updates
+                .push((id.clone(), new_name, new_parent));
+            updated_resp.insert(id.clone(), Value::Null);
+        }
+    }
     let old_state = state.mailbox_state.clone();
     state.mailbox_state = format!("{}-set", old_state);
     json!([
@@ -305,10 +344,10 @@ fn mailbox_set(args: &Value, call_id: &str, state: &mut MockState) -> Value {
             "oldState": old_state,
             "newState": state.mailbox_state,
             "created": Value::Object(created_resp),
-            "updated": {},
+            "updated": Value::Object(updated_resp),
             "destroyed": [],
             "notCreated": Value::Object(not_created_resp),
-            "notUpdated": {},
+            "notUpdated": Value::Object(not_updated_resp),
             "notDestroyed": {},
         },
         call_id
@@ -1539,6 +1578,8 @@ async fn sync_falls_back_when_email_changes_cannot_calculate() {
         pending_email_changes: None,
         mailbox_set_creates: Vec::new(),
         mailbox_set_reject_names: Vec::new(),
+        mailbox_set_updates: Vec::new(),
+        mailbox_set_reject_update_ids: Vec::new(),
     }));
     mount_jmap(&server, state.clone()).await;
     mount_blob_downloads(&server, state.clone()).await;
@@ -2007,5 +2048,547 @@ async fn create_remote_mailbox_skips_child_when_parent_reference_unresolved() {
         creates.is_empty(),
         "child must be warn-skipped when parent reference is unresolved, got {:?}",
         creates
+    );
+}
+/// Local-only rename push: the user `mv`-ed the maildir but the
+/// server hasn't changed. The sentinel walk finds the tracked id
+/// at a disk path the cache (and the server) disagree with, and
+/// resolve_mailboxes emits a `RenameRemoteMailbox` that lands a
+/// `Mailbox/set { update }` with the new name. After success the
+/// cache advances so subsequent cycles see all three views in
+/// agreement.
+#[tokio::test]
+async fn sync_pushes_local_rename_to_server() {
+    let server = MockServer::start().await;
+    mount_session(&server).await;
+
+    let state = Arc::new(Mutex::new(MockState {
+        mailbox_state: "mb-1".to_string(),
+        email_state: "e-1".to_string(),
+        mailboxes: vec![
+            MockMailbox {
+                id: "MB-INBOX".to_string(),
+                name: "Inbox".to_string(),
+                role: Some("inbox".to_string()),
+                parent_id: None,
+            },
+            MockMailbox {
+                id: "MB-ARCH".to_string(),
+                name: "Archive".to_string(),
+                role: Some("archive".to_string()),
+                parent_id: None,
+            },
+        ],
+        ..Default::default()
+    }));
+    mount_jmap(&server, state.clone()).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let conn = fresh_db(&temp);
+    let config = test_config(&server, temp.path(), vec![]);
+
+    // First cycle: maildir lands at Archive/ with a sentinel.
+    SyncEngine::sync(&conn, &config, false)
+        .await
+        .expect("first sync");
+    let archive_old = temp.path().join("Archive");
+    assert!(archive_old.join("cur").is_dir());
+
+    // User renames disk Archive/ -> Archives/ (the sentinel
+    // travels with the directory; server still says Archive).
+    let archives_new = temp.path().join("Archives");
+    std::fs::rename(&archive_old, &archives_new).expect("local mv");
+
+    // Second cycle: the sentinel walk finds MB-ARCH at Archives,
+    // server still says Archive, cache still says Archive. Emit
+    // RenameRemoteMailbox; executor pushes Mailbox/set { update }.
+    SyncEngine::sync(&conn, &config, false)
+        .await
+        .expect("second sync");
+
+    let updates = state.lock().unwrap().mailbox_set_updates.clone();
+    assert_eq!(
+        updates,
+        vec![("MB-ARCH".to_string(), "Archives".to_string(), None)],
+        "exactly one Mailbox/set update must land with the new name"
+    );
+    let cached = queries::get_mailbox(&conn, &jma_mail::ids::JmapMailboxId::from("MB-ARCH"))
+        .unwrap()
+        .expect("MB-ARCH row must still exist");
+    assert_eq!(
+        cached.maildir_folder, "Archives",
+        "cache must advance to the disk folder after Mailbox/set succeeds"
+    );
+    assert_eq!(
+        cached.name, "Archives",
+        "cache must record the new server-side name"
+    );
+    // Server-side state now agrees.
+    let server_name = state
+        .lock()
+        .unwrap()
+        .mailboxes
+        .iter()
+        .find(|m| m.id == "MB-ARCH")
+        .unwrap()
+        .name
+        .clone();
+    assert_eq!(server_name, "Archives", "server mailbox must be renamed");
+}
+
+/// `--dry-run` over a local rename emits the
+/// `RenameRemoteMailbox` action but the executor never runs, so
+/// no `Mailbox/set { update }` reaches the server and the cache
+/// stays anchored to the pre-rename folder. Mirrors the existing
+/// dry-run safety guarantee for the server-side rename path.
+#[tokio::test]
+async fn sync_dry_run_does_not_push_local_rename() {
+    let server = MockServer::start().await;
+    mount_session(&server).await;
+
+    let state = Arc::new(Mutex::new(MockState {
+        mailbox_state: "mb-1".to_string(),
+        email_state: "e-1".to_string(),
+        mailboxes: vec![
+            MockMailbox {
+                id: "MB-INBOX".to_string(),
+                name: "Inbox".to_string(),
+                role: Some("inbox".to_string()),
+                parent_id: None,
+            },
+            MockMailbox {
+                id: "MB-ARCH".to_string(),
+                name: "Archive".to_string(),
+                role: Some("archive".to_string()),
+                parent_id: None,
+            },
+        ],
+        ..Default::default()
+    }));
+    mount_jmap(&server, state.clone()).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let conn = fresh_db(&temp);
+    let config = test_config(&server, temp.path(), vec![]);
+
+    SyncEngine::sync(&conn, &config, false)
+        .await
+        .expect("first sync");
+    let archive_old = temp.path().join("Archive");
+    let archives_new = temp.path().join("Archives");
+    std::fs::rename(&archive_old, &archives_new).expect("local mv");
+
+    SyncEngine::sync(&conn, &config, true)
+        .await
+        .expect("dry-run second sync");
+
+    assert!(
+        state.lock().unwrap().mailbox_set_updates.is_empty(),
+        "no Mailbox/set update may land under --dry-run"
+    );
+    let cached = queries::get_mailbox(&conn, &jma_mail::ids::JmapMailboxId::from("MB-ARCH"))
+        .unwrap()
+        .expect("MB-ARCH row must still exist");
+    assert_eq!(
+        cached.maildir_folder, "Archive",
+        "cache must stay anchored to the pre-rename folder under --dry-run"
+    );
+}
+
+/// `apply_unconditional_mailbox_writes` must not fire under
+/// `--dry-run`. Pre-populate `mailbox_map` with a row whose
+/// metadata disagrees with the freshly fetched server view, run
+/// `SyncEngine::sync(.., dry_run = true)`, and assert the row is
+/// unchanged -- the metadata-refresh write the drain would
+/// otherwise apply must stay un-fired. Then run the same sync
+/// with `dry_run = false` as a positive control so a regression
+/// that broke the drain entirely doesn't pass the dry-run assertion
+/// silently.
+///
+/// Regression test for a placement bug: the drain was originally
+/// called immediately after `resolve_mailboxes` returned, which
+/// is BEFORE the dry-run early return in `SyncEngine::run`. The
+/// shell/core split that introduced the drain was supposed to
+/// move the writes past the dry-run check; the placement
+/// inadvertently landed above it instead.
+#[tokio::test]
+async fn dry_run_does_not_drain_apply_unconditional_mailbox_writes() {
+    let server = MockServer::start().await;
+    mount_session(&server).await;
+
+    let state = Arc::new(Mutex::new(MockState {
+        mailbox_state: "mb-1".to_string(),
+        email_state: "e-1".to_string(),
+        mailboxes: vec![MockMailbox {
+            id: "MB-INBOX".to_string(),
+            name: "Inbox".to_string(),
+            role: Some("inbox".to_string()),
+            parent_id: None,
+        }],
+        ..Default::default()
+    }));
+    mount_jmap(&server, state.clone()).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let conn = fresh_db(&temp);
+    let config = test_config(&server, temp.path(), vec![]);
+
+    // Pre-populate mailbox_map with a row whose `name` and
+    // `sort_order` disagree with what the mock server returns.
+    // The metadata-refresh write `apply_unconditional_mailbox_writes`
+    // stages is the only thing in `run()` that would bring the
+    // cache into agreement; if it fires under dry-run, the row
+    // updates.
+    queries::upsert_mailbox(
+        &conn,
+        &queries::MailboxRecord {
+            jmap_mailbox_id: "MB-INBOX".into(),
+            name: "STALE_NAME".to_string(),
+            role: Some("inbox".to_string()),
+            parent_id: None,
+            maildir_folder: "INBOX".to_string(),
+            sort_order: 99,
+            remote_path: Some("INBOX".to_string()),
+        },
+    )
+    .unwrap();
+
+    // Stamp the on-disk side so the `Unchanged` arm doesn't push
+    // a `CreateLocalMailbox` action and we're observing the pure
+    // metadata-refresh path. Sentinel content matches the server
+    // view so the binding is in steady state.
+    let inbox_path = temp.path().join("INBOX");
+    std::fs::create_dir_all(inbox_path.join("cur")).unwrap();
+    std::fs::create_dir_all(inbox_path.join("new")).unwrap();
+    std::fs::create_dir_all(inbox_path.join("tmp")).unwrap();
+    sentinel::write(
+        &inbox_path,
+        &sentinel::MailboxMapping {
+            jmap_mailbox_id: "MB-INBOX".into(),
+            parent_jmap_mailbox_id: None,
+            server_name: "Inbox".to_string(),
+        },
+    )
+    .unwrap();
+
+    SyncEngine::sync(&conn, &config, true)
+        .await
+        .expect("dry-run sync succeeds");
+
+    let rows = queries::get_all_mailboxes(&conn).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].name, "STALE_NAME",
+        "dry-run must not refresh mailbox_map.name"
+    );
+    assert_eq!(
+        rows[0].sort_order, 99,
+        "dry-run must not refresh mailbox_map.sort_order"
+    );
+
+    // Positive control: a non-dry-run sync refreshes the
+    // metadata. Without this, a regression that broke the drain
+    // entirely (or staged the wrong record) would also satisfy
+    // the dry-run assertion.
+    SyncEngine::sync(&conn, &config, false)
+        .await
+        .expect("commit sync succeeds");
+    let rows = queries::get_all_mailboxes(&conn).unwrap();
+    assert_eq!(rows[0].name, "Inbox", "commit sync refreshes name");
+    assert_eq!(rows[0].sort_order, 0, "commit sync refreshes sort_order");
+}
+
+/// 3-way conflict, `conflict_strategy = ServerWins`: the server
+/// renamed and the user also `mv`-ed locally to a third name.
+/// ServerWins picks the server's view, emitting a
+/// `RenameLocalMailbox` from the user's local name back to the
+/// server's name (overwriting the user's intent). No
+/// `Mailbox/set { update }` lands.
+#[tokio::test]
+async fn sync_conflict_rename_serverwins_overwrites_local() {
+    let server = MockServer::start().await;
+    mount_session(&server).await;
+
+    let state = Arc::new(Mutex::new(MockState {
+        mailbox_state: "mb-1".to_string(),
+        email_state: "e-1".to_string(),
+        mailboxes: vec![
+            MockMailbox {
+                id: "MB-INBOX".to_string(),
+                name: "Inbox".to_string(),
+                role: Some("inbox".to_string()),
+                parent_id: None,
+            },
+            MockMailbox {
+                id: "MB-ARCH".to_string(),
+                name: "Archive".to_string(),
+                role: Some("archive".to_string()),
+                parent_id: None,
+            },
+        ],
+        ..Default::default()
+    }));
+    mount_jmap(&server, state.clone()).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let conn = fresh_db(&temp);
+    let mut config = test_config(&server, temp.path(), vec![]);
+    config.sync.conflict_strategy = ConflictStrategy::ServerWins;
+
+    SyncEngine::sync(&conn, &config, false)
+        .await
+        .expect("first sync");
+
+    // Local: Archive -> MyArchive; server: Archive -> Archives.
+    std::fs::rename(temp.path().join("Archive"), temp.path().join("MyArchive")).expect("local mv");
+    {
+        let mut st = state.lock().unwrap();
+        st.mailboxes
+            .iter_mut()
+            .find(|m| m.id == "MB-ARCH")
+            .unwrap()
+            .name = "Archives".to_string();
+        st.mailbox_state = "mb-2".to_string();
+    }
+
+    SyncEngine::sync(&conn, &config, false)
+        .await
+        .expect("second sync");
+
+    assert!(
+        state.lock().unwrap().mailbox_set_updates.is_empty(),
+        "ServerWins must not push the local rename"
+    );
+    assert!(
+        temp.path().join("Archives").join("cur").is_dir(),
+        "disk must end at the server's name under ServerWins"
+    );
+    assert!(
+        !temp.path().join("MyArchive").exists(),
+        "user's local-rename target must be overwritten under ServerWins"
+    );
+    let cached = queries::get_mailbox(&conn, &jma_mail::ids::JmapMailboxId::from("MB-ARCH"))
+        .unwrap()
+        .expect("MB-ARCH row must still exist");
+    assert_eq!(cached.maildir_folder, "Archives");
+}
+
+/// 3-way conflict, `conflict_strategy = LocalWins`: the user's
+/// local rename wins. Emit `RenameRemoteMailbox` pushing the
+/// user's name to the server; no `RenameLocalMailbox`
+/// overwriting disk. After the cycle, server and disk both carry
+/// the user's name and the cache catches up.
+#[tokio::test]
+async fn sync_conflict_rename_localwins_overwrites_server() {
+    let server = MockServer::start().await;
+    mount_session(&server).await;
+
+    let state = Arc::new(Mutex::new(MockState {
+        mailbox_state: "mb-1".to_string(),
+        email_state: "e-1".to_string(),
+        mailboxes: vec![
+            MockMailbox {
+                id: "MB-INBOX".to_string(),
+                name: "Inbox".to_string(),
+                role: Some("inbox".to_string()),
+                parent_id: None,
+            },
+            MockMailbox {
+                id: "MB-ARCH".to_string(),
+                name: "Archive".to_string(),
+                role: Some("archive".to_string()),
+                parent_id: None,
+            },
+        ],
+        ..Default::default()
+    }));
+    mount_jmap(&server, state.clone()).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let conn = fresh_db(&temp);
+    let mut config = test_config(&server, temp.path(), vec![]);
+    config.sync.conflict_strategy = ConflictStrategy::LocalWins;
+
+    SyncEngine::sync(&conn, &config, false)
+        .await
+        .expect("first sync");
+
+    // Local: Archive -> MyArchive; server: Archive -> Archives.
+    std::fs::rename(temp.path().join("Archive"), temp.path().join("MyArchive")).expect("local mv");
+    {
+        let mut st = state.lock().unwrap();
+        st.mailboxes
+            .iter_mut()
+            .find(|m| m.id == "MB-ARCH")
+            .unwrap()
+            .name = "Archives".to_string();
+        st.mailbox_state = "mb-2".to_string();
+    }
+
+    SyncEngine::sync(&conn, &config, false)
+        .await
+        .expect("second sync");
+
+    let updates = state.lock().unwrap().mailbox_set_updates.clone();
+    assert_eq!(
+        updates,
+        vec![("MB-ARCH".to_string(), "MyArchive".to_string(), None)],
+        "LocalWins must push the user's name to the server"
+    );
+    assert!(
+        temp.path().join("MyArchive").join("cur").is_dir(),
+        "disk must remain at the user's name under LocalWins"
+    );
+    let cached = queries::get_mailbox(&conn, &jma_mail::ids::JmapMailboxId::from("MB-ARCH"))
+        .unwrap()
+        .expect("MB-ARCH row must still exist");
+    assert_eq!(
+        cached.maildir_folder, "MyArchive",
+        "cache must advance to the user's name after Mailbox/set succeeds"
+    );
+}
+
+/// A pure local rename whose Mailbox/set rejection (rigged via
+/// the mock's `mailbox_set_reject_update_ids`) must leave the
+/// cache anchored at the pre-rename folder so the next cycle's
+/// sentinel walk re-emits the same action. Pins the warn-and-
+/// continue contract: one server-side rejection doesn't cascade
+/// into a corrupted cache.
+#[tokio::test]
+async fn sync_local_rename_rejection_leaves_cache_for_retry() {
+    let server = MockServer::start().await;
+    mount_session(&server).await;
+
+    let state = Arc::new(Mutex::new(MockState {
+        mailbox_state: "mb-1".to_string(),
+        email_state: "e-1".to_string(),
+        mailboxes: vec![
+            MockMailbox {
+                id: "MB-INBOX".to_string(),
+                name: "Inbox".to_string(),
+                role: Some("inbox".to_string()),
+                parent_id: None,
+            },
+            MockMailbox {
+                id: "MB-ARCH".to_string(),
+                name: "Archive".to_string(),
+                role: Some("archive".to_string()),
+                parent_id: None,
+            },
+        ],
+        mailbox_set_reject_update_ids: vec!["MB-ARCH".to_string()],
+        ..Default::default()
+    }));
+    mount_jmap(&server, state.clone()).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let conn = fresh_db(&temp);
+    let config = test_config(&server, temp.path(), vec![]);
+
+    SyncEngine::sync(&conn, &config, false)
+        .await
+        .expect("first sync");
+    std::fs::rename(temp.path().join("Archive"), temp.path().join("Archives")).expect("local mv");
+
+    SyncEngine::sync(&conn, &config, false)
+        .await
+        .expect("second sync (rejection is warn-and-continue)");
+
+    let cached = queries::get_mailbox(&conn, &jma_mail::ids::JmapMailboxId::from("MB-ARCH"))
+        .unwrap()
+        .expect("MB-ARCH row must still exist");
+    assert_eq!(
+        cached.maildir_folder, "Archive",
+        "cache must stay at the pre-rename folder after Mailbox/set rejection"
+    );
+    let server_name = state
+        .lock()
+        .unwrap()
+        .mailboxes
+        .iter()
+        .find(|m| m.id == "MB-ARCH")
+        .unwrap()
+        .name
+        .clone();
+    assert_eq!(
+        server_name, "Archive",
+        "server must not have applied the update"
+    );
+}
+
+/// A mailbox whose disk path was produced by a configured
+/// `MapDirectly` rename rule (server `Archive` -> on-disk
+/// `MyArchive`) must not produce a `RenameRemoteMailbox` when
+/// the user re-renames the disk folder again. The rule's
+/// inverse is not generally computable, so pushing a naive
+/// decomposition would silently overwrite the server name with
+/// whatever the user typed in place of the rule's output. The
+/// guard logs a warn and leaves the cache alone so the next
+/// cycle re-applies the rule and surfaces the drift instead of
+/// fighting it.
+#[tokio::test]
+async fn sync_skips_local_rename_when_path_was_resolved_by_rule() {
+    let server = MockServer::start().await;
+    mount_session(&server).await;
+
+    let state = Arc::new(Mutex::new(MockState {
+        mailbox_state: "mb-1".to_string(),
+        email_state: "e-1".to_string(),
+        mailboxes: vec![
+            MockMailbox {
+                id: "MB-INBOX".to_string(),
+                name: "Inbox".to_string(),
+                role: Some("inbox".to_string()),
+                parent_id: None,
+            },
+            MockMailbox {
+                id: "MB-ARCH".to_string(),
+                name: "Archive".to_string(),
+                role: Some("archive".to_string()),
+                parent_id: None,
+            },
+        ],
+        ..Default::default()
+    }));
+    mount_jmap(&server, state.clone()).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let conn = fresh_db(&temp);
+    let mut config = test_config(&server, temp.path(), vec![]);
+    config.compiled_rename_rules = vec![CompiledRenameRule::MapDirectly {
+        source_folder_path: "Archive".to_string(),
+        renamed_name: "MyArchive".to_string(),
+    }];
+
+    // First cycle: server's Archive maps onto on-disk MyArchive
+    // via the rule.
+    SyncEngine::sync(&conn, &config, false)
+        .await
+        .expect("first sync");
+    assert!(
+        temp.path().join("MyArchive").join("cur").is_dir(),
+        "rule-mapped folder must land at MyArchive"
+    );
+
+    // User renames the rule-output folder.
+    std::fs::rename(temp.path().join("MyArchive"), temp.path().join("StillMine"))
+        .expect("local mv");
+
+    // Second cycle: the guard must refuse the local-rename
+    // push and leave the cache alone.
+    SyncEngine::sync(&conn, &config, false)
+        .await
+        .expect("second sync");
+
+    assert!(
+        state.lock().unwrap().mailbox_set_updates.is_empty(),
+        "rule-mapped mailbox must not produce a Mailbox/set update"
+    );
+    let cached = queries::get_mailbox(&conn, &jma_mail::ids::JmapMailboxId::from("MB-ARCH"))
+        .unwrap()
+        .expect("MB-ARCH row must still exist");
+    assert_eq!(
+        cached.maildir_folder, "MyArchive",
+        "cache must stay at the rule's output, ignoring the user's local rename"
     );
 }

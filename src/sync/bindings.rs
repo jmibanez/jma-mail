@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use crate::ids::JmapMailboxId;
 use crate::jmap::types::MailboxFolderBinding;
+use crate::state::queries::MailboxRecord;
 
 /// `by_id` is the authoritative store; `by_folder` is a secondary
 /// index that `MailboxBindingsBuilder::insert` maintains alongside
@@ -59,6 +60,7 @@ pub struct MailboxBindings {
     by_folder: HashMap<String, JmapMailboxId>,
     new_mailboxes: Vec<NewMailboxRecord>,
     renamed_mailboxes: Vec<RenamedMailboxRecord>,
+    mailbox_metadata_writes: Vec<MailboxRecord>,
 }
 
 /// A mailbox whose on-disk state `resolve_mailboxes` found
@@ -83,18 +85,49 @@ pub struct NewMailboxRecord {
     pub replaces_orphan_id: Option<JmapMailboxId>,
 }
 
-/// A mailbox whose cached `mailbox_map.maildir_folder`
-/// disagrees with the freshly resolved folder name -- the
-/// server renamed it, or moved it under a new parent that
-/// resolves to a different path. Reconcile emits a
-/// `SyncAction::RenameLocalMailbox` for each; the executor's
-/// rename phase moves the maildir, rewrites `local_state` rows,
-/// and refreshes the sentinel at the new path. `from_folder` is
-/// the pre-rename path that the rename moves from;
-/// `binding.maildir_folder` is the post-rename target.
+/// Which side initiated the rename, and therefore which action
+/// variant reconcile emits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenameDirection {
+    /// Server renamed; emit `RenameLocalMailbox` to bring disk
+    /// into agreement.
+    Pull,
+    /// User `mv`-ed the maildir locally (or a `LocalWins`
+    /// conflict resolved that way); emit `RenameRemoteMailbox`
+    /// to push the new name and parent to the server.
+    Push,
+}
+
+/// A mailbox whose folder name changed since the cache was last
+/// updated. `direction` distinguishes the two cases: `Pull` for
+/// server renames (cache disagrees with the freshly resolved
+/// server path), `Push` for local renames (sentinel found at a
+/// disk path the cache and server both disagree with).
+/// `binding.maildir_folder` is the post-rename target either way.
+///
+/// `from_folder` and `from_db_folder` model the asymmetric
+/// source paths the executor needs:
+/// - `from_folder` is the filesystem source (where `fs::rename`
+///   reads from). For `Pull/ServerRename` and `Pull/CacheStale`
+///   it equals the cached folder. For `Pull/ConflictServerWins`
+///   it's the disk path the user `mv`-ed to (which the executor
+///   must `fs::rename` back to the server's resolved path).
+///   Unused on `Push` (the user's `mv` already moved the
+///   maildir; the executor doesn't `fs::rename` for a push).
+/// - `from_db_folder` is the DB-rewrite source (where
+///   `local_state.maildir_folder` matches the rows that need
+///   their column rewritten). Equal to the cached folder in
+///   every case -- jma never updated `local_state` between the
+///   user's local `mv` and this cycle.
+///
+/// The two are equal in the common server-rename case; they
+/// diverge in `ConflictServerWins` and for `Push` (where
+/// `from_folder` is moot).
 #[derive(Debug, Clone)]
 pub struct RenamedMailboxRecord {
+    pub direction: RenameDirection,
     pub from_folder: String,
+    pub from_db_folder: String,
     pub binding: MailboxFolderBinding,
     pub parent_jmap_mailbox_id: Option<JmapMailboxId>,
 }
@@ -142,6 +175,18 @@ impl MailboxBindings {
         &self.renamed_mailboxes
     }
 
+    /// `mailbox_map` rows the engine should upsert without
+    /// re-checking disk state -- the `Unchanged`/`CacheStale`
+    /// bucket. Applied by `apply_unconditional_mailbox_writes`
+    /// before the executor runs, so the executor's
+    /// `destroy_remote_mailboxes` phase (which itself calls
+    /// `delete_mailbox` after a successful server destroy) has
+    /// the last write on any shared id. Gated by the same
+    /// dry-run short-circuit as `pending_mailbox_writes`.
+    pub fn mailbox_metadata_writes(&self) -> &[MailboxRecord] {
+        &self.mailbox_metadata_writes
+    }
+
     pub fn len(&self) -> usize {
         self.by_id.len()
     }
@@ -181,7 +226,7 @@ impl MailboxBindingsBuilder {
     pub(crate) fn insert(&mut self, binding: MailboxFolderBinding) {
         let id = binding
             .jmap_mailbox_id
-            .expect_resolved("MailboxBindings::insert -- live set holds only resolved ids")
+            .expect_resolved("MailboxBindingsBuilder::insert -- live set holds only resolved ids")
             .clone();
         self.0
             .by_folder
@@ -195,7 +240,7 @@ impl MailboxBindingsBuilder {
     /// action; the executor then creates the on-disk maildir and
     /// stamps the sentinel before any downstream phase that needs
     /// to write into the folder.
-    pub fn push_new_mailbox(
+    pub(crate) fn push_new_mailbox(
         &mut self,
         binding: MailboxFolderBinding,
         parent_jmap_mailbox_id: Option<JmapMailboxId>,
@@ -208,26 +253,49 @@ impl MailboxBindingsBuilder {
         });
     }
 
-    /// Record a server-side rename: the cached `mailbox_map` row
-    /// for this id points at `from_folder`, but the freshly
-    /// resolved path lives at `binding.maildir_folder`. Reconcile
-    /// emits a `RenameLocalMailbox` action; the executor moves
-    /// the maildir, rewrites `local_state` rows, and refreshes
-    /// the sentinel. Push order is significant: under `LAYOUT=fs`
-    /// a parent rename moves the descendant subtree in one
-    /// `fs::rename` call, and each descendant's own iteration
-    /// recovers via the source-missing/target-present idempotent
-    /// branch -- so the caller must enqueue shallowest-first.
-    pub fn push_renamed_mailbox(
+    /// Record a rename. `direction = Pull` for server-renamed
+    /// (cache disagrees with the freshly resolved path), `Push`
+    /// for locally-renamed (sentinel disagrees with cache).
+    /// `from_folder` is the fs source (where `fs::rename` reads
+    /// from); `from_db_folder` is the DB-rewrite source (where
+    /// `local_state.maildir_folder` matches). The two are equal
+    /// in the common case and diverge only in
+    /// `ConflictServerWins` (user `mv`-ed to a third name).
+    /// `binding.maildir_folder` is the post-rename target.
+    /// Reconcile dispatches on direction to emit the matching
+    /// action variant. Push order is significant: under
+    /// `LAYOUT=fs` a parent rename moves the descendant subtree
+    /// in one `fs::rename` call (for the Pull side) or shifts
+    /// the cached subtree paths (for the Push side; descendants
+    /// re-resolve via their parent's `mailbox_map` upsert next
+    /// cycle), and each descendant's own action recovers via
+    /// the source-missing/target-present idempotent branch --
+    /// so the caller must enqueue shallowest-first.
+    pub(crate) fn push_renamed_mailbox(
         &mut self,
+        direction: RenameDirection,
         from_folder: String,
+        from_db_folder: String,
         binding: MailboxFolderBinding,
         parent_jmap_mailbox_id: Option<JmapMailboxId>,
     ) {
         self.0.renamed_mailboxes.push(RenamedMailboxRecord {
+            direction,
             from_folder,
+            from_db_folder,
             binding,
             parent_jmap_mailbox_id,
         });
+    }
+
+    /// Stage a `mailbox_map` row to be upserted without
+    /// re-checking disk state. Pushed for `Unchanged`/`CacheStale`
+    /// decisions where the cache row already names the correct
+    /// `maildir_folder` and only the metadata (role, sort_order,
+    /// parent_id, remote_path) may have drifted; the finalization
+    /// pass applies these alongside `pending_mailbox_writes` but
+    /// without the disk-state recheck.
+    pub(crate) fn push_mailbox_metadata_write(&mut self, record: MailboxRecord) {
+        self.0.mailbox_metadata_writes.push(record);
     }
 }

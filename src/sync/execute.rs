@@ -114,6 +114,7 @@ impl<'a> Executor<'a> {
         let mut local_moves = Vec::new();
         let mut local_deletes = Vec::new();
         let mut remote_creates = Vec::new();
+        let mut remote_renames = Vec::new();
         let mut uploads = Vec::new();
         let mut remote_keywords = Vec::new();
         let mut remote_moves = Vec::new();
@@ -140,6 +141,7 @@ impl<'a> Executor<'a> {
                 SyncAction::MoveLocal { .. } => local_moves.push(action),
                 SyncAction::DeleteLocal { .. } => local_deletes.push(action),
                 SyncAction::CreateRemoteMailbox { .. } => remote_creates.push(action),
+                SyncAction::RenameRemoteMailbox { .. } => remote_renames.push(action),
                 SyncAction::UploadMessage { .. } => uploads.push(action),
                 SyncAction::UpdateRemoteKeywords { .. } => remote_keywords.push(action),
                 SyncAction::MoveRemote { .. } => remote_moves.push(action),
@@ -173,6 +175,18 @@ impl<'a> Executor<'a> {
         // CreateRemoteMailbox + UploadMessage into the new mailbox in the
         // same cycle finds the destination already provisioned.
         self.create_remote_mailboxes(remote_creates).await?;
+        // Shape-before-content: settle the server-side mailbox
+        // tree (creates, then renames) before any phase that
+        // addresses a mailbox by id and would care about its
+        // current name. Mailbox/set { update } resolves
+        // parent_id against the server's already-assigned ids
+        // (not against any creation_id back-reference issued
+        // earlier this batch), so the executor could in
+        // principle run uploads and the rename in either order;
+        // keeping renames first matches the local-side phase
+        // order (create_local -> rename_local -> downloads) and
+        // makes the per-cycle JMAP trace easier to read.
+        self.rename_remote_mailboxes(remote_renames).await?;
         let upload_results = self.upload_messages(uploads).await?;
         let uploaded = upload_results.uploaded;
         let (outcome, remote_counts) = self
@@ -457,6 +471,7 @@ impl<'a> Executor<'a> {
         for action in actions {
             let SyncAction::RenameLocalMailbox {
                 from_folder,
+                from_db_folder,
                 binding,
                 parent_jmap_mailbox_id,
             } = action
@@ -508,12 +523,12 @@ impl<'a> Executor<'a> {
 
             match queries::rename_local_state_folder(
                 self.conn,
-                &from_folder,
+                &from_db_folder,
                 &binding.maildir_folder,
             ) {
                 Ok(rows) if rows > 0 => debug!(
                     "Rewrote {} local_state rows from {} to {}",
-                    rows, from_folder, binding.maildir_folder
+                    rows, from_db_folder, binding.maildir_folder
                 ),
                 Ok(_) => {}
                 Err(e) => {
@@ -669,6 +684,145 @@ impl<'a> Executor<'a> {
                 Err(e) => {
                     warn!("Failed to create remote mailbox {:?}: {}", name, e);
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Execute `RenameRemoteMailbox` actions by issuing one
+    /// `Mailbox/set { update }` per action (name + parentId
+    /// rewritten atomically) via `jmap::mailbox::update_name_
+    /// and_parent`. On success, upsert `mailbox_map` with the
+    /// new name, parent, and disk folder so the cache advances
+    /// only once the server agrees with the local view --
+    /// preserving the "cache reflects what is on disk and
+    /// accepted by the server" invariant under both `--dry-run`
+    /// (which skips the action) and per-action failure (which
+    /// leaves the cache pointing at the pre-rename folder so
+    /// the next cycle's sentinel walk re-emits the action).
+    ///
+    /// Per-action failures are logged at warn and skipped so
+    /// one server-side rejection (`alreadyExists` from a name
+    /// collision, `invalidProperties` from an over-long name,
+    /// ...) doesn't cascade into the rest of the cycle.
+    async fn rename_remote_mailboxes(&self, actions: Vec<SyncAction>) -> Result<()> {
+        let maildir_root = self.config.maildir_path();
+        for action in actions {
+            let SyncAction::RenameRemoteMailbox {
+                from_folder,
+                binding,
+                parent_jmap_mailbox_id,
+            } = action
+            else {
+                continue;
+            };
+            let mailbox_id = binding
+                .jmap_mailbox_id
+                .expect_resolved("rename_remote_mailboxes -- binding must be resolved");
+            if let Err(e) = crate::jmap::mailbox::update_name_and_parent(
+                &self.client,
+                mailbox_id,
+                &binding.server_name,
+                parent_jmap_mailbox_id.as_ref(),
+            )
+            .await
+            {
+                warn!(
+                    "Failed to rename remote mailbox {} -> {:?}: {}",
+                    mailbox_id, binding.server_name, e
+                );
+                continue;
+            }
+            // Server accepted the rename; advance the cache to
+            // match. Read the existing row only for role and
+            // sort_order (the action carries the post-rename
+            // binding + parent id + pre-rename folder); preserve
+            // those fields across the upsert so a transient
+            // server-side change to them this cycle doesn't get
+            // clobbered.
+            let existing = match queries::get_mailbox(self.conn, mailbox_id) {
+                Ok(Some(row)) => row,
+                Ok(None) => {
+                    warn!(
+                        "Renamed remote mailbox {} succeeded but mailbox_map row vanished; \
+                         next sync cycle's Mailbox/get will rebuild it",
+                        mailbox_id
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    warn!(
+                        "Renamed remote mailbox {} succeeded but mailbox_map read failed: {}",
+                        mailbox_id, e
+                    );
+                    continue;
+                }
+            };
+            if let Err(e) = queries::upsert_mailbox(
+                self.conn,
+                &queries::MailboxRecord {
+                    jmap_mailbox_id: mailbox_id.clone(),
+                    name: binding.server_name.clone(),
+                    role: existing.role,
+                    parent_id: parent_jmap_mailbox_id.clone(),
+                    maildir_folder: binding.maildir_folder.clone(),
+                    sort_order: existing.sort_order,
+                    remote_path: Some(binding.remote_path.clone()),
+                },
+            ) {
+                warn!(
+                    "Renamed remote mailbox {} -> {:?} but mailbox_map upsert failed: {}; \
+                     next sync cycle's Mailbox/get will catch up",
+                    mailbox_id, binding.server_name, e
+                );
+                continue;
+            }
+
+            // local_state rows are keyed by `maildir_folder` --
+            // rewrite them at the new path so the next cycle's
+            // scan + hydrate path finds its rows where the
+            // messages actually live, skipping the one-cycle
+            // "new file with no DB row" / adopt churn the
+            // unchanged-key path would otherwise produce.
+            if from_folder != binding.maildir_folder {
+                match queries::rename_local_state_folder(
+                    self.conn,
+                    &from_folder,
+                    &binding.maildir_folder,
+                ) {
+                    Ok(rows) if rows > 0 => debug!(
+                        "Rewrote {} local_state rows from {} to {}",
+                        rows, from_folder, binding.maildir_folder
+                    ),
+                    Ok(_) => {}
+                    Err(e) => warn!(
+                        "Renamed remote mailbox {} -> {:?} but local_state catch-up \
+                         failed: {}; next cycle's adopt path will rebind from \
+                         Message-ID",
+                        mailbox_id, binding.server_name, e
+                    ),
+                }
+            }
+
+            // Refresh the sentinel at the disk path so its
+            // `server_name` reflects the just-pushed JMAP name
+            // (the rename moved the directory, the sentinel
+            // travels with it, but its name field was the old
+            // server_name until this write).
+            let disk_path = maildir_root.join(&binding.maildir_folder);
+            if let Err(e) = crate::maildir_ops::sentinel::write(
+                &disk_path,
+                &crate::maildir_ops::sentinel::MailboxMapping {
+                    jmap_mailbox_id: mailbox_id.clone(),
+                    parent_jmap_mailbox_id,
+                    server_name: binding.server_name.clone(),
+                },
+            ) {
+                warn!(
+                    "Renamed remote mailbox {} -> {:?} but sentinel refresh failed: {}; \
+                     `janitor rebindfolders` will rebind it after the next sync",
+                    mailbox_id, binding.server_name, e
+                );
             }
         }
         Ok(())
