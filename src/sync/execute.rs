@@ -12,11 +12,11 @@ use tokio::sync::mpsc;
 use tracing::{Instrument, debug, info, warn};
 
 use crate::config::Config;
-use crate::ids::{JmapAccountId, JmapEmailId};
+use crate::ids::{JmapAccountId, JmapEmailId, JmapMailboxId};
 use crate::jmap::email::{self as jmap_email, EmailSetOp};
 use crate::jmap::limits;
 use crate::jmap::retry::is_transient_error;
-use crate::jmap::types::MailboxFolderBinding;
+use crate::jmap::types::{MailboxFolderBinding, MaybeReference};
 use crate::maildir_ops::{flags::keywords_to_flags, store};
 use crate::state::queries::{self, MessageRecord};
 use crate::sync::engine::SyncOutcome;
@@ -112,6 +112,7 @@ impl<'a> Executor<'a> {
         let mut local_flags = Vec::new();
         let mut local_moves = Vec::new();
         let mut local_deletes = Vec::new();
+        let mut remote_creates = Vec::new();
         let mut uploads = Vec::new();
         let mut remote_keywords = Vec::new();
         let mut remote_moves = Vec::new();
@@ -136,6 +137,7 @@ impl<'a> Executor<'a> {
                 SyncAction::UpdateLocalFlags { .. } => local_flags.push(action),
                 SyncAction::MoveLocal { .. } => local_moves.push(action),
                 SyncAction::DeleteLocal { .. } => local_deletes.push(action),
+                SyncAction::CreateRemoteMailbox { .. } => remote_creates.push(action),
                 SyncAction::UploadMessage { .. } => uploads.push(action),
                 SyncAction::UpdateRemoteKeywords { .. } => remote_keywords.push(action),
                 SyncAction::MoveRemote { .. } => remote_moves.push(action),
@@ -154,6 +156,10 @@ impl<'a> Executor<'a> {
         let local_flag_updates = self.update_local_flags(local_flags)?;
         let local_moves_count = self.move_local_messages(local_moves)?;
         let local_deletes_count = self.delete_local_messages(local_deletes)?;
+        // Remote mailbox creates land before uploads so a plan that emits
+        // CreateRemoteMailbox + UploadMessage into the new mailbox in the
+        // same cycle finds the destination already provisioned.
+        self.create_remote_mailboxes(remote_creates).await?;
         let upload_results = self.upload_messages(uploads).await?;
         let uploaded = upload_results.uploaded;
         let (outcome, remote_counts) = self
@@ -402,6 +408,127 @@ impl<'a> Executor<'a> {
                 "Created local maildir for new mailbox: {}",
                 binding.maildir_folder
             );
+        }
+        Ok(())
+    }
+
+    /// Execute `CreateRemoteMailbox` actions by issuing one
+    /// `Mailbox/set { create }` per action via
+    /// `jmap::mailbox::create`. Per-action failures are logged
+    /// at warn and skipped so a single rejected create doesn't
+    /// cascade into the rest of the cycle; the next reconcile
+    /// re-emits the action from the still-untracked local
+    /// folder.
+    ///
+    /// Sequential to honour the parent-before-child invariant the
+    /// emitter establishes: chained creates carry
+    /// `MaybeReference::Reference(parent_folder)` for the parent
+    /// id, and the per-cycle `creation_refs` table records each
+    /// successful create's `(folder, returned_id)` so the next
+    /// action's `Reference` resolves. A child whose `Reference`
+    /// doesn't resolve (the parent's create was rejected or its
+    /// emission was skipped) is warn-skipped; the next cycle's
+    /// emit pass re-runs the chain.
+    ///
+    /// On a successful create, write the local sentinel + ensure
+    /// the maildir tree in the same cycle, mirroring
+    /// `create_local_mailboxes`. Without this the local folder
+    /// would carry no `.jma.mapping` until the next cycle's
+    /// `resolve_mailboxes` saw the freshly-created server mailbox
+    /// and emitted its own `CreateLocalMailbox`; a state-DB nuke
+    /// between cycles would leave the binding recoverable only by
+    /// `janitor::rebindfolders`'s Message-ID probing, which is
+    /// slow and may not even disambiguate. Failures here are
+    /// warn-and-continue: the maildir/sentinel are recoverable
+    /// from the server-side mailbox the next cycle's resolve
+    /// detects.
+    async fn create_remote_mailboxes(&self, actions: Vec<SyncAction>) -> Result<()> {
+        let mut creation_refs: HashMap<String, JmapMailboxId> = HashMap::new();
+        let maildir_root = self.config.maildir_path();
+        for action in actions {
+            let SyncAction::CreateRemoteMailbox {
+                name,
+                parent_jmap_mailbox_id,
+                role,
+                folder,
+            } = action
+            else {
+                continue;
+            };
+            let resolved_parent: Option<JmapMailboxId> = match &parent_jmap_mailbox_id {
+                None => None,
+                Some(MaybeReference::Value(id)) => Some(id.clone()),
+                Some(MaybeReference::Reference(parent_folder)) => {
+                    match creation_refs.get(parent_folder) {
+                        Some(id) => Some(id.clone()),
+                        None => {
+                            warn!(
+                                "Skipping CreateRemoteMailbox {:?}: parent reference {:?} \
+                                 unresolved (parent create missing or rejected this cycle); \
+                                 next cycle will re-emit",
+                                folder, parent_folder
+                            );
+                            continue;
+                        }
+                    }
+                }
+            };
+            match crate::jmap::mailbox::create(
+                &self.client,
+                &name,
+                resolved_parent.as_ref(),
+                role.as_deref(),
+            )
+            .await
+            {
+                Ok(new_id) => {
+                    let folder_path = maildir_root.join(&folder);
+                    // Gate the sentinel write on a successful
+                    // `ensure_maildir`: attempting to write a
+                    // sentinel inside a nonexistent directory
+                    // produces a second, misleading warn line
+                    // downstream of the real cause. The
+                    // `creation_refs` insert still runs either way
+                    // -- the server-side mailbox exists, so a
+                    // child's Reference must still resolve regardless
+                    // of the local-side outcome.
+                    match store::ensure_maildir(&folder_path) {
+                        Ok(_) => {
+                            if let Err(e) = crate::maildir_ops::sentinel::write(
+                                &folder_path,
+                                &crate::maildir_ops::sentinel::MailboxMapping {
+                                    jmap_mailbox_id: new_id.clone(),
+                                    parent_jmap_mailbox_id: resolved_parent.clone(),
+                                    server_name: name.clone(),
+                                },
+                            ) {
+                                warn!(
+                                    "Created remote mailbox {} but sentinel write failed \
+                                     at {}: {}; the next sync will detect the missing \
+                                     sentinel and retry the write",
+                                    new_id,
+                                    folder_path.display(),
+                                    e
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Created remote mailbox {} but local ensure_maildir failed \
+                                 at {}: {}; next sync's resolve_mailboxes will detect the \
+                                 missing folder and retry both the maildir and sentinel",
+                                new_id,
+                                folder_path.display(),
+                                e
+                            );
+                        }
+                    }
+                    creation_refs.insert(folder, new_id);
+                }
+                Err(e) => {
+                    warn!("Failed to create remote mailbox {:?}: {}", name, e);
+                }
+            }
         }
         Ok(())
     }

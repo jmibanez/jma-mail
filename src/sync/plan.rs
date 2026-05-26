@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::ids::{JmapBlobId, JmapEmailId, JmapMailboxId, JmapThreadId, MaildirId, MessageId};
-use crate::jmap::types::MailboxFolderBinding;
+use crate::jmap::types::{MailboxFolderBinding, MaybeReference};
 
 /// A message known by its local maildir handle. The Message-ID rides
 /// along so logs can name the message in human-readable form, and so
@@ -251,6 +251,46 @@ pub enum SyncAction {
         /// first-cycle creates (no cached rows exist for the id).
         replaces_orphan_id: Option<JmapMailboxId>,
     },
+
+    /// Folder-level push-side primitive: `Mailbox/set { create }`
+    /// with the given `name`, optional `parent_jmap_mailbox_id`,
+    /// and optional `role`. Symmetric with `CreateLocalMailbox`.
+    /// The executor issues the JMAP call; the next sync cycle's
+    /// `Mailbox/get` picks up the server-assigned id, which
+    /// `resolve_mailboxes` then upserts into `mailbox_map`.
+    ///
+    /// `parent_jmap_mailbox_id` is `None` for top-level
+    /// mailboxes. For a nested create whose parent already
+    /// exists server-side, the field carries
+    /// `Some(MaybeReference::Value(parent_id))`. For the chained-
+    /// create case (a Flat folder `Foo.Bar.Baz` where neither
+    /// `Foo` nor `Foo.Bar` exist server-side yet, so both parents
+    /// land via earlier `CreateRemoteMailbox` actions in the same
+    /// plan), the field carries `Some(MaybeReference::Reference(
+    /// parent_folder))` and the executor's `creation_refs` table
+    /// resolves it once the parent's own create returns. Top-down
+    /// emission order in the plan guarantees the parent has run
+    /// before the child fires.
+    ///
+    /// `folder` is the on-disk folder string this create
+    /// corresponds to (the same shape as
+    /// `mailbox_map.maildir_folder`). The executor uses it as
+    /// the `creation_refs` key so a child's
+    /// `MaybeReference::Reference(folder)` resolves to the
+    /// server-assigned id once the parent's create returns.
+    ///
+    /// `role` is the JMAP `role` property (`"inbox"`,
+    /// `"archive"`, ...) when the local creation maps to a
+    /// well-known mailbox role, or `None` for a plain folder.
+    /// Per RFC 8621 the server may reject or silently coerce
+    /// role assignment, so callers should not depend on it
+    /// landing on the server side.
+    CreateRemoteMailbox {
+        name: String,
+        parent_jmap_mailbox_id: Option<MaybeReference<JmapMailboxId>>,
+        role: Option<String>,
+        folder: String,
+    },
 }
 
 impl SyncAction {
@@ -265,7 +305,8 @@ impl SyncAction {
             SyncAction::UploadMessage { .. }
             | SyncAction::UpdateRemoteKeywords { .. }
             | SyncAction::DestroyRemote { .. }
-            | SyncAction::MoveRemote { .. } => ActionDirection::Push,
+            | SyncAction::MoveRemote { .. }
+            | SyncAction::CreateRemoteMailbox { .. } => ActionDirection::Push,
             SyncAction::AdoptLocalMessage { .. } => ActionDirection::Both,
         }
     }
@@ -348,6 +389,15 @@ impl SyncPlan {
             .count()
     }
 
+    /// Server-side mailbox creations queued in the plan.
+    /// Symmetric with `folder_create_count` on the push side.
+    pub fn remote_folder_create_count(&self) -> usize {
+        self.actions
+            .iter()
+            .filter(|a| matches!(a, SyncAction::CreateRemoteMailbox { .. }))
+            .count()
+    }
+
     pub fn adopt_count(&self) -> usize {
         self.actions
             .iter()
@@ -399,12 +449,17 @@ impl fmt::Display for SyncPlan {
             return writeln!(f, "Nothing to do.");
         }
         writeln!(f, "Sync plan:")?;
-        writeln!(f, "  Downloads:      {}", self.download_count())?;
-        writeln!(f, "  Uploads:        {}", self.upload_count())?;
-        writeln!(f, "  Adoptions:      {}", self.adopt_count())?;
-        writeln!(f, "  Flag updates:   {}", self.flag_update_count())?;
-        writeln!(f, "  Deletes:        {}", self.delete_count())?;
-        writeln!(f, "  Folder creates: {}", self.folder_create_count())?;
+        writeln!(f, "  Downloads:             {}", self.download_count())?;
+        writeln!(f, "  Uploads:               {}", self.upload_count())?;
+        writeln!(f, "  Adoptions:             {}", self.adopt_count())?;
+        writeln!(f, "  Flag updates:          {}", self.flag_update_count())?;
+        writeln!(f, "  Deletes:               {}", self.delete_count())?;
+        writeln!(f, "  Local folder creates:  {}", self.folder_create_count())?;
+        writeln!(
+            f,
+            "  Remote folder creates: {}",
+            self.remote_folder_create_count()
+        )?;
         writeln!(f)?;
 
         for action in &self.actions {
@@ -456,6 +511,18 @@ impl fmt::Display for SyncPlan {
                     "  [PULL] Create local mailbox {}/ (server mailbox {})",
                     binding.maildir_folder, binding.jmap_mailbox_id
                 )?,
+                SyncAction::CreateRemoteMailbox {
+                    name,
+                    parent_jmap_mailbox_id,
+                    ..
+                } => match parent_jmap_mailbox_id {
+                    Some(parent) => writeln!(
+                        f,
+                        "  [PUSH] Create remote mailbox {:?} under parent {}",
+                        name, parent
+                    )?,
+                    None => writeln!(f, "  [PUSH] Create remote mailbox {:?} (top-level)", name)?,
+                },
             }
         }
         Ok(())

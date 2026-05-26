@@ -53,6 +53,17 @@ struct MockState {
     /// If set, Email/changes returns these created/updated/destroyed
     /// id lists. None means "no changes since last cursor".
     pending_email_changes: Option<EmailChangesResp>,
+    /// Mailbox/set { create } requests recorded in the order they
+    /// arrived. Each entry is the (name, parent_id, role) triple
+    /// the client sent; the handler appends the corresponding
+    /// server-assigned id into `mailboxes` so a follow-up
+    /// `Mailbox/get` would see it.
+    mailbox_set_creates: Vec<(String, Option<String>, Option<String>)>,
+    /// Names that `Mailbox/set { create }` must reject. Each
+    /// matching create goes into `notCreated` with
+    /// `invalidProperties` and is not appended to
+    /// `mailbox_set_creates`. Pins the warn-and-continue path.
+    mailbox_set_reject_names: Vec<String>,
 }
 
 #[derive(Default, Clone)]
@@ -157,7 +168,7 @@ async fn mount_jmap(server: &MockServer, state: Arc<Mutex<MockState>>) {
                     &method_name,
                     &args,
                     &call_id,
-                    &state_for_closure.lock().unwrap(),
+                    &mut state_for_closure.lock().unwrap(),
                 );
                 responses.push(resp);
             }
@@ -194,9 +205,10 @@ async fn mount_blob_downloads(server: &MockServer, state: Arc<Mutex<MockState>>)
         .await;
 }
 
-fn handle_method(name: &str, args: &Value, call_id: &str, state: &MockState) -> Value {
+fn handle_method(name: &str, args: &Value, call_id: &str, state: &mut MockState) -> Value {
     match name {
         "Mailbox/get" => mailbox_get(args, call_id, state),
+        "Mailbox/set" => mailbox_set(args, call_id, state),
         "Email/query" => email_query(args, call_id, state),
         "Email/get" => email_get(args, call_id, state),
         "Email/changes" => email_changes(args, call_id, state),
@@ -208,7 +220,7 @@ fn handle_method(name: &str, args: &Value, call_id: &str, state: &MockState) -> 
     }
 }
 
-fn mailbox_get(_args: &Value, call_id: &str, state: &MockState) -> Value {
+fn mailbox_get(_args: &Value, call_id: &str, state: &mut MockState) -> Value {
     let list: Vec<Value> = state
         .mailboxes
         .iter()
@@ -245,7 +257,63 @@ fn mailbox_get(_args: &Value, call_id: &str, state: &MockState) -> Value {
     ])
 }
 
-fn email_query(args: &Value, call_id: &str, state: &MockState) -> Value {
+/// Minimal `Mailbox/set { create }` dispatcher. Records each
+/// create into `state.mailbox_set_creates`, appends a stub
+/// `MockMailbox` so a follow-up `Mailbox/get` sees it, and
+/// returns the server-assigned id back to the caller. `update`
+/// and `destroy` are unimplemented -- tests that need them have
+/// to extend this handler.
+fn mailbox_set(args: &Value, call_id: &str, state: &mut MockState) -> Value {
+    let mut created_resp = serde_json::Map::new();
+    let mut not_created_resp = serde_json::Map::new();
+    if let Some(creates) = args["create"].as_object() {
+        for (creation_id, props) in creates {
+            let name = props["name"].as_str().unwrap_or_default().to_string();
+            let parent = props["parentId"].as_str().map(|s| s.to_string());
+            let role = match &props["role"] {
+                Value::String(s) => Some(s.clone()),
+                _ => None,
+            };
+            if state.mailbox_set_reject_names.iter().any(|n| n == &name) {
+                not_created_resp.insert(
+                    creation_id.clone(),
+                    json!({
+                        "type": "invalidProperties",
+                        "description": format!("rigged rejection for {:?}", name),
+                    }),
+                );
+                continue;
+            }
+            let new_id = format!("MB-NEW-{}", state.mailboxes.len() + 1);
+            state.mailboxes.push(MockMailbox {
+                id: new_id.clone(),
+                name: name.clone(),
+                role: role.clone(),
+            });
+            state.mailbox_set_creates.push((name, parent, role));
+            created_resp.insert(creation_id.clone(), json!({ "id": new_id }));
+        }
+    }
+    let old_state = state.mailbox_state.clone();
+    state.mailbox_state = format!("{}-set", old_state);
+    json!([
+        "Mailbox/set",
+        {
+            "accountId": ACCOUNT_ID,
+            "oldState": old_state,
+            "newState": state.mailbox_state,
+            "created": Value::Object(created_resp),
+            "updated": {},
+            "destroyed": [],
+            "notCreated": Value::Object(not_created_resp),
+            "notUpdated": {},
+            "notDestroyed": {},
+        },
+        call_id
+    ])
+}
+
+fn email_query(args: &Value, call_id: &str, state: &mut MockState) -> Value {
     // Two filter shapes are supported, matching the two callers
     // in the engine + janitor today:
     //   - `{ "inMailbox": "<id>" }`: SyncEngine's per-mailbox query
@@ -319,7 +387,7 @@ fn email_query(args: &Value, call_id: &str, state: &MockState) -> Value {
     ])
 }
 
-fn email_get(args: &Value, call_id: &str, state: &MockState) -> Value {
+fn email_get(args: &Value, call_id: &str, state: &mut MockState) -> Value {
     let empty = vec![];
     let id_list = args["ids"].as_array().unwrap_or(&empty);
     let want_all_ids = id_list.is_empty();
@@ -358,7 +426,7 @@ fn email_get(args: &Value, call_id: &str, state: &MockState) -> Value {
     ])
 }
 
-fn email_changes(args: &Value, call_id: &str, state: &MockState) -> Value {
+fn email_changes(args: &Value, call_id: &str, state: &mut MockState) -> Value {
     if let Some(err) = state.next_email_changes_error {
         return json!([
             "error",
@@ -1100,6 +1168,8 @@ async fn sync_falls_back_when_email_changes_cannot_calculate() {
         },
         next_email_changes_error: Some("cannotCalculateChanges"),
         pending_email_changes: None,
+        mailbox_set_creates: Vec::new(),
+        mailbox_set_reject_names: Vec::new(),
     }));
     mount_jmap(&server, state.clone()).await;
     mount_blob_downloads(&server, state.clone()).await;
@@ -1250,4 +1320,321 @@ async fn sync_delta_cycle_after_initial_pull_picks_up_new_email() {
         .unwrap()
         .expect("E1 must remain bound across cycles");
     assert_eq!(e1.jmap_mailbox_id.as_ref(), "MB-INBOX");
+}
+
+/// `CreateRemoteMailbox` actions in a `SyncPlan` issue one
+/// `Mailbox/set { create }` per action with the correct name,
+/// optional parent id, and optional role. The handler stub
+/// records each create; the assertions pin both the wire-side
+/// triple and that all three actions land (no early bail on
+/// success).
+#[tokio::test]
+async fn create_remote_mailbox_issues_mailbox_set_per_action() {
+    use jma_mail::ids::JmapMailboxId;
+    use jma_mail::sync::execute::Executor;
+    use jma_mail::sync::plan::{SyncAction, SyncPlan};
+    use std::sync::Arc;
+
+    let server = MockServer::start().await;
+    mount_session(&server).await;
+
+    let state = Arc::new(Mutex::new(MockState {
+        mailbox_state: "mb-1".to_string(),
+        email_state: "e-1".to_string(),
+        mailboxes: vec![MockMailbox {
+            id: "MB-INBOX".to_string(),
+            name: "Inbox".to_string(),
+            role: Some("inbox".to_string()),
+        }],
+        ..Default::default()
+    }));
+    mount_jmap(&server, state.clone()).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let conn = fresh_db(&temp);
+    let config = test_config(&server, temp.path(), vec![]);
+
+    let client = jma_mail::jmap::session::connect(&config.account, &conn)
+        .await
+        .expect("session connects");
+    let executor = Executor::new(Arc::new(client), &conn, &config, None);
+
+    let plan = SyncPlan {
+        actions: vec![
+            SyncAction::CreateRemoteMailbox {
+                name: "Projects".to_string(),
+                parent_jmap_mailbox_id: None,
+                role: None,
+                folder: "Projects".to_string(),
+            },
+            SyncAction::CreateRemoteMailbox {
+                name: "Foo".to_string(),
+                parent_jmap_mailbox_id: Some(jma_mail::jmap::types::MaybeReference::Value(
+                    JmapMailboxId::from("MB-INBOX"),
+                )),
+                role: None,
+                folder: "INBOX.Foo".to_string(),
+            },
+            SyncAction::CreateRemoteMailbox {
+                name: "ImportantStuff".to_string(),
+                parent_jmap_mailbox_id: None,
+                role: Some("important".to_string()),
+                folder: "ImportantStuff".to_string(),
+            },
+        ],
+        new_email_state: None,
+    };
+    executor.execute(plan).await.expect("execute succeeds");
+
+    let creates = state.lock().unwrap().mailbox_set_creates.clone();
+    assert_eq!(
+        creates,
+        vec![
+            ("Projects".to_string(), None, None),
+            ("Foo".to_string(), Some("MB-INBOX".to_string()), None),
+            (
+                "ImportantStuff".to_string(),
+                None,
+                Some("important".to_string())
+            ),
+        ]
+    );
+}
+
+/// A `Mailbox/set { create }` rejection on one action must not
+/// cascade: the other actions still land and `execute` returns
+/// Ok. Pins the per-action warn-and-continue contract documented
+/// on `Executor::create_remote_mailboxes`.
+#[tokio::test]
+async fn create_remote_mailbox_warns_and_continues_on_rejection() {
+    use jma_mail::sync::execute::Executor;
+    use jma_mail::sync::plan::{SyncAction, SyncPlan};
+    use std::sync::Arc;
+
+    let server = MockServer::start().await;
+    mount_session(&server).await;
+
+    let state = Arc::new(Mutex::new(MockState {
+        mailbox_state: "mb-1".to_string(),
+        email_state: "e-1".to_string(),
+        mailbox_set_reject_names: vec!["Rejected".to_string()],
+        ..Default::default()
+    }));
+    mount_jmap(&server, state.clone()).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let conn = fresh_db(&temp);
+    let config = test_config(&server, temp.path(), vec![]);
+
+    let client = jma_mail::jmap::session::connect(&config.account, &conn)
+        .await
+        .expect("session connects");
+    let executor = Executor::new(Arc::new(client), &conn, &config, None);
+
+    let plan = SyncPlan {
+        actions: vec![
+            SyncAction::CreateRemoteMailbox {
+                name: "Before".to_string(),
+                parent_jmap_mailbox_id: None,
+                role: None,
+                folder: "Before".to_string(),
+            },
+            SyncAction::CreateRemoteMailbox {
+                name: "Rejected".to_string(),
+                parent_jmap_mailbox_id: None,
+                role: None,
+                folder: "Rejected".to_string(),
+            },
+            SyncAction::CreateRemoteMailbox {
+                name: "After".to_string(),
+                parent_jmap_mailbox_id: None,
+                role: None,
+                folder: "After".to_string(),
+            },
+        ],
+        new_email_state: None,
+    };
+    executor
+        .execute(plan)
+        .await
+        .expect("execute returns Ok even when one create is rejected");
+
+    let creates = state.lock().unwrap().mailbox_set_creates.clone();
+    assert_eq!(
+        creates,
+        vec![
+            ("Before".to_string(), None, None),
+            ("After".to_string(), None, None),
+        ],
+        "rejected create must be absent; surrounding creates must still land"
+    );
+}
+
+/// Chained create: the plan emits a parent + child pair where the
+/// child's parent is `MaybeReference::Reference("Personal")`. The
+/// executor processes them top-down; after the parent's create
+/// returns its server-assigned id, the child's `Reference` resolves
+/// against `creation_refs` and the child fires with the parent's
+/// real id. Pins the same-cycle chained-create affordance.
+#[tokio::test]
+async fn create_remote_mailbox_chained_create_resolves_parent_reference() {
+    use jma_mail::sync::execute::Executor;
+    use jma_mail::sync::plan::{SyncAction, SyncPlan};
+    use std::sync::Arc;
+
+    let server = MockServer::start().await;
+    mount_session(&server).await;
+
+    let state = Arc::new(Mutex::new(MockState {
+        mailbox_state: "mb-1".to_string(),
+        email_state: "e-1".to_string(),
+        ..Default::default()
+    }));
+    mount_jmap(&server, state.clone()).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let conn = fresh_db(&temp);
+    let config = test_config(&server, temp.path(), vec![]);
+
+    let client = jma_mail::jmap::session::connect(&config.account, &conn)
+        .await
+        .expect("session connects");
+    let executor = Executor::new(Arc::new(client), &conn, &config, None);
+
+    let plan = SyncPlan {
+        actions: vec![
+            SyncAction::CreateRemoteMailbox {
+                name: "Personal".to_string(),
+                parent_jmap_mailbox_id: None,
+                role: None,
+                folder: "Personal".to_string(),
+            },
+            SyncAction::CreateRemoteMailbox {
+                name: "Notes".to_string(),
+                parent_jmap_mailbox_id: Some(jma_mail::jmap::types::MaybeReference::Reference(
+                    "Personal".to_string(),
+                )),
+                role: None,
+                folder: "Personal.Notes".to_string(),
+            },
+        ],
+        new_email_state: None,
+    };
+    executor.execute(plan).await.expect("execute succeeds");
+
+    // Look up the parent's assigned id from the mock's record
+    // instead of hard-coding the mock's counter shape, so the
+    // assertion stays meaningful if the mock's id-assignment
+    // changes.
+    let st = state.lock().unwrap();
+    let creates = st.mailbox_set_creates.clone();
+    let parent_id = st
+        .mailboxes
+        .iter()
+        .find(|m| m.name == "Personal")
+        .map(|m| m.id.clone())
+        .expect("Personal must have been created");
+    // Drop the guard before the second `state.lock()` below;
+    // without this the re-lock for `notes_id` would deadlock
+    // against this guard.
+    drop(st);
+    assert_eq!(creates.len(), 2);
+    assert_eq!(creates[0], ("Personal".to_string(), None, None));
+    // The child's parentId carries the parent's freshly-assigned
+    // id (resolved from the Reference via creation_refs), not
+    // the Reference string itself.
+    assert_eq!(
+        creates[1],
+        ("Notes".to_string(), Some(parent_id.clone()), None)
+    );
+
+    // Same-cycle sentinel writes: a state-DB nuke between cycles
+    // would otherwise leave these folders binding-less on disk,
+    // forcing rebindfolders to recover by Message-ID probing.
+    // Pin that both sentinels exist and carry the right ids
+    // (including the parent reference for the chained child).
+    let personal_sentinel = sentinel::read(&temp.path().join("Personal"))
+        .expect("read Personal sentinel")
+        .expect("Personal sentinel must exist post-create");
+    assert_eq!(personal_sentinel.jmap_mailbox_id.as_ref(), parent_id);
+    assert_eq!(personal_sentinel.server_name, "Personal");
+    assert!(personal_sentinel.parent_jmap_mailbox_id.is_none());
+
+    let notes_path = temp.path().join("Personal.Notes");
+    let notes_sentinel = sentinel::read(&notes_path)
+        .expect("read Personal.Notes sentinel")
+        .expect("Personal.Notes sentinel must exist post-create");
+    let notes_id = state
+        .lock()
+        .unwrap()
+        .mailboxes
+        .iter()
+        .find(|m| m.name == "Notes")
+        .map(|m| m.id.clone())
+        .expect("Notes must be in mock state");
+    assert_eq!(notes_sentinel.jmap_mailbox_id.as_ref(), notes_id);
+    assert_eq!(notes_sentinel.server_name, "Notes");
+    assert_eq!(
+        notes_sentinel
+            .parent_jmap_mailbox_id
+            .as_ref()
+            .map(|p| p.as_ref()),
+        Some(parent_id.as_str()),
+        "chained child sentinel records the resolved parent id, not the Reference"
+    );
+    // ensure_maildir runs in the same phase, so cur/new/tmp
+    // exist for both folders.
+    assert!(temp.path().join("Personal").join("cur").is_dir());
+    assert!(notes_path.join("cur").is_dir());
+}
+
+/// A child create whose `Reference` parent doesn't appear in the
+/// same plan (parent missing entirely, or rejected by the server
+/// earlier in the phase) must warn-skip without firing a JMAP
+/// call. The next cycle's reconcile re-emits once the parent
+/// settles.
+#[tokio::test]
+async fn create_remote_mailbox_skips_child_when_parent_reference_unresolved() {
+    use jma_mail::sync::execute::Executor;
+    use jma_mail::sync::plan::{SyncAction, SyncPlan};
+    use std::sync::Arc;
+
+    let server = MockServer::start().await;
+    mount_session(&server).await;
+
+    let state = Arc::new(Mutex::new(MockState {
+        mailbox_state: "mb-1".to_string(),
+        email_state: "e-1".to_string(),
+        ..Default::default()
+    }));
+    mount_jmap(&server, state.clone()).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let conn = fresh_db(&temp);
+    let config = test_config(&server, temp.path(), vec![]);
+
+    let client = jma_mail::jmap::session::connect(&config.account, &conn)
+        .await
+        .expect("session connects");
+    let executor = Executor::new(Arc::new(client), &conn, &config, None);
+
+    let plan = SyncPlan {
+        actions: vec![SyncAction::CreateRemoteMailbox {
+            name: "Notes".to_string(),
+            parent_jmap_mailbox_id: Some(jma_mail::jmap::types::MaybeReference::Reference(
+                "Personal".to_string(),
+            )),
+            role: None,
+            folder: "Personal.Notes".to_string(),
+        }],
+        new_email_state: None,
+    };
+    executor.execute(plan).await.expect("execute returns Ok");
+
+    let creates = state.lock().unwrap().mailbox_set_creates.clone();
+    assert!(
+        creates.is_empty(),
+        "child must be warn-skipped when parent reference is unresolved, got {:?}",
+        creates
+    );
 }

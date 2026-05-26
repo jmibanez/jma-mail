@@ -197,6 +197,75 @@ pub fn resolve_folder_path(
     Ok(result)
 }
 
+/// Inverse of `resolve_folder_path` at the segment level: take a
+/// `mailbox_map.maildir_folder` string and split it into the
+/// server-side leaf name plus the parent folder string (the same
+/// shape, ready to look up in `MailboxBindings::by_folder`). Used
+/// by reconcile when emitting `CreateRemoteMailbox` from a
+/// `LocalChange::LocalFolderCreated`: the JMAP `Mailbox/set`
+/// `create` call takes the leaf name and the parent's JMAP id
+/// separately, not the layout-flattened on-disk name.
+///
+/// Per-layout decomposition:
+///
+/// - `Flat`: split on `separator`. Last segment is the leaf;
+///   everything before joined with `separator` is the parent
+///   folder string. `Inbox` -> (`Inbox`, None).
+///   `Parent.Child` (separator='.') -> (`Child`, Some("Parent")).
+///   `[Airmail].Sent` (separator='.') -> (`Sent`, Some("[Airmail]")).
+///
+/// - `MaildirPP`: strip the leading `.`, then split on `separator`.
+///   Last segment is the leaf; everything before, joined with
+///   `separator` and re-prefixed with `.`, is the parent folder
+///   string. `.Inbox` -> (`Inbox`, None).
+///   `.Archive.2024` (separator='.') -> (`2024`, Some(".Archive")).
+///   A folder string that doesn't start with `.` is malformed
+///   under this layout and yields a leaf equal to the whole input
+///   with no parent.
+///
+/// - `Fs`: split on `/`. Last segment is the leaf; everything
+///   before joined with `/` is the parent folder string.
+///   `Archive` -> (`Archive`, None).
+///   `Archive/2024` -> (`2024`, Some("Archive")).
+///
+/// Empty input yields an empty leaf and no parent; the caller is
+/// responsible for refusing to act on empty leaves.
+pub fn decompose_folder_string(
+    folder: &str,
+    layout: FolderLayout,
+    separator: char,
+) -> (String, Option<String>) {
+    if folder.is_empty() {
+        return (String::new(), None);
+    }
+    match layout {
+        FolderLayout::Flat => decompose_joined(folder, separator, ""),
+        FolderLayout::MaildirPP => {
+            let stripped = folder.strip_prefix('.').unwrap_or(folder);
+            decompose_joined(stripped, separator, ".")
+        }
+        FolderLayout::Fs => decompose_joined(folder, '/', ""),
+    }
+}
+
+/// Shared backing for `decompose_folder_string`: split `s` on
+/// `sep`, take the last segment as the leaf, and rebuild the
+/// parent string by joining the rest with `sep` and prepending
+/// `parent_prefix` (used for MaildirPP's leading `.`).
+fn decompose_joined(s: &str, sep: char, parent_prefix: &str) -> (String, Option<String>) {
+    let segments: Vec<&str> = s.split(sep).collect();
+    match segments.as_slice() {
+        [] | [_] => (s.to_string(), None),
+        rest => {
+            let leaf = rest.last().expect("len >= 2").to_string();
+            let parent_segments = &rest[..rest.len() - 1];
+            let joined = parent_segments.join(&sep.to_string());
+            let parent = format!("{parent_prefix}{joined}");
+            (leaf, Some(parent))
+        }
+    }
+}
+
 fn maybe_match_rename_rules(segments: &[String], rules: &[CompiledRenameRule]) -> Option<String> {
     let maildir_as_path = segments.join("/");
     for rule in rules.iter() {
@@ -574,5 +643,120 @@ mod tests {
         let mbs = vec![mb_full("m", ".hidden", None, None)];
         let err = resolve(&mbs[0], &mbs, FolderLayout::Fs, '.').unwrap_err();
         assert!(format!("{:#}", err).contains("FS layout"), "got: {err:#}");
+    }
+
+    /// Decomposition under Flat: single-segment names have no
+    /// parent; separator-joined names yield (last_segment,
+    /// joined_rest).
+    #[test]
+    fn decompose_flat() {
+        assert_eq!(
+            decompose_folder_string("Inbox", FolderLayout::Flat, '.'),
+            ("Inbox".to_string(), None)
+        );
+        assert_eq!(
+            decompose_folder_string("Parent.Child", FolderLayout::Flat, '.'),
+            ("Child".to_string(), Some("Parent".to_string()))
+        );
+        assert_eq!(
+            decompose_folder_string("[Airmail].Sent", FolderLayout::Flat, '.'),
+            ("Sent".to_string(), Some("[Airmail]".to_string()))
+        );
+        assert_eq!(
+            decompose_folder_string("A.B.C", FolderLayout::Flat, '.'),
+            ("C".to_string(), Some("A.B".to_string()))
+        );
+    }
+
+    /// Decomposition under MaildirPP: the leading `.` is stripped
+    /// before splitting, then re-prepended onto the parent
+    /// folder. A single-dot folder has no parent.
+    #[test]
+    fn decompose_maildir_pp() {
+        assert_eq!(
+            decompose_folder_string(".Inbox", FolderLayout::MaildirPP, '.'),
+            ("Inbox".to_string(), None)
+        );
+        assert_eq!(
+            decompose_folder_string(".Archive.2024", FolderLayout::MaildirPP, '.'),
+            ("2024".to_string(), Some(".Archive".to_string()))
+        );
+        assert_eq!(
+            decompose_folder_string(".A.B.C", FolderLayout::MaildirPP, '.'),
+            ("C".to_string(), Some(".A.B".to_string()))
+        );
+    }
+
+    /// Decomposition under Fs: splits on `/` regardless of the
+    /// configured separator (Fs always uses `/`).
+    #[test]
+    fn decompose_fs() {
+        assert_eq!(
+            decompose_folder_string("Archive", FolderLayout::Fs, '.'),
+            ("Archive".to_string(), None)
+        );
+        assert_eq!(
+            decompose_folder_string("Archive/2024", FolderLayout::Fs, '.'),
+            ("2024".to_string(), Some("Archive".to_string()))
+        );
+        assert_eq!(
+            decompose_folder_string("A/B/C", FolderLayout::Fs, '/'),
+            ("C".to_string(), Some("A/B".to_string()))
+        );
+    }
+
+    /// Empty input is degenerate: empty leaf, no parent.
+    /// Caller must refuse to act on an empty leaf.
+    #[test]
+    fn decompose_empty() {
+        for layout in [
+            FolderLayout::Flat,
+            FolderLayout::MaildirPP,
+            FolderLayout::Fs,
+        ] {
+            assert_eq!(
+                decompose_folder_string("", layout, '.'),
+                (String::new(), None)
+            );
+        }
+    }
+
+    /// Decomposition is the inverse of resolve_folder_path at the
+    /// segment level: feeding `resolve_folder_path`'s output back
+    /// through `decompose_folder_string` and rebuilding via the
+    /// same separator must round-trip the leaf and the parent
+    /// folder string.
+    #[test]
+    fn decompose_round_trips_against_resolve_flat() {
+        let parent = mb_full("p", "Parent", None, None);
+        let child = mb_full("c", "Child", Some("p"), None);
+        let mbs = vec![parent.clone(), child.clone()];
+        let resolved = resolve(&child, &mbs, FolderLayout::Flat, '.').unwrap();
+        let (leaf, parent_folder) = decompose_folder_string(&resolved, FolderLayout::Flat, '.');
+        assert_eq!(leaf, "Child");
+        assert_eq!(parent_folder, Some("Parent".to_string()));
+    }
+
+    #[test]
+    fn decompose_round_trips_against_resolve_maildir_pp() {
+        let parent = mb_full("p", "Archive", None, None);
+        let child = mb_full("c", "2024", Some("p"), None);
+        let mbs = vec![parent.clone(), child.clone()];
+        let resolved = resolve(&child, &mbs, FolderLayout::MaildirPP, '.').unwrap();
+        let (leaf, parent_folder) =
+            decompose_folder_string(&resolved, FolderLayout::MaildirPP, '.');
+        assert_eq!(leaf, "2024");
+        assert_eq!(parent_folder, Some(".Archive".to_string()));
+    }
+
+    #[test]
+    fn decompose_round_trips_against_resolve_fs() {
+        let parent = mb_full("p", "Archive", None, None);
+        let child = mb_full("c", "2024", Some("p"), None);
+        let mbs = vec![parent.clone(), child.clone()];
+        let resolved = resolve(&child, &mbs, FolderLayout::Fs, '/').unwrap();
+        let (leaf, parent_folder) = decompose_folder_string(&resolved, FolderLayout::Fs, '/');
+        assert_eq!(leaf, "2024");
+        assert_eq!(parent_folder, Some("Archive".to_string()));
     }
 }

@@ -274,6 +274,82 @@ pub async fn get_all(client: &Client) -> Result<Vec<MailboxObject>> {
     Ok(mailboxes)
 }
 
+/// Issue one `Mailbox/set { create }` against the server.
+/// Returns the server-assigned `JmapMailboxId` on success.
+///
+/// `name` is validated against the same per-byte cap and
+/// path-syntax rules `get_all` applies on the read side, so a
+/// caller can't push a mailbox name back through the server
+/// that would later fail validation when the create echoes it
+/// back via `Mailbox/get`. `parent_id` is `None` for top-level
+/// mailboxes; servers that nest mailboxes carry parentage in
+/// `parent_id`, never in `name`.
+///
+/// `role` is advisory: per RFC 8621 the server may reject or
+/// silently coerce role assignment, so callers should not
+/// depend on the role landing on the server side.
+///
+/// Wrapped in `with_retry` so transient failures (rate limit,
+/// network blip) get the same per-call retry treatment every
+/// other JMAP call here gets. Server-side rejection
+/// (`alreadyExists`, `invalidProperties`, ...) is returned as a
+/// non-transient error and surfaces to the executor's per-action
+/// warn-and-continue path.
+pub async fn create(
+    client: &Client,
+    name: &str,
+    parent_id: Option<&JmapMailboxId>,
+    role: Option<&str>,
+) -> Result<JmapMailboxId> {
+    let name_cap = limits::max_size_mailbox_name(client);
+    validate_mailbox_name(name, name_cap)
+        .with_context(|| format!("rejecting Mailbox/set create for {:?}", name))?;
+    let parsed_role = role.map(parse_role).unwrap_or(mailbox::Role::None);
+
+    with_retry("Mailbox/set create", || async {
+        let created = client
+            .mailbox_create(
+                name.to_string(),
+                parent_id.map(|p| p.as_ref().to_string()),
+                parsed_role.clone(),
+            )
+            .await
+            .with_context(|| format!("Mailbox/set create for {:?}", name))?;
+        let id = created
+            .id()
+            .ok_or_else(|| anyhow::anyhow!("Mailbox/set create returned no id for {:?}", name))?
+            .to_string();
+        info!("Created remote mailbox {:?} (id={})", name, id);
+        Ok(JmapMailboxId::from(id))
+    })
+    .await
+}
+
+/// Map jma's lowercase `role` string to the jmap-client `Role`
+/// enum. Pairs only with the well-known role names; the
+/// `Role::Other(...)` string that `get_all` emits for unknown
+/// server roles does not round-trip through this helper and is
+/// not expected to.
+fn parse_role(role: &str) -> mailbox::Role {
+    match role.to_ascii_lowercase().as_str() {
+        "inbox" => mailbox::Role::Inbox,
+        "archive" => mailbox::Role::Archive,
+        "drafts" => mailbox::Role::Drafts,
+        "sent" => mailbox::Role::Sent,
+        "trash" => mailbox::Role::Trash,
+        "junk" => mailbox::Role::Junk,
+        "important" => mailbox::Role::Important,
+        other => {
+            tracing::warn!(
+                "Unknown JMAP role {:?}; submitting Role::None and letting the server \
+                 accept the create without a role binding",
+                other
+            );
+            mailbox::Role::None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
