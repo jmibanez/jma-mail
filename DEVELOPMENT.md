@@ -263,6 +263,10 @@ planning; phase 5 is the only place we mutate the maildir or server, and phase 6
 
   `old_jmap_email_id: Option<JmapEmailId>` is the remote-side analog and covers the destroy+create-with-shared-Message-ID rebind: the server destroyed Email A and created Email B carrying the same wire-format Message-ID header, and reconcile has paired them so the same maildir_id can be rebound from A to B. `commit_adopt` drops A's `message_map` row inside the same txn before upserting B, so the partial unique index on `message_map(maildir_id)` never observes both rows holding the same value. `try_adopt_remote` populates a `consumed_remote_destroys` set when it emits one of these rebinds, and `process_remote_destroys` skips ids in that set so the paired destroy doesn't emit a `DeleteLocal` against the file we just rebound.
 
+#### Local orphans
+
+A *local orphan* is a maildir on disk whose remote counterpart has been deleted server-side. `MailboxBindings::local_orphans()` exposes per-cycle `LocalOrphanRecord`s, populated as a side-effect of `resolve_mailboxes`. Detection feeds two paths: the cache-vs-server diff (cached `mailbox_map` row whose id is missing from the fresh `Mailbox/get`) and the sentinel-driven recovery walk (`.jma.mapping` files on disk whose id is also not in the live server set; `server_name` and `parent_jmap_mailbox_id` are recovered from the sentinel itself, covering fully-nuked DBs and partial-cache states alike). The cache row drops either way -- the state DB is disposable. The record's `binding.jmap_mailbox_id` is a tombstone (the server no longer serves it); useful for identifying DB rows that still point at the dead id. Detections log at `info!` from `resolve_mailboxes`.
+
 #### `SyncPlan`
 
 Holds the action vector plus the JMAP `Email` state cursor that should be persisted *if and only if* the cycle completes. Per-action counters (`download_count`, `adopt_count`, ...) drive the dry-run display. `into_filtered` is the one non-trivial method:
