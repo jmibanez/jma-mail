@@ -308,6 +308,17 @@ impl<'a> SyncEngine<'a> {
         // groups touched by the supplied event paths -- the daemon's
         // common case, where the watcher already told us exactly
         // which files moved.
+        // Orphan folders only join the scan walk when policy
+        // permits destroying them locally; otherwise scan
+        // would surface LocalChange events targeting a dead
+        // JMAP id (no live binding for the executor to act
+        // on), and reconcile has no destructive arm to drop
+        // them.
+        let include_orphans = self
+            .config
+            .sync
+            .allow_destructive_folder_sync
+            .allows_delete_local();
         let (scan_changes, local_flags) = {
             let _phase =
                 tracing::info_span!(target: crate::profile::TARGET_PHASE, "scan").entered();
@@ -315,7 +326,7 @@ impl<'a> SyncEngine<'a> {
                 ScanScope::Full => {
                     let mut changes = Vec::new();
                     let mut local_flags: HashMap<MaildirId, String> = HashMap::new();
-                    for binding in mailboxes.iter() {
+                    for binding in mailboxes.scan_set(include_orphans) {
                         let maildir_path = maildir_root.join(&binding.maildir_folder);
                         // Three reasons a binding's maildir might
                         // not exist on disk:
@@ -341,13 +352,13 @@ impl<'a> SyncEngine<'a> {
                                 && !mailboxes.sentinel_survives_for(id)
                             {
                                 changes.push(scan::LocalChange::LocalFolderDeleted {
-                                    binding: Arc::clone(binding),
+                                    binding: Arc::clone(&binding),
                                 });
                             }
                             continue;
                         };
-                        let known_state = hydrate_known_state(self.conn, binding)?;
-                        let result = scan::scan_folder(&maildir, binding, &known_state)?;
+                        let known_state = hydrate_known_state(self.conn, &binding)?;
+                        let result = scan::scan_folder(&maildir, &binding, &known_state)?;
                         changes.extend(result.changes);
                         local_flags.extend(result.local_flags);
                     }
@@ -370,7 +381,7 @@ impl<'a> SyncEngine<'a> {
                 }
                 ScanScope::Paths(paths) => {
                     let mut known_states = HashMap::new();
-                    for binding in mailboxes.iter() {
+                    for binding in mailboxes.scan_set(include_orphans) {
                         // Path-driven cycles only fire for fsevent
                         // paths the watcher already saw, so a
                         // maildir-shaped folder absent at this
@@ -392,7 +403,7 @@ impl<'a> SyncEngine<'a> {
                         {
                             continue;
                         }
-                        let state = hydrate_known_state(self.conn, binding)?;
+                        let state = hydrate_known_state(self.conn, &binding)?;
                         known_states.insert(binding.maildir_folder.clone(), state);
                     }
                     let result = scan::scan_paths(

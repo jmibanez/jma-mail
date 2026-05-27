@@ -5,13 +5,13 @@ use std::sync::Arc;
 use tracing::{debug, error, warn};
 
 use crate::config::{AllowDestructiveFolderSync, ConflictStrategy, FolderLayout, SyncConfig};
-use crate::ids::{JmapBlobId, JmapEmailId, JmapThreadId, MaildirId, MessageId};
+use crate::ids::{JmapBlobId, JmapEmailId, JmapMailboxId, JmapThreadId, MaildirId, MessageId};
 use crate::jmap::types::{EmailObject, MailboxFolderBinding, MaybeReference};
 use crate::maildir_ops::flags::{flags_to_keyword_patch, flags_to_keywords, keywords_to_flags};
 use crate::maildir_ops::layout::decompose_folder_string;
 use crate::maildir_ops::scan::LocalChange;
 use crate::state::queries::MessageRecord;
-use crate::sync::bindings::MailboxBindings;
+use crate::sync::bindings::{LocalOrphanRecord, MailboxBindings};
 use crate::sync::dedupe::LocalIndex;
 use crate::sync::plan::{BoundId, LocalId, RemoteId, SyncAction, SyncPlan};
 
@@ -376,7 +376,420 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
         &mut plan,
     );
 
+    // Local-orphan destructive arm: gates on
+    // `allows_delete_of_local_folder`. Runs LAST so it sees
+    // every action other emitters produced and can decide per
+    // orphan how to dispatch (no-Blocker, ServerWins+Blocker,
+    // LocalWins+Blocker).
+    finalize_local_orphan_handling(&ctx, &mut plan);
+
     plan
+}
+
+/// Role of a `SyncAction` with respect to one local orphan,
+/// per the destructive-arm matrix:
+///   * `Blocker`: a cycle-local user-initiated action that
+///     targets the orphan (`UploadMessage` into the orphan
+///     folder, `MoveRemote` whose destination is the orphan,
+///     `UpdateRemoteKeywords` on an email bound to the
+///     orphan, `AdoptLocalMessage` pair targeting the
+///     orphan). Triggers conflict-strategy dispatch.
+///   * `Moot`: an action whose effect is subsumed by the
+///     orphan's own destroy (server already destroyed the
+///     orphan's emails; per-message destroys / moves out /
+///     local deletes against orphan-bound emails are
+///     redundant). Dropped from the plan regardless of
+///     strategy.
+///   * `Neutral`: doesn't reference the orphan; left alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrphanActionRole {
+    Neutral,
+    Moot,
+    Blocker,
+}
+
+/// Does this binding's id match the orphan? `Reference` is
+/// the symbolic creation-id form, emitted only by the
+/// resurrect path's `UploadMessage`s, which run under
+/// non-destructive policy (where this classifier doesn't
+/// fire). Every binding the classifier sees comes through
+/// scan_set or `mailboxes.by_id` and carries
+/// `MaybeReference::Value`, so the `Reference` arm is
+/// defensive and returns `false`.
+fn binding_targets_orphan(binding: &MailboxFolderBinding, dead_id: &JmapMailboxId) -> bool {
+    match &binding.jmap_mailbox_id {
+        MaybeReference::Value(id) => id == dead_id,
+        MaybeReference::Reference(_) => false,
+    }
+}
+
+/// Does this `RemoteId`'s `message_map` row point at the
+/// orphan's now-dead `jmap_mailbox_id`?
+fn email_in_orphan(
+    id: &RemoteId,
+    dead_id: &JmapMailboxId,
+    known_by_jmap: &HashMap<JmapEmailId, Arc<MessageRecord>>,
+) -> bool {
+    known_by_jmap
+        .get(&id.jmap_email_id)
+        .map(|r| &r.jmap_mailbox_id == dead_id)
+        .unwrap_or(false)
+}
+
+fn classify_action_against_orphan(
+    action: &SyncAction,
+    dead_id: &JmapMailboxId,
+    folder: &str,
+    known_by_jmap: &HashMap<JmapEmailId, Arc<MessageRecord>>,
+) -> OrphanActionRole {
+    match action {
+        SyncAction::UploadMessage { binding, .. } => {
+            if binding_targets_orphan(binding, dead_id) {
+                OrphanActionRole::Blocker
+            } else {
+                OrphanActionRole::Neutral
+            }
+        }
+        SyncAction::MoveRemote {
+            target_mailbox_ids,
+            from_folder,
+            to_folder,
+            ..
+        } => {
+            if target_mailbox_ids.iter().any(|id| id == dead_id) || to_folder == folder {
+                // Move INTO orphan: Blocker
+                OrphanActionRole::Blocker
+            } else if from_folder == folder {
+                // Move OUT of orphan: Moot (orphan destroy
+                // already obviates the per-email move)
+                OrphanActionRole::Moot
+            } else {
+                OrphanActionRole::Neutral
+            }
+        }
+        SyncAction::UpdateRemoteKeywords { id, .. } => {
+            if email_in_orphan(id, dead_id, known_by_jmap) {
+                OrphanActionRole::Blocker
+            } else {
+                OrphanActionRole::Neutral
+            }
+        }
+        SyncAction::DestroyRemote { id } => {
+            if email_in_orphan(id, dead_id, known_by_jmap) {
+                OrphanActionRole::Moot
+            } else {
+                OrphanActionRole::Neutral
+            }
+        }
+        SyncAction::AdoptLocalMessage {
+            binding,
+            old_maildir_id,
+            ..
+        } => {
+            if old_maildir_id.is_some() && binding_targets_orphan(binding, dead_id) {
+                OrphanActionRole::Blocker
+            } else {
+                OrphanActionRole::Neutral
+            }
+        }
+        // `MoveLocal` and `DeleteLocal` producers gate on
+        // `mailboxes.by_id(...)` being `Some`, which excludes
+        // orphans by construction -- the orphan's id is the
+        // dead one, not in the live set. So neither variant
+        // can target an orphan and both fall through to
+        // Neutral. Pull-side mailbox actions are likewise
+        // never orphan-targeted.
+        _ => OrphanActionRole::Neutral,
+    }
+}
+
+/// Destructive-arm finalizer. Gated on
+/// `allows_delete_of_local_folder()`. For each local orphan,
+/// classifies plan actions against the orphan and dispatches
+/// per the matrix:
+///
+///   * **No Blocker**: drop Moots; emit `DeleteLocalFolder`.
+///     The user opted in to destructive folder sync; the
+///     orphan's content (including any pre-existing files)
+///     vanishes with the folder. The destroy is unconditional
+///     here regardless of conflict strategy -- there is no
+///     conflict to resolve, so `LocalWins` doesn't apply.
+///
+///   * **Blocker + `ServerWins`**: emit counter-actions for
+///     each `MoveRemote` Blocker (reverse `MoveLocal` from
+///     orphan to source folder). Drop every Blocker (the
+///     `UploadMessage`/`UpdateRemoteKeywords` ones are
+///     consume-on-destroy; the `MoveRemote` is paired with
+///     its counter). Drop Moots. Emit `DeleteLocalFolder`.
+///     Server's destroy wins; user's just-made changes are
+///     reversed locally where possible and discarded where
+///     not.
+///
+///   * **Blocker + `LocalWins`**: drop Blockers and Moots,
+///     emit resurrect (`CreateRemoteMailbox` +
+///     per-`orphan.messages` `UploadMessage`s via
+///     `emit_resurrect_for`). User's intent wins -- the
+///     mailbox is re-created server-side and the orphan's
+///     contents get re-uploaded. The user's cycle-local
+///     actions are NOT replayed against the resurrected
+///     mailbox today (the resurrect path uploads from the
+///     `orphan.messages` snapshot, which captures most of
+///     the user's content; race-window files that arrived
+///     after the snapshot are detected on the next cycle
+///     when scan walks the resurrected mailbox).
+///
+/// The no-Blocker arm above is unconditional on conflict
+/// strategy because there is no concurrent user action to
+/// reconcile against; conflict strategy only enters the
+/// dispatch when at least one Blocker has been classified.
+fn finalize_local_orphan_handling(ctx: &ReconcileCtx<'_>, plan: &mut SyncPlan) {
+    if !ctx.policy.allows_delete_of_local_folder() {
+        return;
+    }
+    if ctx.mailboxes.local_orphans().is_empty() {
+        return;
+    }
+
+    let mut keep_mask: Vec<bool> = vec![true; plan.actions.len()];
+    let mut additions: Vec<SyncAction> = Vec::new();
+    let mut needs_resurrect: Vec<usize> = Vec::new();
+
+    for (orphan_idx, orphan) in ctx.mailboxes.local_orphans().iter().enumerate() {
+        let (blockers, moots) = classify_actions_against_orphan(plan, orphan, ctx, &keep_mask);
+        dispatch_orphan_decision(
+            ctx,
+            orphan,
+            orphan_idx,
+            &blockers,
+            &moots,
+            plan,
+            &mut keep_mask,
+            &mut additions,
+            &mut needs_resurrect,
+        );
+    }
+
+    apply_orphan_decisions(plan, &keep_mask, additions, &needs_resurrect, ctx);
+}
+
+/// Walk `plan.actions` and bucket indices that target `orphan` into
+/// (blockers, moots). Skips entries already masked off by an earlier
+/// orphan's pass so per-orphan decisions don't double-count.
+fn classify_actions_against_orphan(
+    plan: &SyncPlan,
+    orphan: &LocalOrphanRecord,
+    ctx: &ReconcileCtx<'_>,
+    keep_mask: &[bool],
+) -> (Vec<usize>, Vec<usize>) {
+    let dead_id = orphan
+        .binding
+        .jmap_mailbox_id
+        .expect_resolved("classify_actions_against_orphan -- orphan binding is resolved");
+    let folder = &orphan.binding.maildir_folder;
+
+    let mut blockers = Vec::new();
+    let mut moots = Vec::new();
+    for (i, action) in plan.actions.iter().enumerate() {
+        if !keep_mask[i] {
+            continue;
+        }
+        match classify_action_against_orphan(action, dead_id, folder, ctx.known_by_jmap) {
+            OrphanActionRole::Blocker => blockers.push(i),
+            OrphanActionRole::Moot => moots.push(i),
+            OrphanActionRole::Neutral => {}
+        }
+    }
+    (blockers, moots)
+}
+
+/// Per-orphan three-arm dispatch. Mutates `keep_mask` (to drop
+/// blockers/moots), `additions` (to emit `DeleteLocalFolder` and any
+/// counter-`MoveLocal`s), and `needs_resurrect` (when the strategy
+/// is to preserve local content via the resurrect path).
+#[allow(clippy::too_many_arguments)]
+fn dispatch_orphan_decision(
+    ctx: &ReconcileCtx<'_>,
+    orphan: &LocalOrphanRecord,
+    orphan_idx: usize,
+    blockers: &[usize],
+    moots: &[usize],
+    plan: &SyncPlan,
+    keep_mask: &mut [bool],
+    additions: &mut Vec<SyncAction>,
+    needs_resurrect: &mut Vec<usize>,
+) {
+    if blockers.is_empty() {
+        resolve_no_blocker(orphan, moots, keep_mask, additions);
+        return;
+    }
+    match ctx.policy.conflict_strategy {
+        ConflictStrategy::ServerWins => resolve_server_wins_with_blocker(
+            ctx, orphan, blockers, moots, plan, keep_mask, additions,
+        ),
+        ConflictStrategy::LocalWins => {
+            resolve_local_wins_with_blocker(orphan_idx, blockers, moots, keep_mask, needs_resurrect)
+        }
+    }
+}
+
+/// No cycle-local Blocker: the user opted in to destructive folder
+/// sync, so drop Moots and emit the destroy. Any pre-existing
+/// content vanishes with the folder.
+fn resolve_no_blocker(
+    orphan: &LocalOrphanRecord,
+    moots: &[usize],
+    keep_mask: &mut [bool],
+    additions: &mut Vec<SyncAction>,
+) {
+    for i in moots {
+        keep_mask[*i] = false;
+    }
+    additions.push(SyncAction::DeleteLocalFolder {
+        binding: Arc::clone(&orphan.binding),
+    });
+}
+
+/// Server's destroy wins despite a cycle-local user action
+/// targeting the orphan. For each `MoveRemote`-into-orphan Blocker,
+/// emit a counter-`MoveLocal` that physically returns the file to
+/// its source folder before the destroy fires. Other Blocker
+/// variants (`UploadMessage`, `UpdateRemoteKeywords`) are
+/// consume-on-destroy -- dropping them is enough.
+fn resolve_server_wins_with_blocker(
+    ctx: &ReconcileCtx<'_>,
+    orphan: &LocalOrphanRecord,
+    blockers: &[usize],
+    moots: &[usize],
+    plan: &SyncPlan,
+    keep_mask: &mut [bool],
+    additions: &mut Vec<SyncAction>,
+) {
+    let folder = &orphan.binding.maildir_folder;
+    let dead_id = orphan
+        .binding
+        .jmap_mailbox_id
+        .expect_resolved("resolve_server_wins_with_blocker -- orphan binding is resolved");
+    for i in blockers {
+        if let Some(counter) = build_counter_move_local(&plan.actions[*i], folder, dead_id, ctx) {
+            additions.push(counter);
+        }
+    }
+    for i in blockers {
+        keep_mask[*i] = false;
+    }
+    for i in moots {
+        keep_mask[*i] = false;
+    }
+    additions.push(SyncAction::DeleteLocalFolder {
+        binding: Arc::clone(&orphan.binding),
+    });
+}
+
+/// User's intent (preserve local content) wins. Drop Blockers and
+/// Moots; defer resurrect emission to the apply phase. The
+/// resurrect path's `orphan.messages` sweep captures the snapshot
+/// at orphan-detection time; race-window files arriving after the
+/// snapshot are caught next cycle.
+fn resolve_local_wins_with_blocker(
+    orphan_idx: usize,
+    blockers: &[usize],
+    moots: &[usize],
+    keep_mask: &mut [bool],
+    needs_resurrect: &mut Vec<usize>,
+) {
+    for i in blockers {
+        keep_mask[*i] = false;
+    }
+    for i in moots {
+        keep_mask[*i] = false;
+    }
+    needs_resurrect.push(orphan_idx);
+}
+
+/// For a `MoveRemote`-into-orphan Blocker, build the
+/// `MoveLocal { from: orphan, to: source }` counter that reverses
+/// the user's move before the orphan-destroy fires. Returns `None`
+/// for non-`MoveRemote` actions and for two warn-and-drop cases:
+/// the source folder isn't in the live set (also an orphan, or
+/// otherwise gone), or `known_by_jmap_to_maildir_id` can't
+/// reconstruct the file's local id (cycle-local adopt with no
+/// `message_map` row yet). In both warn-and-drop cases the file
+/// gets destroyed with the orphan folder rather than rescued.
+fn build_counter_move_local(
+    action: &SyncAction,
+    orphan_folder: &str,
+    dead_id: &JmapMailboxId,
+    ctx: &ReconcileCtx<'_>,
+) -> Option<SyncAction> {
+    let SyncAction::MoveRemote {
+        id, from_folder, ..
+    } = action
+    else {
+        return None;
+    };
+    let Some(source_binding) = ctx.mailboxes.by_folder(from_folder) else {
+        warn!(
+            "ServerWins counter-MoveLocal for orphan {}: source folder {} is not in live set; \
+             dropping counter and the user's move both -- file destroyed with orphan folder",
+            dead_id, from_folder
+        );
+        return None;
+    };
+    let Some(maildir_id) = known_by_jmap_to_maildir_id(&id.jmap_email_id, ctx.known_by_jmap) else {
+        warn!(
+            "ServerWins counter-MoveLocal for orphan {}: no maildir_id known for {} \
+             (cycle-local adopt with no message_map row yet); dropping counter and the user's \
+             move both -- file destroyed with orphan folder",
+            dead_id, id.jmap_email_id
+        );
+        return None;
+    };
+    Some(SyncAction::MoveLocal {
+        id: BoundId {
+            maildir_id,
+            jmap_email_id: id.jmap_email_id.clone(),
+            message_id: id.message_id.clone(),
+        },
+        from_folder: orphan_folder.to_string(),
+        to_binding: Arc::clone(source_binding),
+    })
+}
+
+/// Commit the per-orphan decisions back to the plan: filter actions
+/// by `keep_mask`, append `additions` (counter-moves + destroys),
+/// then emit resurrect actions for any orphan whose strategy is to
+/// preserve local content.
+fn apply_orphan_decisions(
+    plan: &mut SyncPlan,
+    keep_mask: &[bool],
+    additions: Vec<SyncAction>,
+    needs_resurrect: &[usize],
+    ctx: &ReconcileCtx<'_>,
+) {
+    let kept: Vec<SyncAction> = std::mem::take(&mut plan.actions)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, a)| if keep_mask[i] { Some(a) } else { None })
+        .collect();
+    plan.actions = kept;
+    plan.actions.extend(additions);
+    for &orphan_idx in needs_resurrect {
+        emit_resurrect_for(&ctx.mailboxes.local_orphans()[orphan_idx], ctx, plan);
+    }
+}
+
+/// Look up a maildir_id given a jmap_email_id via the
+/// `known_by_jmap` index. Used by counter-action emission to
+/// reconstruct the `BoundId` for a `MoveLocal` derived from a
+/// `MoveRemote` whose original `id: RemoteId` lacks the
+/// maildir_id.
+fn known_by_jmap_to_maildir_id(
+    jmap_email_id: &JmapEmailId,
+    known_by_jmap: &HashMap<JmapEmailId, Arc<MessageRecord>>,
+) -> Option<MaildirId> {
+    known_by_jmap
+        .get(jmap_email_id)
+        .and_then(|r| r.maildir_id.clone())
 }
 
 /// One paired DeletedMessage(src) + NewMessage(dst) discovered during
@@ -501,46 +914,57 @@ fn emit_local_orphan_resurrects(ctx: &ReconcileCtx<'_>, plan: &mut SyncPlan) {
         return;
     }
     for orphan in ctx.mailboxes.local_orphans() {
-        let dead_id = orphan
-            .binding
-            .jmap_mailbox_id
-            .expect_resolved("emit_local_orphan_resurrects -- orphan binding is resolved")
-            .clone();
-        let folder = orphan.binding.maildir_folder.clone();
-        plan.actions.push(SyncAction::CreateRemoteMailbox {
-            name: orphan.binding.server_name.clone(),
-            parent_jmap_mailbox_id: orphan
-                .parent_jmap_mailbox_id
-                .clone()
-                .map(MaybeReference::Value),
-            role: None,
-            folder: folder.clone(),
-            replaces_orphan_id: Some(dead_id),
-        });
-        for message in &orphan.messages {
-            if message.size_bytes > ctx.max_upload_size as u64 {
-                warn!(
-                    "Skipping orphan-resurrect upload for {} ({} bytes > server cap \
-                     {}); file stays on disk in {}",
-                    message.message_id, message.size_bytes, ctx.max_upload_size, folder
-                );
-                continue;
-            }
-            plan.actions.push(SyncAction::UploadMessage {
-                id: LocalId {
-                    maildir_id: message.maildir_id.clone(),
-                    message_id: message.message_id.clone(),
-                },
-                binding: Arc::new(MailboxFolderBinding {
-                    jmap_mailbox_id: MaybeReference::Reference(folder.clone()),
-                    server_name: orphan.binding.server_name.clone(),
-                    maildir_folder: folder.clone(),
-                    remote_path: orphan.binding.remote_path.clone(),
-                }),
-                file_path: message.path.clone(),
-                flags: message.flags.clone(),
-            });
+        emit_resurrect_for(orphan, ctx, plan);
+    }
+}
+
+/// Emit the `CreateRemoteMailbox` + per-message
+/// `UploadMessage` pair that resurrects one local orphan.
+/// Factored out of `emit_local_orphan_resurrects` so the
+/// destructive arm's LocalWins-with-Blocker branch can reach
+/// the same emission when a per-orphan conflict resolution
+/// requires preserving the local content despite the user
+/// having opted in to destructive folder sync.
+fn emit_resurrect_for(orphan: &LocalOrphanRecord, ctx: &ReconcileCtx<'_>, plan: &mut SyncPlan) {
+    let dead_id = orphan
+        .binding
+        .jmap_mailbox_id
+        .expect_resolved("emit_resurrect_for -- orphan binding is resolved")
+        .clone();
+    let folder = orphan.binding.maildir_folder.clone();
+    plan.actions.push(SyncAction::CreateRemoteMailbox {
+        name: orphan.binding.server_name.clone(),
+        parent_jmap_mailbox_id: orphan
+            .parent_jmap_mailbox_id
+            .clone()
+            .map(MaybeReference::Value),
+        role: None,
+        folder: folder.clone(),
+        replaces_orphan_id: Some(dead_id),
+    });
+    for message in &orphan.messages {
+        if message.size_bytes > ctx.max_upload_size as u64 {
+            warn!(
+                "Skipping orphan-resurrect upload for {} ({} bytes > server cap \
+                 {}); file stays on disk in {}",
+                message.message_id, message.size_bytes, ctx.max_upload_size, folder
+            );
+            continue;
         }
+        plan.actions.push(SyncAction::UploadMessage {
+            id: LocalId {
+                maildir_id: message.maildir_id.clone(),
+                message_id: message.message_id.clone(),
+            },
+            binding: Arc::new(MailboxFolderBinding {
+                jmap_mailbox_id: MaybeReference::Reference(folder.clone()),
+                server_name: orphan.binding.server_name.clone(),
+                maildir_folder: folder.clone(),
+                remote_path: orphan.binding.remote_path.clone(),
+            }),
+            file_path: message.path.clone(),
+            flags: message.flags.clone(),
+        });
     }
 }
 
@@ -3839,6 +4263,475 @@ mod tests {
                 creates_count, 1,
                 "delete-remote doesn't permit destroying the local side, \
                  so local-orphan resurrect still fires"
+            );
+        }
+    }
+
+    mod orphan_destructive {
+        use super::*;
+        use crate::sync::bindings::OrphanMessage;
+
+        fn bindings_with_orphan(messages: Vec<OrphanMessage>) -> MailboxBindings {
+            let mut b = MailboxBindings::builder();
+            b.insert(MailboxFolderBinding {
+                jmap_mailbox_id: MaybeReference::Value(JmapMailboxId::from("MB-INBOX")),
+                server_name: "INBOX".to_string(),
+                maildir_folder: "INBOX".to_string(),
+                remote_path: "INBOX".to_string(),
+            });
+            b.push_local_orphan(
+                MailboxFolderBinding {
+                    jmap_mailbox_id: MaybeReference::Value(JmapMailboxId::from("MB-ARCH")),
+                    server_name: "Archive".to_string(),
+                    maildir_folder: "Archive".to_string(),
+                    remote_path: "Archive".to_string(),
+                },
+                None,
+            );
+            let captured = messages.clone();
+            b.populate_local_orphan_messages(|_| Ok(captured.clone()))
+                .unwrap();
+            b.build()
+        }
+
+        fn orphan_msg(jmap_email_id: Option<&str>, maildir_id: &str) -> OrphanMessage {
+            OrphanMessage {
+                jmap_email_id: jmap_email_id.map(JmapEmailId::from),
+                maildir_id: MaildirId::from(maildir_id),
+                message_id: MessageId::from(format!("{}@example.com", maildir_id)),
+                path: std::path::PathBuf::from(format!("/tmp/jma-test/Archive/cur/{}", maildir_id)),
+                flags: "S".to_string(),
+                size_bytes: 100,
+            }
+        }
+
+        fn record_for(jmap_email_id: &str, mailbox_id: &str, maildir_id: &str) -> MessageRecord {
+            MessageRecord {
+                jmap_email_id: jmap_email_id.into(),
+                jmap_blob_id: Some(format!("B-{}", jmap_email_id).into()),
+                jmap_thread_id: Some(format!("T-{}", jmap_email_id).into()),
+                jmap_mailbox_id: mailbox_id.into(),
+                maildir_id: Some(maildir_id.into()),
+                message_id: format!("{}@example.com", jmap_email_id).into(),
+                flags: "S".into(),
+                jmap_keywords: "{}".into(),
+            }
+        }
+
+        fn run_destructive(
+            mailboxes: &MailboxBindings,
+            local_changes: &[LocalChange],
+            allow_destructive: AllowDestructiveFolderSync,
+            strategy: ConflictStrategy,
+            records: &[MessageRecord],
+        ) -> SyncPlan {
+            let local_index = LocalIndex::default();
+            let local_flags = HashMap::new();
+            let known = indices(records);
+            reconcile(ReconcileInput {
+                remote_emails: &[],
+                remote_destroyed: &[],
+                local_changes,
+                known: &known,
+                local_index: &local_index,
+                local_flags: &local_flags,
+                mailboxes,
+                policy: SyncPolicy {
+                    conflict_strategy: strategy,
+                    allow_destructive_folder_sync: allow_destructive,
+                },
+                new_email_state: None,
+                max_upload_size: usize::MAX,
+                used_initial_path: true,
+                folder_layout: FolderLayout::Flat,
+                hierarchy_separator: '.',
+                maildir_root: std::path::Path::new("/tmp/jma-test-maildir-root"),
+            })
+        }
+
+        /// Under `delete-local` + no concurrent user action
+        /// targeting the orphan, the destructive arm emits a
+        /// single `DeleteLocalFolder` for the orphan. No
+        /// counter-actions, no resurrect.
+        #[test]
+        fn destroys_under_delete_local_no_blocker() {
+            let bindings = bindings_with_orphan(vec![orphan_msg(Some("E1"), "FOO.host")]);
+            let plan = run_destructive(
+                &bindings,
+                &[],
+                AllowDestructiveFolderSync::DeleteLocal,
+                ConflictStrategy::ServerWins,
+                &[],
+            );
+
+            let destroys: Vec<_> = plan
+                .actions
+                .iter()
+                .filter_map(|a| match a {
+                    SyncAction::DeleteLocalFolder { binding } => Some(binding.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(destroys.len(), 1, "one DeleteLocalFolder for the orphan");
+            assert_eq!(destroys[0].maildir_folder, "Archive");
+            assert!(
+                !plan
+                    .actions
+                    .iter()
+                    .any(|a| matches!(a, SyncAction::CreateRemoteMailbox { .. })),
+                "no resurrect under destructive-no-Blocker"
+            );
+        }
+
+        /// `DestroyRemote` on an email bound to the orphan is
+        /// Moot -- the orphan-destroy subsumes it. The Moot
+        /// action gets dropped from the plan; the folder
+        /// destroy proceeds.
+        #[test]
+        fn destroyremote_against_orphan_email_is_moot() {
+            let bindings = bindings_with_orphan(vec![]);
+            // Pre-existing message_map row: email E1 bound to
+            // orphan MB-ARCH.
+            let records = vec![record_for("E1", "MB-ARCH", "FOO.host")];
+            // LocalChange::DeletedMessage on that maildir_id
+            // -- process_local_changes turns this into
+            // DestroyRemote.
+            let local_changes = vec![LocalChange::DeletedMessage {
+                maildir_id: MaildirId::from("FOO.host"),
+                binding: Arc::new(MailboxFolderBinding {
+                    jmap_mailbox_id: MaybeReference::Value(JmapMailboxId::from("MB-ARCH")),
+                    server_name: "Archive".to_string(),
+                    maildir_folder: "Archive".to_string(),
+                    remote_path: "Archive".to_string(),
+                }),
+            }];
+
+            let plan = run_destructive(
+                &bindings,
+                &local_changes,
+                AllowDestructiveFolderSync::DeleteLocal,
+                ConflictStrategy::ServerWins,
+                &records,
+            );
+
+            assert!(
+                !plan
+                    .actions
+                    .iter()
+                    .any(|a| matches!(a, SyncAction::DestroyRemote { .. })),
+                "DestroyRemote against orphan-bound email must be Moot-dropped; \
+                 got plan: {:?}",
+                plan.actions
+            );
+            assert!(
+                plan.actions
+                    .iter()
+                    .any(|a| matches!(a, SyncAction::DeleteLocalFolder { .. })),
+                "DeleteLocalFolder must still be emitted"
+            );
+        }
+
+        /// Under `delete-local` + `ServerWins`, a Blocker
+        /// `UpdateRemoteKeywords` against an orphan-bound
+        /// email is consume-on-destroy: drop the action; the
+        /// orphan destroy proceeds. The email is going away
+        /// with the folder; the keyword update is moot.
+        #[test]
+        fn server_wins_drops_keyword_blocker_and_destroys() {
+            let bindings = bindings_with_orphan(vec![]);
+            let records = vec![record_for("E1", "MB-ARCH", "FOO.host")];
+            let local_changes = vec![LocalChange::FlagsChanged {
+                maildir_id: MaildirId::from("FOO.host"),
+                binding: Arc::new(MailboxFolderBinding {
+                    jmap_mailbox_id: MaybeReference::Value(JmapMailboxId::from("MB-ARCH")),
+                    server_name: "Archive".to_string(),
+                    maildir_folder: "Archive".to_string(),
+                    remote_path: "Archive".to_string(),
+                }),
+                old_flags: "S".into(),
+                new_flags: "SF".into(),
+            }];
+
+            let plan = run_destructive(
+                &bindings,
+                &local_changes,
+                AllowDestructiveFolderSync::DeleteLocal,
+                ConflictStrategy::ServerWins,
+                &records,
+            );
+
+            assert!(
+                !plan
+                    .actions
+                    .iter()
+                    .any(|a| matches!(a, SyncAction::UpdateRemoteKeywords { .. })),
+                "UpdateRemoteKeywords Blocker must be consume-on-destroy under \
+                 ServerWins; got plan: {:?}",
+                plan.actions
+            );
+            assert!(
+                plan.actions
+                    .iter()
+                    .any(|a| matches!(a, SyncAction::DeleteLocalFolder { .. })),
+                "DeleteLocalFolder must still be emitted"
+            );
+        }
+
+        /// Under `delete-local` + `LocalWins`, a Blocker
+        /// `UpdateRemoteKeywords` against an orphan-bound
+        /// email triggers resurrect instead of destroy. The
+        /// Blocker is dropped (its email gets re-uploaded with
+        /// the new flags via the file's filename); the orphan
+        /// is recreated server-side via `CreateRemoteMailbox`.
+        #[test]
+        fn local_wins_with_blocker_resurrects_no_destroy() {
+            let bindings = bindings_with_orphan(vec![orphan_msg(Some("E1"), "FOO.host")]);
+            let records = vec![record_for("E1", "MB-ARCH", "FOO.host")];
+            let local_changes = vec![LocalChange::FlagsChanged {
+                maildir_id: MaildirId::from("FOO.host"),
+                binding: Arc::new(MailboxFolderBinding {
+                    jmap_mailbox_id: MaybeReference::Value(JmapMailboxId::from("MB-ARCH")),
+                    server_name: "Archive".to_string(),
+                    maildir_folder: "Archive".to_string(),
+                    remote_path: "Archive".to_string(),
+                }),
+                old_flags: "S".into(),
+                new_flags: "SF".into(),
+            }];
+
+            let plan = run_destructive(
+                &bindings,
+                &local_changes,
+                AllowDestructiveFolderSync::DeleteLocal,
+                ConflictStrategy::LocalWins,
+                &records,
+            );
+
+            assert!(
+                !plan
+                    .actions
+                    .iter()
+                    .any(|a| matches!(a, SyncAction::DeleteLocalFolder { .. })),
+                "LocalWins-with-Blocker must NOT emit destroy; got plan: {:?}",
+                plan.actions
+            );
+            let creates: Vec<_> = plan
+                .actions
+                .iter()
+                .filter_map(|a| match a {
+                    SyncAction::CreateRemoteMailbox {
+                        name,
+                        replaces_orphan_id,
+                        ..
+                    } => Some((name.clone(), replaces_orphan_id.clone())),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(creates.len(), 1, "resurrect emits CreateRemoteMailbox");
+            assert_eq!(creates[0].0, "Archive");
+            assert_eq!(
+                creates[0].1.as_ref().map(|id| id.as_ref()),
+                Some("MB-ARCH"),
+                "CreateRemoteMailbox carries replaces_orphan_id"
+            );
+            assert!(
+                !plan
+                    .actions
+                    .iter()
+                    .any(|a| matches!(a, SyncAction::UpdateRemoteKeywords { .. })),
+                "Blocker UpdateRemoteKeywords must be dropped under LocalWins; \
+                 the file's flags survive via the filename suffix"
+            );
+        }
+
+        /// `MoveRemote` whose source is the orphan folder is
+        /// Moot regardless of strategy -- the orphan's destroy
+        /// subsumes the per-email move.
+        #[test]
+        fn moveremote_out_of_orphan_is_moot() {
+            let action = SyncAction::MoveRemote {
+                id: RemoteId {
+                    jmap_email_id: "E1".into(),
+                    message_id: "x@example.com".into(),
+                },
+                target_mailbox_ids: vec!["MB-INBOX".into()],
+                from_folder: "Archive".to_string(),
+                to_folder: "INBOX".to_string(),
+            };
+            let known = indices(&[]);
+            let role = classify_action_against_orphan(
+                &action,
+                &"MB-ARCH".into(),
+                "Archive",
+                &known.by_jmap,
+            );
+            assert_eq!(role, OrphanActionRole::Moot);
+        }
+
+        /// `MoveRemote` whose target is the orphan folder is
+        /// a Blocker -- user moved a file INTO the orphan.
+        #[test]
+        fn moveremote_into_orphan_is_blocker() {
+            let action = SyncAction::MoveRemote {
+                id: RemoteId {
+                    jmap_email_id: "E1".into(),
+                    message_id: "x@example.com".into(),
+                },
+                target_mailbox_ids: vec!["MB-ARCH".into()],
+                from_folder: "INBOX".to_string(),
+                to_folder: "Archive".to_string(),
+            };
+            let known = indices(&[]);
+            let role = classify_action_against_orphan(
+                &action,
+                &"MB-ARCH".into(),
+                "Archive",
+                &known.by_jmap,
+            );
+            assert_eq!(role, OrphanActionRole::Blocker);
+        }
+
+        /// `UploadMessage` whose binding targets the orphan
+        /// (via Value or Reference) is a Blocker.
+        #[test]
+        fn uploadmessage_targeting_orphan_is_blocker() {
+            let action = SyncAction::UploadMessage {
+                id: LocalId {
+                    maildir_id: MaildirId::from("FOO.host"),
+                    message_id: MessageId::from("x@example.com"),
+                },
+                binding: Arc::new(MailboxFolderBinding {
+                    jmap_mailbox_id: MaybeReference::Value(JmapMailboxId::from("MB-ARCH")),
+                    server_name: "Archive".to_string(),
+                    maildir_folder: "Archive".to_string(),
+                    remote_path: "Archive".to_string(),
+                }),
+                file_path: std::path::PathBuf::from("/tmp/foo"),
+                flags: "S".to_string(),
+            };
+            let known = indices(&[]);
+            let role = classify_action_against_orphan(
+                &action,
+                &"MB-ARCH".into(),
+                "Archive",
+                &known.by_jmap,
+            );
+            assert_eq!(role, OrphanActionRole::Blocker);
+        }
+
+        /// Under `None` policy the destructive arm is gated
+        /// off; no `DeleteLocalFolder` emitted (resurrect
+        /// path handles the orphan).
+        #[test]
+        fn no_destroy_under_none_policy() {
+            let bindings = bindings_with_orphan(vec![]);
+            let plan = run_destructive(
+                &bindings,
+                &[],
+                AllowDestructiveFolderSync::None,
+                ConflictStrategy::ServerWins,
+                &[],
+            );
+            assert!(
+                !plan
+                    .actions
+                    .iter()
+                    .any(|a| matches!(a, SyncAction::DeleteLocalFolder { .. })),
+                "None policy must not emit destroy"
+            );
+            assert!(
+                plan.actions
+                    .iter()
+                    .any(|a| matches!(a, SyncAction::CreateRemoteMailbox { .. })),
+                "None policy must emit resurrect via CreateRemoteMailbox"
+            );
+        }
+
+        /// Under `delete-local` + `ServerWins` with a
+        /// `MoveRemote`-into-orphan Blocker (user moved a
+        /// file from a live folder INTO the orphan this
+        /// cycle), finalize emits a counter `MoveLocal` from
+        /// the orphan back to the source folder before the
+        /// destroy. The original `MoveRemote` is dropped;
+        /// `DeleteLocalFolder` proceeds. The file lands back
+        /// at its source folder; the orphan goes away with
+        /// `remove_dir_all`.
+        #[test]
+        fn server_wins_emits_counter_movelocal_for_moveremote_into_orphan() {
+            let bindings = bindings_with_orphan(vec![]);
+            let records = vec![record_for("E1", "MB-INBOX", "OLD.host")];
+            let local_changes = vec![
+                LocalChange::DeletedMessage {
+                    maildir_id: "OLD.host".into(),
+                    binding: Arc::new(MailboxFolderBinding {
+                        jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
+                        server_name: "INBOX".to_string(),
+                        maildir_folder: "INBOX".to_string(),
+                        remote_path: "INBOX".to_string(),
+                    }),
+                },
+                LocalChange::NewMessage {
+                    maildir_id: "NEW.host".into(),
+                    binding: Arc::new(MailboxFolderBinding {
+                        jmap_mailbox_id: MaybeReference::Value("MB-ARCH".into()),
+                        server_name: "Archive".to_string(),
+                        maildir_folder: "Archive".to_string(),
+                        remote_path: "Archive".to_string(),
+                    }),
+                    flags: "".into(),
+                    path: std::path::PathBuf::from("/tmp/jma-test/Archive/cur/NEW.host"),
+                    message_id: "E1@example.com".into(),
+                    size_bytes: 0,
+                },
+            ];
+
+            let plan = run_destructive(
+                &bindings,
+                &local_changes,
+                AllowDestructiveFolderSync::DeleteLocal,
+                ConflictStrategy::ServerWins,
+                &records,
+            );
+
+            assert!(
+                !plan
+                    .actions
+                    .iter()
+                    .any(|a| matches!(a, SyncAction::MoveRemote { .. })),
+                "ServerWins must drop the MoveRemote Blocker; got plan: {:?}",
+                plan.actions
+            );
+            let counters: Vec<_> = plan
+                .actions
+                .iter()
+                .filter_map(|a| match a {
+                    SyncAction::MoveLocal {
+                        id,
+                        from_folder,
+                        to_binding,
+                    } => Some((id.clone(), from_folder.clone(), to_binding.clone())),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(counters.len(), 1, "one counter MoveLocal for the Blocker");
+            assert_eq!(
+                counters[0].0.maildir_id.as_ref(),
+                "OLD.host",
+                "maildir_id resolved via known_by_jmap"
+            );
+            assert_eq!(
+                counters[0].1, "Archive",
+                "counter source is the orphan folder"
+            );
+            assert_eq!(
+                counters[0].2.maildir_folder, "INBOX",
+                "counter destination is the original source folder"
+            );
+            assert!(
+                plan.actions
+                    .iter()
+                    .any(|a| matches!(a, SyncAction::DeleteLocalFolder { .. })),
+                "DeleteLocalFolder must still be emitted after counter-MoveLocal"
             );
         }
     }
