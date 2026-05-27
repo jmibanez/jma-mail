@@ -252,6 +252,24 @@ pub enum SyncAction {
         replaces_orphan_id: Option<JmapMailboxId>,
     },
 
+    /// Folder-level pull-side destructive action: remove a
+    /// local maildir whose remote counterpart was deleted
+    /// server-side. The executor walks
+    /// `fs::remove_dir_all(maildir_root.join(binding.
+    /// maildir_folder))` and cascades the cache cleanup:
+    /// `delete_messages_by_jmap_mailbox_id` on the dead id,
+    /// `delete_local_state_by_folder` on the folder string,
+    /// and `delete_folder_checkpoint` so the next cycle's
+    /// dedupe dirty-check doesn't trip.
+    ///
+    /// The executor refuses any binding whose resolved path
+    /// escapes `maildir_root` (path traversal). The guard is
+    /// defense-in-depth -- `maildir_folder` is producer-
+    /// controlled, not user input.
+    DeleteLocalFolder {
+        binding: Arc<MailboxFolderBinding>,
+    },
+
     /// Folder-level pull-side action mirroring a server-side
     /// mailbox rename on disk: `fs::rename` the maildir from
     /// `from_folder` to `binding.maildir_folder` under
@@ -379,7 +397,8 @@ impl SyncAction {
             | SyncAction::DeleteLocal { .. }
             | SyncAction::MoveLocal { .. }
             | SyncAction::CreateLocalMailbox { .. }
-            | SyncAction::RenameLocalMailbox { .. } => ActionDirection::Pull,
+            | SyncAction::RenameLocalMailbox { .. }
+            | SyncAction::DeleteLocalFolder { .. } => ActionDirection::Pull,
             SyncAction::UploadMessage { .. }
             | SyncAction::UpdateRemoteKeywords { .. }
             | SyncAction::DestroyRemote { .. }
@@ -647,6 +666,11 @@ impl fmt::Display for SyncPlan {
                     f,
                     "  [PUSH] Rename remote mailbox {} -> {:?} (disk: {}/)",
                     binding.jmap_mailbox_id, binding.remote_path, binding.maildir_folder
+                )?,
+                SyncAction::DeleteLocalFolder { binding } => writeln!(
+                    f,
+                    "  [PULL] Destroy local folder {}/ (id was {})",
+                    binding.maildir_folder, binding.jmap_mailbox_id
                 )?,
             }
         }
