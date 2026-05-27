@@ -317,6 +317,28 @@ impl MailboxBindings {
         self.by_folder.keys().map(String::as_str)
     }
 
+    /// The set of bindings scan should walk this cycle. With
+    /// `include_orphans = false` (the steady state under
+    /// non-destructive policies) returns the live set only --
+    /// orphan folders are off-limits since their JMAP id is
+    /// dead and any emitted action targeting that id would be
+    /// rejected by the server. With `include_orphans = true`
+    /// (destructive policies that may delete the local
+    /// folder) extends with orphan bindings so cycle-local
+    /// activity inside an orphan (a `mv` into it, a draft
+    /// drop, flag edits) surfaces as `LocalChange` events;
+    /// reconcile's destructive-handling matrix recognizes
+    /// those events via `local_orphans()` and dispatches them
+    /// through the conflict-strategy path. Bindings come back
+    /// by `Arc` refcount-bump; no allocation per scan.
+    pub fn scan_set(&self, include_orphans: bool) -> Vec<Arc<MailboxFolderBinding>> {
+        let mut out: Vec<Arc<MailboxFolderBinding>> = self.by_id.values().cloned().collect();
+        if include_orphans {
+            out.extend(self.local_orphans.iter().map(|o| Arc::clone(&o.binding)));
+        }
+        out
+    }
+
     /// Server-known bindings that had no cached `mailbox_map`
     /// row at cycle start. Reconcile emits one
     /// `CreateLocalMailbox` per entry. Empty in steady state.
