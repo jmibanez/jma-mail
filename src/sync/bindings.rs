@@ -23,6 +23,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use anyhow::Result;
+
 use crate::ids::{JmapEmailId, JmapMailboxId, MaildirId, MessageId};
 use crate::jmap::types::MailboxFolderBinding;
 use crate::state::queries::MailboxRecord;
@@ -567,6 +569,21 @@ impl MailboxBindingsBuilder {
     /// `resolve_mailboxes`.
     pub(crate) fn local_orphans(&self) -> &[LocalOrphanRecord] {
         &self.0.local_orphans
+    }
+
+    /// Populate each `LocalOrphanRecord.messages` via the
+    /// provided callback, which receives the orphan record
+    /// (with its binding + cached parent) and returns the
+    /// message vector to attach. Keeps direct mutation of the
+    /// `local_orphans` Vec inside this type.
+    pub(crate) fn populate_local_orphan_messages<F>(&mut self, mut f: F) -> Result<()>
+    where
+        F: FnMut(&LocalOrphanRecord) -> Result<Vec<OrphanMessage>>,
+    {
+        for orphan in &mut self.0.local_orphans {
+            orphan.messages = f(orphan)?;
+        }
+        Ok(())
     }
 
     /// Stage a `mailbox_map` row to be upserted without
