@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
 use crate::ids::{JmapAccountId, JmapEmailId, JmapMailboxId, MaildirId};
@@ -832,6 +832,15 @@ impl<'a> SyncEngine<'a> {
             &maildir_root,
         )?;
 
+        // Catalog each local orphan's messages: file-by-file
+        // walk under `cur/`/`new/`, joined against
+        // `message_map` for the dead id. Runs after both
+        // detection paths so every orphan -- cache-route or
+        // sentinel-route -- gets the same content snapshot.
+        synced.populate_local_orphan_messages(|orphan| {
+            enumerate_local_orphan_messages(self.conn, &maildir_root, orphan)
+        })?;
+
         // Stash the sentinel walk so scan can disambiguate
         // "maildir vanished" (LocalFolderDeleted) from "user
         // renamed maildir, sentinel travelled with it" (rename
@@ -1577,8 +1586,13 @@ fn record_sentinel_route_orphans(
 /// (`mailbox_metadata_writes` + `cache_route_orphan_deletes`
 /// before the executor via `apply_unconditional_mailbox_writes`;
 /// `pending_mailbox_writes` after the executor via
-/// `apply_pending_mailbox_writes`). The shell finalizes with
+/// `apply_pending_mailbox_writes`). The shell populates orphan
+/// messages, stashes the sentinel walk, and finalizes with
 /// `.build()`; no `mailbox_map` writes happen in the shell.
+///
+/// `maildir_root` is passed through so the sentinel-driven orphan
+/// info! log carries the same absolute path it did before the
+/// pre-pass split; the core does no actual I/O against it.
 fn compute_mailbox_resolution(
     input: &MailboxesInput<'_>,
     sync_config: &crate::config::SyncConfig,
@@ -1927,6 +1941,110 @@ fn walk_sentinels(maildir_root: &std::path::Path) -> HashMap<JmapMailboxId, Stri
     let mut out = HashMap::new();
     walk_sentinels_inner(maildir_root, maildir_root, &mut out);
     out
+}
+
+/// Catalog the orphan's messages: every file in `cur/`/`new/`
+/// at detection time, paired with a `Some(jmap_email_id)`
+/// when the file is backed by a `message_map` row pointing at
+/// the orphan's now-dead `jmap_mailbox_id`, or `None` when no
+/// row exists. Files with an unparseable `Message-ID` header
+/// are dropped (jma's idempotency anchor requires one).
+fn enumerate_local_orphan_messages(
+    conn: &Connection,
+    maildir_root: &std::path::Path,
+    orphan: &crate::sync::bindings::LocalOrphanRecord,
+) -> Result<Vec<crate::sync::bindings::OrphanMessage>> {
+    let mailbox_id = orphan
+        .binding
+        .jmap_mailbox_id
+        .expect_resolved("enumerate_local_orphan_messages -- orphan binding is resolved");
+    let folder_path = maildir_root.join(&orphan.binding.maildir_folder);
+    let maildir = match store::try_open_maildir(&folder_path) {
+        Some(md) => md,
+        None => {
+            // `try_open_maildir` returns None for: folder
+            // missing (external action already resolved the
+            // orphan from our side), folder present but
+            // missing `cur/` (no maildir-shaped content), or
+            // a stat failure (permission, EIO, etc.). The
+            // first two reduce to "nothing to catalog." The
+            // third is user-actionable -- surface so the
+            // cause is visible before a downstream destroy
+            // or resurrect fails for the same reason with
+            // less context.
+            match std::fs::metadata(&folder_path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    error!(
+                        "Cannot read orphan folder {}: {} -- skipping its \
+                         message catalog; downstream destroy or resurrect \
+                         will likely fail for the same reason",
+                        folder_path.display(),
+                        e
+                    );
+                }
+                _ => {
+                    debug!(
+                        "Orphan folder {} has nothing to catalog (folder \
+                         absent or no `cur/`)",
+                        folder_path.display()
+                    );
+                }
+            }
+            return Ok(Vec::new());
+        }
+    };
+
+    // Index DB rows by `maildir_id` for an O(1) file->row join
+    // during the directory walk. Files always have a
+    // maildir_id (parsed from the filename); `message_map`
+    // rows may have `maildir_id = NULL`, in which case they
+    // cannot match a file by definition and are skipped from
+    // the join index.
+    let records = queries::get_messages_by_jmap_mailbox_id(conn, mailbox_id)?;
+    let mut bound_by_maildir: HashMap<MaildirId, &queries::MessageRecord> =
+        HashMap::with_capacity(records.len());
+    for r in &records {
+        if let Some(mid) = r.maildir_id.as_ref() {
+            bound_by_maildir.insert(mid.clone(), r);
+        }
+    }
+
+    let mut messages = Vec::new();
+    for entry in maildir.list_cur().chain(maildir.list_new()) {
+        let entry = entry?;
+        let maildir_id = MaildirId::from(entry.id());
+        let path = entry.path().to_path_buf();
+        // I/O failures propagate; `Ok(None)` (no parseable
+        // Message-ID header) drops at `debug!` rather than
+        // `error!` because the orphan folder is destined for
+        // destroy or resurrect anyway -- a doomed file's
+        // missing header isn't user-actionable in the way
+        // scan's ingest-time `error!` is.
+        let message_id = match crate::maildir_ops::headers::parse_message_id_from_file(&path)? {
+            Some(mid) => mid,
+            None => {
+                debug!(
+                    "enumerate_local_orphan_messages: dropping {} -- no parseable Message-ID",
+                    path.display()
+                );
+                continue;
+            }
+        };
+        let flags = entry.flags().to_string();
+        let size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let jmap_email_id = bound_by_maildir
+            .get(&maildir_id)
+            .map(|r| r.jmap_email_id.clone());
+        messages.push(crate::sync::bindings::OrphanMessage {
+            jmap_email_id,
+            maildir_id,
+            message_id,
+            path,
+            flags,
+            size_bytes,
+        });
+    }
+    Ok(messages)
 }
 
 fn walk_sentinels_inner(

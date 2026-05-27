@@ -2878,6 +2878,166 @@ async fn resolve_mailboxes_recovers_local_orphan_via_sentinel_post_nuke() {
     );
 }
 
+/// A local orphan's `messages` field catalogs every file in
+/// its maildir at detection time: previously-synced files
+/// (whose `message_map` row pointed at the now-dead id) come
+/// with `jmap_email_id = Some`; files with no row come with
+/// `None`. The fixture exercises both: the server delivers
+/// one email into Archive, then we drop a hand-written
+/// local-only file into Archive/cur, then the server
+/// deletes Archive.
+#[tokio::test]
+async fn resolve_mailboxes_orphan_catalogs_bound_and_local_only_messages() {
+    let server = MockServer::start().await;
+    mount_session(&server).await;
+
+    let state = Arc::new(Mutex::new(MockState {
+        mailbox_state: "mb-1".to_string(),
+        email_state: "e-1".to_string(),
+        mailboxes: vec![
+            MockMailbox {
+                id: "MB-INBOX".to_string(),
+                name: "Inbox".to_string(),
+                role: Some("inbox".to_string()),
+                parent_id: None,
+            },
+            MockMailbox {
+                id: "MB-ARCH".to_string(),
+                name: "Archive".to_string(),
+                role: Some("archive".to_string()),
+                parent_id: None,
+            },
+        ],
+        emails: vec![MockEmail {
+            id: "E1".to_string(),
+            blob_id: "B1".to_string(),
+            thread_id: "T1".to_string(),
+            mailbox_ids: vec!["MB-ARCH".to_string()],
+            keywords: vec!["$seen".to_string()],
+            message_id: Some("<bound-1@example.com>".to_string()),
+        }],
+        blobs: {
+            let mut m = HashMap::new();
+            m.insert(
+                "B1".to_string(),
+                b"Message-ID: <bound-1@example.com>\r\nSubject: bound\r\n\r\nbody\r\n".to_vec(),
+            );
+            m
+        },
+        ..Default::default()
+    }));
+    mount_jmap(&server, state.clone()).await;
+    mount_blob_downloads(&server, state.clone()).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let conn = fresh_db(&temp);
+    let config = test_config(&server, temp.path(), vec![]);
+
+    SyncEngine::sync(&conn, &config, false)
+        .await
+        .expect("initial sync downloads E1 into Archive");
+
+    // Drop a local-only file into Archive/cur -- no
+    // `message_map` row will exist for it because it was
+    // never delivered by the server. Filename uses the
+    // maildir spec's `<unique>:2,<flags>` shape so the
+    // walker's `split_once(":2,")` recognises it.
+    let local_only_path = temp
+        .path()
+        .join("Archive")
+        .join("cur")
+        .join("LOCAL-FILE-1.host:2,S");
+    std::fs::write(
+        &local_only_path,
+        b"Message-ID: <local-only-1@example.com>\r\nSubject: local\r\n\r\nbody\r\n",
+    )
+    .expect("write local-only file");
+
+    // Negative fixtures the catalog must exclude:
+    //   * `tmp/` is never visited by the maildir crate's
+    //     `list_cur` / `list_new`, so entries there cannot
+    //     appear in `messages`. The assertion below pins
+    //     that we don't grow a stray `tmp/` walk later.
+    //   * Files with no parseable `Message-ID` header are
+    //     dropped by the helper itself (unactionable for
+    //     jma's idempotency anchor).
+    let tmp_dir = temp.path().join("Archive").join("tmp");
+    std::fs::create_dir_all(&tmp_dir).expect("ensure tmp/");
+    std::fs::write(
+        tmp_dir.join("INFLIGHT-1.host:2,"),
+        b"Message-ID: <in-tmp@example.com>\r\nSubject: tmp\r\n\r\nbody\r\n",
+    )
+    .expect("write tmp/ file");
+    std::fs::write(
+        temp.path()
+            .join("Archive")
+            .join("cur")
+            .join("NO-MSGID.host:2,"),
+        b"Subject: missing message-id\r\n\r\nbody\r\n",
+    )
+    .expect("write no-message-id file");
+
+    // Server deletes Archive; next resolve_mailboxes records
+    // the orphan and walks its content.
+    {
+        let mut st = state.lock().unwrap();
+        st.mailboxes.retain(|m| m.id != "MB-ARCH");
+        st.mailbox_state = "mb-2".to_string();
+    }
+
+    let engine = SyncEngine::connect(&conn, &config)
+        .await
+        .expect("connect engine");
+    let bindings = engine.resolve_mailboxes().await.expect("resolve mailboxes");
+
+    let orphans = bindings.local_orphans();
+    assert_eq!(orphans.len(), 1, "exactly one local orphan");
+    let orphan = &orphans[0];
+    assert_eq!(
+        orphan.messages.len(),
+        2,
+        "must catalog the bound + local-only file and drop the tmp/ + no-Message-ID entries; \
+         got: {:?}",
+        orphan
+            .messages
+            .iter()
+            .map(|m| m.path.display().to_string())
+            .collect::<Vec<_>>()
+    );
+
+    let bound = orphan
+        .messages
+        .iter()
+        .find(|m| m.jmap_email_id.as_ref().map(|id| id.as_ref()) == Some("E1"))
+        .expect("bound message must be present with Some(jmap_email_id)");
+    assert_eq!(bound.message_id.as_ref(), "bound-1@example.com");
+    assert!(bound.size_bytes > 0, "bound message size_bytes captured");
+
+    let local_only = orphan
+        .messages
+        .iter()
+        .find(|m| m.jmap_email_id.is_none())
+        .expect("local-only file must be present with None jmap_email_id");
+    assert_eq!(local_only.message_id.as_ref(), "local-only-1@example.com");
+    assert_eq!(local_only.path, local_only_path);
+    assert_eq!(local_only.flags, "S");
+    assert!(local_only.size_bytes > 0, "local-only size_bytes captured");
+
+    // Pin the negative fixtures: tmp/ entry must not appear,
+    // and the no-Message-ID file must drop.
+    assert!(
+        !orphan.messages.iter().any(|m| m.path.starts_with(&tmp_dir)),
+        "tmp/ entries must not appear in messages"
+    );
+    assert!(
+        !orphan
+            .messages
+            .iter()
+            .any(|m| m.maildir_id.as_ref() == "NO-MSGID.host"),
+        "files with no parseable Message-ID must drop at capture time"
+    );
+}
+
 /// Local maildir deletion surfaces as a remote-orphan in the
 /// post-sync `SyncOutcome.remote_orphans_detected` count. The
 /// user `rm -rf`s a previously-synced maildir; the next sync
