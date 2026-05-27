@@ -440,6 +440,19 @@ pub fn delete_local_state(conn: &Connection, maildir_id: &MaildirId) -> Result<(
     Ok(())
 }
 
+/// Delete every `local_state` row whose `maildir_folder`
+/// matches. Used by the orphan-destroy path so the cascade
+/// from `fs::remove_dir_all` doesn't leave dangling rows
+/// pointing at files that no longer exist. Returns the
+/// number of rows removed.
+pub fn delete_local_state_by_folder(conn: &Connection, folder: &str) -> Result<usize> {
+    let removed = conn.execute(
+        "DELETE FROM local_state WHERE maildir_folder = ?1",
+        params![folder],
+    )?;
+    Ok(removed)
+}
+
 // --- Discovery Cache ---
 
 /// Get the cached JMAP session URL for a domain, or None if no
@@ -536,6 +549,18 @@ pub fn upsert_folder_checkpoint(
             cp.cur_count,
             cp.new_count,
         ],
+    )?;
+    Ok(())
+}
+
+/// Delete the `folder_checkpoint` row for a folder. Called
+/// when a folder is destroyed locally so the next cycle's
+/// `compute_dirty_folders` doesn't trip on a row pointing at
+/// a folder that no longer exists.
+pub fn delete_folder_checkpoint(conn: &Connection, folder: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM folder_checkpoint WHERE maildir_folder = ?1",
+        params![folder],
     )?;
     Ok(())
 }

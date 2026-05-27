@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tracing::{Instrument, debug, info, warn};
+use tracing::{Instrument, debug, error, info, warn};
 
 use crate::config::Config;
 use crate::ids::{JmapAccountId, JmapEmailId, JmapMailboxId};
@@ -94,7 +94,8 @@ impl<'a> Executor<'a> {
 
     /// Walk a SyncPlan in dependency order:
     /// adopt -> download -> local-flags -> local-move -> local-delete ->
-    /// upload -> remote-keywords -> remote-move -> remote-destroy.
+    /// delete-local-folder -> upload -> remote-keywords -> remote-move ->
+    /// remote-destroy.
     ///
     /// Adoptions run first so subsequent actions on the same maildir_id /
     /// jmap_email_id see the binding. Server-side mutations come last so
@@ -113,6 +114,7 @@ impl<'a> Executor<'a> {
         let mut local_flags = Vec::new();
         let mut local_moves = Vec::new();
         let mut local_deletes = Vec::new();
+        let mut local_folder_deletes = Vec::new();
         let mut remote_creates = Vec::new();
         let mut remote_renames = Vec::new();
         let mut uploads = Vec::new();
@@ -140,6 +142,7 @@ impl<'a> Executor<'a> {
                 SyncAction::UpdateLocalFlags { .. } => local_flags.push(action),
                 SyncAction::MoveLocal { .. } => local_moves.push(action),
                 SyncAction::DeleteLocal { .. } => local_deletes.push(action),
+                SyncAction::DeleteLocalFolder { .. } => local_folder_deletes.push(action),
                 SyncAction::CreateRemoteMailbox { .. } => remote_creates.push(action),
                 SyncAction::RenameRemoteMailbox { .. } => remote_renames.push(action),
                 SyncAction::UploadMessage { .. } => uploads.push(action),
@@ -171,6 +174,15 @@ impl<'a> Executor<'a> {
         let local_flag_updates = self.update_local_flags(local_flags)?;
         let local_moves_count = self.move_local_messages(local_moves)?;
         let local_deletes_count = self.delete_local_messages(local_deletes)?;
+        // DeleteLocalFolder runs after every per-message
+        // local-side phase so any MoveLocal counter-action
+        // that drained the folder gets to land first; once
+        // the recursive remove fires, the folder + every file
+        // inside is gone regardless. Cascade DB cleanup
+        // (`message_map`, `local_state`, `folder_checkpoint`)
+        // follows so the next cycle's dedupe + lookup don't
+        // trip on rows pointing at a destroyed path.
+        delete_local_folders(self.conn, &self.maildir_root, local_folder_deletes)?;
         // Remote mailbox creates land before uploads so a plan that emits
         // CreateRemoteMailbox + UploadMessage into the new mailbox in the
         // same cycle finds the destination already provisioned. Returns
@@ -1605,6 +1617,124 @@ fn walk_chain(cursor: Option<String>, edges: &HashMap<String, String>) -> Option
     }
 }
 
+/// Execute `DeleteLocalFolder` actions: remove the maildir
+/// directory tree, then cascade DB cleanup so no rows
+/// reference the destroyed path. Per-folder steps:
+///   1. Path safety: refuse if the resolved path escapes
+///      `maildir_root` (defense-in-depth -- producer-
+///      controlled, but the recursive `remove_dir_all` is
+///      catastrophic if a stray `..` slips through).
+///   2. `fs::remove_dir_all`. Treats `NotFound` as a
+///      successful no-op (the folder vanished out of band;
+///      downstream cleanup still runs to drain any stale
+///      rows).
+///   3. Cascade cleanup inside a per-folder transaction:
+///      `delete_messages_by_jmap_mailbox_id` on the dead id,
+///      `delete_local_state_by_folder` on the folder string,
+///      `delete_folder_checkpoint` so the next cycle's dedupe
+///      doesn't trip.
+///
+/// Per-folder failures (path-safety refusal, fs error other
+/// than NotFound) log at `warn!` and skip the remaining
+/// cleanup for that folder so a single broken orphan doesn't
+/// poison the rest.
+fn delete_local_folders(
+    conn: &Connection,
+    maildir_root: &std::path::Path,
+    actions: Vec<SyncAction>,
+) -> Result<()> {
+    if actions.is_empty() {
+        return Ok(());
+    }
+    let maildir_root_canon = match std::fs::canonicalize(maildir_root) {
+        Ok(p) => p,
+        Err(e) => {
+            error!(
+                "DeleteLocalFolder: cannot canonicalize maildir_root {}: {}; \
+                 refusing every destroy this cycle",
+                maildir_root.display(),
+                e
+            );
+            return Ok(());
+        }
+    };
+    for action in actions {
+        let SyncAction::DeleteLocalFolder { binding } = action else {
+            continue;
+        };
+        let target = maildir_root.join(&binding.maildir_folder);
+        // Path-safety guard. `canonicalize` follows symlinks
+        // so a sibling-rooted symlink can't smuggle the
+        // remove outside the root. On the NotFound branch
+        // the target doesn't exist on disk; fall back to a
+        // lexical check, but explicitly refuse any
+        // `ParentDir` component first -- `PathBuf::starts_with`
+        // is component-wise lexical, so `../X` would
+        // otherwise pass the prefix check (the root is still
+        // the prefix; the `..` is just an extra component).
+        let escaped = match std::fs::canonicalize(&target) {
+            Ok(canon) => !canon.starts_with(&maildir_root_canon),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                target
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+                    || !target.starts_with(maildir_root)
+            }
+            Err(e) => {
+                warn!(
+                    "DeleteLocalFolder: cannot canonicalize {}: {}; skipping",
+                    target.display(),
+                    e
+                );
+                continue;
+            }
+        };
+        if escaped {
+            warn!(
+                "DeleteLocalFolder: refusing to remove {} -- resolves outside \
+                 maildir_root {}",
+                target.display(),
+                maildir_root_canon.display()
+            );
+            continue;
+        }
+        match std::fs::remove_dir_all(&target) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                warn!(
+                    "DeleteLocalFolder: remove_dir_all {} failed: {}; \
+                     skipping cascade cleanup so a manual retry next cycle \
+                     can clear the rows once disk catches up",
+                    target.display(),
+                    e
+                );
+                continue;
+            }
+        }
+        let mailbox_id = binding.jmap_mailbox_id.expect_resolved(
+            "delete_local_folders -- binding id must be resolved before reaching \
+             the executor",
+        );
+        // Per-folder transaction so an fs failure on folder
+        // N+1 doesn't roll back folder N's cascade. The fs
+        // op already ran before this point and is irreversible;
+        // a wide txn that included it would leave a half-
+        // deleted state on partial failure.
+        let txn = conn.unchecked_transaction()?;
+        let messages_removed = queries::delete_messages_by_jmap_mailbox_id(&txn, mailbox_id)?;
+        let state_removed = queries::delete_local_state_by_folder(&txn, &binding.maildir_folder)?;
+        queries::delete_folder_checkpoint(&txn, &binding.maildir_folder)?;
+        txn.commit()?;
+        info!(
+            "DeleteLocalFolder {}/ (id {}): removed maildir, dropped {} \
+             message_map row(s) and {} local_state row(s)",
+            binding.maildir_folder, mailbox_id, messages_removed, state_removed
+        );
+    }
+    Ok(())
+}
+
 /// Bind already-on-server messages to existing local files (DB only).
 /// Pure-DB phase, so the whole loop runs in one transaction: a panic
 /// or error mid-loop rolls the entire phase back instead of leaving
@@ -2739,6 +2869,229 @@ mod tests {
                 },
                 other => panic!("expected UploadMessage, got {:?}", other),
             }
+        }
+    }
+
+    mod delete_local_folder {
+        use super::*;
+        use crate::ids::MaildirId;
+        use crate::maildir_ops::sentinel::{self, MailboxMapping};
+        use crate::maildir_ops::store::{ensure_maildir, store_message};
+        use tempfile::tempdir;
+
+        fn action_for(folder: &str, mailbox_id: &str) -> SyncAction {
+            SyncAction::DeleteLocalFolder {
+                binding: Arc::new(MailboxFolderBinding {
+                    jmap_mailbox_id: MaybeReference::Value(JmapMailboxId::from(mailbox_id)),
+                    server_name: folder.to_string(),
+                    maildir_folder: folder.to_string(),
+                    remote_path: folder.to_string(),
+                }),
+            }
+        }
+
+        /// Happy path: maildir exists with one bound file +
+        /// matching DB rows; destroy removes the tree and
+        /// drains every row pointing at the folder/id.
+        #[test]
+        fn destroys_folder_and_cascades_cleanup() {
+            let dir = tempdir().unwrap();
+            let conn = db::open_in_memory().unwrap();
+            let maildir_root = dir.path();
+
+            let folder = "Archive";
+            let folder_path = maildir_root.join(folder);
+            let maildir = ensure_maildir(&folder_path).unwrap();
+            sentinel::write(
+                &folder_path,
+                &MailboxMapping {
+                    jmap_mailbox_id: "MB-ARCH".into(),
+                    parent_jmap_mailbox_id: None,
+                    server_name: folder.to_string(),
+                },
+            )
+            .unwrap();
+            let maildir_id = store_message(
+                &maildir,
+                b"Message-ID: <a@example.com>\r\nSubject: x\r\n\r\nbody\r\n",
+                "",
+            )
+            .unwrap();
+            queries::upsert_message(
+                &conn,
+                &MessageRecord {
+                    jmap_email_id: "E1".into(),
+                    jmap_blob_id: Some("B1".into()),
+                    jmap_thread_id: Some("T1".into()),
+                    jmap_mailbox_id: "MB-ARCH".into(),
+                    maildir_id: Some(maildir_id.clone()),
+                    message_id: "a@example.com".into(),
+                    flags: "".into(),
+                    jmap_keywords: "{}".into(),
+                },
+            )
+            .unwrap();
+            queries::upsert_local_state(&conn, &maildir_id, folder, "", None).unwrap();
+
+            delete_local_folders(&conn, maildir_root, vec![action_for(folder, "MB-ARCH")]).unwrap();
+
+            assert!(!folder_path.exists(), "maildir tree must be removed");
+            assert!(
+                queries::get_message_by_jmap_id(&conn, &"E1".into())
+                    .unwrap()
+                    .is_none(),
+                "message_map row for the dead id must be gone"
+            );
+            assert!(
+                queries::get_local_state_for_folder(&conn, folder)
+                    .unwrap()
+                    .is_empty(),
+                "local_state for the destroyed folder must be drained"
+            );
+            assert!(
+                queries::get_folder_checkpoint(&conn, folder)
+                    .unwrap()
+                    .is_none(),
+                "folder_checkpoint row must be gone so next-cycle dedupe doesn't trip"
+            );
+        }
+
+        /// Path-safety: a binding whose `maildir_folder`
+        /// path-traverses out of `maildir_root` must be
+        /// refused; nothing on disk is touched and the DB
+        /// cleanup is also skipped (the row's existence
+        /// outside the root is the producer's bug to fix).
+        #[test]
+        fn refuses_path_traversal() {
+            let dir = tempdir().unwrap();
+            let conn = db::open_in_memory().unwrap();
+            let maildir_root = dir.path().join("root");
+            std::fs::create_dir_all(&maildir_root).unwrap();
+
+            // Create a sibling directory the action will try to
+            // remove via `../sibling`. If the guard fails, this
+            // directory + file would vanish.
+            let sibling = dir.path().join("sibling");
+            std::fs::create_dir_all(&sibling).unwrap();
+            let canary = sibling.join("canary");
+            std::fs::write(&canary, b"must survive").unwrap();
+
+            let action = SyncAction::DeleteLocalFolder {
+                binding: Arc::new(MailboxFolderBinding {
+                    jmap_mailbox_id: MaybeReference::Value(JmapMailboxId::from("MB-EVIL")),
+                    server_name: "../sibling".to_string(),
+                    maildir_folder: "../sibling".to_string(),
+                    remote_path: "../sibling".to_string(),
+                }),
+            };
+
+            delete_local_folders(&conn, &maildir_root, vec![action]).unwrap();
+
+            assert!(
+                canary.exists(),
+                "path-traversal target must not be touched; canary file gone implies the guard failed"
+            );
+        }
+
+        /// Path-safety on the NotFound branch: the joined
+        /// target doesn't exist on disk, so `canonicalize`
+        /// returns NotFound. `PathBuf::starts_with` is
+        /// component-wise lexical -- without the
+        /// `ParentDir`-component refusal, `root/../missing`
+        /// would slip past the prefix check (root is still
+        /// the lexical prefix), and the DB cascade would
+        /// still drain the dead id's rows. Pin that the
+        /// guard refuses.
+        #[test]
+        fn refuses_path_traversal_when_target_absent() {
+            let dir = tempdir().unwrap();
+            let conn = db::open_in_memory().unwrap();
+            let maildir_root = dir.path().join("root");
+            std::fs::create_dir_all(&maildir_root).unwrap();
+
+            // Pre-seed a `message_map` row pointing at MB-EVIL
+            // so the cascade leg has something to drain --
+            // if the guard fails, this row would vanish.
+            queries::upsert_message(
+                &conn,
+                &MessageRecord {
+                    jmap_email_id: "E-canary".into(),
+                    jmap_blob_id: None,
+                    jmap_thread_id: None,
+                    jmap_mailbox_id: "MB-EVIL".into(),
+                    maildir_id: Some(MaildirId::from("FOO.host")),
+                    message_id: "canary@example.com".into(),
+                    flags: "".into(),
+                    jmap_keywords: "{}".into(),
+                },
+            )
+            .unwrap();
+
+            let action = SyncAction::DeleteLocalFolder {
+                binding: Arc::new(MailboxFolderBinding {
+                    jmap_mailbox_id: MaybeReference::Value(JmapMailboxId::from("MB-EVIL")),
+                    server_name: "../missing".to_string(),
+                    maildir_folder: "../missing".to_string(),
+                    remote_path: "../missing".to_string(),
+                }),
+            };
+
+            delete_local_folders(&conn, &maildir_root, vec![action]).unwrap();
+
+            assert!(
+                queries::get_message_by_jmap_id(&conn, &"E-canary".into())
+                    .unwrap()
+                    .is_some(),
+                "guard must refuse on `../X` even when the target is absent; \
+                 the DB cascade must not run for a refused action"
+            );
+        }
+
+        /// Idempotent on already-absent folder: an external
+        /// `rm -rf` between detection and execution makes
+        /// `remove_dir_all` see NotFound. The cascade cleanup
+        /// still runs so any stale rows still pointing at the
+        /// folder/id get drained.
+        #[test]
+        fn idempotent_on_absent_folder() {
+            let dir = tempdir().unwrap();
+            let conn = db::open_in_memory().unwrap();
+            let maildir_root = dir.path();
+
+            // No folder on disk, but pre-seed DB rows so the
+            // cleanup leg has work to do.
+            queries::upsert_message(
+                &conn,
+                &MessageRecord {
+                    jmap_email_id: "E1".into(),
+                    jmap_blob_id: None,
+                    jmap_thread_id: None,
+                    jmap_mailbox_id: "MB-ARCH".into(),
+                    maildir_id: Some(MaildirId::from("FOO.host")),
+                    message_id: "a@example.com".into(),
+                    flags: "".into(),
+                    jmap_keywords: "{}".into(),
+                },
+            )
+            .unwrap();
+            queries::upsert_local_state(&conn, &MaildirId::from("FOO.host"), "Archive", "", None)
+                .unwrap();
+
+            delete_local_folders(&conn, maildir_root, vec![action_for("Archive", "MB-ARCH")])
+                .unwrap();
+
+            assert!(
+                queries::get_message_by_jmap_id(&conn, &"E1".into())
+                    .unwrap()
+                    .is_none(),
+                "message_map cascade cleanup runs even when the folder was already gone"
+            );
+            assert!(
+                queries::get_local_state_for_folder(&conn, "Archive")
+                    .unwrap()
+                    .is_empty(),
+                "local_state cascade cleanup runs even when the folder was already gone"
+            );
         }
     }
 }
