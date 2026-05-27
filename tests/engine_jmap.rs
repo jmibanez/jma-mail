@@ -2877,3 +2877,277 @@ async fn resolve_mailboxes_recovers_local_orphan_via_sentinel_post_nuke() {
         "sentinel-supplied parent must survive the post-nuke walk"
     );
 }
+
+/// Local maildir deletion surfaces as a remote-orphan in the
+/// post-sync `SyncOutcome.remote_orphans_detected` count. The
+/// user `rm -rf`s a previously-synced maildir; the next sync
+/// cycle's scan sees `try_open_maildir` return None for the
+/// binding, the sentinel walk finds no surviving sentinel, and
+/// neither the new-mailbox nor rename guards apply -- so scan
+/// emits `LocalChange::LocalFolderDeleted` and the engine
+/// converts it into a `RemoteOrphanRecord` before reconcile
+/// runs. No re-creation of the deleted maildir, no destructive
+/// SyncAction (this commit is detection-only).
+#[tokio::test]
+async fn sync_detects_remote_orphan_for_locally_deleted_folder() {
+    let server = MockServer::start().await;
+    mount_session(&server).await;
+
+    let state = Arc::new(Mutex::new(MockState {
+        mailbox_state: "mb-1".to_string(),
+        email_state: "e-1".to_string(),
+        mailboxes: vec![
+            MockMailbox {
+                id: "MB-INBOX".to_string(),
+                name: "Inbox".to_string(),
+                role: Some("inbox".to_string()),
+                parent_id: None,
+            },
+            MockMailbox {
+                id: "MB-ARCH".to_string(),
+                name: "Archive".to_string(),
+                role: Some("archive".to_string()),
+                parent_id: None,
+            },
+        ],
+        // Seed one email on the server so the post-orphan
+        // count hydration's `Email/query (limit: 0)` returns
+        // a non-zero total; the mock's `email_query` returns
+        // `state.emails.len()` regardless of `inMailbox`
+        // filter, so any non-empty count exercises the
+        // hydration round-trip.
+        emails: vec![MockEmail {
+            id: "E1".to_string(),
+            blob_id: "B1".to_string(),
+            thread_id: "T1".to_string(),
+            mailbox_ids: vec!["MB-INBOX".to_string()],
+            keywords: vec!["$seen".to_string()],
+            message_id: Some("<msg-1@example.com>".to_string()),
+        }],
+        blobs: {
+            let mut m = HashMap::new();
+            m.insert(
+                "B1".to_string(),
+                b"Message-ID: <msg-1@example.com>\r\nSubject: hi\r\n\r\nbody\r\n".to_vec(),
+            );
+            m
+        },
+        ..Default::default()
+    }));
+    mount_jmap(&server, state.clone()).await;
+    mount_blob_downloads(&server, state.clone()).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let conn = fresh_db(&temp);
+    let config = test_config(&server, temp.path(), vec![]);
+
+    SyncEngine::sync(&conn, &config, false)
+        .await
+        .expect("first sync establishes the maildirs and cache rows");
+    assert!(
+        temp.path().join("Archive").join("cur").is_dir(),
+        "Archive maildir must exist after first sync"
+    );
+
+    // User deletes the Archive maildir wholesale. The sentinel
+    // lived inside `Archive/`, so the post-deletion sentinel
+    // walk will find no record for MB-ARCH anywhere.
+    std::fs::remove_dir_all(temp.path().join("Archive")).expect("rm -rf Archive");
+
+    let outcome = SyncEngine::sync(&conn, &config, false)
+        .await
+        .expect("second sync detects the orphan");
+    assert_eq!(
+        outcome.remote_orphans_detected, 1,
+        "scan + engine must surface exactly one remote orphan; got outcome = {:?}",
+        outcome
+    );
+    assert_eq!(
+        outcome.remote_orphan_total_emails, 1,
+        "the count-hydration `Email/query` round-trip must populate \
+         `server_email_count` (mock state has 1 email); got outcome = {:?}",
+        outcome
+    );
+
+    // The detection path must NOT have re-created the maildir
+    // (that would silently undo the user's delete).
+    assert!(
+        !temp.path().join("Archive").join("cur").is_dir(),
+        "detection must not re-create the deleted maildir"
+    );
+}
+
+/// A local rename (user `mv`-ed the maildir to a different
+/// path) leaves the sentinel intact at the new path. Scan's
+/// `LocalFolderDeleted` emission consults
+/// `MailboxBindings::sentinel_survives_for`; a survived
+/// sentinel suppresses the emission and the rename detection
+/// inside `decide_mailbox_action` takes the case instead.
+#[tokio::test]
+async fn sync_does_not_misfire_remote_orphan_on_local_rename() {
+    let server = MockServer::start().await;
+    mount_session(&server).await;
+
+    let state = Arc::new(Mutex::new(MockState {
+        mailbox_state: "mb-1".to_string(),
+        email_state: "e-1".to_string(),
+        mailboxes: vec![
+            MockMailbox {
+                id: "MB-INBOX".to_string(),
+                name: "Inbox".to_string(),
+                role: Some("inbox".to_string()),
+                parent_id: None,
+            },
+            MockMailbox {
+                id: "MB-ARCH".to_string(),
+                name: "Archive".to_string(),
+                role: Some("archive".to_string()),
+                parent_id: None,
+            },
+        ],
+        ..Default::default()
+    }));
+    mount_jmap(&server, state.clone()).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let conn = fresh_db(&temp);
+    let config = test_config(&server, temp.path(), vec![]);
+
+    SyncEngine::sync(&conn, &config, false)
+        .await
+        .expect("first sync");
+
+    // User `mv` Archive -> ArchiveRenamed -- the sentinel
+    // lives inside the renamed dir, so the walk will surface
+    // MB-ARCH at the new path.
+    std::fs::rename(
+        temp.path().join("Archive"),
+        temp.path().join("ArchiveRenamed"),
+    )
+    .expect("mv Archive ArchiveRenamed");
+
+    let outcome = SyncEngine::sync(&conn, &config, false)
+        .await
+        .expect("second sync");
+    assert_eq!(
+        outcome.remote_orphans_detected, 0,
+        "local rename must not misfire as a remote orphan; got {:?}",
+        outcome
+    );
+    // Pin that the rename path actually fired: the renamed
+    // maildir survives on disk and the cache row's
+    // `maildir_folder` got rewritten to match. A
+    // regression where scan emits `LocalFolderDeleted` AND a
+    // separate orphan-suppression path happens to mask it
+    // would pass the count assertion above but fail here.
+    assert!(
+        temp.path().join("ArchiveRenamed").join("cur").is_dir(),
+        "renamed maildir must survive the rename-detection cycle"
+    );
+    let cached = jma_mail::state::queries::get_mailbox(&conn, &JmapMailboxId::from("MB-ARCH"))
+        .expect("query mailbox_map")
+        .expect("MB-ARCH cache row exists post-sync");
+    assert_eq!(
+        cached.maildir_folder, "ArchiveRenamed",
+        "rename-detection must rewrite mailbox_map.maildir_folder to the new path"
+    );
+}
+
+/// First-cycle: a server-known mailbox with no cached
+/// `mailbox_map` row, no on-disk maildir, and no sentinel
+/// anywhere. The binding lands on `new_mailboxes` for the
+/// `CreateLocalMailbox` flow; scan's `is_new_mailbox` guard
+/// suppresses any `LocalFolderDeleted` emission so the
+/// not-yet-created mailbox doesn't get misclassified as a
+/// deletion.
+#[tokio::test]
+async fn sync_does_not_misfire_remote_orphan_on_first_cycle() {
+    let server = MockServer::start().await;
+    mount_session(&server).await;
+
+    let state = Arc::new(Mutex::new(MockState {
+        mailbox_state: "mb-1".to_string(),
+        email_state: "e-1".to_string(),
+        mailboxes: vec![
+            MockMailbox {
+                id: "MB-INBOX".to_string(),
+                name: "Inbox".to_string(),
+                role: Some("inbox".to_string()),
+                parent_id: None,
+            },
+            MockMailbox {
+                id: "MB-ARCH".to_string(),
+                name: "Archive".to_string(),
+                role: Some("archive".to_string()),
+                parent_id: None,
+            },
+        ],
+        ..Default::default()
+    }));
+    mount_jmap(&server, state.clone()).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let conn = fresh_db(&temp);
+    let config = test_config(&server, temp.path(), vec![]);
+
+    // No prior sync: cache is empty, disk is empty, no
+    // sentinels anywhere. The first cycle sees both
+    // server-known mailboxes for the first time.
+    let outcome = SyncEngine::sync(&conn, &config, false)
+        .await
+        .expect("first sync");
+    assert_eq!(
+        outcome.remote_orphans_detected, 0,
+        "first-cycle sync must not misfire as remote orphans; got {:?}",
+        outcome
+    );
+
+    // Both mailboxes should have landed on disk via
+    // CreateLocalMailbox.
+    assert!(temp.path().join("INBOX").join("cur").is_dir());
+    assert!(temp.path().join("Archive").join("cur").is_dir());
+
+    // The trailing block that pinned `new_mailboxes()`
+    // membership was specific to resolve_mailboxes' direct
+    // return value -- after the migration to scan + engine
+    // detection, the equivalent assertion is that both
+    // maildirs got provisioned (above). Re-resolve to confirm
+    // the cache rows landed.
+    let engine = SyncEngine::connect(&conn, &config)
+        .await
+        .expect("connect engine for post-sync resolve");
+    let bindings = engine.resolve_mailboxes().await.expect("resolve mailboxes");
+    let cached_ids: Vec<&str> = bindings
+        .iter()
+        .map(|b| {
+            b.jmap_mailbox_id
+                .expect_resolved("post-sync binding is resolved")
+                .as_ref()
+        })
+        .collect();
+    assert!(
+        cached_ids.contains(&"MB-INBOX") && cached_ids.contains(&"MB-ARCH"),
+        "post-sync bindings must include both mailboxes; got {:?}",
+        cached_ids
+    );
+
+    // First-cycle `new_mailboxes()` is the cycle's own slot
+    // for "server-known but not-yet-cached" bindings; after
+    // sync persists the cache rows it's expected to be empty
+    // on re-resolve (since the rows now exist).
+    let new_ids: Vec<&str> = bindings
+        .new_mailboxes()
+        .iter()
+        .map(|n| {
+            n.binding
+                .jmap_mailbox_id
+                .expect_resolved("new mailbox binding is resolved")
+                .as_ref()
+        })
+        .collect();
+    assert!(
+        new_ids.is_empty(),
+        "post-sync re-resolve must see no first-cycle entries; got {:?}",
+        new_ids
+    );
+}

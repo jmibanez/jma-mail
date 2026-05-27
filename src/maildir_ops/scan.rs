@@ -111,14 +111,15 @@ pub enum LocalChange {
         path: PathBuf,
         sentinel: Option<MailboxMapping>,
     },
-    /// A bound folder we expected to see on disk is gone. The
-    /// binding is the cached `Arc<MailboxFolderBinding>` (or one
-    /// hydrated from the sentinel before the folder vanished); the
-    /// consumer pushes the deletion to the server against
-    /// `binding.jmap_mailbox_id`.
-    ///
-    /// No producer or consumer today: the variant lives here so
-    /// the shape is settled before the deletion phase lands.
+    /// A bound folder the cache expects on disk is gone. Emitted
+    /// by the Full-scope scan in `engine::run` when a binding's
+    /// `try_open_maildir` returns None and neither the
+    /// first-cycle nor sentinel-survives-elsewhere guard
+    /// applies. The engine reads this event between scan and
+    /// reconcile and translates it into a
+    /// `RemoteOrphanRecord` on `MailboxBindings`, populating
+    /// each orphan's `server_email_count` via `Email/query` for
+    /// downstream telemetry.
     LocalFolderDeleted { binding: Arc<MailboxFolderBinding> },
     /// A bound folder's on-disk location moved between cycles
     /// (the same `.jma.mapping` sentinel now sits at a different

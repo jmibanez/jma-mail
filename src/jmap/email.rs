@@ -100,6 +100,49 @@ pub async fn get_by_ids(client: &Client, ids: &[JmapEmailId]) -> Result<Vec<Emai
     .await
 }
 
+/// Total messages in `mailbox_id` per the server. One `Email/query`
+/// round-trip with `limit: 0` + `calculateTotal: true` so the
+/// response carries the count and no ids. Used by post-detection
+/// hydration where the consumer wants just the magnitude (e.g.
+/// `RemoteOrphanRecord.server_email_count`), not the messages
+/// themselves.
+pub async fn count_emails_in_mailbox(client: &Client, mailbox_id: &JmapMailboxId) -> Result<u64> {
+    let total = with_retry("Email/query (count)", || async {
+        let mut request = client.build();
+        let query = request
+            .query_email()
+            .account_id(client.default_account_id());
+        query
+            .filter(email::query::Filter::in_mailbox(mailbox_id.as_ref()))
+            .position(0)
+            .limit(0)
+            .calculate_total(true);
+        let response = request
+            .send()
+            .await
+            .context("Failed to query email count")?;
+        let query_response = response
+            .unwrap_method_responses()
+            .pop()
+            .context("No response for email count query")?;
+        let result = query_response
+            .unwrap_query_email()
+            .context("Failed to parse email count query response")?;
+        Ok(result.total())
+    })
+    .await?;
+    match total {
+        Some(t) => Ok(t as u64),
+        None => {
+            warn!(
+                "Email/query for {} omitted calculateTotal despite the request; treating as 0",
+                mailbox_id
+            );
+            Ok(0)
+        }
+    }
+}
+
 /// One `Email/query` round-trip at a specific offset. `with_total`
 /// asks the server to populate `total` in the response so the caller
 /// can plan the remaining pages up front; subsequent pages set it
