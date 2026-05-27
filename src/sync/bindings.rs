@@ -20,9 +20,10 @@
 //! shape; detecting it sits outside the scope of this type today.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::ids::JmapMailboxId;
+use crate::ids::{JmapEmailId, JmapMailboxId, MaildirId, MessageId};
 use crate::jmap::types::MailboxFolderBinding;
 use crate::state::queries::MailboxRecord;
 
@@ -52,21 +53,27 @@ use crate::state::queries::MailboxRecord;
 /// action. The `renamed_mailboxes` slot is the analogous output
 /// for the rename case: any cached `mailbox_map` row whose folder
 /// disagrees with the freshly resolved one becomes a
-/// `RenameLocalMailbox` action. The `cache_route_orphan_deletes`
-/// slot is the inverse of the cache-vs-server diff: ids in the
-/// pre-cycle `mailbox_map` snapshot the fresh `Mailbox/get` no
-/// longer advertises. `apply_unconditional_mailbox_writes`
-/// drains the slot before the executor runs, dropping the stale
-/// `mailbox_map` row and leaving the on-disk maildir alone
-/// (destructive folder resolution is a separate, policy-gated
-/// path). Consumers that only care about the live set ignore
-/// all three slots.
+/// `RenameLocalMailbox` action. The `local_orphans` slot records
+/// bindings whose `mailbox_map` row was dropped this cycle because
+/// the server no longer advertises the id -- the local maildir is
+/// the orphan (parent gone server-side); its
+/// `binding.jmap_mailbox_id` is a tombstone, useful only for
+/// identifying DB rows that still point at the dead id. The
+/// `cache_route_orphan_deletes` slot rides alongside `local_orphans`
+/// for the cache-route subset: ids in the pre-cycle `mailbox_map`
+/// snapshot the fresh `Mailbox/get` no longer advertises.
+/// `apply_unconditional_mailbox_writes` drains the slot before the
+/// executor runs, dropping the stale `mailbox_map` row and leaving
+/// the on-disk maildir alone (destructive folder resolution is a
+/// separate, policy-gated path). Consumers that only care about the
+/// live set ignore all four slots.
 #[derive(Debug, Default)]
 pub struct MailboxBindings {
     by_id: HashMap<JmapMailboxId, Arc<MailboxFolderBinding>>,
     by_folder: HashMap<String, JmapMailboxId>,
     new_mailboxes: Vec<NewMailboxRecord>,
     renamed_mailboxes: Vec<RenamedMailboxRecord>,
+    local_orphans: Vec<LocalOrphanRecord>,
     mailbox_metadata_writes: Vec<MailboxRecord>,
     cache_route_orphan_deletes: Vec<JmapMailboxId>,
 }
@@ -140,6 +147,62 @@ pub struct RenamedMailboxRecord {
     pub parent_jmap_mailbox_id: Option<JmapMailboxId>,
 }
 
+/// A local maildir whose remote counterpart has been deleted
+/// -- the fresh `Mailbox/get` did not return its id, so the
+/// `mailbox_map` row was dropped this cycle. The
+/// `binding.jmap_mailbox_id` is historical: the server no
+/// longer serves it, but local artifacts (the maildir on
+/// disk, `message_map` rows still pointing at the id) survive
+/// until a destructive or resurrect path acts on them.
+/// `binding` is the last-known
+/// `(jmap_mailbox_id, server_name, maildir_folder, remote_path)`
+/// tuple from the dropped cache row (or, under post-DB-nuke
+/// recovery, from the `.jma.mapping` sentinel that survived
+/// the nuke). `parent_jmap_mailbox_id` records the cached
+/// parent so the orphan's position in the hierarchy survives
+/// the cache-row drop.
+#[derive(Debug, Clone)]
+pub struct LocalOrphanRecord {
+    pub binding: Arc<MailboxFolderBinding>,
+    pub parent_jmap_mailbox_id: Option<JmapMailboxId>,
+    /// Messages found in the orphan's maildir at detection
+    /// time. Each entry is one file in `cur/`/`new/`;
+    /// `jmap_email_id` is `Some` when the file is backed by
+    /// a `message_map` row whose `jmap_mailbox_id` matched
+    /// the dead id (a previously-synced message), and `None`
+    /// when the file has no corresponding row. Files whose
+    /// `Message-ID` header is unparseable are dropped at
+    /// capture time (jma's idempotency anchor requires one;
+    /// without it the file is unactionable). Order is capture
+    /// order and is not load-bearing.
+    pub messages: Vec<OrphanMessage>,
+}
+
+/// One message found in a `LocalOrphanRecord`'s maildir at
+/// detection time. `jmap_email_id` discriminates the two
+/// cases: `Some` when the file was backed by a `message_map`
+/// row pointing at the orphan's now-dead `jmap_mailbox_id`
+/// (carried so the row is identifiable without a second DB
+/// pass), `None` when no row exists for the file.
+#[derive(Debug, Clone)]
+pub struct OrphanMessage {
+    pub jmap_email_id: Option<JmapEmailId>,
+    pub maildir_id: MaildirId,
+    pub message_id: MessageId,
+    /// Absolute path to the file in `cur/` or `new/` at
+    /// capture time. Not refreshed if the file moves between
+    /// subdirs mid-cycle.
+    pub path: PathBuf,
+    /// Maildir filename flag suffix (everything after `:2,`)
+    /// at capture time, e.g. `"FS"`. Captured so consumers
+    /// don't have to re-parse the filename.
+    pub flags: String,
+    /// File size in bytes at capture time, from
+    /// `std::fs::metadata`. Lets consumers gate uploads
+    /// against `max_upload_size` without a second `stat`.
+    pub size_bytes: u64,
+}
+
 impl MailboxBindings {
     /// Start a fresh, empty builder. Callers populate via
     /// `MailboxBindingsBuilder` mutators, then finish with `.build()`.
@@ -183,6 +246,14 @@ impl MailboxBindings {
         &self.renamed_mailboxes
     }
 
+    /// Bindings whose `mailbox_map` row was dropped this cycle
+    /// because the server no longer advertises the id. Empty
+    /// in steady state. Order matches detection order in
+    /// `resolve_mailboxes`.
+    pub fn local_orphans(&self) -> &[LocalOrphanRecord] {
+        &self.local_orphans
+    }
+
     /// `mailbox_map` rows the engine should upsert without
     /// re-checking disk state -- the `Unchanged`/`CacheStale`
     /// bucket. Applied by `apply_unconditional_mailbox_writes`
@@ -196,7 +267,8 @@ impl MailboxBindings {
     }
 
     /// Ids whose `mailbox_map` row should be dropped this cycle
-    /// (cache-route orphans). Applied by
+    /// (cache-route orphans). Sentinel-route orphans have no
+    /// cache row to drop and do not appear here. Applied by
     /// `apply_unconditional_mailbox_writes` alongside
     /// `mailbox_metadata_writes`.
     pub fn cache_route_orphan_deletes(&self) -> &[JmapMailboxId] {
@@ -304,6 +376,32 @@ impl MailboxBindingsBuilder {
         });
     }
 
+    /// Record a local orphan: the cached `mailbox_map` row was
+    /// dropped this cycle because the fresh `Mailbox/get` no
+    /// longer carries the id, or the post-nuke sentinel walk
+    /// found a sentinel whose id is not in the live set. The
+    /// local maildir is the orphan (its remote counterpart is
+    /// gone).
+    pub(crate) fn push_local_orphan(
+        &mut self,
+        binding: MailboxFolderBinding,
+        parent_jmap_mailbox_id: Option<JmapMailboxId>,
+    ) {
+        self.0.local_orphans.push(LocalOrphanRecord {
+            binding: Arc::new(binding),
+            parent_jmap_mailbox_id,
+            messages: Vec::new(),
+        });
+    }
+
+    /// Bindings whose `mailbox_map` row was dropped this cycle
+    /// because the server no longer advertises the id. Empty
+    /// in steady state. Order matches detection order in
+    /// `resolve_mailboxes`.
+    pub(crate) fn local_orphans(&self) -> &[LocalOrphanRecord] {
+        &self.0.local_orphans
+    }
+
     /// Stage a `mailbox_map` row to be upserted without
     /// re-checking disk state. Pushed for `Unchanged`/`CacheStale`
     /// decisions where the cache row already names the correct
@@ -315,14 +413,35 @@ impl MailboxBindingsBuilder {
         self.0.mailbox_metadata_writes.push(record);
     }
 
-    /// Queue the `mailbox_map` row delete for a cache-route
-    /// orphan: an id present in `mailbox_map` at cycle start
-    /// that the fresh `Mailbox/get` no longer advertises.
-    /// `apply_unconditional_mailbox_writes` drains the slot
-    /// alongside `mailbox_metadata_writes` before the executor
-    /// runs. The on-disk maildir is intentionally left alone
-    /// here; destructive resolution lives elsewhere.
-    pub(crate) fn push_cache_route_orphan_delete(&mut self, dead_id: JmapMailboxId) {
+    /// Record a cache-route local orphan: a `mailbox_map` row
+    /// dropped this cycle because the fresh `Mailbox/get` no
+    /// longer carries the id. Pushes to `local_orphans` (so
+    /// reconcile sees the drift) AND queues the `mailbox_map`
+    /// row delete on `cache_route_orphan_deletes`. Sentinel-route
+    /// orphans go through `push_local_orphan` -- they have no
+    /// cache row to drop.
+    pub(crate) fn push_cache_route_orphan(
+        &mut self,
+        binding: MailboxFolderBinding,
+        parent_jmap_mailbox_id: Option<JmapMailboxId>,
+    ) {
+        let dead_id = binding
+            .jmap_mailbox_id
+            .expect_resolved("cache-route orphan binding id resolved")
+            .clone();
         self.0.cache_route_orphan_deletes.push(dead_id);
+        self.0.local_orphans.push(LocalOrphanRecord {
+            binding: Arc::new(binding),
+            parent_jmap_mailbox_id,
+            messages: Vec::new(),
+        });
+    }
+}
+
+impl std::ops::Deref for MailboxBindingsBuilder {
+    type Target = MailboxBindings;
+
+    fn deref(&self) -> &MailboxBindings {
+        &self.0
     }
 }

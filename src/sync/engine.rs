@@ -691,6 +691,28 @@ impl<'a> SyncEngine<'a> {
                 },
             );
         }
+        // Sentinel-content pre-pass for the sentinel-route orphan
+        // recovery. `walk_sentinels` discovered every on-disk
+        // sentinel; each entry's TOML content needs to be parsed
+        // before the recovery loop can decide whether to record
+        // an orphan. The pre-pass classifies the read silently
+        // -- the recovery loop's by-id / already-recorded gate
+        // is the place to emit the malformed/failure debug! line,
+        // so a malformed sentinel for a still-live mailbox
+        // doesn't get blamed for "skipping an orphan record" that
+        // was never on the table.
+        let sentinel_contents: HashMap<JmapMailboxId, SentinelReadResult> = disk_sentinels
+            .iter()
+            .map(|(id, folder)| {
+                let folder_path = maildir_root.join(folder);
+                let result = match crate::maildir_ops::sentinel::read(&folder_path) {
+                    Ok(Some(mapping)) => SentinelReadResult::Parsed(mapping),
+                    Ok(None) => SentinelReadResult::EmptyOrMalformed,
+                    Err(e) => SentinelReadResult::ReadFailed(e.to_string()),
+                };
+                (id.clone(), result)
+            })
+            .collect();
 
         // Pure decision core: takes the I/O snapshot above, emits
         // a fully-populated builder. No I/O happens inside.
@@ -700,10 +722,12 @@ impl<'a> SyncEngine<'a> {
                 cached_records: &cached_records,
                 known_mailbox_ids: &known_mailbox_ids,
                 disk_sentinels: &disk_sentinels,
+                sentinel_contents: &sentinel_contents,
                 unchanged_disk_states: &unchanged_disk_states,
             },
             &self.config.sync,
             &layout_definition,
+            &maildir_root,
         )?;
 
         let synced = synced.build();
@@ -1105,6 +1129,19 @@ struct UnchangedDiskState {
     sentinel: Option<crate::maildir_ops::sentinel::MailboxMapping>,
 }
 
+/// Outcome of the shell's per-sentinel pre-read, preserved with
+/// enough detail that the orphan-recovery consumer can replay
+/// the original debug! logging at the original gate (only for
+/// ids that survive the by-id / already-recorded filter). The
+/// pre-pass itself stays silent so a malformed sentinel for a
+/// live mailbox doesn't trigger a spurious "skipping orphan
+/// record" line.
+enum SentinelReadResult {
+    Parsed(crate::maildir_ops::sentinel::MailboxMapping),
+    EmptyOrMalformed,
+    ReadFailed(String),
+}
+
 /// Bundle of every input the pure mailbox-resolution core reads.
 /// The shell does all the I/O up front (JMAP `Mailbox/get`, the
 /// `mailbox_map` SELECTs, the sentinel walk, per-mailbox disk
@@ -1123,6 +1160,7 @@ struct MailboxesInput<'a> {
     /// otherwise shuffle it).
     known_mailbox_ids: &'a [JmapMailboxId],
     disk_sentinels: &'a HashMap<JmapMailboxId, String>,
+    sentinel_contents: &'a HashMap<JmapMailboxId, SentinelReadResult>,
     unchanged_disk_states: &'a HashMap<JmapMailboxId, UnchangedDiskState>,
 }
 
@@ -1256,6 +1294,118 @@ fn dispatch_decision_to_builder(
     }
 }
 
+/// Cache-vs-server orphan detection: emit a `local_orphan`
+/// snapshot for each id in `mailbox_map` that the server no
+/// longer advertises. The shell drops the actual `mailbox_map`
+/// row after the core returns.
+///
+/// The diff is against `by_id` (every mailbox the server
+/// returned), not the filtered/synced set, so a folder the user
+/// dropped from `[sync].mailboxes` -- still on the server, just
+/// unsynced -- is left alone here.
+fn record_cache_route_orphans(
+    synced: &mut MailboxBindingsBuilder,
+    known_mailbox_ids: &[JmapMailboxId],
+    cached_records: &HashMap<JmapMailboxId, queries::MailboxRecord>,
+    by_id: &HashMap<JmapMailboxId, &MailboxObject>,
+) {
+    for cached_id in known_mailbox_ids {
+        if !by_id.contains_key(cached_id) {
+            let cached = cached_records
+                .get(cached_id)
+                .expect("list_known_mailbox_ids and cached_records read the same table this cycle");
+            info!(
+                "Server-side mailbox deletion detected for id {} ({:?} at {}); \
+                 dropping mailbox_map row, leaving disk alone",
+                cached_id, cached.name, cached.maildir_folder
+            );
+            synced.push_cache_route_orphan(
+                MailboxFolderBinding {
+                    jmap_mailbox_id: MaybeReference::Value(cached.jmap_mailbox_id.clone()),
+                    server_name: cached.name.clone(),
+                    maildir_folder: cached.maildir_folder.clone(),
+                    remote_path: cached.remote_path.clone().unwrap_or_default(),
+                },
+                cached.parent_id.clone(),
+            );
+        }
+    }
+}
+
+/// Sentinel-driven orphan recovery: catches orphans the
+/// cache-vs-server diff cannot see (cache started empty, or a
+/// partial cache drop left mailbox_map rows gone while their
+/// disk maildir + sentinel survived). Dedups against the
+/// cache-route push by id. The malformed / read-failure debug!
+/// lines fire here at the original gate -- only for ids that
+/// pass the by_id / already_recorded filter -- so a malformed
+/// sentinel for a live mailbox stays silent.
+fn record_sentinel_route_orphans(
+    synced: &mut MailboxBindingsBuilder,
+    disk_sentinels: &HashMap<JmapMailboxId, String>,
+    sentinel_contents: &HashMap<JmapMailboxId, SentinelReadResult>,
+    by_id: &HashMap<JmapMailboxId, &MailboxObject>,
+    maildir_root: &std::path::Path,
+) {
+    let already_recorded: HashSet<JmapMailboxId> = synced
+        .local_orphans()
+        .iter()
+        .map(|o| {
+            o.binding
+                .jmap_mailbox_id
+                .expect_resolved("local_orphans already_recorded -- live set is resolved")
+                .clone()
+        })
+        .collect();
+    for (id, folder) in disk_sentinels {
+        if by_id.contains_key(id) || already_recorded.contains(id) {
+            continue;
+        }
+        let folder_path = maildir_root.join(folder);
+        match sentinel_contents.get(id) {
+            Some(SentinelReadResult::Parsed(mapping)) => {
+                info!(
+                    "Sentinel-driven orphan detected: sentinel at {} names id {} ({:?}) \
+                     which the server no longer advertises and the cache does not track",
+                    folder_path.display(),
+                    id,
+                    mapping.server_name
+                );
+                // No `remote_path` source available post-nuke:
+                // the cache row is gone and the sentinel doesn't
+                // store the slash-joined path. Leave empty.
+                synced.push_local_orphan(
+                    MailboxFolderBinding {
+                        jmap_mailbox_id: MaybeReference::Value(id.clone()),
+                        server_name: mapping.server_name.clone(),
+                        maildir_folder: folder.clone(),
+                        remote_path: String::new(),
+                    },
+                    mapping.parent_jmap_mailbox_id.clone(),
+                );
+            }
+            Some(SentinelReadResult::EmptyOrMalformed) => {
+                debug!(
+                    "Sentinel-driven recovery: sentinel at {} read as empty / malformed; \
+                     skipping orphan record",
+                    folder_path.display()
+                );
+            }
+            Some(SentinelReadResult::ReadFailed(e)) => {
+                debug!(
+                    "Sentinel-driven recovery: sentinel re-read at {} failed: {}; \
+                     skipping orphan record",
+                    folder_path.display(),
+                    e
+                );
+            }
+            None => {
+                unreachable!("disk_sentinels and sentinel_contents are built from the same walk")
+            }
+        }
+    }
+}
+
 /// Pure-decision core of `resolve_mailboxes`. Takes the upfront
 /// I/O snapshot and produces a fully-populated
 /// `MailboxBindingsBuilder`: the live binding set, the
@@ -1268,6 +1418,7 @@ fn compute_mailbox_resolution(
     input: &MailboxesInput<'_>,
     sync_config: &crate::config::SyncConfig,
     layout: &FolderLayoutDefinition,
+    maildir_root: &std::path::Path,
 ) -> Result<MailboxBindingsBuilder> {
     let by_id: HashMap<JmapMailboxId, &MailboxObject> = input
         .remote_mailboxes
@@ -1413,35 +1564,21 @@ fn compute_mailbox_resolution(
         synced.insert(binding);
     }
 
-    record_cache_route_orphans(&mut synced, input.known_mailbox_ids, &by_id);
+    record_cache_route_orphans(
+        &mut synced,
+        input.known_mailbox_ids,
+        input.cached_records,
+        &by_id,
+    );
+    record_sentinel_route_orphans(
+        &mut synced,
+        input.disk_sentinels,
+        input.sentinel_contents,
+        &by_id,
+        maildir_root,
+    );
 
     Ok(synced)
-}
-
-/// Cache-vs-server orphan detection: queue a `mailbox_map` row
-/// drop for each id in `mailbox_map` that the server no longer
-/// advertises. The actual `delete_mailbox` call lands in
-/// `apply_unconditional_mailbox_writes` when it drains the
-/// `cache_route_orphan_deletes` slot before the executor runs.
-///
-/// The diff is against `by_id` (every mailbox the server
-/// returned), not the filtered/synced set, so a folder the user
-/// dropped from `[sync].mailboxes` -- still on the server, just
-/// unsynced -- is left alone here.
-fn record_cache_route_orphans(
-    synced: &mut MailboxBindingsBuilder,
-    known_mailbox_ids: &[JmapMailboxId],
-    by_id: &HashMap<JmapMailboxId, &MailboxObject>,
-) {
-    for cached_id in known_mailbox_ids {
-        if !by_id.contains_key(cached_id) {
-            info!(
-                "Server-side mailbox deletion detected for id {}; dropping mailbox_map row",
-                cached_id
-            );
-            synced.push_cache_route_orphan_delete(cached_id.clone());
-        }
-    }
 }
 
 /// Three-way diff over `(cached_folder, server_folder, disk_folder)`

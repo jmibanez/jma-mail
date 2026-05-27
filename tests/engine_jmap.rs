@@ -2683,3 +2683,197 @@ async fn resolve_mailboxes_drops_row_for_server_side_deletion() {
         "Inbox maildir must still be present"
     );
 }
+
+/// Server-side mailbox deletion also produces a local-orphan
+/// record on the returned `MailboxBindings`. The record carries
+/// the last-known binding (id + server_name + maildir_folder +
+/// remote_path) and the cached parent, so plan readers observe
+/// the dead binding without re-reading the dropped `mailbox_map`
+/// row. Sibling to
+/// `resolve_mailboxes_drops_row_for_server_side_deletion`, which
+/// pins the cache-row-drop side; this one pins the orphan slot.
+#[tokio::test]
+async fn resolve_mailboxes_records_local_orphan_for_server_side_deletion() {
+    let server = MockServer::start().await;
+    mount_session(&server).await;
+
+    let state = Arc::new(Mutex::new(MockState {
+        mailbox_state: "mb-1".to_string(),
+        email_state: "e-1".to_string(),
+        mailboxes: vec![
+            MockMailbox {
+                id: "MB-INBOX".to_string(),
+                name: "Inbox".to_string(),
+                role: Some("inbox".to_string()),
+                parent_id: None,
+            },
+            MockMailbox {
+                id: "MB-ARCH".to_string(),
+                name: "Archive".to_string(),
+                role: Some("archive".to_string()),
+                parent_id: None,
+            },
+        ],
+        ..Default::default()
+    }));
+    mount_jmap(&server, state.clone()).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let conn = fresh_db(&temp);
+    let config = test_config(&server, temp.path(), vec![]);
+
+    SyncEngine::sync(&conn, &config, false)
+        .await
+        .expect("first sync");
+
+    {
+        let mut st = state.lock().unwrap();
+        st.mailboxes.retain(|m| m.id != "MB-ARCH");
+        st.mailbox_state = "mb-2".to_string();
+    }
+
+    // Drive resolve_mailboxes directly so the local_orphans slot
+    // is observable; the data-shape contract is what we want to
+    // pin.
+    let engine = SyncEngine::connect(&conn, &config)
+        .await
+        .expect("connect engine");
+    let bindings = engine.resolve_mailboxes().await.expect("resolve mailboxes");
+
+    let orphans = bindings.local_orphans();
+    assert_eq!(
+        orphans.len(),
+        1,
+        "exactly one local orphan must be recorded"
+    );
+    let orphan = &orphans[0];
+    assert_eq!(
+        orphan
+            .binding
+            .jmap_mailbox_id
+            .expect_resolved("orphan binding is resolved")
+            .as_ref(),
+        "MB-ARCH"
+    );
+    assert_eq!(orphan.binding.server_name, "Archive");
+    assert_eq!(orphan.binding.maildir_folder, "Archive");
+    assert_eq!(orphan.parent_jmap_mailbox_id, None);
+}
+
+/// Post-DB-nuke recovery: when `mailbox_map` is empty at cycle
+/// start (fresh DB, schema-version nuke, etc.) the cache-vs-
+/// server diff finds no orphans. A surviving `.jma.mapping`
+/// sentinel whose id the server no longer advertises must still
+/// be detected. The sentinel itself supplies `server_name` and
+/// `parent_jmap_mailbox_id` for the local-orphan record -- this
+/// test exercises the parent-recovery half with a nested orphan
+/// (Archive/Old under Archive, both dropped server-side).
+#[tokio::test]
+async fn resolve_mailboxes_recovers_local_orphan_via_sentinel_post_nuke() {
+    let server = MockServer::start().await;
+    mount_session(&server).await;
+
+    let state = Arc::new(Mutex::new(MockState {
+        mailbox_state: "mb-1".to_string(),
+        email_state: "e-1".to_string(),
+        mailboxes: vec![
+            MockMailbox {
+                id: "MB-INBOX".to_string(),
+                name: "Inbox".to_string(),
+                role: Some("inbox".to_string()),
+                parent_id: None,
+            },
+            MockMailbox {
+                id: "MB-ARCH".to_string(),
+                name: "Archive".to_string(),
+                role: Some("archive".to_string()),
+                parent_id: None,
+            },
+            MockMailbox {
+                id: "MB-OLD".to_string(),
+                name: "Old".to_string(),
+                role: None,
+                parent_id: Some("MB-ARCH".to_string()),
+            },
+        ],
+        ..Default::default()
+    }));
+    mount_jmap(&server, state.clone()).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let conn = fresh_db(&temp);
+    let config = test_config(&server, temp.path(), vec![]);
+
+    // First cycle: lands sentinels on disk for all three mailboxes.
+    SyncEngine::sync(&conn, &config, false)
+        .await
+        .expect("first sync");
+    assert!(
+        temp.path().join("Archive").join("cur").is_dir(),
+        "Archive sentinel-bearing folder must exist after first sync"
+    );
+
+    // Server deletes Archive and its child Old; we nuke the DB
+    // (open a fresh connection on a new path so cache starts
+    // empty). Disk still has both sentinels from the first cycle.
+    {
+        let mut st = state.lock().unwrap();
+        st.mailboxes
+            .retain(|m| m.id != "MB-ARCH" && m.id != "MB-OLD");
+        st.mailbox_state = "mb-2".to_string();
+    }
+    drop(conn);
+    let temp2 = tempfile::tempdir().unwrap();
+    let nuked_db = temp2.path().join("state.db");
+    let conn = jma_mail::state::db::open_or_recreate(&nuked_db).expect("open fresh DB");
+    // `SyncEngine::connect` uses the `&Connection` argument we
+    // pass, not `config.state.db_path`, so the new empty `conn`
+    // is what makes the cache start fresh.
+    let config = test_config(&server, temp.path(), vec![]);
+
+    let engine = SyncEngine::connect(&conn, &config)
+        .await
+        .expect("connect engine post-nuke");
+    let bindings = engine
+        .resolve_mailboxes()
+        .await
+        .expect("resolve mailboxes post-nuke");
+
+    let orphans = bindings.local_orphans();
+    assert_eq!(
+        orphans.len(),
+        2,
+        "post-nuke sentinel walk must detect both orphans"
+    );
+
+    let arch = orphans
+        .iter()
+        .find(|o| {
+            o.binding
+                .jmap_mailbox_id
+                .expect_resolved("resolved")
+                .as_ref()
+                == "MB-ARCH"
+        })
+        .expect("Archive orphan must be recorded");
+    assert_eq!(arch.binding.server_name, "Archive");
+    assert_eq!(arch.binding.maildir_folder, "Archive");
+    assert_eq!(arch.parent_jmap_mailbox_id, None);
+
+    let old = orphans
+        .iter()
+        .find(|o| {
+            o.binding
+                .jmap_mailbox_id
+                .expect_resolved("resolved")
+                .as_ref()
+                == "MB-OLD"
+        })
+        .expect("Old orphan must be recorded");
+    assert_eq!(old.binding.server_name, "Old");
+    assert_eq!(
+        old.parent_jmap_mailbox_id.as_ref().map(|id| id.as_ref()),
+        Some("MB-ARCH"),
+        "sentinel-supplied parent must survive the post-nuke walk"
+    );
+}
