@@ -65,8 +65,20 @@ use crate::state::queries::MailboxRecord;
 /// `apply_unconditional_mailbox_writes` drains the slot before the
 /// executor runs, dropping the stale `mailbox_map` row and leaving
 /// the on-disk maildir alone (destructive folder resolution is a
-/// separate, policy-gated path). Consumers that only care about the
-/// live set ignore all four slots.
+/// separate, policy-gated path).
+///
+/// The `pending_mailbox_writes` slot carries `mailbox_map`
+/// rows that should be upserted only after the executor
+/// confirms the disk state matches -- the durability invariant
+/// jma applies elsewhere (maildir write + `F_BARRIERFSYNC`,
+/// then state DB). `resolve_mailboxes` pushes rows here for
+/// the decisions whose cache write depends on a successful
+/// executor disk op (`FirstCycle`, `ServerRename`,
+/// `ConflictServerWins`); `Unchanged` and `CacheStale` write
+/// inline because disk is already in agreement at cycle start.
+///
+/// Consumers that only care about the live set ignore all
+/// five slots.
 #[derive(Debug, Default)]
 pub struct MailboxBindings {
     by_id: HashMap<JmapMailboxId, Arc<MailboxFolderBinding>>,
@@ -74,6 +86,7 @@ pub struct MailboxBindings {
     new_mailboxes: Vec<NewMailboxRecord>,
     renamed_mailboxes: Vec<RenamedMailboxRecord>,
     local_orphans: Vec<LocalOrphanRecord>,
+    pending_mailbox_writes: Vec<MailboxRecord>,
     mailbox_metadata_writes: Vec<MailboxRecord>,
     cache_route_orphan_deletes: Vec<JmapMailboxId>,
 }
@@ -254,6 +267,14 @@ impl MailboxBindings {
         &self.local_orphans
     }
 
+    /// `mailbox_map` rows staged this cycle for upsert after
+    /// the executor confirms disk state. Empty in steady state
+    /// (no new mailboxes or renames). Order matches push order
+    /// in `resolve_mailboxes`.
+    pub fn pending_mailbox_writes(&self) -> &[MailboxRecord] {
+        &self.pending_mailbox_writes
+    }
+
     /// `mailbox_map` rows the engine should upsert without
     /// re-checking disk state -- the `Unchanged`/`CacheStale`
     /// bucket. Applied by `apply_unconditional_mailbox_writes`
@@ -392,6 +413,17 @@ impl MailboxBindingsBuilder {
             parent_jmap_mailbox_id,
             messages: Vec::new(),
         });
+    }
+
+    /// Stage a `mailbox_map` row to be upserted after the
+    /// executor confirms disk state. Pushed from
+    /// `resolve_mailboxes` for decisions where the cache write
+    /// follows a disk op (folder create or rename); a separate
+    /// post-executor pass applies each row iff the maildir +
+    /// sentinel at `record.maildir_folder` are now consistent
+    /// with `record`.
+    pub(crate) fn push_pending_mailbox_write(&mut self, record: MailboxRecord) {
+        self.0.pending_mailbox_writes.push(record);
     }
 
     /// Bindings whose `mailbox_map` row was dropped this cycle
