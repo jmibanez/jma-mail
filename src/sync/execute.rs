@@ -244,9 +244,11 @@ impl<'a> Executor<'a> {
             moved,
             deleted,
             failed_remote_actions,
-            // Engine sets this from the unfiltered plan; executor
-            // doesn't have the visibility to compute it.
+            // Engine sets these from the unfiltered plan / bindings;
+            // executor doesn't have the visibility to compute them.
             already_in_sync: false,
+            remote_orphans_detected: 0,
+            remote_orphan_total_emails: 0,
         })
     }
 

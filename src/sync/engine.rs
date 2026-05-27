@@ -82,6 +82,17 @@ pub struct SyncOutcome {
     /// so the user can correlate the no-op cycle with the FS event
     /// paths that drove it.
     pub already_in_sync: bool,
+    /// Push-side orphans detected this cycle: locally-deleted
+    /// maildirs whose server-side counterpart still exists. Detection
+    /// only -- no destroy emitted in this scope; the count is
+    /// surfaced so tests and the daemon log can confirm that the
+    /// detection path fired.
+    pub remote_orphans_detected: usize,
+    /// Sum of `server_email_count` across all remote orphans
+    /// detected this cycle. Surfaced for telemetry and for tests
+    /// that want to pin "the count-hydration round-trip actually
+    /// landed" rather than just "the orphan got recorded."
+    pub remote_orphan_total_emails: u64,
 }
 
 /// Bundles the immutable state every engine helper threads through
@@ -194,7 +205,7 @@ impl<'a> SyncEngine<'a> {
         direction: SyncDirection,
         scan_scope: ScanScope,
     ) -> Result<SyncOutcome> {
-        let mailboxes = self.resolve_mailboxes().await?;
+        let mut mailboxes = self.resolve_mailboxes().await?;
         let maildir_root = self.config.maildir_path();
 
         // Push-only on a fresh config has nothing local to upload:
@@ -306,15 +317,33 @@ impl<'a> SyncEngine<'a> {
                     let mut local_flags: HashMap<MaildirId, String> = HashMap::new();
                     for binding in mailboxes.iter() {
                         let maildir_path = maildir_root.join(&binding.maildir_folder);
-                        // A live binding whose maildir doesn't yet
-                        // exist on disk is the first-cycle case for
-                        // a server-known mailbox; the
-                        // `CreateLocalMailbox` action emitted by
-                        // reconcile will create it in the executor's
-                        // first phase. Skip the walk here -- no
-                        // local files to classify -- without side-
-                        // effecting the folder into existence.
+                        // Three reasons a binding's maildir might
+                        // not exist on disk:
+                        //   - First-cycle binding awaiting
+                        //     `CreateLocalMailbox` (filtered via
+                        //     `is_new_mailbox`).
+                        //   - Sentinel survived elsewhere (the
+                        //     user `mv`-ed the folder; rename
+                        //     detection in `resolve_mailboxes` is
+                        //     authoritative).
+                        //   - Sentinel gone everywhere -- the user
+                        //     deleted the folder.
+                        // Only the third emits
+                        // `LocalChange::LocalFolderDeleted`; the
+                        // first two skip silently. Pull-side
+                        // orphan bindings (only present under
+                        // `include_orphans`) aren't in `by_id`, so
+                        // the live-binding check filters them too.
                         let Some(maildir) = store::try_open_maildir(&maildir_path) else {
+                            if let MaybeReference::Value(id) = &binding.jmap_mailbox_id
+                                && mailboxes.by_id(id).is_some()
+                                && !mailboxes.is_new_mailbox(id)
+                                && !mailboxes.sentinel_survives_for(id)
+                            {
+                                changes.push(scan::LocalChange::LocalFolderDeleted {
+                                    binding: Arc::clone(binding),
+                                });
+                            }
                             continue;
                         };
                         let known_state = hydrate_known_state(self.conn, binding)?;
@@ -349,6 +378,15 @@ impl<'a> SyncEngine<'a> {
                         // Skip the state hydration for absent
                         // folders rather than creating them as a
                         // side effect.
+                        //
+                        // Push-side orphan detection
+                        // (`LocalFolderDeleted` emission for an
+                        // absent maildir) lives only in the
+                        // Full-scope branch above; Paths cycles
+                        // converge on the next periodic Full
+                        // sweep (or post-disconnect catchup),
+                        // since `scan_paths` operates on event
+                        // paths rather than bindings.
                         if store::try_open_maildir(&maildir_root.join(&binding.maildir_folder))
                             .is_none()
                         {
@@ -415,6 +453,55 @@ impl<'a> SyncEngine<'a> {
         } else {
             scan_changes
         };
+
+        // Convert `LocalChange::LocalFolderDeleted` events into
+        // entries on `mailboxes.remote_orphans()`. Scan emits the
+        // raw events; downstream phases read `remote_orphans`
+        // rather than the LocalChange variant directly. Lookup
+        // `parent_jmap_mailbox_id` from `mailbox_map` (the
+        // cycle-start cached parent, before the user deleted the
+        // folder), then fan out the count `Email/query` calls in
+        // parallel via `try_join_all`. Each record is constructed
+        // once with its final `server_email_count`.
+        let pending: Vec<(
+            Arc<MailboxFolderBinding>,
+            Option<JmapMailboxId>,
+            JmapMailboxId,
+        )> = all_local_changes
+            .iter()
+            .filter_map(|change| match change {
+                LocalChange::LocalFolderDeleted { binding } => Some(binding),
+                _ => None,
+            })
+            .map(|binding| {
+                let id = binding
+                    .jmap_mailbox_id
+                    .expect_resolved("LocalFolderDeleted binding id must be resolved")
+                    .clone();
+                let parent = queries::get_mailbox(self.conn, &id)?.and_then(|r| r.parent_id);
+                Ok((Arc::clone(binding), parent, id))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if !pending.is_empty() {
+            let counts = futures_util::future::try_join_all(pending.iter().map(|(_, _, id)| {
+                let client = Arc::clone(&self.client);
+                let id = id.clone();
+                async move { crate::jmap::email::count_emails_in_mailbox(&client, &id).await }
+            }))
+            .await?;
+            let mut builder = mailboxes.into_builder();
+            pending
+                .into_iter()
+                .zip(counts)
+                .for_each(|((binding, parent, id), count)| {
+                    info!(
+                        "remote orphan detected: {} (id {}, server has {} email(s))",
+                        binding.server_name, id, count
+                    );
+                    builder.push_remote_orphan(binding, parent, count);
+                });
+            mailboxes = builder.build();
+        }
 
         // Path-scan short-circuit: a LocalChange-driven cycle whose
         // scan classified nothing has no local work to send and no
@@ -561,6 +648,12 @@ impl<'a> SyncEngine<'a> {
             ))
             .await?;
         outcome.already_in_sync = already_in_sync;
+        outcome.remote_orphans_detected = mailboxes.remote_orphans().len();
+        outcome.remote_orphan_total_emails = mailboxes
+            .remote_orphans()
+            .iter()
+            .map(|o| o.server_email_count)
+            .sum();
 
         if outcome.failed_remote_actions > 0 {
             warn!(
@@ -725,7 +818,7 @@ impl<'a> SyncEngine<'a> {
 
         // Pure decision core: takes the I/O snapshot above, emits
         // a fully-populated builder. No I/O happens inside.
-        let synced = compute_mailbox_resolution(
+        let mut synced = compute_mailbox_resolution(
             &MailboxesInput {
                 remote_mailboxes: &remote_mailboxes,
                 cached_records: &cached_records,
@@ -738,6 +831,13 @@ impl<'a> SyncEngine<'a> {
             &layout_definition,
             &maildir_root,
         )?;
+
+        // Stash the sentinel walk so scan can disambiguate
+        // "maildir vanished" (LocalFolderDeleted) from "user
+        // renamed maildir, sentinel travelled with it" (rename
+        // candidate, already handled by `decide_mailbox_action`
+        // above).
+        synced.set_disk_sentinels(disk_sentinels);
 
         let synced = synced.build();
 

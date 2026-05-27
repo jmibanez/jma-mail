@@ -36,7 +36,8 @@ use crate::state::queries::MailboxRecord;
 /// `MailboxBindings` itself is immutable -- once
 /// `MailboxBindingsBuilder::build` hands one back, no method on the
 /// type mutates state. Construction goes through
-/// `MailboxBindings::builder()`.
+/// `MailboxBindings::builder()` (fresh) or
+/// `MailboxBindings::into_builder()` (transform an existing one).
 ///
 /// Bindings are stored as `Arc<MailboxFolderBinding>` so downstream
 /// in-memory event types (`LocalChange`, `SyncAction`) that need to
@@ -53,32 +54,59 @@ use crate::state::queries::MailboxRecord;
 /// action. The `renamed_mailboxes` slot is the analogous output
 /// for the rename case: any cached `mailbox_map` row whose folder
 /// disagrees with the freshly resolved one becomes a
-/// `RenameLocalMailbox` action. The `local_orphans` slot records
-/// bindings whose `mailbox_map` row was dropped this cycle because
-/// the server no longer advertises the id -- the local maildir is
-/// the orphan (parent gone server-side); its
+/// `RenameLocalMailbox` action. The `local_orphans` slot
+/// records bindings whose `mailbox_map` row was dropped this
+/// cycle because the server no longer advertises the id -- the
+/// local maildir is the orphan (parent gone server-side); its
 /// `binding.jmap_mailbox_id` is a tombstone, useful only for
 /// identifying DB rows that still point at the dead id. The
-/// `cache_route_orphan_deletes` slot rides alongside `local_orphans`
-/// for the cache-route subset: ids in the pre-cycle `mailbox_map`
-/// snapshot the fresh `Mailbox/get` no longer advertises.
-/// `apply_unconditional_mailbox_writes` drains the slot before the
-/// executor runs, dropping the stale `mailbox_map` row and leaving
-/// the on-disk maildir alone (destructive folder resolution is a
-/// separate, policy-gated path).
+/// `remote_orphans` slot records the inverse: server-known
+/// bindings whose local maildir + sentinel are both absent on
+/// disk, where `binding.jmap_mailbox_id` is live and the
+/// on-disk side is the one that has vanished.
 ///
-/// The `pending_mailbox_writes` slot carries `mailbox_map`
-/// rows that should be upserted only after the executor
-/// confirms the disk state matches -- the durability invariant
-/// jma applies elsewhere (maildir write + `F_BARRIERFSYNC`,
-/// then state DB). `resolve_mailboxes` pushes rows here for
-/// the decisions whose cache write depends on a successful
-/// executor disk op (`FirstCycle`, `ServerRename`,
-/// `ConflictServerWins`); `Unchanged` and `CacheStale` write
-/// inline because disk is already in agreement at cycle start.
+/// `MailboxBindings` is purely a description of what
+/// `resolve_mailboxes` decided. It writes nothing to
+/// `mailbox_map` directly; instead it surfaces every cache
+/// mutation through one of three slots, each drained at a
+/// specific point in the engine's run:
+///
+/// - `mailbox_metadata_writes`: rows upserted *before* the
+///   executor runs (`Unchanged`/`CacheStale` bindings whose
+///   `maildir_folder` already matches the live binding; only
+///   drifted metadata -- `role`, `sort_order`, `parent_id`,
+///   `remote_path` -- needs a refresh). Drained by
+///   `apply_unconditional_mailbox_writes`. Pre-executor
+///   ordering matters: the executor's `destroy_remote_mailboxes`
+///   phase also calls `delete_mailbox` for ids it destroys
+///   server-side, so running this slot first means the
+///   executor's destroy has the last write on any shared id.
+/// - `cache_route_orphan_deletes`: ids whose `mailbox_map` row
+///   should be dropped this cycle (cache-route orphans -- the
+///   id was in the cache at cycle start but the server no
+///   longer advertises it). Drained alongside
+///   `mailbox_metadata_writes` by
+///   `apply_unconditional_mailbox_writes`. Sentinel-route
+///   orphans have no cache row to drop and so don't land here.
+/// - `pending_mailbox_writes`: rows upserted *after* the
+///   executor runs, gated on disk consistency
+///   (`FirstCycle`/`ServerRename`/`ConflictServerWins`). The
+///   pass at `apply_pending_mailbox_writes` rechecks
+///   maildir+sentinel per row and skips on disk-not-ready,
+///   honoring the durability invariant jma applies elsewhere
+///   (maildir + `F_BARRIERFSYNC`, then state DB).
+///
+/// Both drain functions sit past the `--dry-run` early return
+/// in `run`, so plan-only invocations leave `mailbox_map`
+/// untouched regardless of slot.
+///
+/// `LocalRename`/`ConflictLocalWins` arms emit no cache write
+/// at all -- the cache stays at the pre-rename triple until
+/// `Mailbox/set { update }` lands and the next cycle re-reads
+/// the server view.
 ///
 /// Consumers that only care about the live set ignore all
-/// five slots.
+/// other slots.
 #[derive(Debug, Default)]
 pub struct MailboxBindings {
     by_id: HashMap<JmapMailboxId, Arc<MailboxFolderBinding>>,
@@ -86,9 +114,17 @@ pub struct MailboxBindings {
     new_mailboxes: Vec<NewMailboxRecord>,
     renamed_mailboxes: Vec<RenamedMailboxRecord>,
     local_orphans: Vec<LocalOrphanRecord>,
+    remote_orphans: Vec<RemoteOrphanRecord>,
     pending_mailbox_writes: Vec<MailboxRecord>,
     mailbox_metadata_writes: Vec<MailboxRecord>,
     cache_route_orphan_deletes: Vec<JmapMailboxId>,
+    /// Per-cycle sentinel walk: `jmap_mailbox_id -> relative
+    /// folder path` for every `.jma.mapping` `resolve_mailboxes`
+    /// found on disk. Populated once during binding construction
+    /// and read by scan (to disambiguate "maildir vanished" from
+    /// "user renamed maildir", since a sentinel surviving at a
+    /// different path means rename territory, not deletion).
+    disk_sentinels: HashMap<JmapMailboxId, String>,
 }
 
 /// A mailbox whose on-disk state `resolve_mailboxes` found
@@ -216,11 +252,46 @@ pub struct OrphanMessage {
     pub size_bytes: u64,
 }
 
+/// A server-known mailbox whose on-disk side has vanished --
+/// `try_open_maildir(cached_path)` returns None AND no
+/// `.jma.mapping` sentinel for this id exists anywhere on
+/// disk. The detector observes absence; the cause (user
+/// delete, external script, backup restore that excluded the
+/// maildir, etc.) is the consumer's concern. The
+/// `binding.jmap_mailbox_id` is live: the server still serves
+/// it; only the on-disk side has vanished. `binding` carries
+/// the cached
+/// `(jmap_mailbox_id, server_name, maildir_folder, remote_path)`
+/// tuple as it stood at cycle start. `parent_jmap_mailbox_id`
+/// is the server-side parent at cycle start.
+#[derive(Debug, Clone)]
+pub struct RemoteOrphanRecord {
+    pub binding: Arc<MailboxFolderBinding>,
+    pub parent_jmap_mailbox_id: Option<JmapMailboxId>,
+    /// Total messages the server holds for the orphan mailbox at
+    /// cycle start. The engine populates this after detection by
+    /// iterating `remote_orphans_mut()` and calling
+    /// `Email/query` with `limit: 0`; zero before that pass
+    /// runs. The `limit: 0` form returns just the total, so the
+    /// count is cheap regardless of mailbox size.
+    pub server_email_count: u64,
+}
+
 impl MailboxBindings {
     /// Start a fresh, empty builder. Callers populate via
     /// `MailboxBindingsBuilder` mutators, then finish with `.build()`.
     pub(crate) fn builder() -> MailboxBindingsBuilder {
         MailboxBindingsBuilder::default()
+    }
+
+    /// Hand a built `MailboxBindings` back to a builder so a later
+    /// phase can push additional records (e.g. remote orphans from
+    /// `LocalFolderDeleted` events) before re-finalising via
+    /// `.build()`. The intermediate phases of the engine consume
+    /// the immutable bindings; this escape hatch is for the few
+    /// callers that need to append.
+    pub(crate) fn into_builder(self) -> MailboxBindingsBuilder {
+        MailboxBindingsBuilder(self)
     }
 
     pub fn by_id(&self, id: &JmapMailboxId) -> Option<&Arc<MailboxFolderBinding>> {
@@ -265,6 +336,38 @@ impl MailboxBindings {
     /// `resolve_mailboxes`.
     pub fn local_orphans(&self) -> &[LocalOrphanRecord] {
         &self.local_orphans
+    }
+
+    /// Server-known bindings whose local maildir was deleted
+    /// by the user this cycle. Empty in steady state. Order
+    /// matches scan emission order of
+    /// `LocalChange::LocalFolderDeleted`.
+    pub fn remote_orphans(&self) -> &[RemoteOrphanRecord] {
+        &self.remote_orphans
+    }
+
+    /// Does a `.jma.mapping` sentinel for this id exist on disk
+    /// at any path? Scan uses this to filter `LocalFolderDeleted`
+    /// emissions -- if the sentinel survives elsewhere, the
+    /// binding's missing maildir is a rename candidate, not a
+    /// deletion. Operates on the walk recorded via
+    /// `MailboxBindingsBuilder::set_disk_sentinels`; returns
+    /// `false` if the walk hasn't run (early-cycle callers see
+    /// "no sentinel," which keeps them from misfiring).
+    pub fn sentinel_survives_for(&self, id: &JmapMailboxId) -> bool {
+        self.disk_sentinels.contains_key(id)
+    }
+
+    /// Whether this id is a first-cycle (never-synced) mailbox.
+    /// Used by scan to filter `LocalFolderDeleted` emissions:
+    /// a first-cycle binding's maildir is absent by design --
+    /// `CreateLocalMailbox` will provision it -- so the absence
+    /// is not a user deletion.
+    pub fn is_new_mailbox(&self, id: &JmapMailboxId) -> bool {
+        self.new_mailboxes.iter().any(|nm| {
+            matches!(&nm.binding.jmap_mailbox_id,
+                crate::jmap::types::MaybeReference::Value(v) if v == id)
+        })
     }
 
     /// `mailbox_map` rows staged this cycle for upsert after
@@ -319,7 +422,7 @@ pub(crate) struct MailboxBindingsBuilder(MailboxBindings);
 
 impl MailboxBindingsBuilder {
     /// Finalise the builder. The returned `MailboxBindings` is
-    /// immutable.
+    /// immutable; further mutation requires `.into_builder()`.
     pub(crate) fn build(self) -> MailboxBindings {
         self.0
     }
@@ -413,6 +516,38 @@ impl MailboxBindingsBuilder {
             parent_jmap_mailbox_id,
             messages: Vec::new(),
         });
+    }
+
+    /// Record a remote orphan: a server-known binding whose
+    /// local maildir is gone and whose `.jma.mapping` sentinel
+    /// is absent from disk. Called by the engine's post-scan
+    /// conversion loop after consuming a
+    /// `LocalChange::LocalFolderDeleted` event. The caller is
+    /// responsible for the absence check; scan filters via
+    /// `is_new_mailbox` and `sentinel_survives_for` before
+    /// emitting the event. `server_email_count` comes from the
+    /// caller's `Email/query` round-trip with `limit: 0`.
+    pub(crate) fn push_remote_orphan(
+        &mut self,
+        binding: Arc<MailboxFolderBinding>,
+        parent_jmap_mailbox_id: Option<JmapMailboxId>,
+        server_email_count: u64,
+    ) {
+        self.0.remote_orphans.push(RemoteOrphanRecord {
+            binding,
+            parent_jmap_mailbox_id,
+            server_email_count,
+        });
+    }
+
+    /// Stash the per-cycle sentinel walk so downstream phases
+    /// (scan, primarily) can disambiguate "binding's maildir is
+    /// missing because the user renamed it" (sentinel survives
+    /// at a different path) from "binding's maildir is missing
+    /// because the user deleted it" (sentinel gone everywhere).
+    /// Called once by `resolve_mailboxes` after its own walk.
+    pub(crate) fn set_disk_sentinels(&mut self, walk: HashMap<JmapMailboxId, String>) {
+        self.0.disk_sentinels = walk;
     }
 
     /// Stage a `mailbox_map` row to be upserted after the
