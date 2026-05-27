@@ -147,8 +147,6 @@ impl<T: Clone> MaybeReference<T> {
     /// `None` if `Reference` is unresolved in the table -- the
     /// caller decides whether that's a soft skip (warn) or a
     /// hard error (the producer never ran or never succeeded).
-    /// Unused today; lives here so the resolution-step shape is
-    /// in place before the first producer commit lands.
     pub fn resolve_with(&self, table: &std::collections::HashMap<String, T>) -> Option<T> {
         match self {
             MaybeReference::Reference(name) => table.get(name).cloned(),
