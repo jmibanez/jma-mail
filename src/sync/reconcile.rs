@@ -35,6 +35,25 @@ impl SyncPolicy {
             allow_destructive_folder_sync: sync.allow_destructive_folder_sync,
         }
     }
+
+    /// True iff the policy permits destroying a local
+    /// maildir folder in response to a server-side mailbox
+    /// deletion (i.e. `allow_destructive_folder_sync` is
+    /// `delete-local` or `both`). Reconcile gates its pull-
+    /// side destructive arm on this; the resurrect arm gates
+    /// on the negation.
+    pub fn allows_delete_of_local_folder(&self) -> bool {
+        self.allow_destructive_folder_sync.allows_delete_local()
+    }
+
+    /// True iff the policy permits issuing JMAP
+    /// `Mailbox/set { destroy }` in response to a local
+    /// maildir deletion (i.e. `allow_destructive_folder_sync`
+    /// is `delete-remote` or `both`). Reconcile gates its
+    /// push-side destructive arm on this.
+    pub fn allows_delete_of_remote_folder(&self) -> bool {
+        self.allow_destructive_folder_sync.allows_delete_remote()
+    }
 }
 
 /// Look up a `MessageRecord` (or records) by whichever ID kind you
@@ -335,6 +354,7 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
     // display order.
     emit_create_local_mailboxes(ctx.mailboxes, &mut plan);
     emit_rename_mailboxes(ctx.mailboxes, &mut plan);
+    emit_local_orphan_resurrects(&ctx, &mut plan);
 
     process_remote_destroys(
         remote_destroyed,
@@ -450,6 +470,76 @@ fn emit_rename_mailboxes(mailboxes: &MailboxBindings, plan: &mut SyncPlan) {
                     parent_jmap_mailbox_id: renamed.parent_jmap_mailbox_id.clone(),
                 });
             }
+        }
+    }
+}
+
+/// Emit resurrect actions for each `LocalOrphanRecord` whose
+/// policy permits non-destructive handling. The default
+/// (`allow_destructive_folder_sync = None`) and the
+/// `delete-remote` variant both forbid destroying the local
+/// side, so they fall through here: re-create the mailbox
+/// server-side and upload every cataloged message. The
+/// destructive variants (`delete-local`/`both`) skip this
+/// emission -- under those policies the local maildir is
+/// allowed to be destroyed in response to a server-side
+/// deletion, so the resurrect path (which preserves local
+/// content) doesn't apply.
+///
+/// Each orphan produces one `CreateRemoteMailbox` keyed on
+/// the orphan's `maildir_folder` (creation_refs key) plus one
+/// `UploadMessage` per cataloged message. The upload's
+/// `binding.jmap_mailbox_id` carries a
+/// `MaybeReference::Reference(folder)` that the executor
+/// resolves to the freshly-assigned server id via
+/// `resolve_upload_references`. The create's
+/// `replaces_orphan_id` carries the dead id so the executor
+/// pre-deletes the orphan's stale `message_map` rows before
+/// the new uploads write fresh ones.
+fn emit_local_orphan_resurrects(ctx: &ReconcileCtx<'_>, plan: &mut SyncPlan) {
+    if ctx.policy.allows_delete_of_local_folder() {
+        return;
+    }
+    for orphan in ctx.mailboxes.local_orphans() {
+        let dead_id = orphan
+            .binding
+            .jmap_mailbox_id
+            .expect_resolved("emit_local_orphan_resurrects -- orphan binding is resolved")
+            .clone();
+        let folder = orphan.binding.maildir_folder.clone();
+        plan.actions.push(SyncAction::CreateRemoteMailbox {
+            name: orphan.binding.server_name.clone(),
+            parent_jmap_mailbox_id: orphan
+                .parent_jmap_mailbox_id
+                .clone()
+                .map(MaybeReference::Value),
+            role: None,
+            folder: folder.clone(),
+            replaces_orphan_id: Some(dead_id),
+        });
+        for message in &orphan.messages {
+            if message.size_bytes > ctx.max_upload_size as u64 {
+                warn!(
+                    "Skipping orphan-resurrect upload for {} ({} bytes > server cap \
+                     {}); file stays on disk in {}",
+                    message.message_id, message.size_bytes, ctx.max_upload_size, folder
+                );
+                continue;
+            }
+            plan.actions.push(SyncAction::UploadMessage {
+                id: LocalId {
+                    maildir_id: message.maildir_id.clone(),
+                    message_id: message.message_id.clone(),
+                },
+                binding: Arc::new(MailboxFolderBinding {
+                    jmap_mailbox_id: MaybeReference::Reference(folder.clone()),
+                    server_name: orphan.binding.server_name.clone(),
+                    maildir_folder: folder.clone(),
+                    remote_path: orphan.binding.remote_path.clone(),
+                }),
+                file_path: message.path.clone(),
+                flags: message.flags.clone(),
+            });
         }
     }
 }
@@ -1190,6 +1280,7 @@ fn handle_local_folder_created(
             parent_jmap_mailbox_id: parent_ref,
             role: None,
             folder,
+            replaces_orphan_id: None,
         });
     }
 }
@@ -3540,6 +3631,215 @@ mod tests {
                 assert_eq!(parent_id.as_ref(), "MB-ARCH");
             }
             other => panic!("expected CreateRemoteMailbox, got {:?}", other),
+        }
+    }
+
+    mod orphan_resurrect {
+        use super::*;
+        use crate::sync::bindings::OrphanMessage;
+
+        fn bindings_with_orphan(messages: Vec<OrphanMessage>) -> MailboxBindings {
+            let mut b = MailboxBindings::builder();
+            b.push_local_orphan(
+                MailboxFolderBinding {
+                    jmap_mailbox_id: MaybeReference::Value(JmapMailboxId::from("MB-ARCH")),
+                    server_name: "Archive".to_string(),
+                    maildir_folder: "Archive".to_string(),
+                    remote_path: "Archive".to_string(),
+                },
+                None,
+            );
+            let captured = messages.clone();
+            b.populate_local_orphan_messages(|_| Ok(captured.clone()))
+                .unwrap();
+            b.build()
+        }
+
+        fn orphan_msg(
+            jmap_email_id: Option<&str>,
+            maildir_id: &str,
+            message_id: &str,
+        ) -> OrphanMessage {
+            OrphanMessage {
+                jmap_email_id: jmap_email_id.map(JmapEmailId::from),
+                maildir_id: MaildirId::from(maildir_id),
+                message_id: MessageId::from(message_id),
+                path: std::path::PathBuf::from(format!("/tmp/jma-test/Archive/cur/{}", maildir_id)),
+                flags: "S".to_string(),
+                size_bytes: 100,
+            }
+        }
+
+        fn run_with_orphan(
+            mailboxes: &MailboxBindings,
+            allow_destructive: AllowDestructiveFolderSync,
+        ) -> SyncPlan {
+            let local_index = LocalIndex::default();
+            let local_flags = HashMap::new();
+            let known = indices(&[]);
+            reconcile(ReconcileInput {
+                remote_emails: &[],
+                remote_destroyed: &[],
+                local_changes: &[],
+                known: &known,
+                local_index: &local_index,
+                local_flags: &local_flags,
+                mailboxes,
+                policy: SyncPolicy {
+                    conflict_strategy: ConflictStrategy::ServerWins,
+                    allow_destructive_folder_sync: allow_destructive,
+                },
+                new_email_state: None,
+                max_upload_size: usize::MAX,
+                used_initial_path: true,
+                folder_layout: FolderLayout::Flat,
+                hierarchy_separator: '.',
+                maildir_root: std::path::Path::new("/tmp/jma-test-maildir-root"),
+            })
+        }
+
+        /// Under the default policy (`None`, non-destructive),
+        /// a local orphan with both bound and local-only
+        /// messages emits one `CreateRemoteMailbox` (with
+        /// `replaces_orphan_id = Some(MB-ARCH)`) plus one
+        /// `UploadMessage` per cataloged message. Each upload's
+        /// `binding.jmap_mailbox_id` is a `Reference` keyed on
+        /// the orphan's `maildir_folder` -- the executor's
+        /// `creation_refs` table resolves it after the create
+        /// lands.
+        #[test]
+        fn local_orphan_under_none_policy_emits_resurrect() {
+            let bindings = bindings_with_orphan(vec![
+                orphan_msg(Some("E1"), "FOO.host", "<bound-1@example.com>"),
+                orphan_msg(None, "BAR.host", "<local-only-1@example.com>"),
+            ]);
+
+            let plan = run_with_orphan(&bindings, AllowDestructiveFolderSync::None);
+
+            let creates: Vec<_> = plan
+                .actions
+                .iter()
+                .filter_map(|a| match a {
+                    SyncAction::CreateRemoteMailbox {
+                        name,
+                        folder,
+                        replaces_orphan_id,
+                        ..
+                    } => Some((name.clone(), folder.clone(), replaces_orphan_id.clone())),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(creates.len(), 1, "one CreateRemoteMailbox for the orphan");
+            assert_eq!(creates[0].0, "Archive");
+            assert_eq!(creates[0].1, "Archive");
+            assert_eq!(
+                creates[0].2.as_ref().map(|id| id.as_ref()),
+                Some("MB-ARCH"),
+                "replaces_orphan_id carries the dead mailbox id"
+            );
+
+            let uploads: Vec<_> = plan
+                .actions
+                .iter()
+                .filter_map(|a| match a {
+                    SyncAction::UploadMessage { id, binding, .. } => {
+                        Some((id.maildir_id.as_ref().to_string(), binding.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(uploads.len(), 2, "one UploadMessage per orphan message");
+            for (_, binding) in &uploads {
+                match &binding.jmap_mailbox_id {
+                    MaybeReference::Reference(folder) => assert_eq!(folder, "Archive"),
+                    other => panic!("expected Reference(Archive), got {:?}", other),
+                }
+            }
+        }
+
+        /// Under `delete-local` (the user opted in to
+        /// destructive folder sync on the pull side), the
+        /// policy permits destroying the local side, so the
+        /// resurrect path must not fire. Pins the policy gate.
+        #[test]
+        fn local_orphan_under_delete_local_policy_skips_resurrect() {
+            let bindings = bindings_with_orphan(vec![orphan_msg(
+                Some("E1"),
+                "FOO.host",
+                "<bound-1@example.com>",
+            )]);
+
+            let plan = run_with_orphan(&bindings, AllowDestructiveFolderSync::DeleteLocal);
+
+            assert!(
+                !plan
+                    .actions
+                    .iter()
+                    .any(|a| matches!(a, SyncAction::CreateRemoteMailbox { .. })),
+                "no CreateRemoteMailbox should be emitted under delete-local; got {:?}",
+                plan.actions
+            );
+            assert!(
+                !plan
+                    .actions
+                    .iter()
+                    .any(|a| matches!(a, SyncAction::UploadMessage { .. })),
+                "no UploadMessage should be emitted under delete-local"
+            );
+        }
+
+        /// Symmetrically, `Both` (delete-local + delete-remote)
+        /// also opts in to destructive local handling and
+        /// must skip resurrect.
+        #[test]
+        fn local_orphan_under_both_policy_skips_resurrect() {
+            let bindings = bindings_with_orphan(vec![orphan_msg(
+                Some("E1"),
+                "FOO.host",
+                "<bound-1@example.com>",
+            )]);
+
+            let plan = run_with_orphan(&bindings, AllowDestructiveFolderSync::Both);
+
+            assert!(
+                !plan
+                    .actions
+                    .iter()
+                    .any(|a| matches!(a, SyncAction::CreateRemoteMailbox { .. })),
+                "no CreateRemoteMailbox under Both"
+            );
+            assert!(
+                !plan
+                    .actions
+                    .iter()
+                    .any(|a| matches!(a, SyncAction::UploadMessage { .. })),
+                "no UploadMessage under Both"
+            );
+        }
+
+        /// `delete-remote` permits destructive push-side
+        /// handling but NOT pull-side -- so local orphans
+        /// (server deleted the mailbox) still resurrect.
+        #[test]
+        fn local_orphan_under_delete_remote_policy_still_resurrects() {
+            let bindings = bindings_with_orphan(vec![orphan_msg(
+                Some("E1"),
+                "FOO.host",
+                "<bound-1@example.com>",
+            )]);
+
+            let plan = run_with_orphan(&bindings, AllowDestructiveFolderSync::DeleteRemote);
+
+            let creates_count = plan
+                .actions
+                .iter()
+                .filter(|a| matches!(a, SyncAction::CreateRemoteMailbox { .. }))
+                .count();
+            assert_eq!(
+                creates_count, 1,
+                "delete-remote doesn't permit destroying the local side, \
+                 so local-orphan resurrect still fires"
+            );
         }
     }
 }

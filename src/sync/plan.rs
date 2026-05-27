@@ -330,6 +330,17 @@ pub enum SyncAction {
         parent_jmap_mailbox_id: Option<MaybeReference<JmapMailboxId>>,
         role: Option<String>,
         folder: String,
+        /// When this create resurrects a local orphan (a
+        /// mailbox the server deleted while the disk side
+        /// survived), the dead `jmap_mailbox_id` whose
+        /// `message_map` rows should be cleaned up before the
+        /// new create runs. The executor deletes those rows
+        /// inline so the cycle's subsequent upserts (one per
+        /// `UploadMessage` re-binding the file to the freshly
+        /// created mailbox) can land without collision against
+        /// the unique-on-`maildir_id` index. `None` for a
+        /// regular (non-resurrect) create.
+        replaces_orphan_id: Option<JmapMailboxId>,
     },
 
     /// Folder-level push-side primitive: `Mailbox/set { update }`

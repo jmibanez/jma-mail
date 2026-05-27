@@ -151,6 +151,22 @@ pub fn delete_message_by_jmap_id(conn: &Connection, jmap_email_id: &JmapEmailId)
     Ok(())
 }
 
+/// Delete every `message_map` row whose `jmap_mailbox_id`
+/// matches the given id. Returns the number of rows removed.
+/// Used by the orphan-resurrect path to clean stale bindings
+/// to the dead mailbox id before re-uploading the messages
+/// into a freshly-created server-side mailbox.
+pub fn delete_messages_by_jmap_mailbox_id(
+    conn: &Connection,
+    jmap_mailbox_id: &JmapMailboxId,
+) -> Result<usize> {
+    let removed = conn.execute(
+        "DELETE FROM message_map WHERE jmap_mailbox_id = ?1",
+        params![jmap_mailbox_id],
+    )?;
+    Ok(removed)
+}
+
 /// True iff `message_map` has at least one row. Used by the dedupe
 /// pass to decide whether reconcile will need a `LocalIndex` this
 /// cycle: an empty table means initial sync or post-recovery wipe,

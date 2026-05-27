@@ -173,8 +173,12 @@ impl<'a> Executor<'a> {
         let local_deletes_count = self.delete_local_messages(local_deletes)?;
         // Remote mailbox creates land before uploads so a plan that emits
         // CreateRemoteMailbox + UploadMessage into the new mailbox in the
-        // same cycle finds the destination already provisioned.
-        self.create_remote_mailboxes(remote_creates).await?;
+        // same cycle finds the destination already provisioned. Returns
+        // the populated `creation_refs` table so subsequent
+        // `UploadMessage` actions whose `binding.jmap_mailbox_id` carries
+        // a `MaybeReference::Reference(folder)` (orphan-resurrect path)
+        // can be resolved against the server-assigned ids.
+        let creation_refs = self.create_remote_mailboxes(remote_creates).await?;
         // Shape-before-content: settle the server-side mailbox
         // tree (creates, then renames) before any phase that
         // addresses a mailbox by id and would care about its
@@ -187,6 +191,7 @@ impl<'a> Executor<'a> {
         // order (create_local -> rename_local -> downloads) and
         // makes the per-cycle JMAP trace easier to read.
         self.rename_remote_mailboxes(remote_renames).await?;
+        let uploads = resolve_upload_references(uploads, &creation_refs);
         let upload_results = self.upload_messages(uploads).await?;
         let uploaded = upload_results.uploaded;
         let (outcome, remote_counts) = self
@@ -600,7 +605,10 @@ impl<'a> Executor<'a> {
     /// warn-and-continue: the maildir/sentinel are recoverable
     /// from the server-side mailbox the next cycle's resolve
     /// detects.
-    async fn create_remote_mailboxes(&self, actions: Vec<SyncAction>) -> Result<()> {
+    async fn create_remote_mailboxes(
+        &self,
+        actions: Vec<SyncAction>,
+    ) -> Result<HashMap<String, JmapMailboxId>> {
         let mut creation_refs: HashMap<String, JmapMailboxId> = HashMap::new();
         let maildir_root = self.config.maildir_path();
         for action in actions {
@@ -609,6 +617,7 @@ impl<'a> Executor<'a> {
                 parent_jmap_mailbox_id,
                 role,
                 folder,
+                replaces_orphan_id,
             } = action
             else {
                 continue;
@@ -631,6 +640,23 @@ impl<'a> Executor<'a> {
                     }
                 }
             };
+            // Resurrect path: clean stale `message_map` rows
+            // pointing at the dead `jmap_mailbox_id` before the
+            // JMAP create runs. Subsequent `UploadMessage`
+            // actions in this cycle will write fresh rows
+            // bound to the new server-side id; the unique-on-
+            // `maildir_id` index would reject the upsert
+            // otherwise. Runs after parent resolution so a
+            // parent-unresolved skip above doesn't strand the
+            // rows with no create attempt to surface.
+            if let Some(dead_id) = replaces_orphan_id.as_ref() {
+                let removed = queries::delete_messages_by_jmap_mailbox_id(self.conn, dead_id)?;
+                debug!(
+                    "Resurrect cleanup: dropped {} message_map row(s) for dead \
+                     mailbox id {} before re-creating as {:?}",
+                    removed, dead_id, folder
+                );
+            }
             match crate::jmap::mailbox::create(
                 &self.client,
                 &name,
@@ -688,7 +714,7 @@ impl<'a> Executor<'a> {
                 }
             }
         }
-        Ok(())
+        Ok(creation_refs)
     }
 
     /// Execute `RenameRemoteMailbox` actions by issuing one
@@ -1392,6 +1418,77 @@ impl<'a> Executor<'a> {
         }
         Ok(())
     }
+}
+
+/// Swap any `MaybeReference::Reference(folder)` in an
+/// `UploadMessage`'s binding to `MaybeReference::Value(id)`
+/// using the `creation_refs` map populated by
+/// `create_remote_mailboxes`. Used for the orphan-resurrect
+/// path, where reconcile emits `CreateRemoteMailbox` for the
+/// dead mailbox plus one `UploadMessage` per orphan message
+/// in the same plan; the upload's binding can only carry a
+/// reference until the create returns the server-assigned id.
+///
+/// Drops `UploadMessage` actions whose reference is unresolved
+/// (the parent create failed or was warn-skipped), with a
+/// `warn!`; the file stays on disk for the next cycle to
+/// retry. Non-`UploadMessage` actions and uploads with
+/// already-resolved bindings pass through unchanged.
+fn resolve_upload_references(
+    uploads: Vec<SyncAction>,
+    creation_refs: &HashMap<String, JmapMailboxId>,
+) -> Vec<SyncAction> {
+    uploads
+        .into_iter()
+        .filter_map(|action| match action {
+            SyncAction::UploadMessage {
+                id,
+                binding,
+                file_path,
+                flags,
+            } => {
+                if binding.jmap_mailbox_id.is_resolved() {
+                    return Some(SyncAction::UploadMessage {
+                        id,
+                        binding,
+                        file_path,
+                        flags,
+                    });
+                }
+                let resolved_id = match binding.jmap_mailbox_id.resolve_with(creation_refs) {
+                    Some(id) => id,
+                    None => {
+                        // `is_resolved` was false above, so the
+                        // unresolved case is a `Reference` whose
+                        // key is missing from `creation_refs`.
+                        let folder = match &binding.jmap_mailbox_id {
+                            MaybeReference::Reference(f) => f.as_str(),
+                            MaybeReference::Value(_) => unreachable!("is_resolved == false"),
+                        };
+                        warn!(
+                            "Skipping UploadMessage {}: parent mailbox reference {:?} \
+                             unresolved (CreateRemoteMailbox missing or rejected this \
+                             cycle); next cycle will re-emit",
+                            id, folder
+                        );
+                        return None;
+                    }
+                };
+                Some(SyncAction::UploadMessage {
+                    id,
+                    binding: Arc::new(MailboxFolderBinding {
+                        jmap_mailbox_id: MaybeReference::Value(resolved_id),
+                        server_name: binding.server_name.clone(),
+                        maildir_folder: binding.maildir_folder.clone(),
+                        remote_path: binding.remote_path.clone(),
+                    }),
+                    file_path,
+                    flags,
+                })
+            }
+            other => Some(other),
+        })
+        .collect()
 }
 
 /// Pump downloaded blob tmp-file handles into `tx` from a parallel
@@ -2553,5 +2650,95 @@ mod tests {
             cache.matches_all(&[cur_path, new_path]),
             "self-write cache must hold both sides of the new/->cur/ promotion"
         );
+    }
+
+    mod resolve_upload_refs {
+        use super::*;
+        use crate::ids::MessageId;
+        use crate::sync::plan::LocalId;
+
+        fn upload_with_binding(binding: Arc<MailboxFolderBinding>) -> SyncAction {
+            SyncAction::UploadMessage {
+                id: LocalId {
+                    maildir_id: MaildirId::from("FOO.host"),
+                    message_id: MessageId::from("msg-1@example.com"),
+                },
+                binding,
+                file_path: std::path::PathBuf::from("/tmp/jma-test/Archive/cur/FOO.host"),
+                flags: "S".to_string(),
+            }
+        }
+
+        fn reference_binding(folder: &str) -> Arc<MailboxFolderBinding> {
+            Arc::new(MailboxFolderBinding {
+                jmap_mailbox_id: MaybeReference::Reference(folder.to_string()),
+                server_name: folder.to_string(),
+                maildir_folder: folder.to_string(),
+                remote_path: folder.to_string(),
+            })
+        }
+
+        /// Reference matches a `creation_refs` entry: swap to
+        /// `Value(id)` so the upload commit's
+        /// `expect_resolved` succeeds.
+        #[test]
+        fn resolved_reference_swaps_to_value() {
+            let mut refs = HashMap::new();
+            refs.insert("Archive".to_string(), JmapMailboxId::from("MB-NEW-2"));
+            let uploads = vec![upload_with_binding(reference_binding("Archive"))];
+
+            let out = resolve_upload_references(uploads, &refs);
+
+            assert_eq!(out.len(), 1);
+            match &out[0] {
+                SyncAction::UploadMessage { binding, .. } => match &binding.jmap_mailbox_id {
+                    MaybeReference::Value(id) => assert_eq!(id.as_ref(), "MB-NEW-2"),
+                    other => panic!("expected Value, got {:?}", other),
+                },
+                other => panic!("expected UploadMessage, got {:?}", other),
+            }
+        }
+
+        /// Unresolved reference (parent create failed or
+        /// rejected): warn-and-drop the upload so the next
+        /// cycle can re-emit.
+        #[test]
+        fn unresolved_reference_drops_action() {
+            let refs = HashMap::new();
+            let uploads = vec![upload_with_binding(reference_binding("Archive"))];
+
+            let out = resolve_upload_references(uploads, &refs);
+
+            assert!(
+                out.is_empty(),
+                "unresolved Reference must drop the upload; got {:?}",
+                out
+            );
+        }
+
+        /// Already-resolved Value bindings pass through
+        /// unchanged.
+        #[test]
+        fn value_binding_passes_through() {
+            let refs = HashMap::new();
+            let value_binding = Arc::new(MailboxFolderBinding {
+                jmap_mailbox_id: MaybeReference::Value(JmapMailboxId::from("MB-INBOX")),
+                server_name: "Inbox".to_string(),
+                maildir_folder: "INBOX".to_string(),
+                remote_path: "Inbox".to_string(),
+            });
+            let uploads = vec![upload_with_binding(value_binding)];
+
+            let out = resolve_upload_references(uploads, &refs);
+
+            assert_eq!(out.len(), 1);
+            match &out[0] {
+                SyncAction::UploadMessage { binding, .. } => match &binding.jmap_mailbox_id {
+                    MaybeReference::Value(id) => assert_eq!(id.as_ref(), "MB-INBOX"),
+                    other => panic!("expected Value, got {:?}", other),
+                },
+                other => panic!("expected UploadMessage, got {:?}", other),
+            }
+        }
     }
 }
