@@ -569,6 +569,15 @@ impl<'a> SyncEngine<'a> {
             );
         }
 
+        // Apply any `mailbox_map` writes that were staged in
+        // `resolve_mailboxes` and gated on the executor's disk
+        // ops landing. Each row upserts iff the maildir +
+        // sentinel are now consistent with the staged record;
+        // partial-failure rows stay un-applied so the next
+        // cycle sees the same `FirstCycle` (or rename) state
+        // and retries cleanly.
+        apply_pending_mailbox_writes(self.conn, &maildir_root, mailboxes.pending_mailbox_writes())?;
+
         // Phase 6: record per-folder checkpoints. Snapshot every
         // synced folder after the executor has landed its writes,
         // so the next cycle's Phase 0 dirty check sees the
@@ -731,6 +740,19 @@ impl<'a> SyncEngine<'a> {
         )?;
 
         let synced = synced.build();
+
+        // No `mailbox_map` writes happen here. Every cache
+        // mutation rides on `pending_mailbox_writes` /
+        // `mailbox_metadata_writes` / `cache_route_orphan_deletes`
+        // and applies in the engine's run: the metadata writes
+        // and cache-route deletes drain before the executor (so
+        // `destroy_remote_mailboxes` wins any race on shared
+        // ids); the pending writes drain after the executor (so
+        // disk-confirmation gating runs against the post-disk-op
+        // state). Both drains sit past the `--dry-run` early
+        // return, so plan-only runs leave `mailbox_map`
+        // untouched.
+
         crate::notify!("Syncing {} mailboxes", synced.len());
         Ok(synced)
     }
@@ -931,7 +953,7 @@ fn compute_dirty_folders(
 /// Apply the unconditional cache mutations resolved during the
 /// per-cycle decision pass: metadata refreshes for
 /// `Unchanged`/`CacheStale` bindings, and `mailbox_map` row
-/// drops for cache-route orphans. The path does not check disk
+/// drops for cache-route orphans. Neither path checks disk
 /// state -- the metadata writes target rows whose
 /// `maildir_folder` already matches the live binding, and the
 /// deletes are for ids the server no longer advertises (the
@@ -950,6 +972,47 @@ fn apply_unconditional_mailbox_writes(
     }
     for id in deletes {
         queries::delete_mailbox(conn, id)?;
+    }
+    Ok(())
+}
+
+/// Apply `mailbox_map` rows staged this cycle, gated on disk
+/// consistency. Each row is upserted iff
+/// `try_open_maildir(record.maildir_folder)` returns `Some` AND
+/// the sentinel at that path matches
+/// `(jmap_mailbox_id, server_name, parent_id)`. Rows whose
+/// disk hasn't caught up (executor failed, dry-run, etc.) are
+/// skipped and re-evaluated next cycle -- the missing cache
+/// row keeps the binding in `FirstCycle` (or the analogous
+/// rename retry) so the executor's next pass can retry from
+/// scratch, instead of leaving a phantom row that the
+/// remote-orphan check would misread.
+fn apply_pending_mailbox_writes(
+    conn: &Connection,
+    maildir_root: &std::path::Path,
+    writes: &[queries::MailboxRecord],
+) -> Result<()> {
+    for record in writes {
+        let folder_path = maildir_root.join(&record.maildir_folder);
+        let maildir_ok = store::try_open_maildir(&folder_path).is_some();
+        let sentinel_ok = match crate::maildir_ops::sentinel::read(&folder_path)? {
+            Some(m) => {
+                m.jmap_mailbox_id == record.jmap_mailbox_id
+                    && m.server_name == record.name
+                    && m.parent_jmap_mailbox_id == record.parent_id
+            }
+            None => false,
+        };
+        if maildir_ok && sentinel_ok {
+            queries::upsert_mailbox(conn, record)?;
+        } else {
+            debug!(
+                "Pending mailbox write for id {} ({} at {}) skipped: \
+                 disk state not yet consistent (maildir_ok={}, sentinel_ok={}); \
+                 next cycle will re-evaluate",
+                record.jmap_mailbox_id, record.name, record.maildir_folder, maildir_ok, sentinel_ok,
+            );
+        }
     }
     Ok(())
 }
@@ -1409,11 +1472,13 @@ fn record_sentinel_route_orphans(
 /// Pure-decision core of `resolve_mailboxes`. Takes the upfront
 /// I/O snapshot and produces a fully-populated
 /// `MailboxBindingsBuilder`: the live binding set, the
-/// new/renamed slots, and the `mailbox_metadata_writes` cache-
-/// write slot that the engine's drain pass applies
-/// (`apply_unconditional_mailbox_writes` before the executor).
-/// The shell finalizes with `.build()`; no `mailbox_map` writes
-/// happen in the shell.
+/// new/renamed/orphan slots, and three cache-write slots that
+/// the engine's drain passes apply
+/// (`mailbox_metadata_writes` + `cache_route_orphan_deletes`
+/// before the executor via `apply_unconditional_mailbox_writes`;
+/// `pending_mailbox_writes` after the executor via
+/// `apply_pending_mailbox_writes`). The shell finalizes with
+/// `.build()`; no `mailbox_map` writes happen in the shell.
 fn compute_mailbox_resolution(
     input: &MailboxesInput<'_>,
     sync_config: &crate::config::SyncConfig,
@@ -1489,15 +1554,17 @@ fn compute_mailbox_resolution(
         );
 
         // Build the per-id `mailbox_map` row and route it to the
-        // metadata-write slot. `apply_unconditional_mailbox_writes`
-        // drains the slot before the executor runs, so all
-        // server-winning outcomes land their cache row this
-        // cycle. Local-rename arms emit no record at all: the
-        // cache deliberately stays at the pre-rename triple
-        // until `Mailbox/set { update }` lands; writing the
-        // server's stale fields here would leave the cache
-        // half-updated, and on `--dry-run` or per-action failure
-        // the next cycle's sentinel walk re-emits the same
+        // right slot. `apply_unconditional_mailbox_writes` drains
+        // the `Unchanged`/`CacheStale` rows before the executor
+        // runs; `apply_pending_mailbox_writes` drains the
+        // `FirstCycle`/`ServerRename`/`ConflictServerWins` rows
+        // after the executor confirms disk state. Local-rename
+        // arms emit no record at all -- the cache deliberately
+        // stays at the pre-rename triple until
+        // `Mailbox/set { update }` lands; writing the server's
+        // stale fields here would leave the cache half-updated,
+        // and on `--dry-run` or per-action failure the next
+        // cycle's sentinel walk re-emits the same
         // `RenameRemoteMailbox` to converge cleanly.
         let record = queries::MailboxRecord {
             jmap_mailbox_id: mb.id.clone(),
@@ -1509,12 +1576,13 @@ fn compute_mailbox_resolution(
             remote_path: Some(remote_path.clone()),
         };
         match &decision {
-            MailboxDecision::FirstCycle
-            | MailboxDecision::Unchanged
-            | MailboxDecision::ServerRename { .. }
-            | MailboxDecision::CacheStale
-            | MailboxDecision::ConflictServerWins { .. } => {
+            MailboxDecision::Unchanged | MailboxDecision::CacheStale => {
                 synced.push_mailbox_metadata_write(record);
+            }
+            MailboxDecision::FirstCycle
+            | MailboxDecision::ServerRename { .. }
+            | MailboxDecision::ConflictServerWins { .. } => {
+                synced.push_pending_mailbox_write(record);
             }
             MailboxDecision::LocalRename { .. } | MailboxDecision::ConflictLocalWins { .. } => {}
         }
@@ -2063,6 +2131,128 @@ mod tests {
             Arc::ptr_eq(from_jmap, from_msgid),
             "by_jmap and by_message_id must share the same Arc"
         );
+    }
+
+    mod pending_mailbox_writes {
+        use super::*;
+        use crate::maildir_ops::sentinel::{self, MailboxMapping};
+        use tempfile::tempdir;
+
+        fn make_maildir(root: &std::path::Path, folder: &str) -> std::path::PathBuf {
+            let path = root.join(folder);
+            crate::maildir_ops::store::ensure_maildir(&path).unwrap();
+            path
+        }
+
+        fn record(id: &str, folder: &str) -> queries::MailboxRecord {
+            queries::MailboxRecord {
+                jmap_mailbox_id: id.into(),
+                name: folder.to_string(),
+                role: None,
+                parent_id: None,
+                maildir_folder: folder.to_string(),
+                sort_order: 0,
+                remote_path: Some(folder.to_string()),
+            }
+        }
+
+        /// Happy path: maildir + sentinel present and matching
+        /// the staged record. The pending write lands.
+        #[test]
+        fn applies_when_disk_is_consistent() {
+            let conn = db::open_in_memory().unwrap();
+            let dir = tempdir().unwrap();
+            let folder = make_maildir(dir.path(), "Archive");
+            sentinel::write(
+                &folder,
+                &MailboxMapping {
+                    jmap_mailbox_id: "MB-ARCH".into(),
+                    parent_jmap_mailbox_id: None,
+                    server_name: "Archive".to_string(),
+                },
+            )
+            .unwrap();
+
+            apply_pending_mailbox_writes(&conn, dir.path(), &[record("MB-ARCH", "Archive")])
+                .unwrap();
+
+            let rows = queries::list_known_mailbox_ids(&conn).unwrap();
+            assert!(
+                rows.iter().any(|id| id.as_ref() == "MB-ARCH"),
+                "row must be written when maildir + sentinel agree"
+            );
+        }
+
+        /// Partial-failure path: executor never created the
+        /// maildir. The pending write must NOT land, so the
+        /// next cycle hits `FirstCycle` and retries cleanly
+        /// instead of carrying a phantom cache row that the
+        /// remote-orphan check would misread.
+        #[test]
+        fn skips_when_maildir_absent() {
+            let conn = db::open_in_memory().unwrap();
+            let dir = tempdir().unwrap();
+            // No maildir, no sentinel: executor didn't run, or
+            // failed before creating the folder.
+
+            apply_pending_mailbox_writes(&conn, dir.path(), &[record("MB-ARCH", "Archive")])
+                .unwrap();
+
+            let rows = queries::list_known_mailbox_ids(&conn).unwrap();
+            assert!(
+                !rows.iter().any(|id| id.as_ref() == "MB-ARCH"),
+                "row must not be written when maildir is absent"
+            );
+        }
+
+        /// Sentinel absent (maildir present but `sentinel::write`
+        /// failed or never ran) -- still partial state; do not
+        /// advance cache.
+        #[test]
+        fn skips_when_sentinel_absent() {
+            let conn = db::open_in_memory().unwrap();
+            let dir = tempdir().unwrap();
+            make_maildir(dir.path(), "Archive");
+            // Skip sentinel::write.
+
+            apply_pending_mailbox_writes(&conn, dir.path(), &[record("MB-ARCH", "Archive")])
+                .unwrap();
+
+            let rows = queries::list_known_mailbox_ids(&conn).unwrap();
+            assert!(
+                !rows.iter().any(|id| id.as_ref() == "MB-ARCH"),
+                "row must not be written when sentinel is missing"
+            );
+        }
+
+        /// Sentinel present but its contents disagree with the
+        /// staged record. Could happen if a rename mid-cycle
+        /// landed differently from the staged target; treat as
+        /// not-yet-consistent and skip the upsert.
+        #[test]
+        fn skips_when_sentinel_disagrees() {
+            let conn = db::open_in_memory().unwrap();
+            let dir = tempdir().unwrap();
+            let folder = make_maildir(dir.path(), "Archive");
+            sentinel::write(
+                &folder,
+                &MailboxMapping {
+                    jmap_mailbox_id: "MB-DIFFERENT".into(),
+                    parent_jmap_mailbox_id: None,
+                    server_name: "Archive".to_string(),
+                },
+            )
+            .unwrap();
+
+            apply_pending_mailbox_writes(&conn, dir.path(), &[record("MB-ARCH", "Archive")])
+                .unwrap();
+
+            let rows = queries::list_known_mailbox_ids(&conn).unwrap();
+            assert!(
+                !rows.iter().any(|id| id.as_ref() == "MB-ARCH"),
+                "row must not be written when sentinel id disagrees"
+            );
+        }
     }
 
     mod folder_checkpoint {
