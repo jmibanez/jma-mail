@@ -3320,3 +3320,131 @@ async fn sync_does_not_misfire_remote_orphan_on_first_cycle() {
         new_ids
     );
 }
+
+/// Rescue-failure abort-retry: when `rescue_unmapped_files`
+/// can't move an unmapped file (target path is blocked --
+/// here, pre-create a directory at the destination so
+/// `fs::rename` fails with EISDIR), the executor aborts the
+/// destroy for that orphan. The orphan maildir stays on disk
+/// with the unmapped file inside; the cascade DB cleanup is
+/// skipped. The user's concern is that the *next* cycle must
+/// re-detect the same orphan and emit a fresh
+/// `DeleteLocalFolder` so the retry succeeds once the
+/// blockage clears. Cache-vs-server diff doesn't re-fire
+/// (the row was dropped during the first detection), so
+/// next-cycle detection rides entirely on the sentinel
+/// walk picking up the surviving `.jma.mapping` file in the
+/// un-destroyed orphan folder.
+///
+/// This test pins that retry path empirically. Three sync
+/// calls: the initial sync seeds Archive on disk; the second
+/// (with rescue blocked) detects the orphan via cache-vs-
+/// server diff, fails the rescue, and aborts the destroy; the
+/// third (with the block removed) re-detects via sentinel
+/// walk, rescues the file, and destroys the folder.
+#[tokio::test]
+async fn destroy_local_folder_aborts_on_rescue_failure_then_succeeds_on_retry() {
+    let server = MockServer::start().await;
+    mount_session(&server).await;
+
+    let state = Arc::new(Mutex::new(MockState {
+        mailbox_state: "mb-1".to_string(),
+        email_state: "e-1".to_string(),
+        mailboxes: vec![
+            MockMailbox {
+                id: "MB-INBOX".to_string(),
+                name: "Inbox".to_string(),
+                role: Some("inbox".to_string()),
+                parent_id: None,
+            },
+            MockMailbox {
+                id: "MB-ARCH".to_string(),
+                name: "Archive".to_string(),
+                role: Some("archive".to_string()),
+                parent_id: None,
+            },
+        ],
+        ..Default::default()
+    }));
+    mount_jmap(&server, state.clone()).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let conn = fresh_db(&temp);
+    let mut config = test_config(&server, temp.path(), vec![]);
+    config.sync.allow_destructive_folder_sync =
+        jma_mail::config::AllowDestructiveFolderSync::DeleteLocal;
+
+    // Initial sync: lands Archive on disk with its sentinel.
+    SyncEngine::sync(&conn, &config, false)
+        .await
+        .expect("initial sync");
+    let archive = temp.path().join("Archive");
+    assert!(archive.join("cur").is_dir(), "Archive cur/ provisioned");
+    assert!(
+        archive.join(".jma.mapping").exists(),
+        "Archive sentinel must be written"
+    );
+
+    // Drop a local-only file into Archive/cur/ that has no
+    // `message_map` row -- the kind the rescue path catches.
+    let unmapped_file = archive.join("cur").join("unmapped.local:2,");
+    std::fs::write(
+        &unmapped_file,
+        b"From: a@b\r\nMessage-ID: <unmapped@x>\r\n\r\n",
+    )
+    .unwrap();
+
+    // Pre-block the rescue destination so `fs::rename` will
+    // fail with EISDIR on the first attempt.
+    let rescue_target = temp
+        .path()
+        .join(".jma-rescue")
+        .join("cur")
+        .join("unmapped.local:2,");
+    std::fs::create_dir_all(&rescue_target).expect("pre-block rescue target");
+
+    // Server deletes MB-ARCH; cycle 2 will detect it as a
+    // local orphan via cache-vs-server diff.
+    {
+        let mut st = state.lock().unwrap();
+        st.mailboxes.retain(|m| m.id != "MB-ARCH");
+        st.mailbox_state = "mb-2".to_string();
+    }
+
+    // Cycle 2: rescue fails, destroy aborted.
+    SyncEngine::sync(&conn, &config, false)
+        .await
+        .expect("second sync");
+    assert!(
+        archive.exists() && unmapped_file.exists(),
+        "rescue failure must leave the orphan + unmapped file intact"
+    );
+    let cache_after_failure = queries::list_known_mailbox_ids(&conn).expect("list mailboxes");
+    assert!(
+        !cache_after_failure.contains(&JmapMailboxId::from("MB-ARCH")),
+        "mailbox_map row drops during orphan detection regardless of \
+         the executor outcome; got cache = {:?}",
+        cache_after_failure
+    );
+
+    // Remove the blockage; cycle 3 must re-detect via the
+    // surviving sentinel and complete the destroy.
+    std::fs::remove_dir(&rescue_target).expect("clear rescue blockage");
+    SyncEngine::sync(&conn, &config, false)
+        .await
+        .expect("third sync");
+
+    assert!(!archive.exists(), "orphan must be destroyed on retry");
+    let rescued: Vec<_> = std::fs::read_dir(temp.path().join(".jma-rescue").join("cur"))
+        .expect("rescue cur exists")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        rescued.len(),
+        1,
+        "exactly the previously-unmapped file must land in .jma-rescue/cur/, got {:?}",
+        rescued
+    );
+    assert_eq!(rescued[0], "unmapped.local:2,");
+}
