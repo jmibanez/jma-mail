@@ -12,12 +12,12 @@ use tokio::sync::mpsc;
 use tracing::{Instrument, debug, error, info, warn};
 
 use crate::config::Config;
-use crate::ids::{JmapAccountId, JmapEmailId, JmapMailboxId};
+use crate::ids::{JmapAccountId, JmapEmailId, JmapMailboxId, MaildirId};
 use crate::jmap::email::{self as jmap_email, EmailSetOp};
 use crate::jmap::limits;
 use crate::jmap::retry::is_transient_error;
 use crate::jmap::types::{MailboxFolderBinding, MaybeReference};
-use crate::maildir_ops::{flags::keywords_to_flags, store};
+use crate::maildir_ops::{flags::keywords_to_flags, namespace, store};
 use crate::state::queries::{self, MessageRecord};
 use crate::sync::engine::SyncOutcome;
 use crate::sync::plan::{BoundId, LocalId, RemoteId, SyncAction, SyncPlan};
@@ -1698,6 +1698,30 @@ fn delete_local_folders(
             );
             continue;
         }
+        let mailbox_id = binding.jmap_mailbox_id.expect_resolved(
+            "delete_local_folders -- binding id must be resolved before reaching the executor",
+        );
+        match rescue_unmapped_files(conn, maildir_root, &target, mailbox_id) {
+            Ok(0) => {}
+            Ok(n) => {
+                info!(
+                    "DeleteLocalFolder {}/ (id {}): rescued {} unmapped file(s) to {}/",
+                    binding.maildir_folder,
+                    mailbox_id,
+                    n,
+                    namespace::RESCUE_FOLDER_NAME
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "DeleteLocalFolder {}/ (id {}): rescue failed: {}; aborting \
+                     destroy this cycle, will retry next cycle once the rescue \
+                     dir is writable",
+                    binding.maildir_folder, mailbox_id, e
+                );
+                continue;
+            }
+        }
         match std::fs::remove_dir_all(&target) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1712,10 +1736,6 @@ fn delete_local_folders(
                 continue;
             }
         }
-        let mailbox_id = binding.jmap_mailbox_id.expect_resolved(
-            "delete_local_folders -- binding id must be resolved before reaching \
-             the executor",
-        );
         // Per-folder transaction so an fs failure on folder
         // N+1 doesn't roll back folder N's cascade. The fs
         // op already ran before this point and is irreversible;
@@ -1733,6 +1753,73 @@ fn delete_local_folders(
         );
     }
     Ok(())
+}
+
+/// Walk the orphan's `cur/` and `new/`, comparing each file's
+/// `maildir_id` against the set of ids `message_map` still has for
+/// the orphan's dead `jmap_mailbox_id`. Files with no row are
+/// unmapped (local-only drafts, or files that arrived after the
+/// catalog snapshot was taken in `resolve_mailboxes`); rename them
+/// into `<maildir_root>/.jma-rescue/{cur,new}/` so the upcoming
+/// `remove_dir_all` doesn't sweep them up silently. Returns the
+/// number of files rescued, or `Err` on any rescue failure --
+/// caller aborts the destroy in that case so the orphan can retry
+/// on a later cycle. `Err` includes both rescue-dir provisioning
+/// failures and per-file `fs::rename` failures.
+///
+/// The rescue maildir is created lazily on first need (so the
+/// no-rescue path doesn't touch the filesystem). `ensure_maildir`
+/// provisions the standard `cur/`, `new/`, `tmp/` triple; the
+/// rescue path itself only writes into `cur/`.
+fn rescue_unmapped_files(
+    conn: &Connection,
+    maildir_root: &Path,
+    folder_path: &Path,
+    jmap_mailbox_id: &JmapMailboxId,
+) -> Result<usize> {
+    let Some(maildir) = store::try_open_maildir(folder_path) else {
+        return Ok(0);
+    };
+    let known: HashSet<MaildirId> =
+        queries::get_messages_by_jmap_mailbox_id(conn, jmap_mailbox_id)?
+            .into_iter()
+            .filter_map(|m| m.maildir_id)
+            .collect();
+    let rescue_root = maildir_root.join(namespace::RESCUE_FOLDER_NAME);
+    let mut rescued = 0usize;
+    let mut rescue_dir_created = false;
+    for entry in maildir.list_cur().chain(maildir.list_new()) {
+        let entry = entry?;
+        if known.contains(entry.id()) {
+            continue;
+        }
+        if !rescue_dir_created {
+            store::ensure_maildir(&rescue_root).map_err(|e| {
+                anyhow::anyhow!("ensure_maildir {} failed: {}", rescue_root.display(), e)
+            })?;
+            rescue_dir_created = true;
+        }
+        let src = entry.path();
+        let filename = src.file_name().ok_or_else(|| {
+            anyhow::anyhow!("rescue source has no filename component: {}", src.display())
+        })?;
+        let dst = rescue_root.join("cur").join(filename);
+        info!(
+            "DeleteLocalFolder: rescuing unmapped file {} -> {}",
+            src.display(),
+            dst.display()
+        );
+        std::fs::rename(src, &dst).map_err(|e| {
+            anyhow::anyhow!(
+                "rename {} -> {} failed: {}",
+                src.display(),
+                dst.display(),
+                e
+            )
+        })?;
+        rescued += 1;
+    }
+    Ok(rescued)
 }
 
 /// Bind already-on-server messages to existing local files (DB only).
@@ -3092,6 +3179,199 @@ mod tests {
                     .is_empty(),
                 "local_state cascade cleanup runs even when the folder was already gone"
             );
+        }
+
+        /// Two files in the orphan: one with a `message_map`
+        /// row (mapped), one without (local-only draft). After
+        /// destroy, the mapped file is gone (with the folder)
+        /// and the unmapped file lands in
+        /// `<root>/.jma-rescue/cur/`.
+        #[test]
+        fn rescues_unmapped_files_to_rescue_maildir() {
+            let dir = tempdir().unwrap();
+            let conn = db::open_in_memory().unwrap();
+            let maildir_root = dir.path();
+
+            let folder = "Archive";
+            let folder_path = maildir_root.join(folder);
+            let maildir = ensure_maildir(&folder_path).unwrap();
+            let mapped_id = store_message(
+                &maildir,
+                b"Message-ID: <mapped@example.com>\r\nSubject: x\r\n\r\nbody\r\n",
+                "",
+            )
+            .unwrap();
+            let unmapped_id = store_message(
+                &maildir,
+                b"Message-ID: <unmapped@example.com>\r\nSubject: y\r\n\r\nbody\r\n",
+                "",
+            )
+            .unwrap();
+            queries::upsert_message(
+                &conn,
+                &MessageRecord {
+                    jmap_email_id: "E-MAPPED".into(),
+                    jmap_blob_id: None,
+                    jmap_thread_id: None,
+                    jmap_mailbox_id: "MB-ARCH".into(),
+                    maildir_id: Some(mapped_id.clone()),
+                    message_id: "mapped@example.com".into(),
+                    flags: "".into(),
+                    jmap_keywords: "{}".into(),
+                },
+            )
+            .unwrap();
+
+            delete_local_folders(&conn, maildir_root, vec![action_for(folder, "MB-ARCH")]).unwrap();
+
+            assert!(!folder_path.exists(), "orphan maildir destroyed");
+            // Rescue funnels all files into `cur/` regardless
+            // of their source subdir -- rescued mail is no
+            // longer "new" in the maildir-notification sense.
+            let rescue_cur = maildir_root.join(namespace::RESCUE_FOLDER_NAME).join("cur");
+            let rescued: Vec<String> = std::fs::read_dir(&rescue_cur)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(
+                rescued.len(),
+                1,
+                "exactly one file rescued, got {:?}",
+                rescued
+            );
+            assert!(
+                rescued[0].contains(unmapped_id.as_ref()),
+                "rescued file's name should contain the unmapped maildir_id ({}); got {}",
+                unmapped_id,
+                rescued[0]
+            );
+            assert!(
+                !rescued[0].contains(mapped_id.as_ref()),
+                "the mapped file must NOT appear in rescue dir; got {}",
+                rescued[0]
+            );
+        }
+
+        /// Every file in the orphan has a `message_map` row; no
+        /// rescue needed. The `.jma-rescue` directory is not
+        /// created (lazy-creation contract: zero-touch when
+        /// nothing needs rescuing).
+        #[test]
+        fn no_rescue_dir_when_every_file_is_mapped() {
+            let dir = tempdir().unwrap();
+            let conn = db::open_in_memory().unwrap();
+            let maildir_root = dir.path();
+
+            let folder = "Archive";
+            let folder_path = maildir_root.join(folder);
+            let maildir = ensure_maildir(&folder_path).unwrap();
+            let mapped_id = store_message(
+                &maildir,
+                b"Message-ID: <a@example.com>\r\nSubject: x\r\n\r\nbody\r\n",
+                "",
+            )
+            .unwrap();
+            queries::upsert_message(
+                &conn,
+                &MessageRecord {
+                    jmap_email_id: "E1".into(),
+                    jmap_blob_id: None,
+                    jmap_thread_id: None,
+                    jmap_mailbox_id: "MB-ARCH".into(),
+                    maildir_id: Some(mapped_id),
+                    message_id: "a@example.com".into(),
+                    flags: "".into(),
+                    jmap_keywords: "{}".into(),
+                },
+            )
+            .unwrap();
+
+            delete_local_folders(&conn, maildir_root, vec![action_for(folder, "MB-ARCH")]).unwrap();
+
+            assert!(!folder_path.exists(), "orphan destroyed");
+            assert!(
+                !maildir_root.join(namespace::RESCUE_FOLDER_NAME).exists(),
+                "no rescue dir should be created when nothing needed rescuing"
+            );
+        }
+
+        /// Rescue failure aborts the destroy: the orphan stays
+        /// on disk and the cascade DB cleanup is skipped so a
+        /// later cycle can retry. Provoke the failure by
+        /// pre-creating a *directory* at the rescue destination
+        /// path the unmapped file would `fs::rename` into --
+        /// rename onto an existing directory fails with EISDIR.
+        #[test]
+        fn rescue_failure_aborts_destroy_and_keeps_db_rows() {
+            let dir = tempdir().unwrap();
+            let conn = db::open_in_memory().unwrap();
+            let maildir_root = dir.path();
+
+            let folder = "Archive";
+            let folder_path = maildir_root.join(folder);
+            let maildir = ensure_maildir(&folder_path).unwrap();
+            let unmapped_id = store_message(
+                &maildir,
+                b"Message-ID: <unmapped@example.com>\r\nSubject: y\r\n\r\nbody\r\n",
+                "",
+            )
+            .unwrap();
+            // Pre-create `.jma-rescue/cur/<unmapped_id...>` as a
+            // directory so `fs::rename` fails (rescue always
+            // targets cur/, regardless of where the source
+            // file lives). The source file lives in `new/`
+            // because `store_message` with empty flags routes
+            // through `store_new_with_flags`.
+            let src_filename = std::fs::read_dir(folder_path.join("new"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .file_name();
+            let rescue_cur = maildir_root.join(namespace::RESCUE_FOLDER_NAME).join("cur");
+            std::fs::create_dir_all(&rescue_cur).unwrap();
+            std::fs::create_dir_all(rescue_cur.join(&src_filename)).unwrap();
+
+            // Pre-seed a DB row so we can detect that cascade
+            // cleanup did NOT run.
+            queries::upsert_message(
+                &conn,
+                &MessageRecord {
+                    jmap_email_id: "E-OTHER".into(),
+                    jmap_blob_id: None,
+                    jmap_thread_id: None,
+                    jmap_mailbox_id: "MB-ARCH".into(),
+                    maildir_id: Some(MaildirId::from("SOMETHING-ELSE")),
+                    message_id: "other@example.com".into(),
+                    flags: "".into(),
+                    jmap_keywords: "{}".into(),
+                },
+            )
+            .unwrap();
+
+            delete_local_folders(&conn, maildir_root, vec![action_for(folder, "MB-ARCH")]).unwrap();
+
+            assert!(
+                folder_path.exists(),
+                "orphan maildir must remain on disk after rescue failure"
+            );
+            assert!(
+                folder_path.join("new").join(&src_filename).exists(),
+                "the unmapped file must remain in the orphan after rescue failure"
+            );
+            assert!(
+                queries::get_message_by_jmap_id(&conn, &"E-OTHER".into())
+                    .unwrap()
+                    .is_some(),
+                "cascade DB cleanup must be skipped so next-cycle retry has \
+                 the same input state -- ie unmapped maildir id still mapped to E-OTHER"
+            );
+
+            // Sanity: the unmapped id is unchanged (we'd rather
+            // see retry produce the same rescue attempt next
+            // cycle than discover the file vanished).
+            assert!(unmapped_id.as_ref().chars().count() > 0);
         }
     }
 }
