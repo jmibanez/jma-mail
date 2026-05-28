@@ -495,7 +495,8 @@ fn print_maildir_drift(conn: &rusqlite::Connection, maildir_root: &std::path::Pa
 /// maildir?" marker -- works under any folder layout and matches
 /// what `ensure_maildir` actually creates.
 ///
-/// Skips jma's own state markers (`.jma.*`), the maildir
+/// Skips jma's own private namespace (see
+/// `maildir_ops::namespace::is_jma_private`), the maildir
 /// internals (`cur`/`new`/`tmp` -- we don't recurse into them, since
 /// any directory that *contains* one of those is itself a maildir
 /// already). Read errors at any level are silently dropped: this is
@@ -524,7 +525,7 @@ fn walk_for_maildirs(root: &std::path::Path, dir: &std::path::Path, found: &mut 
         }
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        if name_str.starts_with(".jma.") {
+        if maildir_ops::namespace::is_jma_private(&name_str) {
             continue;
         }
         if name_str == "cur" || name_str == "new" || name_str == "tmp" {

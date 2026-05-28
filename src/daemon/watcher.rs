@@ -14,9 +14,9 @@ use crate::sync::self_writes::SelfWriteCache;
 /// convention live in `<folder>/cur/` (delivered+seen) or
 /// `<folder>/new/` (delivered, awaiting first read). Everything else
 /// inside the watched root is noise: `<folder>/tmp/` is mid-delivery
-/// scratch, and the maildir root itself can hold sidecar files
-/// jma writes (`.jma.db` and its `-wal` / `-shm` siblings
-/// in WAL mode, `.jma.lock`, etc.) that shouldn't kick a sync.
+/// scratch, and the maildir root itself can hold sidecar files jma
+/// writes inside its private namespace (see
+/// `crate::maildir_ops::namespace`) that shouldn't kick a sync.
 /// Read-only commands like `mailboxes` and `status` open the state DB
 /// to consult the discovery cache, which by itself touches the WAL
 /// and SHM siblings -- without this filter, running them alongside

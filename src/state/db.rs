@@ -264,12 +264,18 @@ pub fn open_in_memory() -> Result<Connection> {
     Ok(conn)
 }
 
+/// Suffix appended to the state DB path to form its advisory lock
+/// path. With the default DB at `<maildir>/.jma.db` this yields
+/// `.jma.db.lock`; with a `[state].db_path` override it yields
+/// `<override>.lock`.
+pub const LOCK_SUFFIX: &str = ".lock";
+
 /// Path of the advisory lock file paired with a given state DB
 /// (`state.db` -> `state.db.lock`). Exposed for diagnostics; not
 /// normally needed by callers.
 pub fn lock_path_for(db_path: &Path) -> PathBuf {
     let mut p = db_path.as_os_str().to_owned();
-    p.push(".lock");
+    p.push(LOCK_SUFFIX);
     PathBuf::from(p)
 }
 

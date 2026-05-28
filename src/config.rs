@@ -3,6 +3,8 @@ use regex::Regex;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+use crate::maildir_ops::namespace;
+
 #[derive(Debug, Default, Deserialize)]
 pub struct Config {
     pub account: AccountConfig,
@@ -407,7 +409,7 @@ impl Config {
     pub fn db_path(&self) -> PathBuf {
         match self.state.db_path.as_deref() {
             Some(p) => expand_tilde(Path::new(p)),
-            None => self.maildir_path().join(".jma.db"),
+            None => self.maildir_path().join(namespace::STATE_DB_FILENAME),
         }
     }
 }

@@ -4,11 +4,13 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use tracing::info;
 
+use super::namespace;
+
 /// Path of the advisory lock file paired with a given maildir root
 /// (`<root>/.jma.lock`). Exposed for diagnostics; not normally
 /// needed by callers.
 pub fn lock_path_for(maildir_root: &Path) -> PathBuf {
-    maildir_root.join(".jma.lock")
+    maildir_root.join(namespace::MAILDIR_LOCK_FILENAME)
 }
 
 /// Acquire an exclusive advisory lock on `<maildir_root>/.jma.lock`
