@@ -106,6 +106,7 @@ impl<'a> Executor<'a> {
             new_email_state,
         } = plan;
 
+        let mut remote_mailbox_destroys = Vec::new();
         let mut local_creates = Vec::new();
         let mut local_renames = Vec::new();
         let mut unconditional_adopts = Vec::new();
@@ -149,6 +150,7 @@ impl<'a> Executor<'a> {
                 SyncAction::UpdateRemoteKeywords { .. } => remote_keywords.push(action),
                 SyncAction::MoveRemote { .. } => remote_moves.push(action),
                 SyncAction::DestroyRemote { .. } => remote_destroys.push(action),
+                SyncAction::DestroyRemoteMailbox { .. } => remote_mailbox_destroys.push(action),
             }
         }
 
@@ -208,6 +210,13 @@ impl<'a> Executor<'a> {
         let uploaded = upload_results.uploaded;
         let (outcome, remote_counts) = self
             .apply_remote_set(remote_keywords, remote_moves, remote_destroys)
+            .await?;
+        // DestroyRemoteMailbox runs after every per-email push
+        // phase so any cycle-local Upload/Move/Update targeting
+        // the soon-to-be-destroyed mailbox lands first. Matches
+        // the pull-side `delete_local_folders` "run after
+        // per-message phases" discipline.
+        self.destroy_remote_mailboxes(remote_mailbox_destroys)
             .await?;
         let flag_updates = local_flag_updates + remote_counts.keyword_updates;
         let moved = local_moves_count + remote_counts.moves;
@@ -862,6 +871,46 @@ impl<'a> Executor<'a> {
                     "Renamed remote mailbox {} -> {:?} but sentinel refresh failed: {}; \
                      `janitor rebindfolders` will rebind it after the next sync",
                     mailbox_id, binding.server_name, e
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Push-side mirror of `delete_local_folders`. Issues one
+    /// `Mailbox/set { destroy }` per action via
+    /// `jmap::mailbox::destroy`, with `onDestroyRemoveEmails: true`
+    /// so a mailbox holding cycle-local stale email content
+    /// vanishes with the folder rather than failing the destroy.
+    /// On success drops the `mailbox_map` row inline -- the
+    /// next-cycle cache-vs-server diff would drop it anyway, but
+    /// inline cleanup keeps `MailboxBindings`'s invariants tight.
+    ///
+    /// Server-side rejection (per-id `notDestroyed`) logs at
+    /// `warn!` and continues to the next action; the cache row
+    /// stays in place so a subsequent cycle can retry.
+    async fn destroy_remote_mailboxes(&self, actions: Vec<SyncAction>) -> Result<()> {
+        for action in actions {
+            let SyncAction::DestroyRemoteMailbox { binding } = action else {
+                continue;
+            };
+            let jmap_mailbox_id = binding
+                .jmap_mailbox_id
+                .expect_resolved("destroy_remote_mailboxes -- binding must be resolved");
+            let label = binding.remote_path.as_str();
+            if let Err(e) = crate::jmap::mailbox::destroy(&self.client, jmap_mailbox_id).await {
+                warn!(
+                    "Failed to destroy remote mailbox {} (id {}): {}; \
+                     mailbox_map row stays for next-cycle retry",
+                    label, jmap_mailbox_id, e
+                );
+                continue;
+            }
+            if let Err(e) = queries::delete_mailbox(self.conn, jmap_mailbox_id) {
+                warn!(
+                    "Destroyed remote mailbox {} (id {}) but mailbox_map drop failed: {}; \
+                     next cycle's cache-vs-server diff will catch up",
+                    label, jmap_mailbox_id, e
                 );
             }
         }
