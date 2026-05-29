@@ -372,6 +372,30 @@ pub async fn update_name_and_parent(
     .await
 }
 
+/// Issue one `Mailbox/set { destroy: [id], onDestroyRemoveEmails:
+/// true }` against the server. `onDestroyRemoveEmails: true` lets
+/// the server delete any emails still resident in the mailbox at
+/// destroy time, which would otherwise surface as `mailboxHasEmail`
+/// per RFC 8621 §2.3. Callers are responsible for emitting destroys
+/// children-first; the server still rejects with `mailboxHasChild`
+/// independent of the flag.
+///
+/// Wrapped in `with_retry` so transient failures get the same
+/// per-call retry as every other JMAP call. Server-side rejection
+/// (the `notDestroyed` map per RFC 8621 §5.3) surfaces from
+/// `destroyed()` as an error.
+pub async fn destroy(client: &Client, id: &JmapMailboxId) -> Result<()> {
+    with_retry("Mailbox/set destroy", || async {
+        client
+            .mailbox_destroy(id.as_ref(), true)
+            .await
+            .with_context(|| format!("Mailbox/set destroy for {}", id))?;
+        info!("Destroyed remote mailbox {}", id);
+        Ok(())
+    })
+    .await
+}
+
 /// Map jma's lowercase `role` string to the jmap-client `Role`
 /// enum. Pairs only with the well-known role names; the
 /// `Role::Other(...)` string that `get_all` emits for unknown

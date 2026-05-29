@@ -78,6 +78,16 @@ struct MockState {
     /// `invalidProperties` and is not appended to
     /// `mailbox_set_updates` / does not rewrite the mailbox.
     mailbox_set_reject_update_ids: Vec<String>,
+    /// Mailbox/set { destroy } ids recorded in the order they
+    /// arrived. The handler removes the matching `MockMailbox`
+    /// so a follow-up `Mailbox/get` no longer reflects it.
+    mailbox_set_destroys: Vec<String>,
+    /// Ids that `Mailbox/set { destroy }` must reject. Each
+    /// matching destroy goes into `notDestroyed` with
+    /// `mailboxHasEmail` and is not appended to
+    /// `mailbox_set_destroys` / does not remove the mailbox.
+    /// Pins the warn-and-continue path.
+    mailbox_set_reject_destroy_ids: Vec<String>,
 }
 
 #[derive(Default, Clone)]
@@ -272,12 +282,12 @@ fn mailbox_get(_args: &Value, call_id: &str, state: &mut MockState) -> Value {
     ])
 }
 
-/// Minimal `Mailbox/set { create | update }` dispatcher. Records
-/// each create into `state.mailbox_set_creates` and each update
-/// into `state.mailbox_set_updates`, rewriting / appending the
-/// matching `MockMailbox` so a follow-up `Mailbox/get` reflects
-/// the change. `destroy` is unimplemented -- tests that need it
-/// have to extend this handler.
+/// Minimal `Mailbox/set { create | update | destroy }`
+/// dispatcher. Records each create into `state.mailbox_set_creates`,
+/// each update into `state.mailbox_set_updates`, and each destroy
+/// into `state.mailbox_set_destroys`, rewriting / appending /
+/// removing the matching `MockMailbox` so a follow-up
+/// `Mailbox/get` reflects the change.
 fn mailbox_set(args: &Value, call_id: &str, state: &mut MockState) -> Value {
     let mut created_resp = serde_json::Map::new();
     let mut not_created_resp = serde_json::Map::new();
@@ -336,6 +346,28 @@ fn mailbox_set(args: &Value, call_id: &str, state: &mut MockState) -> Value {
             updated_resp.insert(id.clone(), Value::Null);
         }
     }
+    let mut destroyed_resp: Vec<Value> = Vec::new();
+    let mut not_destroyed_resp = serde_json::Map::new();
+    if let Some(destroys) = args["destroy"].as_array() {
+        for id_val in destroys {
+            let Some(id) = id_val.as_str() else {
+                continue;
+            };
+            if state.mailbox_set_reject_destroy_ids.iter().any(|x| x == id) {
+                not_destroyed_resp.insert(
+                    id.to_string(),
+                    json!({
+                        "type": "mailboxHasEmail",
+                        "description": format!("rigged rejection for {}", id),
+                    }),
+                );
+                continue;
+            }
+            state.mailboxes.retain(|m| m.id != id);
+            state.mailbox_set_destroys.push(id.to_string());
+            destroyed_resp.push(Value::String(id.to_string()));
+        }
+    }
     let old_state = state.mailbox_state.clone();
     state.mailbox_state = format!("{}-set", old_state);
     json!([
@@ -346,10 +378,10 @@ fn mailbox_set(args: &Value, call_id: &str, state: &mut MockState) -> Value {
             "newState": state.mailbox_state,
             "created": Value::Object(created_resp),
             "updated": Value::Object(updated_resp),
-            "destroyed": [],
+            "destroyed": Value::Array(destroyed_resp),
             "notCreated": Value::Object(not_created_resp),
             "notUpdated": Value::Object(not_updated_resp),
-            "notDestroyed": {},
+            "notDestroyed": Value::Object(not_destroyed_resp),
         },
         call_id
     ])
@@ -1582,6 +1614,8 @@ async fn sync_falls_back_when_email_changes_cannot_calculate() {
         mailbox_set_reject_names: Vec::new(),
         mailbox_set_updates: Vec::new(),
         mailbox_set_reject_update_ids: Vec::new(),
+        mailbox_set_destroys: Vec::new(),
+        mailbox_set_reject_destroy_ids: Vec::new(),
     }));
     mount_jmap(&server, state.clone()).await;
     mount_blob_downloads(&server, state.clone()).await;
@@ -2061,6 +2095,215 @@ async fn create_remote_mailbox_skips_child_when_parent_reference_unresolved() {
         creates
     );
 }
+
+/// Push-side destructive primitive: one `DestroyRemoteMailbox`
+/// per action lands a `Mailbox/set { destroy }` call carrying
+/// the JMAP id, and on success the matching `mailbox_map` row
+/// drops inline so the next cycle's cache-vs-server diff has
+/// nothing left to clean. Pins both halves of the contract --
+/// the on-the-wire call shape and the in-cycle DB cleanup.
+#[tokio::test]
+async fn destroy_remote_mailbox_issues_mailbox_set_per_action_and_drops_cache_row() {
+    use jma_mail::jmap::types::{MailboxFolderBinding, MaybeReference};
+    use jma_mail::state::queries;
+    use jma_mail::state::queries::MailboxRecord;
+    use jma_mail::sync::execute::Executor;
+    use jma_mail::sync::plan::{SyncAction, SyncPlan};
+    use std::sync::Arc;
+
+    let server = MockServer::start().await;
+    mount_session(&server).await;
+
+    let state = Arc::new(Mutex::new(MockState {
+        mailbox_state: "mb-1".to_string(),
+        email_state: "e-1".to_string(),
+        mailboxes: vec![
+            MockMailbox {
+                id: "MB-INBOX".to_string(),
+                name: "Inbox".to_string(),
+                role: Some("inbox".to_string()),
+                parent_id: None,
+            },
+            MockMailbox {
+                id: "MB-ARCH".to_string(),
+                name: "Archive".to_string(),
+                role: Some("archive".to_string()),
+                parent_id: None,
+            },
+        ],
+        ..Default::default()
+    }));
+    mount_jmap(&server, state.clone()).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let conn = fresh_db(&temp);
+    let config = test_config(&server, temp.path(), vec![]);
+
+    // Seed the cache so the executor has a row to drop.
+    queries::upsert_mailbox(
+        &conn,
+        &MailboxRecord {
+            jmap_mailbox_id: JmapMailboxId::from("MB-ARCH"),
+            name: "Archive".to_string(),
+            role: Some("archive".to_string()),
+            parent_id: None,
+            maildir_folder: "Archive".to_string(),
+            sort_order: 0,
+            remote_path: Some("Archive".to_string()),
+        },
+    )
+    .unwrap();
+
+    let client = jma_mail::jmap::session::connect(&config.account, &conn)
+        .await
+        .expect("session connects");
+    let executor = Executor::new(Arc::new(client), &conn, &config, None);
+
+    let plan = SyncPlan {
+        actions: vec![SyncAction::DestroyRemoteMailbox {
+            binding: Arc::new(MailboxFolderBinding {
+                jmap_mailbox_id: MaybeReference::Value(JmapMailboxId::from("MB-ARCH")),
+                server_name: "Archive".to_string(),
+                maildir_folder: "Archive".to_string(),
+                remote_path: "Archive".to_string(),
+            }),
+        }],
+        new_email_state: None,
+    };
+    executor.execute(plan).await.expect("execute succeeds");
+
+    let destroys = state.lock().unwrap().mailbox_set_destroys.clone();
+    assert_eq!(
+        destroys,
+        vec!["MB-ARCH".to_string()],
+        "executor must issue Mailbox/set destroy carrying the orphan's id"
+    );
+    let remaining_server_ids: Vec<String> = state
+        .lock()
+        .unwrap()
+        .mailboxes
+        .iter()
+        .map(|m| m.id.clone())
+        .collect();
+    assert_eq!(
+        remaining_server_ids,
+        vec!["MB-INBOX".to_string()],
+        "server-side state must reflect the destroy"
+    );
+    let cache_ids = queries::list_known_mailbox_ids(&conn).expect("list mailbox_map");
+    assert!(
+        cache_ids.is_empty(),
+        "mailbox_map row for the destroyed id must drop inline; got {:?}",
+        cache_ids
+    );
+}
+
+/// Server-side rejection (per-id `notDestroyed`): the executor
+/// logs at `warn!`, leaves the `mailbox_map` row intact so the
+/// next cycle's reconcile can retry, and continues to the next
+/// action. Pins the warn-and-continue contract documented on
+/// `Executor::destroy_remote_mailboxes`.
+#[tokio::test]
+async fn destroy_remote_mailbox_keeps_cache_row_on_rejection_and_continues() {
+    use jma_mail::jmap::types::{MailboxFolderBinding, MaybeReference};
+    use jma_mail::state::queries;
+    use jma_mail::state::queries::MailboxRecord;
+    use jma_mail::sync::execute::Executor;
+    use jma_mail::sync::plan::{SyncAction, SyncPlan};
+    use std::sync::Arc;
+
+    let server = MockServer::start().await;
+    mount_session(&server).await;
+
+    let state = Arc::new(Mutex::new(MockState {
+        mailbox_state: "mb-1".to_string(),
+        email_state: "e-1".to_string(),
+        mailboxes: vec![
+            MockMailbox {
+                id: "MB-REJECT".to_string(),
+                name: "Rejected".to_string(),
+                role: None,
+                parent_id: None,
+            },
+            MockMailbox {
+                id: "MB-OK".to_string(),
+                name: "Accepted".to_string(),
+                role: None,
+                parent_id: None,
+            },
+        ],
+        mailbox_set_reject_destroy_ids: vec!["MB-REJECT".to_string()],
+        ..Default::default()
+    }));
+    mount_jmap(&server, state.clone()).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let conn = fresh_db(&temp);
+    let config = test_config(&server, temp.path(), vec![]);
+
+    for (id, name) in [("MB-REJECT", "Rejected"), ("MB-OK", "Accepted")] {
+        queries::upsert_mailbox(
+            &conn,
+            &MailboxRecord {
+                jmap_mailbox_id: JmapMailboxId::from(id),
+                name: name.to_string(),
+                role: None,
+                parent_id: None,
+                maildir_folder: name.to_string(),
+                sort_order: 0,
+                remote_path: Some(name.to_string()),
+            },
+        )
+        .unwrap();
+    }
+
+    let client = jma_mail::jmap::session::connect(&config.account, &conn)
+        .await
+        .expect("session connects");
+    let executor = Executor::new(Arc::new(client), &conn, &config, None);
+
+    let plan = SyncPlan {
+        actions: vec![
+            SyncAction::DestroyRemoteMailbox {
+                binding: Arc::new(MailboxFolderBinding {
+                    jmap_mailbox_id: MaybeReference::Value(JmapMailboxId::from("MB-REJECT")),
+                    server_name: "Rejected".to_string(),
+                    maildir_folder: "Rejected".to_string(),
+                    remote_path: "Rejected".to_string(),
+                }),
+            },
+            SyncAction::DestroyRemoteMailbox {
+                binding: Arc::new(MailboxFolderBinding {
+                    jmap_mailbox_id: MaybeReference::Value(JmapMailboxId::from("MB-OK")),
+                    server_name: "Accepted".to_string(),
+                    maildir_folder: "Accepted".to_string(),
+                    remote_path: "Accepted".to_string(),
+                }),
+            },
+        ],
+        new_email_state: None,
+    };
+    executor
+        .execute(plan)
+        .await
+        .expect("execute returns Ok even when one destroy is rejected");
+
+    let destroys = state.lock().unwrap().mailbox_set_destroys.clone();
+    assert_eq!(
+        destroys,
+        vec!["MB-OK".to_string()],
+        "rejected destroy must be absent from server-side destroys; \
+         the surrounding accepted destroy must still land"
+    );
+    let cache_ids = queries::list_known_mailbox_ids(&conn).expect("list mailbox_map");
+    assert_eq!(
+        cache_ids,
+        vec![JmapMailboxId::from("MB-REJECT")],
+        "rejected id's mailbox_map row must survive for next-cycle retry; \
+         accepted id's row must be cleaned up inline"
+    );
+}
+
 /// Local-only rename push: the user `mv`-ed the maildir but the
 /// server hasn't changed. The sentinel walk finds the tracked id
 /// at a disk path the cache (and the server) disagree with, and

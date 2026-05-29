@@ -2174,6 +2174,10 @@ fn log_dropped(direction: SyncDirection, dropped: &[SyncAction]) {
                 "{:?}: dropped DeleteLocalFolder {}/ (id was {})",
                 direction, binding.maildir_folder, binding.jmap_mailbox_id
             ),
+            SyncAction::DestroyRemoteMailbox { binding } => warn!(
+                "{:?}: dropped DestroyRemoteMailbox {} (id {})",
+                direction, binding.remote_path, binding.jmap_mailbox_id
+            ),
             // Adoption is always kept; it never appears here.
             SyncAction::AdoptLocalMessage { .. } => {}
         }

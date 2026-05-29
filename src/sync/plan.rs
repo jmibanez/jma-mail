@@ -386,6 +386,24 @@ pub enum SyncAction {
         binding: Arc<MailboxFolderBinding>,
         parent_jmap_mailbox_id: Option<JmapMailboxId>,
     },
+
+    /// Folder-level push-side destructive action: issue
+    /// `Mailbox/set { destroy: [id], onDestroyRemoveEmails:
+    /// true }` to drop a server-known mailbox whose local
+    /// maildir + sentinel have vanished. The executor drops
+    /// the `mailbox_map` row inline on success (tight invariant
+    /// vs. waiting for the next cycle's cache-vs-server diff
+    /// to drop it).
+    ///
+    /// Carries the full `MailboxFolderBinding` so the executor
+    /// can log the leaf name + the slash-joined hierarchy
+    /// (`Personal/Archive/Old`) alongside the JMAP id. RFC 8621's
+    /// destroy doesn't carry path metadata on the wire, only the
+    /// id; the binding fields exist for Display + warn-log
+    /// readability.
+    DestroyRemoteMailbox {
+        binding: Arc<MailboxFolderBinding>,
+    },
 }
 
 impl SyncAction {
@@ -404,7 +422,8 @@ impl SyncAction {
             | SyncAction::DestroyRemote { .. }
             | SyncAction::MoveRemote { .. }
             | SyncAction::CreateRemoteMailbox { .. }
-            | SyncAction::RenameRemoteMailbox { .. } => ActionDirection::Push,
+            | SyncAction::RenameRemoteMailbox { .. }
+            | SyncAction::DestroyRemoteMailbox { .. } => ActionDirection::Push,
             SyncAction::AdoptLocalMessage { .. } => ActionDirection::Both,
         }
     }
@@ -671,6 +690,11 @@ impl fmt::Display for SyncPlan {
                     f,
                     "  [PULL] Destroy local folder {}/ (id was {})",
                     binding.maildir_folder, binding.jmap_mailbox_id
+                )?,
+                SyncAction::DestroyRemoteMailbox { binding } => writeln!(
+                    f,
+                    "  [PUSH] Destroy remote mailbox {} (id {})",
+                    binding.remote_path, binding.jmap_mailbox_id
                 )?,
             }
         }
