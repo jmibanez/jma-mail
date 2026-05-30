@@ -581,6 +581,34 @@ impl<'a> SyncEngine<'a> {
             })
         };
 
+        // Structural write barrier: folder-level primitives
+        // (CreateLocalMailbox, RenameLocalMailbox, DeleteLocalFolder,
+        // CreateRemoteMailbox, RenameRemoteMailbox,
+        // DestroyRemoteMailbox) are inherently bidirectional. The
+        // destructive-arm conflict matrix's resolution may emit
+        // cross-direction adjustments (counter-moves, resurrect
+        // uploads or downloads, cross-direction destroys), and a
+        // directional filter cannot guarantee the resulting state
+        // reflects user intent -- pending cycle-local user actions
+        // on the affected folders would also fail to land
+        // coherently. Hard-refuse before any side effect lands so
+        // the user re-runs as a full bidirectional cycle. Fires
+        // under `--dry-run` too: the preview of a refusal is more
+        // useful than a preview of a plan we'd refuse to execute.
+        if !matches!(direction, SyncDirection::Both) && plan.has_structural_actions() {
+            return Err(anyhow::anyhow!(
+                "Refusing direction-filtered sync ({:?}): the cycle's plan includes folder-\
+                 level primitives (CreateLocalMailbox / RenameLocalMailbox / DeleteLocalFolder \
+                 / CreateRemoteMailbox / RenameRemoteMailbox / DestroyRemoteMailbox). \
+                 Folder operations are bidirectional in nature -- the conflict matrix's \
+                 resolution may emit cross-direction adjustments that --pull-only / \
+                 --push-only would silently drop, leaving cache and maildir state \
+                 inconsistent. Re-run as a full bidirectional sync (omit --pull-only / \
+                 --push-only) to land them coherently.",
+                direction
+            ));
+        }
+
         // Snapshot before `into_filtered`: empty here means reconcile
         // produced nothing, not "everything got filtered out by
         // pull-only/push-only" -- those still need the regular log.
