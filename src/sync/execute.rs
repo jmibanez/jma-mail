@@ -421,11 +421,35 @@ impl<'a> Executor<'a> {
             let SyncAction::CreateLocalMailbox {
                 binding,
                 parent_jmap_mailbox_id,
-                ..
+                replaces_orphan_id,
             } = action
             else {
                 continue;
             };
+            // Push-side ServerWins-with-Blocker resurrect: the
+            // engine pre-pass hoisted this binding back into the
+            // first-cycle slot with `replaces_orphan_id` set to
+            // the id whose cached `message_map` rows are now
+            // stale (the user deleted the local maildir; the rows
+            // point at maildir_ids that no longer exist on disk).
+            // Drop them BEFORE ensure_maildir so a partial-failure
+            // retry next cycle re-runs the same SQL idempotently;
+            // downstream DownloadMessage actions then write fresh
+            // rows for the same id against the recreated maildir.
+            if let Some(dead_id) = &replaces_orphan_id
+                && let Err(e) = queries::delete_messages_by_jmap_mailbox_id(self.conn, dead_id)
+            {
+                warn!(
+                    "CreateLocalMailbox for {}: failed to drop stale message_map rows for \
+                     orphan id {}: {}; downstream DownloadMessage actions may collide with \
+                     stale rows on the unique-on-maildir-id index",
+                    binding.maildir_folder, dead_id, e
+                );
+                // Continue: the maildir provisioning is still
+                // worth doing; the row collision (if any)
+                // surfaces as a per-download failure rather
+                // than blocking the whole create.
+            }
             let folder_path = self.maildir_root.join(&binding.maildir_folder);
             if let Err(e) = store::ensure_maildir(&folder_path) {
                 warn!(

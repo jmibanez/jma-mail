@@ -383,6 +383,14 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
     // LocalWins+Blocker).
     finalize_local_orphan_handling(&ctx, &mut plan);
 
+    // Remote-orphan destructive arm: gates on
+    // `allows_delete_of_remote_folder`. Independent of the pull-
+    // side finalizer (different orphan slot). ServerWins+Blocker
+    // orphans were already pre-handled engine-side and removed
+    // from `remote_orphans()` before reconcile ran; here we only
+    // see no-Blocker and LocalWins+Blocker cases.
+    finalize_remote_orphan_handling(&ctx, &mut plan);
+
     plan
 }
 
@@ -776,6 +784,166 @@ fn apply_orphan_decisions(
     for &orphan_idx in needs_resurrect {
         emit_resurrect_for(&ctx.mailboxes.local_orphans()[orphan_idx], ctx, plan);
     }
+}
+
+/// Role of a cycle-local server email change with respect to one
+/// remote orphan (push-side destructive arm). The orphan's id is
+/// known dead from the local side (user deleted the maildir); a
+/// remote_emails entry whose `mailbox_ids` contains the orphan's
+/// id is the Blocker signal.
+///
+///   * `Move`: the email's cycle-start cached membership points at
+///     a different (live) mailbox. The server moved it INTO the
+///     orphan; the prior source is recoverable. Under `LocalWins`,
+///     paired with a counter `MoveRemote` that puts the email back
+///     at its source before the destroy fires. Under jma's single-
+///     mailbox-per-email DB model `prior_source` is the email's
+///     full prior membership; the multi-mailbox case (an email in
+///     `{orphan, live_A}` with two prior members) is out of scope.
+///   * `Consumed`: either the server added a new email directly to
+///     the orphan (no cached row) or the server only changed
+///     keywords on an email already in the orphan (cached row's
+///     mailbox matches the orphan id). Either way the email goes
+///     away with the mailbox under `LocalWins` -- no counter, no
+///     observable difference between the two cases at dispatch.
+enum RemoteOrphanBlocker {
+    Move {
+        id: JmapEmailId,
+        message_id: MessageId,
+        prior_source: JmapMailboxId,
+    },
+    Consumed,
+}
+
+/// Per-email classifier. Returns `None` for any email whose
+/// `mailbox_ids` does not contain the orphan's id; otherwise the
+/// cached `message_map` row decides between `Move` and `Consumed`.
+fn classify_email_against_remote_orphan(
+    email: &EmailObject,
+    dead_id: &JmapMailboxId,
+    known_by_jmap: &HashMap<JmapEmailId, Arc<MessageRecord>>,
+) -> Option<RemoteOrphanBlocker> {
+    if !email.mailbox_ids.contains_key(dead_id) {
+        return None;
+    }
+    match known_by_jmap.get(&email.id) {
+        Some(prior) if &prior.jmap_mailbox_id != dead_id => Some(RemoteOrphanBlocker::Move {
+            id: email.id.clone(),
+            message_id: prior.message_id.clone(),
+            prior_source: prior.jmap_mailbox_id.clone(),
+        }),
+        _ => Some(RemoteOrphanBlocker::Consumed),
+    }
+}
+
+/// Push-side destructive-arm finalizer. Gated on
+/// `allows_delete_of_remote_folder()`. For each remote orphan,
+/// classifies cycle-local server email changes (`ctx.remote_emails`)
+/// targeting the orphan and dispatches per the matrix:
+///
+///   * **No Blocker**: emit `DestroyRemoteMailbox`. The user opted
+///     in to destructive folder sync; the server-side mailbox goes
+///     away. No conflict to resolve, so conflict strategy doesn't
+///     apply -- mirrors the pull-side no-Blocker arm.
+///
+///   * **Blocker + `LocalWins`**: the user's intent (destroy this
+///     mailbox) wins. For each `Move` Blocker emit a counter
+///     `MoveRemote { from: orphan, to: prior_source }` BEFORE the
+///     destroy so the server's just-made move gets reversed and
+///     the email lands back at its source. `Consumed` Blockers
+///     (new emails / keyword changes) go away with the mailbox.
+///     Then emit `DestroyRemoteMailbox`.
+///
+///   * **Blocker + `ServerWins`**: handled engine-side before
+///     reconcile runs. `SyncEngine::resurrect_remote_orphans_for_
+///     server_wins` hoists the orphan back into the live set,
+///     drops its `message_map` rows, and fetches the orphan's
+///     server contents; reconcile then re-creates the maildir
+///     via `CreateLocalMailbox` and downloads each email via
+///     `DownloadMessage` (the local files are gone with the
+///     deleted maildir, so the adopt branch has nothing to match
+///     against). The pre-pass also removes the resurrected
+///     orphan from `remote_orphans()` so this finalizer never
+///     sees it -- only no-Blocker and `LocalWins`-with-Blocker
+///     cases survive.
+fn finalize_remote_orphan_handling(ctx: &ReconcileCtx<'_>, plan: &mut SyncPlan) {
+    if !ctx.policy.allows_delete_of_remote_folder() {
+        return;
+    }
+    if ctx.mailboxes.remote_orphans().is_empty() {
+        return;
+    }
+    for orphan in ctx.mailboxes.remote_orphans() {
+        let dead_id = orphan
+            .binding
+            .jmap_mailbox_id
+            .expect_resolved("finalize_remote_orphan_handling -- orphan binding is resolved");
+        let blockers: Vec<RemoteOrphanBlocker> = ctx
+            .remote_emails
+            .iter()
+            .filter_map(|email| {
+                classify_email_against_remote_orphan(email, dead_id, ctx.known_by_jmap)
+            })
+            .collect();
+        if blockers.is_empty() {
+            plan.actions.push(SyncAction::DestroyRemoteMailbox {
+                binding: Arc::clone(&orphan.binding),
+            });
+            continue;
+        }
+        // LocalWins-with-Blocker: per-Move counter-action then
+        // destroy. ServerWins-with-Blocker was pre-handled engine-
+        // side so it can't reach here; if it does (shouldn't),
+        // treat as no-conflict and destroy the same way.
+        for blocker in &blockers {
+            if let RemoteOrphanBlocker::Move {
+                id,
+                message_id,
+                prior_source,
+            } = blocker
+                && let Some(counter) =
+                    build_counter_move_remote(id, message_id, prior_source, &orphan.binding, ctx)
+            {
+                plan.actions.push(counter);
+            }
+        }
+        plan.actions.push(SyncAction::DestroyRemoteMailbox {
+            binding: Arc::clone(&orphan.binding),
+        });
+    }
+}
+
+/// For a `Move` Blocker (server moved email INTO orphan from a
+/// recoverable prior source), build the `MoveRemote { from:
+/// orphan, to: prior_source }` counter that reverses the move
+/// before the orphan-destroy fires. Returns `None` when the
+/// prior source isn't in the live set (also an orphan, or
+/// otherwise gone); in that warn-and-drop case the email gets
+/// destroyed with the orphan mailbox.
+fn build_counter_move_remote(
+    id: &JmapEmailId,
+    message_id: &MessageId,
+    prior_source: &JmapMailboxId,
+    orphan_binding: &MailboxFolderBinding,
+    ctx: &ReconcileCtx<'_>,
+) -> Option<SyncAction> {
+    let Some(source_binding) = ctx.mailboxes.by_id(prior_source) else {
+        warn!(
+            "LocalWins counter-MoveRemote for orphan {}: prior source {} is not in live set; \
+             dropping counter -- email {} gets destroyed with the orphan mailbox",
+            orphan_binding.remote_path, prior_source, id
+        );
+        return None;
+    };
+    Some(SyncAction::MoveRemote {
+        id: RemoteId {
+            jmap_email_id: id.clone(),
+            message_id: message_id.clone(),
+        },
+        target_mailbox_ids: vec![prior_source.clone()],
+        from_folder: orphan_binding.maildir_folder.clone(),
+        to_folder: source_binding.maildir_folder.clone(),
+    })
 }
 
 /// Look up a maildir_id given a jmap_email_id via the
@@ -4733,6 +4901,375 @@ mod tests {
                     .any(|a| matches!(a, SyncAction::DeleteLocalFolder { .. })),
                 "DeleteLocalFolder must still be emitted after counter-MoveLocal"
             );
+        }
+    }
+
+    /// Push-side destructive arm: the matrix in
+    /// `finalize_remote_orphan_handling` decides per remote
+    /// orphan whether to emit `DestroyRemoteMailbox` (and, under
+    /// LocalWins + Blocker, paired counter `MoveRemote`s) or
+    /// leave it alone. ServerWins+Blocker is pre-handled engine-
+    /// side and is exercised in `tests/engine_jmap.rs` end-to-
+    /// end; the tests below cover the reconcile-side arms.
+    mod remote_orphan_destructive {
+        use super::*;
+
+        fn bindings_with_remote_orphan() -> MailboxBindings {
+            let mut b = MailboxBindings::builder();
+            // Prior source of any Move-blocker. Lives in the
+            // live set so `by_id` lookups succeed.
+            b.insert(MailboxFolderBinding {
+                jmap_mailbox_id: MaybeReference::Value(JmapMailboxId::from("MB-INBOX")),
+                server_name: "INBOX".to_string(),
+                maildir_folder: "INBOX".to_string(),
+                remote_path: "INBOX".to_string(),
+            });
+            b.push_remote_orphan(
+                Arc::new(MailboxFolderBinding {
+                    jmap_mailbox_id: MaybeReference::Value(JmapMailboxId::from("MB-ARCH")),
+                    server_name: "Archive".to_string(),
+                    maildir_folder: "Archive".to_string(),
+                    remote_path: "Archive".to_string(),
+                }),
+                None,
+                0,
+            );
+            b.build()
+        }
+
+        fn record(jmap_id: &str, mailbox_id: &str, maildir_id: &str) -> MessageRecord {
+            MessageRecord {
+                jmap_email_id: jmap_id.into(),
+                jmap_blob_id: Some(format!("B-{}", jmap_id).into()),
+                jmap_thread_id: Some(format!("T-{}", jmap_id).into()),
+                jmap_mailbox_id: mailbox_id.into(),
+                maildir_id: Some(maildir_id.into()),
+                message_id: format!("{}@example.com", jmap_id).into(),
+                flags: "S".into(),
+                jmap_keywords: "{}".into(),
+            }
+        }
+
+        fn run_remote_destructive(
+            mailboxes: &MailboxBindings,
+            remote_emails: &[EmailObject],
+            allow_destructive: AllowDestructiveFolderSync,
+            strategy: ConflictStrategy,
+            records: &[MessageRecord],
+        ) -> SyncPlan {
+            let local_index = LocalIndex::default();
+            let local_flags = HashMap::new();
+            let known = indices(records);
+            reconcile(ReconcileInput {
+                remote_emails,
+                remote_destroyed: &[],
+                local_changes: &[],
+                known: &known,
+                local_index: &local_index,
+                local_flags: &local_flags,
+                mailboxes,
+                policy: SyncPolicy {
+                    conflict_strategy: strategy,
+                    allow_destructive_folder_sync: allow_destructive,
+                },
+                new_email_state: None,
+                max_upload_size: usize::MAX,
+                used_initial_path: true,
+                folder_layout: FolderLayout::Flat,
+                hierarchy_separator: '.',
+                maildir_root: std::path::Path::new("/tmp/jma-test-maildir-root"),
+            })
+        }
+
+        /// No cycle-local activity targeting the orphan: under
+        /// `delete-remote` + any strategy, the orphan is destroyed
+        /// server-side. No conflict to resolve, so strategy
+        /// doesn't enter.
+        #[test]
+        fn destroys_under_delete_remote_no_blocker() {
+            let bindings = bindings_with_remote_orphan();
+            let plan = run_remote_destructive(
+                &bindings,
+                &[],
+                AllowDestructiveFolderSync::DeleteRemote,
+                ConflictStrategy::ServerWins,
+                &[],
+            );
+
+            let destroys: Vec<_> = plan
+                .actions
+                .iter()
+                .filter_map(|a| match a {
+                    SyncAction::DestroyRemoteMailbox { binding } => Some(binding.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                destroys.len(),
+                1,
+                "one DestroyRemoteMailbox for the orphan; got {:?}",
+                plan.actions
+            );
+            assert_eq!(destroys[0].remote_path, "Archive");
+        }
+
+        /// `None` policy gates off the push-side destructive arm;
+        /// no `DestroyRemoteMailbox` emitted regardless of orphan
+        /// state.
+        #[test]
+        fn no_destroy_under_none_policy() {
+            let bindings = bindings_with_remote_orphan();
+            let plan = run_remote_destructive(
+                &bindings,
+                &[],
+                AllowDestructiveFolderSync::None,
+                ConflictStrategy::ServerWins,
+                &[],
+            );
+            assert!(
+                !plan
+                    .actions
+                    .iter()
+                    .any(|a| matches!(a, SyncAction::DestroyRemoteMailbox { .. })),
+                "None policy must not emit DestroyRemoteMailbox; got {:?}",
+                plan.actions
+            );
+        }
+
+        /// `delete-local` permits destructive pull-side handling
+        /// but NOT push-side -- so remote orphans (user deleted
+        /// the maildir) are left alone.
+        #[test]
+        fn no_destroy_under_delete_local_policy() {
+            let bindings = bindings_with_remote_orphan();
+            let plan = run_remote_destructive(
+                &bindings,
+                &[],
+                AllowDestructiveFolderSync::DeleteLocal,
+                ConflictStrategy::ServerWins,
+                &[],
+            );
+            assert!(
+                !plan
+                    .actions
+                    .iter()
+                    .any(|a| matches!(a, SyncAction::DestroyRemoteMailbox { .. })),
+                "delete-local must not emit DestroyRemoteMailbox; got {:?}",
+                plan.actions
+            );
+        }
+
+        /// LocalWins + Move Blocker: server moved an email INTO
+        /// the orphan from a live source. Counter `MoveRemote`
+        /// puts it back at the source, then `DestroyRemoteMailbox`
+        /// fires. Order matters -- the move must land before the
+        /// mailbox is destroyed.
+        #[test]
+        fn local_wins_with_move_blocker_emits_counter_move_then_destroy() {
+            let bindings = bindings_with_remote_orphan();
+            // Cached row: E1 was in MB-INBOX at cycle start.
+            let records = vec![record("E1", "MB-INBOX", "FILE-1")];
+            // Server-side delta: E1 is now in MB-ARCH (the orphan).
+            let emails = vec![email("E1", "MB-ARCH", "S", Some("E1@example.com"))];
+
+            let plan = run_remote_destructive(
+                &bindings,
+                &emails,
+                AllowDestructiveFolderSync::DeleteRemote,
+                ConflictStrategy::LocalWins,
+                &records,
+            );
+
+            // Locate the counter MoveRemote and the
+            // DestroyRemoteMailbox; assert order.
+            let move_idx = plan
+                .actions
+                .iter()
+                .position(|a| matches!(a, SyncAction::MoveRemote { .. }))
+                .unwrap_or_else(|| {
+                    panic!("counter MoveRemote missing; got plan: {:?}", plan.actions)
+                });
+            let destroy_idx = plan
+                .actions
+                .iter()
+                .position(|a| matches!(a, SyncAction::DestroyRemoteMailbox { .. }))
+                .unwrap_or_else(|| {
+                    panic!("DestroyRemoteMailbox missing; got plan: {:?}", plan.actions)
+                });
+            assert!(
+                move_idx < destroy_idx,
+                "counter MoveRemote must precede DestroyRemoteMailbox in the plan; \
+                 got move_idx={}, destroy_idx={}",
+                move_idx,
+                destroy_idx
+            );
+
+            let SyncAction::MoveRemote {
+                id,
+                target_mailbox_ids,
+                from_folder,
+                to_folder,
+            } = &plan.actions[move_idx]
+            else {
+                unreachable!()
+            };
+            assert_eq!(id.jmap_email_id.as_ref(), "E1");
+            assert_eq!(
+                target_mailbox_ids,
+                &vec![JmapMailboxId::from("MB-INBOX")],
+                "counter targets the cycle-start cached mailbox"
+            );
+            assert_eq!(
+                from_folder, "Archive",
+                "counter source is the orphan folder"
+            );
+            assert_eq!(to_folder, "INBOX", "counter dest is the prior source");
+        }
+
+        /// LocalWins + Consumed Blocker (server added a new email
+        /// directly to the orphan -- no cached row): no counter
+        /// emitted, but `DestroyRemoteMailbox` still fires. The
+        /// new email goes away with the mailbox.
+        #[test]
+        fn local_wins_with_consumed_blocker_just_destroys() {
+            let bindings = bindings_with_remote_orphan();
+            // Server-side delta: brand-new E1, only in the orphan,
+            // no cached row.
+            let emails = vec![email("E1", "MB-ARCH", "S", Some("E1@example.com"))];
+
+            let plan = run_remote_destructive(
+                &bindings,
+                &emails,
+                AllowDestructiveFolderSync::DeleteRemote,
+                ConflictStrategy::LocalWins,
+                &[],
+            );
+
+            assert!(
+                !plan
+                    .actions
+                    .iter()
+                    .any(|a| matches!(a, SyncAction::MoveRemote { .. })),
+                "Consumed blocker emits no counter; got plan: {:?}",
+                plan.actions
+            );
+            assert_eq!(
+                plan.actions
+                    .iter()
+                    .filter(|a| matches!(a, SyncAction::DestroyRemoteMailbox { .. }))
+                    .count(),
+                1,
+                "DestroyRemoteMailbox still fires; got plan: {:?}",
+                plan.actions
+            );
+        }
+
+        /// LocalWins + Move Blocker whose prior source is no
+        /// longer in the live set (also an orphan, or otherwise
+        /// gone): the counter is warn-dropped, the email gets
+        /// destroyed with the mailbox, the destroy still fires.
+        #[test]
+        fn local_wins_move_blocker_warns_when_prior_source_missing() {
+            let bindings = bindings_with_remote_orphan();
+            // Cached row points at MB-GONE which is NOT in the
+            // live set.
+            let records = vec![record("E1", "MB-GONE", "FILE-1")];
+            let emails = vec![email("E1", "MB-ARCH", "S", Some("E1@example.com"))];
+
+            let plan = run_remote_destructive(
+                &bindings,
+                &emails,
+                AllowDestructiveFolderSync::DeleteRemote,
+                ConflictStrategy::LocalWins,
+                &records,
+            );
+
+            assert!(
+                !plan
+                    .actions
+                    .iter()
+                    .any(|a| matches!(a, SyncAction::MoveRemote { .. })),
+                "no counter MoveRemote when prior source is missing; got plan: {:?}",
+                plan.actions
+            );
+            assert_eq!(
+                plan.actions
+                    .iter()
+                    .filter(|a| matches!(a, SyncAction::DestroyRemoteMailbox { .. }))
+                    .count(),
+                1,
+                "DestroyRemoteMailbox still fires after warn-dropping the counter"
+            );
+        }
+
+        /// Classifier unit: email whose `mailbox_ids` does NOT
+        /// include the orphan id returns `None`.
+        #[test]
+        fn classify_email_returns_none_when_orphan_not_in_mailbox_ids() {
+            let email = email("E1", "MB-INBOX", "S", Some("E1@example.com"));
+            let known = indices(&[]);
+            let result = classify_email_against_remote_orphan(
+                &email,
+                &JmapMailboxId::from("MB-ARCH"),
+                &known.by_jmap,
+            );
+            assert!(result.is_none());
+        }
+
+        /// Classifier unit: cached row's mailbox differs from
+        /// orphan id -> Move Blocker carrying prior_source.
+        #[test]
+        fn classify_email_as_move_blocker_when_prior_source_differs() {
+            let email = email("E1", "MB-ARCH", "S", Some("E1@example.com"));
+            let records = vec![record("E1", "MB-INBOX", "FILE-1")];
+            let known = indices(&records);
+            let result = classify_email_against_remote_orphan(
+                &email,
+                &JmapMailboxId::from("MB-ARCH"),
+                &known.by_jmap,
+            );
+            match result {
+                Some(RemoteOrphanBlocker::Move {
+                    id,
+                    message_id,
+                    prior_source,
+                }) => {
+                    assert_eq!(id.as_ref(), "E1");
+                    assert_eq!(message_id.as_ref(), "E1@example.com");
+                    assert_eq!(prior_source.as_ref(), "MB-INBOX");
+                }
+                other => panic!("expected Move blocker, got {:?}", other.is_some()),
+            }
+        }
+
+        /// Classifier unit: cached row's mailbox equals orphan id
+        /// (server just changed keywords on an email already in
+        /// the orphan) -> Consumed blocker.
+        #[test]
+        fn classify_email_as_consumed_when_prior_source_matches_orphan() {
+            let email = email("E1", "MB-ARCH", "S", Some("E1@example.com"));
+            let records = vec![record("E1", "MB-ARCH", "FILE-1")];
+            let known = indices(&records);
+            let result = classify_email_against_remote_orphan(
+                &email,
+                &JmapMailboxId::from("MB-ARCH"),
+                &known.by_jmap,
+            );
+            assert!(matches!(result, Some(RemoteOrphanBlocker::Consumed)));
+        }
+
+        /// Classifier unit: no cached row at all (server added a
+        /// new email directly to the orphan) -> Consumed blocker.
+        #[test]
+        fn classify_email_as_consumed_when_no_prior_row() {
+            let email = email("E1", "MB-ARCH", "S", Some("E1@example.com"));
+            let known = indices(&[]);
+            let result = classify_email_against_remote_orphan(
+                &email,
+                &JmapMailboxId::from("MB-ARCH"),
+                &known.by_jmap,
+            );
+            assert!(matches!(result, Some(RemoteOrphanBlocker::Consumed)));
         }
     }
 }

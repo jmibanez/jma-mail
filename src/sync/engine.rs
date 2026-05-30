@@ -82,16 +82,18 @@ pub struct SyncOutcome {
     /// so the user can correlate the no-op cycle with the FS event
     /// paths that drove it.
     pub already_in_sync: bool,
-    /// Push-side orphans detected this cycle: locally-deleted
-    /// maildirs whose server-side counterpart still exists. Detection
-    /// only -- no destroy emitted in this scope; the count is
-    /// surfaced so tests and the daemon log can confirm that the
-    /// detection path fired.
+    /// Push-side orphans that reached reconcile this cycle: locally-
+    /// deleted maildirs whose server-side counterpart still exists,
+    /// minus any resurrected back into the live set by
+    /// `resurrect_remote_orphans_for_server_wins`. Counted after the
+    /// pre-pass so the field reflects orphans the matrix actually
+    /// dispatched against (either destroyed via
+    /// `DestroyRemoteMailbox` or left intact under non-destructive
+    /// policy), not orphans detected by scan alone.
     pub remote_orphans_detected: usize,
-    /// Sum of `server_email_count` across all remote orphans
-    /// detected this cycle. Surfaced for telemetry and for tests
-    /// that want to pin "the count-hydration round-trip actually
-    /// landed" rather than just "the orphan got recorded."
+    /// Sum of `server_email_count` across the remote orphans counted
+    /// in `remote_orphans_detected`. Same post-resurrect semantics:
+    /// resurrected orphans don't contribute.
     pub remote_orphan_total_emails: u64,
 }
 
@@ -544,6 +546,16 @@ impl<'a> SyncEngine<'a> {
                 target: crate::profile::TARGET_PHASE,
                 "fetch_remote",
             ))
+            .await?;
+
+        // Push-side destructive-arm pre-classification: under
+        // delete-remote + ServerWins, hoist any remote orphan with
+        // cycle-local server activity back into the live set and
+        // fetch its full server contents, so reconcile re-creates
+        // the maildir + downloads emails via the regular paths.
+        // No-op under any other policy/strategy combination.
+        let (mailboxes, remote_emails) = self
+            .resurrect_remote_orphans_for_server_wins(mailboxes, remote_emails)
             .await?;
 
         // Phase 3: build known indices and reconcile.
@@ -1009,6 +1021,138 @@ impl<'a> SyncEngine<'a> {
             out.extend(batch?);
         }
         Ok(out)
+    }
+
+    /// Push-side destructive-arm pre-classification: under
+    /// `delete-remote`/`both` + `ServerWins`, treat any remote
+    /// orphan with cycle-local server activity as a fresh-pull
+    /// mailbox. Mirrors the pull-side `LocalWins-with-Blocker`
+    /// resurrect path's intent (preserve the loser's view in-
+    /// cycle), but does so by re-using the existing initial-pull
+    /// machinery rather than introducing a new resurrect primitive.
+    ///
+    /// For each resurrected orphan:
+    ///   * Drop the orphan's `message_map` rows so
+    ///     `process_remote_emails` enters the unknown-id path
+    ///     and emits `DownloadMessage` per email. The
+    ///     adopt-by-Message-ID branch is structurally reachable
+    ///     but dead in practice here: the user deleted the local
+    ///     maildir, so the prior on-disk files are gone and the
+    ///     `LocalIndex` scan has nothing to match against.
+    ///   * Hoist the binding into the live set (`insert`) so
+    ///     `process_remote_emails` matches the orphan id against a
+    ///     live binding, and into `new_mailboxes` so
+    ///     `emit_create_local_mailboxes` emits `CreateLocalMailbox`
+    ///     to bring the maildir back on disk this cycle.
+    ///   * `Email/query` + `Email/get` for the orphan, mirroring
+    ///     `initial_remote_state`'s per-mailbox path. Extend
+    ///     `remote_emails` with the result so reconcile sees the
+    ///     orphan's full server contents, not just cycle-local
+    ///     changes.
+    ///
+    /// Resurrected orphans are removed from `remote_orphans()` so
+    /// `finalize_remote_orphan_handling` doesn't also try to
+    /// destroy them. Tested directly via the third engine
+    /// integration test; the post-pass count drives
+    /// `SyncOutcome.remote_orphans_detected`.
+    ///
+    /// Engine-side rather than reconcile-side because reconcile is
+    /// sync (cannot do the `Email/query`+`Email/get` round-trips
+    /// itself). The remaining matrix arms (no-Blocker destroy,
+    /// LocalWins-with-Blocker counter+destroy) stay in reconcile.
+    async fn resurrect_remote_orphans_for_server_wins(
+        &self,
+        mailboxes: MailboxBindings,
+        mut remote_emails: Vec<EmailObject>,
+    ) -> Result<(MailboxBindings, Vec<EmailObject>)> {
+        let policy = reconcile::SyncPolicy::from_sync_config(&self.config.sync);
+        if !policy.allows_delete_of_remote_folder() {
+            return Ok((mailboxes, remote_emails));
+        }
+        if !matches!(
+            policy.conflict_strategy,
+            crate::config::ConflictStrategy::ServerWins
+        ) {
+            return Ok((mailboxes, remote_emails));
+        }
+        let mut builder = mailboxes.into_builder();
+        // Partition the orphan slot into (to-resurrect, to-keep);
+        // restore the kept entries so the matrix dispatches against
+        // them downstream. take/partition/set keeps the internal
+        // mutation localized to the value this function owns.
+        let (to_resurrect, kept): (
+            Vec<crate::sync::bindings::RemoteOrphanRecord>,
+            Vec<crate::sync::bindings::RemoteOrphanRecord>,
+        ) = builder
+            .take_remote_orphans()
+            .into_iter()
+            .partition(|orphan| {
+                let dead_id = orphan.binding.jmap_mailbox_id.expect_resolved(
+                    "resurrect_remote_orphans_for_server_wins -- orphan id resolved",
+                );
+                remote_emails
+                    .iter()
+                    .any(|e| e.mailbox_ids.contains_key(dead_id))
+            });
+        builder.set_remote_orphans(kept);
+
+        for orphan in to_resurrect {
+            let dead_id = orphan
+                .binding
+                .jmap_mailbox_id
+                .expect_resolved(
+                    "resurrect_remote_orphans_for_server_wins -- resurrect id resolved",
+                )
+                .clone();
+            info!(
+                "ServerWins resurrecting remote orphan {} (id {}): cycle-local server activity \
+                 detected; fetching server contents to recreate locally",
+                orphan.binding.remote_path, dead_id
+            );
+
+            // Hoist binding into the live set + first-cycle slot.
+            // The first-cycle record carries `replaces_orphan_id =
+            // Some(dead_id)` so the executor's CreateLocalMailbox
+            // phase drops the cached `message_map` rows pointing
+            // at this id before downstream DownloadMessage actions
+            // write fresh ones. Carrying the cleanup in the action
+            // (rather than running it here) preserves the
+            // `--dry-run` no-side-effects contract: the pre-pass
+            // mutates only in-memory state, while the destructive
+            // DB write lives behind the executor.
+            let binding = (*orphan.binding).clone();
+            builder.insert(binding.clone());
+            builder.push_new_mailbox(
+                binding,
+                orphan.parent_jmap_mailbox_id.clone(),
+                Some(dead_id.clone()),
+            );
+
+            // Fetch the orphan's full server contents, mirroring
+            // `initial_remote_state`'s per-mailbox shape.
+            let n =
+                limits::concurrent_requests(&self.client, self.config.sync.download_concurrency);
+            let ids = jmap_email::query_mailbox(
+                &self.client,
+                dead_id.as_ref(),
+                &orphan.binding.maildir_folder,
+                n,
+            )
+            .await?;
+            // Dedupe against any cycle-local entries that already
+            // landed via Email/changes; without this, an orphan
+            // email appearing in both the delta and the per-mailbox
+            // query would surface twice and emit duplicate actions.
+            let already: HashSet<&JmapEmailId> = remote_emails.iter().map(|e| &e.id).collect();
+            let to_fetch: Vec<JmapEmailId> =
+                ids.into_iter().filter(|id| !already.contains(id)).collect();
+            if to_fetch.is_empty() {
+                continue;
+            }
+            let fetched = self.batched_get(&to_fetch).await?;
+            remote_emails.extend(fetched);
+        }
+        Ok((builder.build(), remote_emails))
     }
 }
 
