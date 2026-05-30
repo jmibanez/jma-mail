@@ -3691,3 +3691,232 @@ async fn destroy_local_folder_aborts_on_rescue_failure_then_succeeds_on_retry() 
     );
     assert_eq!(rescued[0], "unmapped.local:2,");
 }
+
+/// Push-side destructive arm under `delete-remote` with no
+/// cycle-local server activity targeting the orphan: the server
+/// mailbox gets destroyed via `Mailbox/set { destroy }`. Cache
+/// row drops inline; on-disk maildir stays absent (the user
+/// deleted it; we're honoring that).
+#[tokio::test]
+async fn sync_destroys_remote_orphan_under_delete_remote_no_blocker() {
+    let server = MockServer::start().await;
+    mount_session(&server).await;
+
+    let state = Arc::new(Mutex::new(MockState {
+        mailbox_state: "mb-1".to_string(),
+        email_state: "e-1".to_string(),
+        mailboxes: vec![
+            MockMailbox {
+                id: "MB-INBOX".to_string(),
+                name: "Inbox".to_string(),
+                role: Some("inbox".to_string()),
+                parent_id: None,
+            },
+            MockMailbox {
+                id: "MB-ARCH".to_string(),
+                name: "Archive".to_string(),
+                role: Some("archive".to_string()),
+                parent_id: None,
+            },
+        ],
+        ..Default::default()
+    }));
+    mount_jmap(&server, state.clone()).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let conn = fresh_db(&temp);
+    let mut config = test_config(&server, temp.path(), vec![]);
+
+    // Cycle 1 seeds the cache + maildirs under the default
+    // policy. Policy is flipped before cycle 2.
+    SyncEngine::sync(&conn, &config, false)
+        .await
+        .expect("first sync seeds bindings");
+    assert!(temp.path().join("Archive").join("cur").is_dir());
+
+    std::fs::remove_dir_all(temp.path().join("Archive")).expect("rm -rf Archive");
+
+    config.sync.allow_destructive_folder_sync = AllowDestructiveFolderSync::DeleteRemote;
+    let outcome = SyncEngine::sync(&conn, &config, false)
+        .await
+        .expect("second sync destroys server mailbox");
+    assert_eq!(outcome.remote_orphans_detected, 1);
+
+    let destroyed = state.lock().unwrap().mailbox_set_destroys.clone();
+    assert_eq!(
+        destroyed,
+        vec!["MB-ARCH".to_string()],
+        "server-side destroy must fire for the orphan id; got {:?}",
+        destroyed
+    );
+    let cache = jma_mail::state::queries::list_known_mailbox_ids(&conn).expect("list");
+    assert!(
+        !cache.contains(&JmapMailboxId::from("MB-ARCH")),
+        "mailbox_map row must drop inline on destroy success; got {:?}",
+        cache
+    );
+}
+
+/// Push-side under `None` policy: no destroy emitted regardless
+/// of orphan state. Pins the gate.
+#[tokio::test]
+async fn sync_does_not_destroy_remote_orphan_under_none_policy() {
+    let server = MockServer::start().await;
+    mount_session(&server).await;
+
+    let state = Arc::new(Mutex::new(MockState {
+        mailbox_state: "mb-1".to_string(),
+        email_state: "e-1".to_string(),
+        mailboxes: vec![
+            MockMailbox {
+                id: "MB-INBOX".to_string(),
+                name: "Inbox".to_string(),
+                role: Some("inbox".to_string()),
+                parent_id: None,
+            },
+            MockMailbox {
+                id: "MB-ARCH".to_string(),
+                name: "Archive".to_string(),
+                role: Some("archive".to_string()),
+                parent_id: None,
+            },
+        ],
+        ..Default::default()
+    }));
+    mount_jmap(&server, state.clone()).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let conn = fresh_db(&temp);
+    let config = test_config(&server, temp.path(), vec![]);
+
+    SyncEngine::sync(&conn, &config, false)
+        .await
+        .expect("first sync");
+    std::fs::remove_dir_all(temp.path().join("Archive")).expect("rm -rf Archive");
+
+    // Policy stays at the default `None`.
+    let outcome = SyncEngine::sync(&conn, &config, false)
+        .await
+        .expect("second sync");
+    assert_eq!(outcome.remote_orphans_detected, 1);
+
+    let destroyed = state.lock().unwrap().mailbox_set_destroys.clone();
+    assert!(
+        destroyed.is_empty(),
+        "None policy must not emit Mailbox/set destroy; got {:?}",
+        destroyed
+    );
+}
+
+/// Push-side under `delete-remote` + `ServerWins` with cycle-
+/// local server activity on the orphan: the engine pre-handler
+/// hoists the orphan back into the live set, drops cached rows,
+/// and fetches the orphan's server contents. Reconcile then re-
+/// creates the maildir via `CreateLocalMailbox` and downloads
+/// the email. No Mailbox/set destroy fires.
+#[tokio::test]
+async fn sync_resurrects_remote_orphan_under_server_wins_with_blocker() {
+    let server = MockServer::start().await;
+    mount_session(&server).await;
+
+    let state = Arc::new(Mutex::new(MockState {
+        mailbox_state: "mb-1".to_string(),
+        email_state: "e-1".to_string(),
+        mailboxes: vec![
+            MockMailbox {
+                id: "MB-INBOX".to_string(),
+                name: "Inbox".to_string(),
+                role: Some("inbox".to_string()),
+                parent_id: None,
+            },
+            MockMailbox {
+                id: "MB-ARCH".to_string(),
+                name: "Archive".to_string(),
+                role: Some("archive".to_string()),
+                parent_id: None,
+            },
+        ],
+        ..Default::default()
+    }));
+    mount_jmap(&server, state.clone()).await;
+    mount_blob_downloads(&server, state.clone()).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let conn = fresh_db(&temp);
+    let mut config = test_config(&server, temp.path(), vec![]);
+    config.sync.allow_destructive_folder_sync = AllowDestructiveFolderSync::DeleteRemote;
+    config.sync.conflict_strategy = ConflictStrategy::ServerWins;
+
+    SyncEngine::sync(&conn, &config, false)
+        .await
+        .expect("first sync seeds bindings");
+    assert!(temp.path().join("Archive").join("cur").is_dir());
+
+    // User deletes the local maildir.
+    std::fs::remove_dir_all(temp.path().join("Archive")).expect("rm -rf Archive");
+
+    // Server adds an email to MB-ARCH and surfaces it as a
+    // cycle-local change via Email/changes.
+    {
+        let mut st = state.lock().unwrap();
+        st.emails.push(MockEmail {
+            id: "E-RACE".to_string(),
+            blob_id: "B-RACE".to_string(),
+            thread_id: "T-RACE".to_string(),
+            mailbox_ids: vec!["MB-ARCH".to_string()],
+            keywords: vec![],
+            message_id: Some("<race@example.com>".to_string()),
+        });
+        st.blobs.insert(
+            "B-RACE".to_string(),
+            b"Message-ID: <race@example.com>\r\nSubject: race\r\n\r\nbody\r\n".to_vec(),
+        );
+        st.email_state = "e-2".to_string();
+        st.pending_email_changes = Some(EmailChangesResp {
+            created: vec!["E-RACE".to_string()],
+            updated: vec![],
+            destroyed: vec![],
+        });
+    }
+
+    let outcome = SyncEngine::sync(&conn, &config, false)
+        .await
+        .expect("second sync");
+
+    // ServerWins-with-Blocker takes the resurrect path engine-
+    // side, so the matrix never sees this orphan. The maildir
+    // reappears on disk; the cycle-local email lands inside it.
+    assert!(
+        temp.path().join("Archive").join("cur").is_dir(),
+        "Archive maildir must be recreated by ServerWins resurrect"
+    );
+    let cur_files: Vec<_> = std::fs::read_dir(temp.path().join("Archive").join("cur"))
+        .expect("read Archive/cur")
+        .filter_map(|e| e.ok())
+        .collect();
+    let new_files: Vec<_> = std::fs::read_dir(temp.path().join("Archive").join("new"))
+        .expect("read Archive/new")
+        .filter_map(|e| e.ok())
+        .collect();
+    assert_eq!(
+        cur_files.len() + new_files.len(),
+        1,
+        "exactly one file (E-RACE) must land in resurrected Archive; got cur={:?} new={:?}",
+        cur_files.iter().map(|e| e.file_name()).collect::<Vec<_>>(),
+        new_files.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+    );
+    let destroyed = state.lock().unwrap().mailbox_set_destroys.clone();
+    assert!(
+        destroyed.is_empty(),
+        "ServerWins resurrect must not destroy the server mailbox; got {:?}",
+        destroyed
+    );
+    // The resurrected orphan is no longer counted as an orphan
+    // in the outcome, because the engine moved it back into the
+    // live set before reconcile classified.
+    assert_eq!(
+        outcome.remote_orphans_detected, 0,
+        "resurrected orphan must not be counted post-cycle; got {:?}",
+        outcome
+    );
+}

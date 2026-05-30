@@ -153,9 +153,6 @@ pub fn delete_message_by_jmap_id(conn: &Connection, jmap_email_id: &JmapEmailId)
 
 /// Delete every `message_map` row whose `jmap_mailbox_id`
 /// matches the given id. Returns the number of rows removed.
-/// Used by the orphan-resurrect path to clean stale bindings
-/// to the dead mailbox id before re-uploading the messages
-/// into a freshly-created server-side mailbox.
 pub fn delete_messages_by_jmap_mailbox_id(
     conn: &Connection,
     jmap_mailbox_id: &JmapMailboxId,

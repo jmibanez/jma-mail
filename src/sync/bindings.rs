@@ -608,6 +608,21 @@ impl MailboxBindingsBuilder {
         Ok(())
     }
 
+    /// Drain the remote-orphan slot, returning the full Vec.
+    /// The engine's push-side destructive arm partitions outside
+    /// `MailboxBindings` (the resurrect arm needs async I/O)
+    /// then restores the kept entries via `set_remote_orphans`.
+    pub(crate) fn take_remote_orphans(&mut self) -> Vec<RemoteOrphanRecord> {
+        std::mem::take(&mut self.0.remote_orphans)
+    }
+
+    /// Restore the remote-orphan slot. Counterpart to
+    /// `take_remote_orphans` for the partition-and-put-back
+    /// pattern.
+    pub(crate) fn set_remote_orphans(&mut self, v: Vec<RemoteOrphanRecord>) {
+        self.0.remote_orphans = v;
+    }
+
     /// Stage a `mailbox_map` row to be upserted without
     /// re-checking disk state. Pushed for `Unchanged`/`CacheStale`
     /// decisions where the cache row already names the correct
