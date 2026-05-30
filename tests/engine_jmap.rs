@@ -870,21 +870,15 @@ async fn push_only_errors_on_fresh_config_without_local_maildirs() {
 }
 
 /// Steady-state `jma push` with one new server-side mailbox the
-/// user hasn't pulled yet must NOT error: the user has existing
-/// maildirs with messages to push, and the new remote mailbox is
-/// irrelevant to that work. The CreateLocalMailbox action for
-/// the new folder gets dropped by the direction filter; the rest
-/// of the push proceeds normally.
-///
-/// Asserts the post-conditions (push completes, Projects/ not
-/// provisioned) rather than positively pinning the
-/// emit-then-drop path. Reconcile's unit tests
-/// (`emit_create_local_mailboxes_emits_one_per_new_binding`)
-/// cover the emission side; the assertion here is that the
-/// direction filter does the right thing with whatever reconcile
-/// produces.
+/// user hasn't pulled yet must REFUSE: reconcile emits a
+/// `CreateLocalMailbox` for the new folder, which is a structural
+/// (folder-level) action. Folder operations are inherently
+/// bidirectional in the conflict matrix and the direction filter
+/// can't honor them coherently, so the engine hard-refuses
+/// instead of silently dropping. The user re-runs as a full
+/// bidirectional sync to materialise the new maildir.
 #[tokio::test]
-async fn push_only_succeeds_when_some_local_maildirs_are_provisioned() {
+async fn push_only_refuses_when_plan_has_structural_actions() {
     let server = MockServer::start().await;
     mount_session(&server).await;
 
@@ -925,16 +919,24 @@ async fn push_only_succeeds_when_some_local_maildirs_are_provisioned() {
         st.mailbox_state = "mb-2".to_string();
     }
 
-    // Push-only must not error here: INBOX is provisioned, and
-    // the dropped CreateLocalMailbox for Projects is not the
-    // user's concern in a push cycle.
-    SyncEngine::push_only(&conn, &config, false)
+    // Push-only must refuse: reconcile emits a CreateLocalMailbox
+    // for the new Projects mailbox, and folder-level primitives
+    // can't be honored under a directional filter.
+    let err = SyncEngine::push_only(&conn, &config, false)
         .await
-        .expect("push-only with at least one provisioned maildir must succeed");
+        .expect_err("push-only must refuse a structural-change plan");
+    let msg = format!("{}", err);
+    assert!(
+        msg.contains("Refusing direction-filtered sync") && msg.contains("PushOnly"),
+        "error message must surface the refusal and direction; got: {}",
+        msg
+    );
 
+    // Refusal short-circuits the cycle so the maildir doesn't
+    // land as a side effect.
     assert!(
         !temp.path().join("Projects").exists(),
-        "push-only must not provision the new server-side mailbox as a side effect"
+        "refused cycle must not provision the new server-side mailbox"
     );
 }
 

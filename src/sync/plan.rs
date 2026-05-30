@@ -548,6 +548,32 @@ impl SyncPlan {
             .count()
     }
 
+    /// True iff the plan contains any folder-level primitive
+    /// (CreateLocalMailbox, RenameLocalMailbox, DeleteLocalFolder,
+    /// CreateRemoteMailbox, RenameRemoteMailbox, DestroyRemoteMailbox).
+    /// `SyncEngine::run` treats a `true` here as a write barrier
+    /// for direction-filtered (`--pull-only` / `--push-only`)
+    /// invocations: structural folder operations are inherently
+    /// bidirectional in the conflict matrix (a destructive arm's
+    /// resolution may emit counter-moves, resurrect uploads or
+    /// downloads, or cross-direction destroys), and a directional
+    /// filter cannot guarantee the resulting state reflects user
+    /// intent. Folder operations require a full bidirectional
+    /// cycle to land coherently.
+    pub fn has_structural_actions(&self) -> bool {
+        self.actions.iter().any(|a| {
+            matches!(
+                a,
+                SyncAction::CreateLocalMailbox { .. }
+                    | SyncAction::RenameLocalMailbox { .. }
+                    | SyncAction::DeleteLocalFolder { .. }
+                    | SyncAction::CreateRemoteMailbox { .. }
+                    | SyncAction::RenameRemoteMailbox { .. }
+                    | SyncAction::DestroyRemoteMailbox { .. }
+            )
+        })
+    }
+
     /// Split the plan into (kept, dropped) according to `direction`.
     /// AdoptLocalMessage is always kept — it is byte-identical and pure
     /// DB, so adopting in pull-only or push-only mode is still strictly
