@@ -113,12 +113,7 @@ pub enum JanitorAction {
     /// candidates without writing. Pass --apply to write the
     /// `.jma.mapping` sentinel for each unambiguous candidate.
     Rebindfolders {
-        /// Number of Message-ID samples to probe per orphan folder.
-        /// Higher samples narrow ambiguous bindings (more shared
-        /// agreement) at the cost of one Email/get round-trip per
-        /// folder. Default 10. Must be at least 1: a zero-sample
-        /// probe carries no information and the task would skip
-        /// every folder.
+        /// Samples per consensus group (default 4; 3 groups, 12 total).
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
         sample_size: Option<u32>,
         /// Write the resolved sentinels. Without this flag the
