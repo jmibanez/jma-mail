@@ -51,6 +51,52 @@ fn is_maildir_message_path(path: &Path) -> bool {
         .is_some_and(|c| c.is_ascii_digit())
 }
 
+/// Whether a notify event path should fire a structural-change
+/// trigger. Structural events are folder-level actions: the user
+/// `mkdir`-ed a new maildir folder, `mv`-ed one to a different
+/// name, or `rm -rf`-ed one. Each of these affects the
+/// (`folder` <-> `jmap_mailbox_id`) binding set and requires a
+/// Full-scope cycle so the engine's `discover_unbound_folders` and
+/// sentinel walk pick them up. The Paths-scope scan can't classify
+/// a structural event (it walks only message-level
+/// `(folder, maildir_id)` groups), so the watcher promotes these
+/// events to a separate `LocalStructuralChange` trigger rather than
+/// burying them under a `LocalChange(paths)` that would
+/// short-circuit.
+///
+/// A path qualifies as structural when it sits under
+/// `maildir_root`, is NOT in jma's private namespace (see
+/// `crate::maildir_ops::namespace::is_jma_private`, which covers
+/// both the `.jma.*` and `.jma-*` prefixes), and does NOT
+/// contain `/cur/`, `/new/`, or `/tmp/` as a substring within
+/// the relative-to-root path (those are either message-file
+/// events handled by `is_maildir_message_path` or mid-delivery
+/// scratch). The remaining cases capture folder-level events
+/// (the folder directory itself, the `cur`/`new`/`tmp` directory
+/// trio at the folder root, or other non-message paths within a
+/// folder's lifecycle). The substring check runs on the
+/// relative path so a maildir root whose own ancestor name
+/// happens to contain those segments doesn't suppress
+/// detection.
+fn is_maildir_structural_path(path: &Path, maildir_root: &Path) -> bool {
+    let Ok(rel) = path.strip_prefix(maildir_root) else {
+        return false;
+    };
+    if rel.as_os_str().is_empty() {
+        return false;
+    }
+    for component in rel.components() {
+        if let std::path::Component::Normal(seg) = component
+            && let Some(seg_str) = seg.to_str()
+            && crate::maildir_ops::namespace::is_jma_private(seg_str)
+        {
+            return false;
+        }
+    }
+    let rel_str = rel.to_string_lossy();
+    !(rel_str.contains("/cur/") || rel_str.contains("/new/") || rel_str.contains("/tmp/"))
+}
+
 /// Whether a coalesced batch of relevant maildir paths can possibly
 /// produce a `LocalChange` from `scan_paths`. Returning `false`
 /// lets the watcher drop the batch before it reaches the trigger
@@ -102,41 +148,59 @@ pub async fn watch(
 ) -> Result<()> {
     crate::notify!("Watching maildir at {} for changes", maildir_root.display());
 
-    let (notify_tx, mut notify_rx) = tokio::sync::mpsc::channel::<Vec<PathBuf>>(100);
+    let (notify_tx, mut notify_rx) = tokio::sync::mpsc::channel::<SyncTrigger>(100);
+    let maildir_root_owned = maildir_root.to_path_buf();
 
     let mut debouncer = new_debouncer(
         Duration::from_secs(debounce_secs),
         move |result: Result<Vec<notify_debouncer_mini::DebouncedEvent>, notify::Error>| {
             match result {
                 Ok(events) => {
-                    let paths: Vec<PathBuf> = events
-                        .into_iter()
-                        .filter(|e| {
-                            matches!(e.kind, DebouncedEventKind::Any)
-                                && is_maildir_message_path(&e.path)
-                        })
-                        .map(|e| e.path)
-                        .collect();
-                    if paths.is_empty() {
+                    // Classify each event: structural (folder-level)
+                    // dominates because the destructive-arm matrix +
+                    // bidirectional folder lifecycle can't be safely
+                    // run in Paths scope. A batch with any
+                    // structural path collapses to one
+                    // LocalStructuralChange trigger and drops the
+                    // message-path set (Full scope subsumes the
+                    // file-level work). Otherwise we route the
+                    // message paths as today.
+                    let mut message_paths: Vec<PathBuf> = Vec::new();
+                    let mut saw_structural = false;
+                    for e in events {
+                        if !matches!(e.kind, DebouncedEventKind::Any) {
+                            continue;
+                        }
+                        if is_maildir_message_path(&e.path) {
+                            message_paths.push(e.path);
+                        } else if is_maildir_structural_path(&e.path, &maildir_root_owned) {
+                            saw_structural = true;
+                        }
+                    }
+                    if saw_structural {
+                        let _ = notify_tx.blocking_send(SyncTrigger::LocalStructuralChange);
                         return;
                     }
-                    if !batch_might_emit_changes(&paths) {
+                    if message_paths.is_empty() {
+                        return;
+                    }
+                    if !batch_might_emit_changes(&message_paths) {
                         debug!(
                             "Skipping all-live-new fsevents batch ({} path(s)); scan would emit nothing",
-                            paths.len()
+                            message_paths.len()
                         );
                         return;
                     }
                     if let Some(cache) = &self_writes
-                        && cache.matches_all(&paths)
+                        && cache.matches_all(&message_paths)
                     {
                         debug!(
                             "Skipping fsevents batch ({} path(s)); all paths matched recent self-writes",
-                            paths.len()
+                            message_paths.len()
                         );
                         return;
                     }
-                    let _ = notify_tx.blocking_send(paths);
+                    let _ = notify_tx.blocking_send(SyncTrigger::LocalChange(message_paths));
                 }
                 Err(e) => {
                     warn!("Filesystem watcher error: {}", e);
@@ -151,9 +215,9 @@ pub async fn watch(
 
     info!("Filesystem watcher started");
 
-    while let Some(paths) = notify_rx.recv().await {
-        debug!("Local filesystem change detected ({} path(s))", paths.len());
-        if tx.send(SyncTrigger::LocalChange(paths)).await.is_err() {
+    while let Some(trigger) = notify_rx.recv().await {
+        debug!("Local filesystem change detected ({})", trigger);
+        if tx.send(trigger).await.is_err() {
             info!("Sync channel closed, shutting down watcher");
             break;
         }
@@ -250,10 +314,118 @@ mod tests {
     fn skips_folder_directory_itself() {
         // The `cur` directory at the folder root, no trailing slash.
         // A folder being created (e.g. by sync provisioning a new
-        // mailbox) shouldn't fire on the directory event alone --
-        // any actual message inside will.
+        // mailbox) shouldn't fire as a message-path trigger --
+        // structural detection handles it via the separate
+        // `is_maildir_structural_path` predicate.
         let p = PathBuf::from("/home/u/Mail/INBOX/cur");
         assert!(!is_maildir_message_path(&p));
+    }
+
+    #[test]
+    fn structural_fires_on_top_level_folder_create() {
+        let root = PathBuf::from("/home/u/Mail");
+        let p = PathBuf::from("/home/u/Mail/Projects");
+        assert!(is_maildir_structural_path(&p, &root));
+    }
+
+    #[test]
+    fn structural_fires_on_maildir_trio_dirs() {
+        // The cur/new/tmp directory trio appearing under a folder
+        // root: the user (or jma's executor) is provisioning or
+        // tearing down a maildir. Each of the three dirs is a
+        // folder-level event and must promote the cycle to Full
+        // scope.
+        let root = PathBuf::from("/home/u/Mail");
+        for sub in ["cur", "new", "tmp"] {
+            let p = PathBuf::from(format!("/home/u/Mail/Projects/{}", sub));
+            assert!(
+                is_maildir_structural_path(&p, &root),
+                "{} should classify as structural",
+                p.display()
+            );
+        }
+    }
+
+    #[test]
+    fn structural_fires_on_nested_fs_layout_folder() {
+        // Dovecot `LAYOUT=fs` nests folders as recursive
+        // directories. A new `Personal/Notes` maildir is a
+        // structural event at the leaf.
+        let root = PathBuf::from("/home/u/Mail");
+        let p = PathBuf::from("/home/u/Mail/Personal/Notes");
+        assert!(is_maildir_structural_path(&p, &root));
+    }
+
+    #[test]
+    fn structural_skips_jma_private_namespace() {
+        let root = PathBuf::from("/home/u/Mail");
+        // `is_jma_private` covers both `.jma.*` (db, db-wal, lock,
+        // discovery, mapping sentinel) and `.jma-*` (rescue dir
+        // for unmapped files staged before destructive folder
+        // sync). Both prefix shapes must be rejected by the
+        // structural classifier so the watcher doesn't fire on
+        // jma's own internal writes.
+        for name in [
+            ".jma.lock",
+            ".jma.db",
+            ".jma.db-wal",
+            ".jma.discovery",
+            ".jma-rescue",
+        ] {
+            let p = PathBuf::from(format!("/home/u/Mail/{}", name));
+            assert!(
+                !is_maildir_structural_path(&p, &root),
+                "{} must not fire structural; it's private jma state",
+                p.display()
+            );
+        }
+    }
+
+    #[test]
+    fn structural_skips_message_paths_under_cur_new_tmp() {
+        // Files inside cur/, new/, tmp/ are message-level events
+        // (or mid-delivery scratch); the message-path predicate
+        // covers them. Structural detection only sees folder-level
+        // events.
+        let root = PathBuf::from("/home/u/Mail");
+        for path in [
+            "/home/u/Mail/INBOX/cur/1700000000.M1.host:2,S",
+            "/home/u/Mail/INBOX/new/1700000000.M1.host",
+            "/home/u/Mail/INBOX/tmp/1700000000.M1.host",
+        ] {
+            let p = PathBuf::from(path);
+            assert!(
+                !is_maildir_structural_path(&p, &root),
+                "{} must not fire structural; it's a message-level path",
+                path
+            );
+        }
+    }
+
+    #[test]
+    fn structural_skips_path_outside_maildir_root() {
+        let root = PathBuf::from("/home/u/Mail");
+        let p = PathBuf::from("/home/u/Documents/Foo");
+        assert!(!is_maildir_structural_path(&p, &root));
+    }
+
+    #[test]
+    fn structural_skips_root_event() {
+        let root = PathBuf::from("/home/u/Mail");
+        assert!(!is_maildir_structural_path(&root, &root));
+    }
+
+    #[test]
+    fn structural_substring_check_is_relative_to_root() {
+        // The /cur/, /new/, /tmp/ substring suppression runs on
+        // the relative-to-root path. A user whose maildir root
+        // sits at a path that already contains one of those
+        // segments (`/home/u/curated/Mail`) would otherwise have
+        // every event suppressed -- the prefix `/cur/` would match
+        // anywhere in the full path string.
+        let root = PathBuf::from("/home/u/curated/Mail");
+        let p = PathBuf::from("/home/u/curated/Mail/Projects");
+        assert!(is_maildir_structural_path(&p, &root));
     }
 
     /// All-live-new batch: every path lives under a `new/` subdir
