@@ -215,11 +215,13 @@ pub enum ConflictStrategy {
 /// "Destructive" here means deleting an on-disk maildir (when the
 /// server-side mailbox is gone) or destroying a server-side
 /// mailbox (when the local maildir is gone). The default `None`
-/// preserves the orphan-and-rely-on-prune behavior that #5 left
-/// in place: the DB row drops on server-side deletion, the
-/// disk state is untouched, and `jma janitor prune` is the
-/// explicit cleanup path. Users who want strict mirror semantics
-/// in one or both directions opt in.
+/// preserves the orphan-and-rely-on-prune behavior: on a
+/// server-side deletion the cache row drops from `mailbox_map`
+/// but the on-disk maildir is left untouched, and the inverse
+/// (locally-removed maildir whose server mailbox still exists)
+/// leaves the server mailbox alone; `jma janitor prune` is the
+/// explicit cleanup path for the resulting drift. Users who want
+/// strict mirror semantics in one or both directions opt in.
 ///
 /// Variants are named for what they permit doing (deleting the
 /// local or remote side), not for the direction of propagation:
@@ -252,7 +254,7 @@ pub enum AllowDestructiveFolderSync {
     /// server-side stay on disk; locally-removed maildirs whose
     /// mailbox still exists server-side stay server-side. Drift
     /// is surfaced via `jma status` and cleanup goes through
-    /// `jma janitor prune`. This is the post-#5 behavior.
+    /// `jma janitor prune`.
     #[default]
     None,
     /// Permit deleting the local maildir when the server-side
@@ -834,9 +836,9 @@ mod tests {
     }
 
     /// `allow_destructive_folder_sync` defaults to `none`. Pins
-    /// the post-#5 orphan-and-rely-on-prune contract so a future
-    /// default change doesn't silently start deleting maildirs on
-    /// existing configs.
+    /// the orphan-and-rely-on-prune contract so a future default
+    /// change doesn't silently start deleting maildirs on existing
+    /// configs.
     #[test]
     fn allow_destructive_folder_sync_defaults_to_none() {
         let cfg = SyncConfig::default();

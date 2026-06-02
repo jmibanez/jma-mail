@@ -94,19 +94,36 @@ pub enum LocalChange {
     /// A maildir-shaped directory appeared under the configured
     /// maildir root that no `MailboxBindings` entry covers. No
     /// `Arc<MailboxFolderBinding>` because the server-side JMAP id
-    /// isn't known yet: a later cycle will resolve it (either
-    /// because the cache lost a binding that the on-disk sentinel
-    /// still pins, or because no prior binding exists and a future
-    /// emit path will push the folder to the server). `sentinel`
-    /// is the result of reading `path/.jma.mapping`: `Some` means
-    /// a past sync wrote a binding here (the consumer can recover
-    /// the bound JMAP id from the sentinel); `None` means the
-    /// folder is unbound on both sides.
+    /// isn't known yet: the consumer routes it via one of two paths
+    /// depending on `sentinel`, the result of reading
+    /// `path/.jma.mapping`: `Some` means a past sync wrote a
+    /// binding here (the consumer can recover the bound JMAP id
+    /// from the sentinel), `None` means the folder is unbound on
+    /// both sides.
     ///
-    /// No producer or consumer today: the variant lives here so
-    /// the shape is settled before scan grows the folder-discovery
-    /// pass and reconcile grows the arm that turns these into
-    /// server-side mailbox actions.
+    /// Producers (both in this module): `discover_unbound_folders`
+    /// is the comprehensive sweep -- `engine::run` invokes it once
+    /// per cycle for Full-scope scans, walking layout-eligible
+    /// maildir-shaped directories under the configured root and
+    /// emitting one event per directory not in
+    /// `MailboxBindings::by_folder`. `scan_paths` is the per-event
+    /// path, emitting the same variant for unbound layout-eligible
+    /// folders surfaced live by a watcher event (deduped to once
+    /// per folder per call via `discovered_folders`). Both paths
+    /// converge on identical shapes so the consumer doesn't branch
+    /// on origin.
+    ///
+    /// Consumer: `reconcile::handle_local_folder_created`. The
+    /// `sentinel: Some` arm hands recovery off to
+    /// `janitor::rebindfolders` (cache lost the binding, but the
+    /// sentinel pins it). The `sentinel: None` arm walks the
+    /// parent chain via `decompose_folder_string` and emits a
+    /// `CreateRemoteMailbox` chain top-down: already-bound parents
+    /// flow as `MaybeReference::Value`, parents being created in
+    /// the same cycle flow as
+    /// `MaybeReference::Reference(parent_folder)` for the
+    /// executor's `creation_refs` table to resolve once each
+    /// parent's `Mailbox/set { create }` returns.
     LocalFolderCreated {
         path: PathBuf,
         sentinel: Option<MailboxMapping>,
