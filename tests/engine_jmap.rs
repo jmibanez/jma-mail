@@ -1430,6 +1430,7 @@ async fn rebindfolders_rebinds_orphan_folder_from_message_ids() {
         &conn,
         temp.path(),
         jma_mail::janitor::rebindfolders::DEFAULT_SAMPLE_SIZE,
+        std::collections::HashMap::new(),
     )
     .await
     .expect("plan");
@@ -1453,6 +1454,350 @@ async fn rebindfolders_rebinds_orphan_folder_from_message_ids() {
     let written = sentinel::read(&orphan).expect("read").expect("present");
     assert_eq!(written.jmap_mailbox_id, JmapMailboxId::from("MB-SENT"));
     assert_eq!(written.server_name, "Sent");
+}
+
+/// Explicit `--bind PATH=REMOTE_PATH` override skips the per-folder
+/// probe entirely: the orphan is bound directly to the supplied
+/// remote_path's mailbox, `RebindCandidate.source` is tagged
+/// `Explicit`, and the binding is what the operator named (not
+/// what the probe would have inferred).
+#[tokio::test]
+async fn rebindfolders_honors_explicit_bind_override_and_skips_probe() {
+    let server = MockServer::start().await;
+    mount_session(&server).await;
+    let state = Arc::new(Mutex::new(MockState {
+        mailbox_state: "mb-1".to_string(),
+        email_state: "e-1".to_string(),
+        mailboxes: vec![
+            MockMailbox {
+                id: "MB-INBOX".to_string(),
+                name: "Inbox".to_string(),
+                role: Some("inbox".to_string()),
+                parent_id: None,
+            },
+            MockMailbox {
+                id: "MB-SENT".to_string(),
+                name: "Sent".to_string(),
+                role: Some("sent".to_string()),
+                parent_id: None,
+            },
+        ],
+        emails: vec![MockEmail {
+            id: "E1".to_string(),
+            blob_id: "B1".to_string(),
+            thread_id: "T1".to_string(),
+            mailbox_ids: vec!["MB-SENT".to_string()],
+            keywords: vec![],
+            message_id: Some("a@x".to_string()),
+        }],
+        ..Default::default()
+    }));
+    mount_jmap(&server, state.clone()).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let conn = fresh_db(&temp);
+    let config = test_config(&server, temp.path(), vec![]);
+
+    // Orphan whose probe would have inferred MB-SENT (its sole
+    // sample lives there). Operator overrides to "Inbox" instead.
+    let orphan = temp.path().join("ForcedBind");
+    std::fs::create_dir_all(orphan.join("cur")).unwrap();
+    std::fs::create_dir_all(orphan.join("new")).unwrap();
+    std::fs::create_dir_all(orphan.join("tmp")).unwrap();
+    std::fs::write(
+        orphan.join("cur").join("1.x:2,"),
+        b"Message-ID: <a@x>\r\nSubject: t\r\n\r\nbody",
+    )
+    .unwrap();
+
+    let client = jma_mail::jmap::session::connect(&config.account, &conn)
+        .await
+        .expect("connect");
+
+    let mut overrides: std::collections::HashMap<std::path::PathBuf, String> =
+        std::collections::HashMap::new();
+    overrides.insert(orphan.clone(), "Inbox".to_string());
+
+    let plan = jma_mail::janitor::rebindfolders::plan(
+        &client,
+        &conn,
+        temp.path(),
+        jma_mail::janitor::rebindfolders::DEFAULT_SAMPLE_SIZE,
+        overrides,
+    )
+    .await
+    .expect("plan with explicit override");
+
+    assert_eq!(plan.candidates.len(), 1, "exactly one candidate");
+    let c = &plan.candidates[0];
+    assert_eq!(c.folder_path, orphan);
+    assert_eq!(
+        c.jmap_mailbox_id,
+        JmapMailboxId::from("MB-INBOX"),
+        "explicit override binds to MB-INBOX (the id behind the named \
+         remote_path), not the MB-SENT the probe would have inferred"
+    );
+    assert_eq!(c.remote_path, "Inbox");
+    assert_eq!(
+        c.source,
+        jma_mail::janitor::rebindfolders::ResolveSource::Explicit
+    );
+    assert_eq!(
+        c.sample_count, 0,
+        "explicit overrides bypass sampling entirely"
+    );
+    assert!(plan.skipped.is_empty());
+}
+
+/// Refuse two `--bind` entries on distinct paths that resolve to
+/// the same server-side mailbox. Without the in-batch tracker the
+/// duplicate-target guard would only catch collisions against
+/// pre-existing claimed state -- both `--bind /A=Inbox --bind
+/// /B=Inbox` would pass the per-entry check (MB-INBOX isn't yet
+/// in `mailbox_map` or in any sentinel), then `apply()` would
+/// write two sentinels at /A and /B both pointing at MB-INBOX,
+/// the exact duplicate-binding the guard is built to prevent.
+#[tokio::test]
+async fn rebindfolders_rejects_two_explicit_binds_targeting_same_mailbox() {
+    let server = MockServer::start().await;
+    mount_session(&server).await;
+    let state = Arc::new(Mutex::new(MockState {
+        mailbox_state: "mb-1".to_string(),
+        email_state: "e-1".to_string(),
+        mailboxes: vec![MockMailbox {
+            id: "MB-INBOX".to_string(),
+            name: "Inbox".to_string(),
+            role: Some("inbox".to_string()),
+            parent_id: None,
+        }],
+        ..Default::default()
+    }));
+    mount_jmap(&server, state.clone()).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let conn = fresh_db(&temp);
+    let config = test_config(&server, temp.path(), vec![]);
+
+    // Two distinct in-root orphans, both targeted at "Inbox".
+    let a = temp.path().join("A");
+    let b = temp.path().join("B");
+    for p in [&a, &b] {
+        std::fs::create_dir_all(p.join("cur")).unwrap();
+    }
+
+    let client = jma_mail::jmap::session::connect(&config.account, &conn)
+        .await
+        .expect("connect");
+
+    let mut overrides: std::collections::HashMap<std::path::PathBuf, String> =
+        std::collections::HashMap::new();
+    overrides.insert(a, "Inbox".to_string());
+    overrides.insert(b, "Inbox".to_string());
+
+    let err = jma_mail::janitor::rebindfolders::plan(
+        &client,
+        &conn,
+        temp.path(),
+        jma_mail::janitor::rebindfolders::DEFAULT_SAMPLE_SIZE,
+        overrides,
+    )
+    .await
+    .expect_err("guard should reject two --binds on the same mailbox");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("already") && msg.contains("--bind"),
+        "error should explain the in-batch duplicate-target rejection, got: {msg}"
+    );
+}
+
+/// Refuse `--bind PATH=REMOTE_PATH` when PATH resolves outside the
+/// configured `maildir_root`. Defense in depth: the orphan walk
+/// only enumerates under `maildir_root` so an off-root path would
+/// silently warn-and-no-op anyway, but operators get a typo-friendly
+/// loud error instead -- consistent with the other --bind validations
+/// (ghost remote_path, target already claimed) that fail-fast on bad
+/// input.
+#[tokio::test]
+async fn rebindfolders_rejects_explicit_bind_outside_maildir_root() {
+    let server = MockServer::start().await;
+    mount_session(&server).await;
+    let state = Arc::new(Mutex::new(MockState {
+        mailbox_state: "mb-1".to_string(),
+        email_state: "e-1".to_string(),
+        mailboxes: vec![MockMailbox {
+            id: "MB-INBOX".to_string(),
+            name: "Inbox".to_string(),
+            role: Some("inbox".to_string()),
+            parent_id: None,
+        }],
+        ..Default::default()
+    }));
+    mount_jmap(&server, state.clone()).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let other_root = tempfile::tempdir().expect("second tempdir for off-root path");
+    let conn = fresh_db(&temp);
+    let config = test_config(&server, temp.path(), vec![]);
+
+    // Plant a maildir outside the configured root; the operator's
+    // --bind references it as if it were in-scope.
+    let off_root = other_root.path().join("Stranger");
+    std::fs::create_dir_all(off_root.join("cur")).unwrap();
+
+    let client = jma_mail::jmap::session::connect(&config.account, &conn)
+        .await
+        .expect("connect");
+
+    let mut overrides: std::collections::HashMap<std::path::PathBuf, String> =
+        std::collections::HashMap::new();
+    overrides.insert(off_root.clone(), "Inbox".to_string());
+
+    let err = jma_mail::janitor::rebindfolders::plan(
+        &client,
+        &conn,
+        temp.path(),
+        jma_mail::janitor::rebindfolders::DEFAULT_SAMPLE_SIZE,
+        overrides,
+    )
+    .await
+    .expect_err("guard should reject off-root --bind path");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("outside maildir_root"),
+        "error should name the off-root rejection, got: {msg}"
+    );
+}
+
+/// Refuse `--bind /new=ExistingMailbox` when ExistingMailbox is
+/// already bound to a different maildir folder on disk (either via
+/// `mailbox_map` or via a surviving sentinel). Without this guard
+/// the `apply()` step would write a second `.jma.mapping` at /new
+/// pointing at the same mailbox id, leaving two on-disk folders
+/// claiming the same server mailbox -- destructive in the silent-
+/// data-duplication sense (the next sync's `resolve_mailboxes`
+/// would resolve one as canonical and the other as drift).
+#[tokio::test]
+async fn rebindfolders_rejects_explicit_bind_when_target_already_claimed() {
+    let server = MockServer::start().await;
+    mount_session(&server).await;
+    let state = Arc::new(Mutex::new(MockState {
+        mailbox_state: "mb-1".to_string(),
+        email_state: "e-1".to_string(),
+        mailboxes: vec![MockMailbox {
+            id: "MB-INBOX".to_string(),
+            name: "Inbox".to_string(),
+            role: Some("inbox".to_string()),
+            parent_id: None,
+        }],
+        ..Default::default()
+    }));
+    mount_jmap(&server, state.clone()).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let conn = fresh_db(&temp);
+    let config = test_config(&server, temp.path(), vec![]);
+
+    // Plant MB-INBOX as already bound in mailbox_map. Any --bind
+    // whose target resolves to MB-INBOX should now be refused.
+    jma_mail::state::queries::upsert_mailbox(
+        &conn,
+        &jma_mail::state::queries::MailboxRecord {
+            jmap_mailbox_id: JmapMailboxId::from("MB-INBOX"),
+            name: "Inbox".to_string(),
+            role: Some("inbox".to_string()),
+            parent_id: None,
+            maildir_folder: "INBOX".to_string(),
+            sort_order: 0,
+            remote_path: Some("Inbox".to_string()),
+        },
+    )
+    .unwrap();
+
+    // Plant an orphan maildir at a different path so the bind has
+    // a real target to attach to. Without this the precondition
+    // discussion would degenerate into "no orphans, --bind is a
+    // no-op anyway"; with it, the guard is the only thing
+    // preventing the duplicate-sentinel write.
+    let orphan = temp.path().join("SomeOtherFolder");
+    std::fs::create_dir_all(orphan.join("cur")).unwrap();
+
+    let client = jma_mail::jmap::session::connect(&config.account, &conn)
+        .await
+        .expect("connect");
+
+    let mut overrides: std::collections::HashMap<std::path::PathBuf, String> =
+        std::collections::HashMap::new();
+    overrides.insert(orphan.clone(), "Inbox".to_string());
+
+    let err = jma_mail::janitor::rebindfolders::plan(
+        &client,
+        &conn,
+        temp.path(),
+        jma_mail::janitor::rebindfolders::DEFAULT_SAMPLE_SIZE,
+        overrides,
+    )
+    .await
+    .expect_err("guard should reject duplicate-target binding");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("already claimed"),
+        "error should explain the duplicate-target rejection, got: {msg}"
+    );
+}
+
+/// Supplying `--bind PATH=REMOTE_PATH` where REMOTE_PATH names a
+/// mailbox the server doesn't advertise is rejected up front,
+/// before any orphan walk or disk write. The operator catches the
+/// typo before sentinels are touched.
+#[tokio::test]
+async fn rebindfolders_rejects_explicit_bind_to_unknown_remote_path() {
+    let server = MockServer::start().await;
+    mount_session(&server).await;
+    let state = Arc::new(Mutex::new(MockState {
+        mailbox_state: "mb-1".to_string(),
+        email_state: "e-1".to_string(),
+        mailboxes: vec![MockMailbox {
+            id: "MB-INBOX".to_string(),
+            name: "Inbox".to_string(),
+            role: Some("inbox".to_string()),
+            parent_id: None,
+        }],
+        ..Default::default()
+    }));
+    mount_jmap(&server, state.clone()).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let conn = fresh_db(&temp);
+    let config = test_config(&server, temp.path(), vec![]);
+
+    let client = jma_mail::jmap::session::connect(&config.account, &conn)
+        .await
+        .expect("connect");
+
+    // Plant a real maildir under the configured root so the off-
+    // root guard passes and the ghost-remote-path validation gets
+    // the chance to fire.
+    let target = temp.path().join("Anything");
+    std::fs::create_dir_all(target.join("cur")).unwrap();
+
+    let mut overrides: std::collections::HashMap<std::path::PathBuf, String> =
+        std::collections::HashMap::new();
+    overrides.insert(target, "Folders/DoesNotExist".to_string());
+
+    let err = jma_mail::janitor::rebindfolders::plan(
+        &client,
+        &conn,
+        temp.path(),
+        jma_mail::janitor::rebindfolders::DEFAULT_SAMPLE_SIZE,
+        overrides,
+    )
+    .await
+    .expect_err("ghost remote_path should error");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("Folders/DoesNotExist"),
+        "error should name the rejected remote_path, got: {msg}"
+    );
 }
 
 /// End-to-end initial pull. State DB starts empty so engine routes to
