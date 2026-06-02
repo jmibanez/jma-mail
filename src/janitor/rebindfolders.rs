@@ -186,6 +186,13 @@ pub enum ResolveSource {
     /// maildir count and no folder probed to NoMessageIds /
     /// NoServerMatches in this cycle.
     CrossMapping,
+    /// The operator supplied an explicit binding via
+    /// `--bind PATH=REMOTE_PATH`. The per-folder probe was
+    /// skipped entirely for this path; the cross-mapping post-pass
+    /// is globally disabled for this run because providing any
+    /// explicit binding is a declaration that the operator is
+    /// taking manual control of disambiguation.
+    Explicit,
 }
 
 /// One folder the planner refused to rebind, paired with the reason
@@ -239,6 +246,7 @@ pub async fn plan(
     conn: &Connection,
     maildir_root: &Path,
     samples_per_group: usize,
+    explicit_bindings: HashMap<PathBuf, String>,
 ) -> Result<RebindFoldersPlan> {
     let _phase =
         tracing::info_span!(target: crate::profile::TARGET_PHASE, "rebindfolders").entered();
@@ -269,8 +277,115 @@ pub async fn plan(
         .into_iter()
         .collect();
 
-    let orphans = walk_for_orphans(maildir_root, &by_id, &bound_folders);
+    // Reject --bind paths that aren't inside maildir_root, or
+    // resolve via symlink to somewhere outside it. `canonicalize`
+    // returns the fully-resolved absolute path with all symlinks
+    // followed, so a maildir_root-relative symlink pointing at
+    // /etc would canonicalize to /etc and fail the prefix check.
+    // The orphan walk only enumerates under maildir_root, so an
+    // off-root --bind path would otherwise just produce the
+    // typo-warn below; rejecting up front gives the operator a
+    // clear error instead.
+    let canonical_root = maildir_root.canonicalize().with_context(|| {
+        format!(
+            "maildir_root {} cannot be canonicalized",
+            maildir_root.display()
+        )
+    })?;
+    for path in explicit_bindings.keys() {
+        let canonical = path.canonicalize().with_context(|| {
+            format!(
+                "--bind {} rejected: path does not exist or is not accessible",
+                path.display()
+            )
+        })?;
+        if !canonical.starts_with(&canonical_root) {
+            return Err(anyhow::anyhow!(
+                "--bind {} rejected: path resolves to {} which is outside maildir_root {}",
+                path.display(),
+                canonical.display(),
+                canonical_root.display(),
+            ));
+        }
+    }
+
+    // Validate each --bind's remote_path against the live server.
+    // Reverse-lookup from path -> id; reject up front when the
+    // operator named a mailbox that doesn't exist, so a typo
+    // surfaces before any orphan walk or disk write. RFC 8621
+    // section 2.5's `nameAlreadyExists` rejects same-name-and-
+    // parentId at `Mailbox/set`, so spec-compliant servers
+    // shouldn't expose colliding paths in `Mailbox/get`;
+    // last-write-wins handles non-conformant servers.
+    let path_to_id: HashMap<&str, &JmapMailboxId> = remote_paths
+        .iter()
+        .map(|(id, path)| (path.as_str(), id))
+        .collect();
+    let resolved_bindings: HashMap<PathBuf, (JmapMailboxId, String)> = explicit_bindings
+        .iter()
+        .map(|(path, remote_path)| {
+            let id = path_to_id.get(remote_path.as_str()).copied().with_context(|| {
+                format!(
+                    "explicit --bind {} -> {} rejected: no server mailbox advertises that remote_path",
+                    path.display(),
+                    remote_path,
+                )
+            })?;
+            Ok::<_, anyhow::Error>((path.clone(), (id.clone(), remote_path.clone())))
+        })
+        .collect::<Result<_>>()?;
+
+    let (orphans, sentinel_bound_ids) = walk_for_orphans(maildir_root, &by_id, &bound_folders);
     info!("rebindfolders: found {} candidate folder(s)", orphans.len());
+
+    // Refuse any --bind whose target mailbox id is already bound
+    // somewhere on disk OR claimed by another --bind in the same
+    // invocation. The set is the union of cache-side `mailbox_map`
+    // rows, sentinel-survives folders the orphan walk just
+    // enumerated, and in-batch duplicates. Without this guard
+    // `--bind /foo=Bar` where Bar is already at `/bar`, OR
+    // `--bind /foo=Bar --bind /baz=Bar` in the same call, would
+    // write two sentinels pointing at the same mailbox id,
+    // leaving two on-disk folders claiming the same server
+    // mailbox. The next sync cycle's `resolve_mailboxes` would
+    // resolve one as canonical and the other as drift --
+    // destructive in the silent-data-duplication sense. Fail
+    // loudly here instead.
+    let cache_claimed_ids: HashSet<JmapMailboxId> =
+        queries::list_known_mailbox_ids(conn)?.into_iter().collect();
+    let mut seen_target_ids: HashSet<JmapMailboxId> = HashSet::new();
+    for (path, (mailbox_id, remote_path)) in &resolved_bindings {
+        if cache_claimed_ids.contains(mailbox_id)
+            || sentinel_bound_ids.contains(mailbox_id)
+            || !seen_target_ids.insert(mailbox_id.clone())
+        {
+            return Err(anyhow::anyhow!(
+                "explicit --bind {} -> {} rejected: that mailbox is already \
+                 claimed (by another --bind in this invocation, by `mailbox_map`, \
+                 or by a surviving sentinel). Clean up the existing binding \
+                 before redirecting.",
+                path.display(),
+                remote_path,
+            ));
+        }
+    }
+
+    // Surface explicit bindings whose path is not in the orphan
+    // walk so the operator notices typos / stale paths instead of
+    // a silent no-op. Each unmatched path warns but stays in the
+    // map; the per-orphan loop below only iterates real orphans, so
+    // no Bind will be emitted for the typo. The cross-mapping gate
+    // still treats the run as operator-controlled because the
+    // operator has declared intent by passing any --bind at all.
+    let orphan_set: HashSet<&PathBuf> = orphans.iter().collect();
+    for path in resolved_bindings.keys() {
+        if !orphan_set.contains(path) {
+            tracing::warn!(
+                "rebindfolders: --bind {} ignored: path is not in the orphan walk",
+                path.display()
+            );
+        }
+    }
 
     // Cross-mapping precondition input: maildir count visible to the
     // cache + orphan layer. Counts `bound_folders` (mailbox_map rows
@@ -292,6 +407,25 @@ pub async fn plan(
     let mut plan = RebindFoldersPlan::default();
     let get_cap = limits::max_objects_in_get(client);
     for folder_path in orphans {
+        // Explicit override: skip the probe and emit a Bind tagged
+        // `Explicit` straight from the resolved binding. Validated
+        // above against `path_to_id`, so the lookup cannot miss.
+        if let Some((mailbox_id, remote_path)) = resolved_bindings.get(&folder_path) {
+            let mb = by_id
+                .get(mailbox_id)
+                .expect("validated id missed by_id lookup");
+            plan.candidates.push(RebindCandidate {
+                folder_path,
+                jmap_mailbox_id: mb.id.clone(),
+                server_name: mb.name.clone(),
+                remote_path: remote_path.clone(),
+                parent_jmap_mailbox_id: mb.parent_id.clone(),
+                sample_count: 0,
+                source: ResolveSource::Explicit,
+            });
+            continue;
+        }
+
         match probe_folder(
             client,
             &folder_path,
@@ -333,10 +467,17 @@ pub async fn plan(
         }
     }
 
-    // Cross-mapping pass: see module docs. Promotes
-    // `AmbiguousAcrossSamples` skips to `CrossMapping` candidates
-    // when the preconditions hold.
-    cross_resolve_ambiguous(&mut plan, conn, &by_id, &remote_paths, n_disk)?;
+    // Cross-mapping pass: see module docs. Globally disabled when
+    // the operator supplied any explicit binding -- including
+    // typo'd `--bind` whose path didn't match an orphan, because
+    // the operator's intent ("I am taking manual control") is the
+    // signal we honor, not whether each individual binding was
+    // load-bearing in this cycle. Mixing operator overrides with
+    // algorithmic disambiguation composes surprisingly, so the
+    // algorithm steps out entirely.
+    if explicit_bindings.is_empty() {
+        cross_resolve_ambiguous(&mut plan, conn, &by_id, &remote_paths, n_disk)?;
+    }
 
     plan.remote_paths = remote_paths;
     Ok(plan)
@@ -564,9 +705,17 @@ pub async fn run(
     conn: &Connection,
     maildir_root: &Path,
     samples_per_group: usize,
+    explicit_bindings: HashMap<PathBuf, String>,
     dry_run: bool,
 ) -> Result<RebindFoldersPlan> {
-    let p = plan(client, conn, maildir_root, samples_per_group).await?;
+    let p = plan(
+        client,
+        conn,
+        maildir_root,
+        samples_per_group,
+        explicit_bindings,
+    )
+    .await?;
     if !dry_run {
         apply(&p)?;
     }
@@ -874,41 +1023,48 @@ fn walk_for_orphans(
     maildir_root: &Path,
     by_id: &HashMap<JmapMailboxId, &MailboxObject>,
     bound_folders: &HashSet<String>,
-) -> Vec<PathBuf> {
+) -> (Vec<PathBuf>, HashSet<JmapMailboxId>) {
     let mut found = Vec::new();
     walk_for_maildirs(maildir_root, &mut found);
     found.sort();
 
-    found
-        .into_iter()
-        .filter(|abs_path| {
-            // Skip folders already bound via mailbox_map. The
-            // relative path is what `mailbox_map.maildir_folder`
-            // stores.
-            if let Ok(rel) = abs_path.strip_prefix(maildir_root) {
-                let rel_str = rel.to_string_lossy();
-                if bound_folders.contains(rel_str.as_ref()) {
-                    return false;
-                }
+    let mut orphans: Vec<PathBuf> = Vec::new();
+    let mut sentinel_bound_ids: HashSet<JmapMailboxId> = HashSet::new();
+    for abs_path in found {
+        // Skip folders already bound via mailbox_map. The relative
+        // path is what `mailbox_map.maildir_folder` stores. These
+        // are tracked by the cache-side claim set (built from
+        // `list_known_mailbox_ids` at the call site); no need to
+        // surface their ids here too.
+        if let Ok(rel) = abs_path.strip_prefix(maildir_root) {
+            let rel_str = rel.to_string_lossy();
+            if bound_folders.contains(rel_str.as_ref()) {
+                continue;
             }
-            // Skip folders whose sentinel already names a known
-            // server mailbox. A sentinel pointing at an id the
-            // server doesn't advertise is orphaned (deleted
-            // server-side or copied from another account), so
-            // include those.
-            match sentinel::read(abs_path) {
-                Ok(Some(m)) => !by_id.contains_key(&m.jmap_mailbox_id),
-                Ok(None) => true,
-                Err(e) => {
-                    debug!(
-                        "rebindfolders: sentinel read failed at {} ({e}); treating as orphan",
-                        abs_path.display()
-                    );
-                    true
-                }
+        }
+        // Folders whose sentinel already names a known server
+        // mailbox are bound on disk even though the cache may have
+        // lost the row. Surface the claimed id so the --bind guard
+        // can refuse a binding that would create a duplicate
+        // sentinel. A sentinel pointing at an id the server doesn't
+        // advertise is orphaned (deleted server-side or copied
+        // from another account), so include those in the orphan
+        // list.
+        match sentinel::read(&abs_path) {
+            Ok(Some(m)) if by_id.contains_key(&m.jmap_mailbox_id) => {
+                sentinel_bound_ids.insert(m.jmap_mailbox_id);
             }
-        })
-        .collect()
+            Ok(_) => orphans.push(abs_path),
+            Err(e) => {
+                debug!(
+                    "rebindfolders: sentinel read failed at {} ({e}); treating as orphan",
+                    abs_path.display()
+                );
+                orphans.push(abs_path);
+            }
+        }
+    }
+    (orphans, sentinel_bound_ids)
 }
 
 /// Recursive maildir-tree walk. Mirrors the helper used by the
@@ -1218,8 +1374,14 @@ mod tests {
             server.iter().map(|m| (m.id.clone(), m)).collect();
         let bound: HashSet<String> = ["INBOX".to_string()].into();
 
-        let orphans = walk_for_orphans(root, &by_id, &bound);
+        let (orphans, sentinel_bound_ids) = walk_for_orphans(root, &by_id, &bound);
         assert_eq!(orphans, vec![root.join("Lost")]);
+        assert_eq!(
+            sentinel_bound_ids,
+            [JmapMailboxId::from("MB-ARCH")].into(),
+            "Archive's sentinel pins MB-ARCH; that id is what the --bind guard \
+             reads to refuse rebinding it under a different folder name"
+        );
     }
 
     /// A sentinel naming a mailbox the server no longer advertises
@@ -1245,8 +1407,12 @@ mod tests {
         let by_id: HashMap<JmapMailboxId, &MailboxObject> =
             server.iter().map(|m| (m.id.clone(), m)).collect();
 
-        let orphans = walk_for_orphans(root, &by_id, &HashSet::new());
+        let (orphans, sentinel_bound_ids) = walk_for_orphans(root, &by_id, &HashSet::new());
         assert_eq!(orphans, vec![root.join("Stranger")]);
+        assert!(
+            sentinel_bound_ids.is_empty(),
+            "MB-GONE isn't in by_id so the sentinel-survives bucket stays empty"
+        );
     }
 
     /// `apply` writes the sentinel for every candidate but leaves

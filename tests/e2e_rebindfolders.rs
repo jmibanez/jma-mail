@@ -160,6 +160,7 @@ async fn rebindfolders_rebinds_inbox_after_db_nuke_and_sentinel_loss() {
         &conn,
         temp.path(),
         rebindfolders::DEFAULT_SAMPLE_SIZE,
+        std::collections::HashMap::new(),
     )
     .await
     .expect("rebindfolders::plan against live Stalwart");
@@ -466,6 +467,7 @@ async fn rebindfolders_cross_mapping_resolves_ambiguous_archive() {
         &conn,
         temp.path(),
         rebindfolders::DEFAULT_SAMPLE_SIZE,
+        std::collections::HashMap::new(),
     )
     .await
     .expect("rebindfolders::plan against live Stalwart");

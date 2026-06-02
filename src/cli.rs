@@ -116,6 +116,9 @@ pub enum JanitorAction {
         /// Samples per consensus group (default 4; 3 groups, 12 total).
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
         sample_size: Option<u32>,
+        /// Bypass probe, bind `PATH` to `REMOTE_PATH`. Repeatable, disables cross-mapping.
+        #[arg(long, value_name = "PATH=REMOTE_PATH")]
+        bind: Vec<String>,
         /// Write the resolved sentinels. Without this flag the
         /// plan is printed and disk stays untouched.
         #[arg(long)]

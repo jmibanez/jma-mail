@@ -578,9 +578,11 @@ async fn cmd_janitor(cli: &Cli, action: Option<JanitorAction>) -> Result<()> {
         JanitorAction::Remotededupe { mailbox, yes } => {
             cmd_janitor_remotededupe(cli, mailbox, yes).await
         }
-        JanitorAction::Rebindfolders { sample_size, apply } => {
-            cmd_janitor_rebindfolders(cli, sample_size, apply).await
-        }
+        JanitorAction::Rebindfolders {
+            sample_size,
+            bind,
+            apply,
+        } => cmd_janitor_rebindfolders(cli, sample_size, bind, apply).await,
     }
 }
 
@@ -725,7 +727,12 @@ async fn cmd_janitor_remotededupe(cli: &Cli, mailbox: Option<String>, yes: bool)
     Ok(())
 }
 
-async fn cmd_janitor_rebindfolders(cli: &Cli, sample_size: Option<u32>, apply: bool) -> Result<()> {
+async fn cmd_janitor_rebindfolders(
+    cli: &Cli,
+    sample_size: Option<u32>,
+    bind: Vec<String>,
+    apply: bool,
+) -> Result<()> {
     let config = load_config(cli)?;
     // Same lock posture as remotededupe: rebindfolders hits the
     // network and can write sentinels, so the honest stance is
@@ -739,6 +746,43 @@ async fn cmd_janitor_rebindfolders(cli: &Cli, sample_size: Option<u32>, apply: b
         .map(|n| n as usize)
         .unwrap_or(jma_mail::janitor::rebindfolders::DEFAULT_SAMPLE_SIZE);
 
+    // Parse each --bind into (PathBuf, remote_path String). Split on
+    // the LAST `=` to tolerate `=` in maildir paths. Mailbox names
+    // per RFC 8621 section 2 may contain `=` (the spec only
+    // forbids `/` and control characters), so a remote_path
+    // containing `=` would misparse here -- the up-front validation
+    // in `plan()` rejects misparsed paths with a clear error rather
+    // than silently misbinding, which is the acceptable failure
+    // mode.
+    let parsed_bindings: Vec<(std::path::PathBuf, String)> = bind
+        .iter()
+        .map(|raw| {
+            let (path, remote) = raw.rsplit_once('=').with_context(|| {
+                format!("invalid --bind value {raw:?}; expected PATH=REMOTE_PATH")
+            })?;
+            Ok::<_, anyhow::Error>((std::path::PathBuf::from(path), remote.to_string()))
+        })
+        .collect::<Result<_>>()?;
+
+    // Refuse repeat --bind on the same path. Collecting straight
+    // into a HashMap would silently last-write-wins the second
+    // entry, dropping the operator's first declaration without a
+    // warning -- exactly the class of behavior the rest of --bind
+    // is built to refuse. Two distinct --bind on the same path
+    // is unambiguously a transcription error.
+    let mut seen_paths: std::collections::HashSet<&std::path::PathBuf> =
+        std::collections::HashSet::new();
+    for (path, _) in &parsed_bindings {
+        if !seen_paths.insert(path) {
+            anyhow::bail!(
+                "--bind {} given twice; specify each PATH at most once",
+                path.display()
+            );
+        }
+    }
+    let explicit_bindings: std::collections::HashMap<std::path::PathBuf, String> =
+        parsed_bindings.into_iter().collect();
+
     // Sentinel writes require explicit --apply; otherwise treat as
     // a dry run. --dry-run also forces dry; --apply is the only
     // affirmative gate so a probe that landed on the wrong mailbox
@@ -749,6 +793,7 @@ async fn cmd_janitor_rebindfolders(cli: &Cli, sample_size: Option<u32>, apply: b
         &conn,
         &maildir_root,
         samples_per_group,
+        explicit_bindings,
         effective_dry_run,
     )
     .await?;
@@ -791,6 +836,7 @@ fn render_rebindfolders_plan(plan: &jma_mail::janitor::rebindfolders::RebindFold
             jma_mail::janitor::rebindfolders::ResolveSource::CrossMapping => {
                 "cross-mapping".to_string()
             }
+            jma_mail::janitor::rebindfolders::ResolveSource::Explicit => "explicit".to_string(),
         };
         println!(
             "  [REBIND] {} -> {} ({via})",
