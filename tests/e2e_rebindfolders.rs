@@ -16,14 +16,15 @@
 //!   `mailboxIds`, and the freshly-written sentinel round-tripping.
 //!
 //! - `rebindfolders_cross_mapping_resolves_ambiguous_archive`
-//!   covers the post-pass. Whole-account sync with INBOX seeded
-//!   to a heavily-pure majority and a small multi-mailbox subset
-//!   in `{INBOX, Archive}`, plus one unique email seeded into each
-//!   of Stalwart's auto-provisioned role mailboxes (Sent, Drafts,
-//!   Junk, Trash) so those probe to clean per-folder consensus
-//!   binds rather than `NoMessageIds` skips that would break the
-//!   cross-mapping precondition. After the full nuke, INBOX
-//!   consensus-binds on its pure majority, the role mailboxes
+//!   covers the post-pass. Whole-account sync with INBOX seeded to
+//!   a heavily-pure majority, four of whose Message-IDs are also
+//!   seeded into Archive as distinct emails so the same headers
+//!   resolve to `{INBOX, Archive}`, plus one unique email seeded
+//!   into each of Stalwart's auto-provisioned role mailboxes (Sent,
+//!   Drafts, Junk, Trash) so those probe to clean per-folder
+//!   consensus binds rather than `NoMessageIds` skips that would
+//!   break the cross-mapping precondition. After the full nuke,
+//!   INBOX consensus-binds on its pure majority, the role mailboxes
 //!   each consensus-bind on their single seeded sample, and the
 //!   cross-mapping pass forces Archive's strict feasibility from
 //!   `{INBOX, Archive}` to `{Archive}` via the unclaimed-pool
@@ -39,7 +40,7 @@
 
 mod common;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use jma_mail::config::{
     AccountConfig, AllowDestructiveFolderSync, Config, ConflictStrategy, FolderLayout, StateConfig,
     SyncConfig, WatchConfig,
@@ -51,8 +52,6 @@ use jma_mail::maildir_ops::sentinel;
 use jma_mail::state::{db, queries};
 use jma_mail::sync::engine::SyncEngine;
 use jmap_client::client::{Client, Credentials};
-use jmap_client::core::query::Filter as CoreFilter;
-use jmap_client::email::query::Filter as EmailFilter;
 use jmap_client::mailbox::Role;
 
 #[tokio::test]
@@ -254,14 +253,14 @@ async fn rebindfolders_cross_mapping_resolves_ambiguous_archive() {
         .await
         .expect("spawn Stalwart fixture");
 
-    // 30 unique Message-IDs into INBOX. 26 stay pure-INBOX; 4 get
-    // Archive added via JMAP Email/set below, so Archive's local
-    // maildir ends up holding only that 4-multi-mailbox slice. The
-    // 26-pure majority pushes INBOX's per-folder consensus past any
-    // plausible flake threshold: under the M=3, N=4 partition the
-    // chance an entire group of four shuffled samples lands all-
-    // multi (the only path to a non-singleton narrow on INBOX) is
-    // negligible at this ratio.
+    // 30 unique Message-IDs into INBOX. 26 stay pure-INBOX; 4 of
+    // those headers are also seeded into Archive as distinct emails
+    // below, so Archive's maildir ends up holding only that
+    // 4-message shared slice. The 26-pure majority pushes INBOX's
+    // per-folder consensus past any plausible flake threshold: under
+    // the M=3, N=4 partition the chance an entire group of four
+    // shuffled samples lands all-shared (the only path to a non-
+    // singleton narrow on INBOX) is negligible at this ratio.
     let mut seeds = Vec::with_capacity(30);
     for i in 0..30 {
         seeds.push(
@@ -273,12 +272,11 @@ async fn rebindfolders_cross_mapping_resolves_ambiguous_archive() {
         .await
         .expect("seed INBOX with 30 unique Message-IDs");
 
-    // Direct jmap-client for the Email/set move and Mailbox/set
-    // create steps so a regression in jma's outbound JMAP shape
-    // can't silently invalidate the seed. The INBOX-id lookup
-    // below does reach into one jma helper for ergonomics; the
-    // load-bearing assertion path (the rebindfolders probe) is what
-    // matters for independence.
+    // Direct jmap-client for role-folder discovery and the Archive
+    // Mailbox/set create so a regression in jma's outbound JMAP
+    // shape can't silently invalidate the seed. The load-bearing
+    // assertion path (the rebindfolders probe) is what matters for
+    // independence.
     let admin = connect_admin_client(&fx)
         .await
         .expect("connect admin jmap-client");
@@ -331,56 +329,31 @@ async fn rebindfolders_cross_mapping_resolves_ambiguous_archive() {
         })
         .expect("create Archive mailbox");
 
-    // Discover INBOX's id via Mailbox/get so we can scope the
-    // Email/query that pulls the seeded ids.
-    let inbox_id = jma_mail::jmap::mailbox::get_all(&admin)
+    // Seed the same four Message-IDs that lead INBOX's corpus into
+    // Archive as four *distinct* server emails. jma deposits each
+    // email into exactly one maildir (one mailbox per `mailbox_ids`
+    // membership), so a second email sharing a header is how the
+    // same logical message comes to sit in two folders on disk --
+    // the shape an account reaches when a message is filed in INBOX
+    // and copied to Archive (IMAP COPY mints a second email with the
+    // same Message-ID). The probe unions mailbox membership per
+    // Message-ID (`intersect_mailboxes_by_sample`), so these four
+    // shared headers resolve to {INBOX, Archive}: Archive's per-
+    // folder probe lands on `AmbiguousAcrossSamples` while INBOX's
+    // pure-majority corpus still consensus-binds. Using two single-
+    // membership emails rather than one {INBOX, Archive} email keeps
+    // the on-disk deposit deterministic -- `process_remote_emails`
+    // routes each email by its sole binding, with no dependence on
+    // mailbox iteration order.
+    let archive_seeds: Vec<common::SeedMessage> = (0..4)
+        .map(|i| {
+            common::SeedMessage::simple("sender@example.com", &format!("Inbox-{i}"), "body")
+                .with_message_id(&format!("<cross-{i}@test.local>"))
+        })
+        .collect();
+    common::seed_folder(&fx, "Archive", &archive_seeds)
         .await
-        .expect("Mailbox/get for INBOX lookup")
-        .into_iter()
-        .find(|m| m.role.as_deref() == Some("inbox"))
-        .expect("Stalwart should expose an inbox role mailbox after first APPEND")
-        .id;
-
-    // Email/query in INBOX to recover the seeded ids. Take any 4
-    // to flip to multi-mailbox -- which 4 doesn't matter because
-    // the per-folder probe samples randomly from disk against the
-    // multi-mailbox membership of whichever ids surface.
-    let in_inbox = CoreFilter::and([EmailFilter::in_mailbox(inbox_id.as_ref())]);
-    let inbox_email_ids = with_seeded_ids(&admin, in_inbox)
-        .await
-        .expect("Email/query against INBOX");
-    assert_eq!(
-        inbox_email_ids.len(),
-        30,
-        "INBOX should contain exactly the 30 seeded messages"
-    );
-
-    // Set mailbox_ids = {INBOX, Archive} on the first 4 emails.
-    // Full-replacement update (jmap-client's mailbox_ids() call
-    // mirrors the same shape jma's set_email_batch uses for moves).
-    let multi_ids: Vec<&str> = inbox_email_ids.iter().take(4).map(|s| s.as_str()).collect();
-    {
-        let mut request = admin.build();
-        {
-            let set = request.set_email().account_id(admin.default_account_id());
-            for id in &multi_ids {
-                set.update(*id)
-                    .mailbox_ids([inbox_id.as_ref(), archive_id.as_ref()].iter().copied());
-            }
-        }
-        let response = request
-            .send_single::<jmap_client::core::response::EmailSetResponse>()
-            .await
-            .expect("Email/set add-Archive request");
-        let failures: Vec<String> = response
-            .not_updated_ids()
-            .map(|iter| iter.cloned().collect())
-            .unwrap_or_default();
-        assert!(
-            failures.is_empty(),
-            "no per-id failures expected; got: {failures:?}"
-        );
-    }
+        .expect("seed Archive with the four shared Message-IDs");
 
     // Initial sync with no mailbox filter so every server mailbox
     // gets a local maildir -- the cross-mapping precondition
@@ -518,23 +491,4 @@ async fn connect_admin_client(fx: &common::JmapFixture) -> Result<Client> {
         .connect(&fx.session_url)
         .await
         .map_err(|e| anyhow!("connect jmap-client to fixture: {e}"))
-}
-
-/// Run an Email/query filter against the fixture and return the
-/// matched ids in their server-returned order.
-async fn with_seeded_ids(admin: &Client, filter: CoreFilter<EmailFilter>) -> Result<Vec<String>> {
-    let mut request = admin.build();
-    let q = request.query_email().account_id(admin.default_account_id());
-    q.filter(filter);
-    let response = request
-        .send()
-        .await
-        .context("Email/query against fixture")?;
-    let parsed = response
-        .unwrap_method_responses()
-        .pop()
-        .context("no Email/query response")?
-        .unwrap_query_email()
-        .context("parse Email/query response")?;
-    Ok(parsed.ids().iter().map(|s| s.to_string()).collect())
 }
