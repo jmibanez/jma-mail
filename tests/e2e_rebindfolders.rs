@@ -1,32 +1,33 @@
 //! End-to-end rebindfolders against a real Stalwart Mail container.
 //!
 //! The wiremock test in `tests/engine_jmap.rs` proves we send what
-//! we think we send. This e2e is intended to prove the *server*
-//! interprets what we send the way we expect -- specifically:
+//! we think we send. The two e2e cases in this file prove the
+//! *server* interprets what we send the way we expect across two
+//! resolution paths the per-folder probe and its cross-mapping
+//! post-pass take:
 //!
-//! - That the `header` filter with a Message-ID value matches
-//!   against the bracketed form stored in the server's index (the
-//!   RFC 8621 4.4.1 substring rule the algorithm builds on).
-//! - That `Filter::or` over multiple `header` conditions
-//!   round-trips through jmap-client's JSON encoding into something
-//!   the server's query engine accepts and dispatches correctly.
-//! - That `Email/get` returning `mailboxIds` for each matched id
-//!   gives us the membership map the intersection step needs.
-//! - That a fresh sentinel written by `rebindfolders::apply`
-//!   round-trips through subsequent reads with the bound mailbox
-//!   id intact.
+//! - `rebindfolders_rebinds_inbox_after_db_nuke_and_sentinel_loss`
+//!   covers the per-folder consensus path. INBOX-only sync, three
+//!   seeded messages, nuke INBOX's sentinel + state DB, expect a
+//!   single `Consensus`-tagged rebind to the originally-bound
+//!   INBOX id. Exercises the `header` filter's bracketed-Message-ID
+//!   match (RFC 8621 4.4.1 substring rule), `Filter::or` over
+//!   multiple `header` conditions, `Email/get` returning
+//!   `mailboxIds`, and the freshly-written sentinel round-tripping.
 //!
-//! Setup:
-//!  1. Spawn Stalwart, seed N messages into INBOX over IMAP APPEND.
-//!  2. Run `SyncEngine::sync` -- INBOX downloads, sentinel written,
-//!     mailbox_map populated. Capture the bound INBOX `jmap_
-//!     mailbox_id` to compare against.
-//!  3. Simulate sentinel loss + state-DB nuke: remove the
-//!     `.jma.mapping` file, drop the entire state DB.
-//!  4. Run `rebindfolders::run` against the fixture's live JMAP
-//!     endpoint.
-//!  5. Assert exactly one rebind candidate, pointing at INBOX,
-//!     binding to the same mailbox id captured in step 2.
+//! - `rebindfolders_cross_mapping_resolves_ambiguous_archive`
+//!   covers the post-pass. Whole-account sync with INBOX seeded
+//!   to a heavily-pure majority and a small multi-mailbox subset
+//!   in `{INBOX, Archive}`, plus one unique email seeded into each
+//!   of Stalwart's auto-provisioned role mailboxes (Sent, Drafts,
+//!   Junk, Trash) so those probe to clean per-folder consensus
+//!   binds rather than `NoMessageIds` skips that would break the
+//!   cross-mapping precondition. After the full nuke, INBOX
+//!   consensus-binds on its pure majority, the role mailboxes
+//!   each consensus-bind on their single seeded sample, and the
+//!   cross-mapping pass forces Archive's strict feasibility from
+//!   `{INBOX, Archive}` to `{Archive}` via the unclaimed-pool
+//!   shrink left by the other consensus claims.
 //!
 //! Marked `#[ignore]` so the default `cargo test` invocation
 //! (and the existing `ci.yaml` build job) keeps working on machines
@@ -38,15 +39,21 @@
 
 mod common;
 
+use anyhow::{Context, Result, anyhow};
 use jma_mail::config::{
     AccountConfig, AllowDestructiveFolderSync, Config, ConflictStrategy, FolderLayout, StateConfig,
     SyncConfig, WatchConfig,
 };
+use jma_mail::ids::JmapMailboxId;
 use jma_mail::janitor::rebindfolders;
 use jma_mail::jmap::session;
 use jma_mail::maildir_ops::sentinel;
 use jma_mail::state::{db, queries};
 use jma_mail::sync::engine::SyncEngine;
+use jmap_client::client::{Client, Credentials};
+use jmap_client::core::query::Filter as CoreFilter;
+use jmap_client::email::query::Filter as EmailFilter;
+use jmap_client::mailbox::Role;
 
 #[tokio::test]
 #[ignore = "requires Docker; run via cargo test -- --ignored"]
@@ -175,6 +182,11 @@ async fn rebindfolders_rebinds_inbox_after_db_nuke_and_sentinel_loss() {
         "rebound id must match the originally synced INBOX id"
     );
     assert_eq!(candidate.server_name, "Inbox");
+    assert_eq!(
+        candidate.remote_path, "Inbox",
+        "remote_path is the user-facing identifier; for top-level \
+         INBOX it equals server_name"
+    );
     assert!(
         candidate.sample_count > 0,
         "at least one Message-ID must have been sampled and matched"
@@ -220,4 +232,307 @@ async fn rebindfolders_rebinds_inbox_after_db_nuke_and_sentinel_loss() {
             .any(|m| m.maildir_folder == "INBOX" && m.jmap_mailbox_id == expected_inbox_id),
         "post-sync mailbox_map must contain the rebound INBOX row"
     );
+}
+
+/// End-to-end validation of the cross-mapping post-pass. Sets up a
+/// fixture where the per-folder M-of-N consensus probe refuses one
+/// maildir (Archive) because every sample lives in two server-side
+/// mailboxes -- not because the algorithm is wrong, but because the
+/// content genuinely is ambiguous from Archive's local perspective.
+/// INBOX's content is asymmetric (mostly pure-INBOX, a minority
+/// shared with Archive) so its per-folder consensus binds cleanly.
+/// The cross-mapping pass then uses the bijection cardinality
+/// argument (i_total == n_disk) plus INBOX's claim shrinking the
+/// unclaimed pool to drive Archive's strict feasibility to exactly
+/// `{Archive}`, forcing the unique matching that promotes Archive
+/// with `ResolveSource::CrossMapping`.
+#[tokio::test]
+#[ignore = "requires Docker; run via cargo test -- --ignored"]
+async fn rebindfolders_cross_mapping_resolves_ambiguous_archive() {
+    let fx = common::spawn_stalwart()
+        .await
+        .expect("spawn Stalwart fixture");
+
+    // 30 unique Message-IDs into INBOX. 26 stay pure-INBOX; 4 get
+    // Archive added via JMAP Email/set below, so Archive's local
+    // maildir ends up holding only that 4-multi-mailbox slice. The
+    // 26-pure majority pushes INBOX's per-folder consensus past any
+    // plausible flake threshold: under the M=3, N=4 partition the
+    // chance an entire group of four shuffled samples lands all-
+    // multi (the only path to a non-singleton narrow on INBOX) is
+    // negligible at this ratio.
+    let mut seeds = Vec::with_capacity(30);
+    for i in 0..30 {
+        seeds.push(
+            common::SeedMessage::simple("sender@example.com", &format!("Inbox-{i}"), "body")
+                .with_message_id(&format!("<cross-{i}@test.local>")),
+        );
+    }
+    common::seed_inbox(&fx, &seeds)
+        .await
+        .expect("seed INBOX with 30 unique Message-IDs");
+
+    // Direct jmap-client for the Email/set move and Mailbox/set
+    // create steps so a regression in jma's outbound JMAP shape
+    // can't silently invalidate the seed. The INBOX-id lookup
+    // below does reach into one jma helper for ergonomics; the
+    // load-bearing assertion path (the rebindfolders probe) is what
+    // matters for independence.
+    let admin = connect_admin_client(&fx)
+        .await
+        .expect("connect admin jmap-client");
+
+    // Stalwart auto-provisions role mailboxes on account spawn.
+    // Whole-account sync pulls them in as empty maildirs which then
+    // probe to `NoMessageIds` -- a SkipReason the cross-mapping
+    // precondition rejects (it breaks the bijection assumption that
+    // every disk maildir corresponds to a server mailbox in this
+    // cycle's probe pool). Discover non-INBOX mailboxes via JMAP
+    // and seed one unique message into each so the per-folder pass
+    // binds them by consensus and removes them from the skip list
+    // before cross-mapping looks at the plan. Discovery beats
+    // hard-coding "Sent/Drafts/Junk/Trash": Stalwart's IMAP folder
+    // names for role mailboxes are not guaranteed to match those
+    // labels exactly across image tags, so going through Mailbox/get
+    // sources the names the server actually advertises.
+    let preexisting = jma_mail::jmap::mailbox::get_all(&admin)
+        .await
+        .expect("Mailbox/get for role-folder discovery");
+    for mb in &preexisting {
+        if mb.role.as_deref() == Some("inbox") {
+            continue;
+        }
+        common::seed_folder(
+            &fx,
+            &mb.name,
+            &[common::SeedMessage::simple(
+                "sender@example.com",
+                &format!("{}-bootstrap", mb.name),
+                "body",
+            )
+            .with_message_id(&format!(
+                "<{}-bootstrap@test.local>",
+                mb.name.to_lowercase().replace(' ', "-")
+            ))],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("seed {} with bootstrap message: {e}", mb.name));
+    }
+
+    let archive_id = admin
+        .mailbox_create("Archive".to_string(), None::<String>, Role::None)
+        .await
+        .map(|mb| {
+            JmapMailboxId::from(
+                mb.id()
+                    .expect("Mailbox/set create returned no id for Archive"),
+            )
+        })
+        .expect("create Archive mailbox");
+
+    // Discover INBOX's id via Mailbox/get so we can scope the
+    // Email/query that pulls the seeded ids.
+    let inbox_id = jma_mail::jmap::mailbox::get_all(&admin)
+        .await
+        .expect("Mailbox/get for INBOX lookup")
+        .into_iter()
+        .find(|m| m.role.as_deref() == Some("inbox"))
+        .expect("Stalwart should expose an inbox role mailbox after first APPEND")
+        .id;
+
+    // Email/query in INBOX to recover the seeded ids. Take any 4
+    // to flip to multi-mailbox -- which 4 doesn't matter because
+    // the per-folder probe samples randomly from disk against the
+    // multi-mailbox membership of whichever ids surface.
+    let in_inbox = CoreFilter::and([EmailFilter::in_mailbox(inbox_id.as_ref())]);
+    let inbox_email_ids = with_seeded_ids(&admin, in_inbox)
+        .await
+        .expect("Email/query against INBOX");
+    assert_eq!(
+        inbox_email_ids.len(),
+        30,
+        "INBOX should contain exactly the 30 seeded messages"
+    );
+
+    // Set mailbox_ids = {INBOX, Archive} on the first 4 emails.
+    // Full-replacement update (jmap-client's mailbox_ids() call
+    // mirrors the same shape jma's set_email_batch uses for moves).
+    let multi_ids: Vec<&str> = inbox_email_ids.iter().take(4).map(|s| s.as_str()).collect();
+    {
+        let mut request = admin.build();
+        {
+            let set = request.set_email().account_id(admin.default_account_id());
+            for id in &multi_ids {
+                set.update(*id)
+                    .mailbox_ids([inbox_id.as_ref(), archive_id.as_ref()].iter().copied());
+            }
+        }
+        let response = request
+            .send_single::<jmap_client::core::response::EmailSetResponse>()
+            .await
+            .expect("Email/set add-Archive request");
+        let failures: Vec<String> = response
+            .not_updated_ids()
+            .map(|iter| iter.cloned().collect())
+            .unwrap_or_default();
+        assert!(
+            failures.is_empty(),
+            "no per-id failures expected; got: {failures:?}"
+        );
+    }
+
+    // Initial sync with no mailbox filter so every server mailbox
+    // gets a local maildir -- the cross-mapping precondition
+    // demands i_total == n_disk, and with the filter empty Stalwart's
+    // role mailboxes plus the explicit Archive form the bijection.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let db_path = temp.path().join("state.db");
+    let config = Config {
+        account: AccountConfig {
+            email: fx.account_email.clone(),
+            token: Some(fx.bearer.clone()),
+            session_url: Some(fx.session_url.clone()),
+        },
+        sync: SyncConfig {
+            maildir_path: temp.path().to_string_lossy().into_owned(),
+            mailboxes: vec![],
+            conflict_strategy: ConflictStrategy::ServerWins,
+            case_insensitive_match: false,
+            folder_layout: FolderLayout::Fs,
+            hierarchy_separator: '/',
+            download_concurrency: 2,
+            upload_concurrency: 2,
+            retry_max_attempts: 1,
+            retry_initial_backoff_ms: 1,
+            retry_max_backoff_ms: 1,
+            allow_destructive_folder_sync: AllowDestructiveFolderSync::None,
+        },
+        state: StateConfig {
+            db_path: Some(db_path.to_string_lossy().into_owned()),
+        },
+        watch: WatchConfig::default(),
+        rename_rules: Vec::new(),
+        compiled_rename_rules: Vec::new(),
+    };
+
+    let archive_path = temp.path().join("Archive");
+    let inbox_path = temp.path().join("INBOX");
+    {
+        let conn = db::open_or_recreate(&db_path).expect("open state DB");
+        SyncEngine::sync(&conn, &config, false)
+            .await
+            .expect("initial sync against fixture");
+    }
+    assert!(inbox_path.join("cur").is_dir(), "INBOX/cur written by sync");
+    assert!(
+        archive_path.join("cur").is_dir(),
+        "Archive/cur written by sync"
+    );
+
+    // Capture expected ids from the freshly-written sentinels so the
+    // cross-mapping rebind assertion has a ground truth.
+    let pre_archive = sentinel::read(&archive_path)
+        .expect("read Archive sentinel")
+        .expect("sentinel written for Archive by sync");
+    assert_eq!(pre_archive.jmap_mailbox_id, archive_id);
+
+    // Nuke EVERY sentinel under the maildir root plus the state DB.
+    // walk_for_orphans treats sentinel-survives folders as already
+    // bound (drops them from the orphan list) and the cross-mapping
+    // precondition needs every disk maildir to enter the orphan +
+    // probe path, so leaving any survivor would shrink n_disk.
+    for entry in std::fs::read_dir(temp.path()).expect("read maildir root") {
+        let path = entry.expect("dir entry").path();
+        if path.join("cur").is_dir() {
+            sentinel::remove(&path).expect("remove sentinel");
+        }
+    }
+    std::fs::remove_file(&db_path).expect("drop state DB");
+    for sib in ["-wal", "-shm"] {
+        let mut p = db_path.as_os_str().to_owned();
+        p.push(sib);
+        let _ = std::fs::remove_file(std::path::PathBuf::from(p));
+    }
+
+    // Fresh DB + JMAP client. plan() runs the per-folder probe and
+    // the cross-mapping post-pass internally; the returned plan is
+    // the composed result.
+    let conn = db::open_or_recreate(&db_path).expect("reopen fresh state DB");
+    let client = session::connect(&config.account, &conn)
+        .await
+        .expect("connect to fixture JMAP");
+    let plan = rebindfolders::plan(
+        &client,
+        &conn,
+        temp.path(),
+        rebindfolders::DEFAULT_SAMPLE_SIZE,
+    )
+    .await
+    .expect("rebindfolders::plan against live Stalwart");
+
+    let archive_candidate = plan
+        .candidates
+        .iter()
+        .find(|c| c.folder_path == archive_path)
+        .unwrap_or_else(|| {
+            panic!(
+                "Archive should be a rebind candidate; plan was: candidates={:?}, skipped={:?}",
+                plan.candidates, plan.skipped
+            )
+        });
+    assert_eq!(
+        archive_candidate.source,
+        rebindfolders::ResolveSource::CrossMapping,
+        "Archive should be promoted via the cross-mapping post-pass"
+    );
+    assert_eq!(
+        archive_candidate.jmap_mailbox_id, archive_id,
+        "cross-mapping must rebind Archive to its original server id"
+    );
+    assert_eq!(
+        archive_candidate.remote_path, "Archive",
+        "cross-mapping candidate carries the user-facing remote_path"
+    );
+
+    let inbox_candidate = plan
+        .candidates
+        .iter()
+        .find(|c| c.folder_path == inbox_path)
+        .expect("INBOX should rebind via per-folder consensus");
+    assert_eq!(
+        inbox_candidate.source,
+        rebindfolders::ResolveSource::Consensus,
+        "INBOX's per-folder probe should consensus-bind given the asymmetric content"
+    );
+}
+
+/// Connect a fresh `jmap-client` `Client` to the fixture for direct
+/// server-side manipulation. Independent of `jma_mail`'s own JMAP
+/// helpers so a regression in those does not silently invalidate the
+/// fixture-side state the cross-mapping assertion drives off.
+async fn connect_admin_client(fx: &common::JmapFixture) -> Result<Client> {
+    Client::new()
+        .credentials(Credentials::bearer(&fx.bearer))
+        .connect(&fx.session_url)
+        .await
+        .map_err(|e| anyhow!("connect jmap-client to fixture: {e}"))
+}
+
+/// Run an Email/query filter against the fixture and return the
+/// matched ids in their server-returned order.
+async fn with_seeded_ids(admin: &Client, filter: CoreFilter<EmailFilter>) -> Result<Vec<String>> {
+    let mut request = admin.build();
+    let q = request.query_email().account_id(admin.default_account_id());
+    q.filter(filter);
+    let response = request
+        .send()
+        .await
+        .context("Email/query against fixture")?;
+    let parsed = response
+        .unwrap_method_responses()
+        .pop()
+        .context("no Email/query response")?
+        .unwrap_query_email()
+        .context("parse Email/query response")?;
+    Ok(parsed.ids().iter().map(|s| s.to_string()).collect())
 }

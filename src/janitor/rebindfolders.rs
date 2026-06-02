@@ -86,6 +86,26 @@
 //! K and form fewer or partial groups) honestly degrades the
 //! consensus signal in that case rather than masking the reduced
 //! coverage.
+//!
+//! After the per-folder pass, a cross-mapping pass runs over any
+//! `AmbiguousAcrossSamples` results. The bijection assumption (each
+//! maildir corresponds to exactly one server mailbox) plus the
+//! cardinality match (server mailbox count equals on-disk maildir
+//! count, no NoMessageIds / NoServerMatches in this cycle) turns
+//! the remaining ambiguity into a bipartite-matching problem
+//! between ambiguous maildirs and still-unclaimed server mailboxes.
+//! Strict feasibility -- a maildir is feasible for a mailbox iff
+//! that mailbox is in every non-empty per-group narrowed set --
+//! prunes the graph; a unique perfect matching then promotes each
+//! ambiguous skip to a `RebindCandidate` tagged
+//! `ResolveSource::CrossMapping`. The `i_total == N_disk`
+//! precondition uses the unfiltered server list on purpose: the
+//! disk reflects historical sync state, the `[sync].mailboxes`
+//! filter is a runtime decision that may have changed since the
+//! maildirs landed, and trusting the filter would risk misbinding
+//! across a boundary the user configured for a reason. Non-unique
+//! or absent matchings keep the original AmbiguousAcrossSamples
+//! skip in place rather than guessing.
 
 use anyhow::{Context, Result};
 use jmap_client::client::Client;
@@ -137,8 +157,35 @@ pub struct RebindCandidate {
     pub folder_path: PathBuf,
     pub jmap_mailbox_id: JmapMailboxId,
     pub server_name: String,
+    /// Slash-joined server-side hierarchy path -- the user-facing
+    /// identifier for the bound mailbox (e.g. `INBOX`, `Folders/
+    /// Archive`). Carried alongside `jmap_mailbox_id` because the
+    /// operator-visible report refers to mailboxes by path, not
+    /// by opaque server token.
+    pub remote_path: String,
     pub parent_jmap_mailbox_id: Option<JmapMailboxId>,
     pub sample_count: usize,
+    pub source: ResolveSource,
+}
+
+/// How a `RebindCandidate` arrived at its binding -- surfaced in the
+/// operator-facing report so the operator can see whether the choice
+/// rests on the per-folder consensus alone or on the cross-folder
+/// cardinality argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolveSource {
+    /// Per-folder M-of-N consensus narrowed to a single mailbox.
+    /// Strongest signal: the folder's own samples pointed at the
+    /// binding without help.
+    Consensus,
+    /// The per-folder probe was `AmbiguousAcrossSamples`, but a
+    /// unique perfect matching from the ambiguous-maildir set to
+    /// the unclaimed-mailbox set forced the assignment under the
+    /// strict feasibility test. Implies the bipartite-matching
+    /// preconditions held: server mailbox count equals on-disk
+    /// maildir count and no folder probed to NoMessageIds /
+    /// NoServerMatches in this cycle.
+    CrossMapping,
 }
 
 /// One folder the planner refused to rebind, paired with the reason
@@ -176,6 +223,12 @@ pub enum SkipReason {
 pub struct RebindFoldersPlan {
     pub candidates: Vec<RebindCandidate>,
     pub skipped: Vec<SkippedFolder>,
+    /// Lookup the operator-facing render uses to translate the
+    /// id-typed entries inside `SkipReason::AmbiguousAcrossSamples`
+    /// into user-readable remote_paths at print time. Empty when
+    /// the plan is constructed in a unit test fixture; populated
+    /// from `Mailbox/get` at the head of `plan()`.
+    pub remote_paths: HashMap<JmapMailboxId, String>,
 }
 
 /// Build a rebind plan against the live server. Pure plan; nothing
@@ -196,12 +249,45 @@ pub async fn plan(
         .map(|mb| (mb.id.clone(), mb))
         .collect();
 
+    // Reuse `sync::engine`'s remote_path primitives: sort by parent
+    // chain depth so each iteration sees its parent's already-
+    // computed path, then compose per mailbox. Same shape as the
+    // engine's topological pre-pass in `resolve_mailboxes`.
+    let mut ordered: Vec<&MailboxObject> = by_id.values().copied().collect();
+    ordered.sort_by_key(|mb| crate::sync::engine::parent_chain_depth(mb, &by_id));
+    let mut remote_paths: HashMap<JmapMailboxId, String> = HashMap::new();
+    for mb in &ordered {
+        let path = crate::sync::engine::compose_remote_path(
+            mb.parent_id.as_ref(),
+            &mb.name,
+            &remote_paths,
+        );
+        remote_paths.insert(mb.id.clone(), path);
+    }
+
     let bound_folders: HashSet<String> = queries::list_known_maildir_folders(conn)?
         .into_iter()
         .collect();
 
     let orphans = walk_for_orphans(maildir_root, &by_id, &bound_folders);
     info!("rebindfolders: found {} candidate folder(s)", orphans.len());
+
+    // Cross-mapping precondition input: maildir count visible to the
+    // cache + orphan layer. Counts `bound_folders` (mailbox_map rows
+    // with a folder name on disk) plus `orphans` (unclaimed
+    // candidates `walk_for_orphans` returned). Does *not* count
+    // sentinel-survives-but-cache-lost maildirs -- those are dropped
+    // by `walk_for_orphans` because their `.jma.mapping` points at a
+    // known server mailbox. In a state-DB-nuke recovery where
+    // sentinels survived for some maildirs and were lost for others,
+    // `n_disk` undercounts by the survivor population and the
+    // `i_total == n_disk` gate fails closed -- cross-mapping skips
+    // and the per-folder report still surfaces the ambiguous
+    // remnants. Acceptable as conservatism: the alternative is a
+    // second disk walk to enumerate sentinel survivors plus the
+    // unclaimed-pool adjustment, and the partial-state setup it
+    // targets is uncommon.
+    let n_disk = bound_folders.len() + orphans.len();
 
     let mut plan = RebindFoldersPlan::default();
     let get_cap = limits::max_objects_in_get(client);
@@ -213,6 +299,7 @@ pub async fn plan(
             DEFAULT_GROUP_COUNT,
             get_cap,
             &by_id,
+            &remote_paths,
         )
         .await?
         {
@@ -223,12 +310,18 @@ pub async fn plan(
                 let mb = by_id
                     .get(&jmap_mailbox_id)
                     .with_context(|| format!("intersection picked unknown id {jmap_mailbox_id}"))?;
+                let remote_path = remote_paths
+                    .get(&jmap_mailbox_id)
+                    .cloned()
+                    .expect("remote_paths populated for every server-known mailbox");
                 plan.candidates.push(RebindCandidate {
                     folder_path,
                     jmap_mailbox_id: mb.id.clone(),
                     server_name: mb.name.clone(),
+                    remote_path,
                     parent_jmap_mailbox_id: mb.parent_id.clone(),
                     sample_count,
+                    source: ResolveSource::Consensus,
                 });
             }
             ProbeOutcome::Skip(reason) => {
@@ -239,7 +332,207 @@ pub async fn plan(
             }
         }
     }
+
+    // Cross-mapping pass: see module docs. Promotes
+    // `AmbiguousAcrossSamples` skips to `CrossMapping` candidates
+    // when the preconditions hold.
+    cross_resolve_ambiguous(&mut plan, conn, &by_id, &remote_paths, n_disk)?;
+
+    plan.remote_paths = remote_paths;
     Ok(plan)
+}
+
+/// Promote `AmbiguousAcrossSamples` skips to Binds when the bipartite
+/// matching between ambiguous maildirs and unclaimed server mailboxes
+/// has a unique perfect solution under strict feasibility.
+///
+/// Preconditions, any of which short-circuits to a no-op:
+/// - Server mailbox count must equal on-disk maildir count
+///   (`i_total == N_disk`). The disk-side filter is deliberately
+///   ignored -- the disk reflects historical sync state, the
+///   `[sync].mailboxes` filter is a runtime decision that may have
+///   changed since the maildirs landed, and trusting it would risk
+///   misbinding across a filter boundary the user configured for a
+///   reason.
+/// - Every orphan must have resolved to either Consensus (already
+///   on `plan.candidates`) or AmbiguousAcrossSamples. Any other
+///   skip reason (NoMessageIds, NoServerMatches) breaks the
+///   bijection assumption: a folder with no server-side match
+///   doesn't correspond to a server mailbox in this cycle.
+/// - The count of ambiguous maildirs must equal the count of
+///   still-unclaimed server mailboxes (mailboxes neither in
+///   `mailbox_map` nor in this cycle's Consensus binds). With the
+///   first two preconditions met this is algebraic; the explicit
+///   check is a belt-and-braces guard.
+///
+/// Strict feasibility: a maildir is feasible for a mailbox iff the
+/// mailbox is in every non-empty per-group narrowed set for that
+/// maildir and is in the unclaimed pool. Empty per-group sets
+/// abstain rather than disqualify -- a group whose samples are all
+/// server-side absent (deleted between cycles) carries no
+/// constraint, but isn't a vote *against* any mailbox either.
+///
+/// Uniqueness: standard bipartite matching can find a perfect
+/// matching when one exists; uniqueness needs a separate check.
+/// The implementation enumerates matchings via backtracking,
+/// capping the collection at two so non-uniqueness shows up as
+/// `found.len() > 1` without continuing to enumerate. Non-unique
+/// matchings keep the original AmbiguousAcrossSamples skip in
+/// place -- picking one arbitrarily would push the same "guessing"
+/// risk up one level.
+fn cross_resolve_ambiguous(
+    plan: &mut RebindFoldersPlan,
+    conn: &Connection,
+    by_id: &HashMap<JmapMailboxId, &MailboxObject>,
+    remote_paths: &HashMap<JmapMailboxId, String>,
+    n_disk: usize,
+) -> Result<()> {
+    if by_id.len() != n_disk {
+        return Ok(());
+    }
+    let all_ambiguous = plan
+        .skipped
+        .iter()
+        .all(|s| matches!(s.reason, SkipReason::AmbiguousAcrossSamples { .. }));
+    if !all_ambiguous {
+        return Ok(());
+    }
+    let ambiguous: Vec<(PathBuf, Vec<Vec<JmapMailboxId>>)> = plan
+        .skipped
+        .iter()
+        .filter_map(|s| match &s.reason {
+            SkipReason::AmbiguousAcrossSamples { per_group } => {
+                Some((s.folder_path.clone(), per_group.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    if ambiguous.is_empty() {
+        return Ok(());
+    }
+
+    let already_claimed: HashSet<JmapMailboxId> =
+        queries::list_known_mailbox_ids(conn)?.into_iter().collect();
+    let cycle_claimed: HashSet<JmapMailboxId> = plan
+        .candidates
+        .iter()
+        .map(|c| c.jmap_mailbox_id.clone())
+        .collect();
+    let unclaimed: HashSet<JmapMailboxId> = by_id
+        .keys()
+        .filter(|id| !already_claimed.contains(*id) && !cycle_claimed.contains(*id))
+        .cloned()
+        .collect();
+
+    if ambiguous.len() != unclaimed.len() {
+        return Ok(());
+    }
+
+    let feasibility: Vec<Vec<JmapMailboxId>> = ambiguous
+        .iter()
+        .map(|(_, per_group)| strict_feasibility(per_group, &unclaimed))
+        .collect();
+
+    let Some(matching) = unique_perfect_matching(&feasibility) else {
+        return Ok(());
+    };
+
+    let promoted_paths: HashSet<PathBuf> = ambiguous.iter().map(|(p, _)| p.clone()).collect();
+    for (i, (folder_path, _)) in ambiguous.into_iter().enumerate() {
+        let mailbox_id = matching[i].clone();
+        let mb = by_id
+            .get(&mailbox_id)
+            .with_context(|| format!("cross-mapping picked unknown id {mailbox_id}"))?;
+        let remote_path = remote_paths
+            .get(&mailbox_id)
+            .cloned()
+            .expect("remote_paths populated for every server-known mailbox");
+        debug!(
+            "rebindfolders: {} -> {} (via cross-mapping)",
+            folder_path.display(),
+            remote_path
+        );
+        plan.candidates.push(RebindCandidate {
+            folder_path,
+            jmap_mailbox_id: mb.id.clone(),
+            server_name: mb.name.clone(),
+            remote_path,
+            parent_jmap_mailbox_id: mb.parent_id.clone(),
+            sample_count: 0,
+            source: ResolveSource::CrossMapping,
+        });
+    }
+    plan.skipped
+        .retain(|s| !promoted_paths.contains(&s.folder_path));
+    Ok(())
+}
+
+/// Strict feasibility set for one ambiguous maildir: intersection of
+/// every non-empty per-group narrowed set, then intersected with the
+/// unclaimed pool. Operates on `JmapMailboxId` because that's what
+/// the consensus probe binds (and the cross-mapping post-pass
+/// consumes); the remote_path conversion lives at the operator-
+/// facing render boundary.
+fn strict_feasibility(
+    per_group: &[Vec<JmapMailboxId>],
+    unclaimed: &HashSet<JmapMailboxId>,
+) -> Vec<JmapMailboxId> {
+    let non_empty: Vec<&Vec<JmapMailboxId>> = per_group.iter().filter(|g| !g.is_empty()).collect();
+    if non_empty.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<JmapMailboxId> = non_empty[0]
+        .iter()
+        .filter(|id| non_empty.iter().all(|g| g.contains(*id)) && unclaimed.contains(*id))
+        .cloned()
+        .collect();
+    out.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+    out
+}
+
+/// Return Some(matching) iff exactly one perfect matching exists from
+/// the feasibility constraints. Backtracking enumeration short-circuits
+/// after the second matching is discovered; typical k is small (1-5),
+/// so even the worst-case k! enumeration is cheap.
+fn unique_perfect_matching(feasibility: &[Vec<JmapMailboxId>]) -> Option<Vec<JmapMailboxId>> {
+    if feasibility.is_empty() {
+        return None;
+    }
+    let mut current: Vec<JmapMailboxId> = Vec::with_capacity(feasibility.len());
+    let mut used: HashSet<JmapMailboxId> = HashSet::new();
+    let mut found: Vec<Vec<JmapMailboxId>> = Vec::new();
+    enumerate_matchings(feasibility, 0, &mut current, &mut used, &mut found, 2);
+    (found.len() == 1).then(|| found.into_iter().next().expect("len == 1"))
+}
+
+fn enumerate_matchings(
+    feasibility: &[Vec<JmapMailboxId>],
+    i: usize,
+    current: &mut Vec<JmapMailboxId>,
+    used: &mut HashSet<JmapMailboxId>,
+    found: &mut Vec<Vec<JmapMailboxId>>,
+    cap: usize,
+) {
+    if found.len() >= cap {
+        return;
+    }
+    if i == feasibility.len() {
+        found.push(current.clone());
+        return;
+    }
+    for candidate in &feasibility[i] {
+        if used.contains(candidate) {
+            continue;
+        }
+        used.insert(candidate.clone());
+        current.push(candidate.clone());
+        enumerate_matchings(feasibility, i + 1, current, used, found, cap);
+        current.pop();
+        used.remove(candidate);
+        if found.len() >= cap {
+            return;
+        }
+    }
 }
 
 /// Write the sentinel for each rebind candidate in `plan`. Returns
@@ -256,10 +549,9 @@ pub fn apply(plan: &RebindFoldersPlan) -> Result<usize> {
             },
         )?;
         info!(
-            "rebindfolders: bound {} to {} ({})",
+            "rebindfolders: bound {} to {}",
             c.folder_path.display(),
-            c.jmap_mailbox_id,
-            c.server_name
+            c.remote_path,
         );
     }
     Ok(plan.candidates.len())
@@ -293,7 +585,11 @@ enum ProbeOutcome {
 /// Probe a single orphan: sample its Message-IDs in `group_count`
 /// independent PRNG-shuffled groups of `samples_per_group` each,
 /// query the server with a single flat `Email/query`, then check
-/// consensus across groups.
+/// consensus across groups. `remote_paths` is the by-id remote-path
+/// lookup needed to render the `AmbiguousAcrossSamples` skip in
+/// user-facing terms; only the skip arm reads it, but threading it
+/// through the bind arm too would mean the skip arm couldn't be
+/// constructed at the probe boundary without a follow-up pass.
 async fn probe_folder(
     client: &Client,
     folder_path: &Path,
@@ -301,6 +597,7 @@ async fn probe_folder(
     group_count: usize,
     get_cap: usize,
     by_id: &HashMap<JmapMailboxId, &MailboxObject>,
+    remote_paths: &HashMap<JmapMailboxId, String>,
 ) -> Result<ProbeOutcome> {
     let groups = sample_message_id_groups(folder_path, group_count, samples_per_group)?;
     if groups.is_empty() {
@@ -350,10 +647,14 @@ async fn probe_folder(
 
     match consensus {
         Some(id) => {
+            let path_display = remote_paths
+                .get(&id)
+                .map(String::as_str)
+                .unwrap_or_else(|| id.as_ref());
             debug!(
                 "rebindfolders: {} -> {} (consensus across {} group(s), {} sample(s) total)",
                 folder_path.display(),
-                id,
+                path_display,
                 groups.len(),
                 total_samples,
             );
@@ -961,15 +1262,334 @@ mod tests {
                 folder_path: target.clone(),
                 jmap_mailbox_id: JmapMailboxId::from("MB-LOST"),
                 server_name: "Lost".to_string(),
+                remote_path: "Lost".to_string(),
                 parent_jmap_mailbox_id: None,
                 sample_count: 3,
+                source: ResolveSource::Consensus,
             }],
             skipped: vec![],
+            remote_paths: HashMap::new(),
         };
         let n = apply(&plan).unwrap();
         assert_eq!(n, 1);
         let got = sentinel::read(&target).unwrap().expect("sentinel written");
         assert_eq!(got.jmap_mailbox_id, JmapMailboxId::from("MB-LOST"));
         assert_eq!(got.server_name, "Lost");
+    }
+
+    fn mid(s: &str) -> JmapMailboxId {
+        JmapMailboxId::from(s)
+    }
+
+    fn unclaimed_set(ids: &[&str]) -> HashSet<JmapMailboxId> {
+        ids.iter().map(|s| mid(s)).collect()
+    }
+
+    /// Every non-empty group narrows to the same single mailbox, the
+    /// rest abstain: feasibility is that single mailbox.
+    #[test]
+    fn feasibility_intersect_of_non_empty_groups() {
+        let per_group = vec![vec![mid("MB-A")], vec![mid("MB-A")], vec![]];
+        let unclaimed = unclaimed_set(&["MB-A", "MB-B"]);
+        assert_eq!(
+            strict_feasibility(&per_group, &unclaimed),
+            vec![mid("MB-A")]
+        );
+    }
+
+    /// Every per-group set is empty: feasibility is empty (no
+    /// non-empty groups to derive constraints from).
+    #[test]
+    fn feasibility_all_empty_groups_yields_empty() {
+        let per_group: Vec<Vec<JmapMailboxId>> = vec![vec![], vec![]];
+        let unclaimed = unclaimed_set(&["MB-A"]);
+        assert!(strict_feasibility(&per_group, &unclaimed).is_empty());
+    }
+
+    /// Intersection includes a mailbox that's already claimed in
+    /// this cycle: the unclaimed filter drops it.
+    #[test]
+    fn feasibility_filters_out_claimed_mailboxes() {
+        let per_group = vec![vec![mid("MB-A"), mid("MB-B")]];
+        let unclaimed = unclaimed_set(&["MB-B"]); // MB-A is claimed
+        assert_eq!(
+            strict_feasibility(&per_group, &unclaimed),
+            vec![mid("MB-B")]
+        );
+    }
+
+    /// Two groups disagree: intersection is empty even though each
+    /// group is a singleton. (This is the case the per-folder
+    /// consensus check already refuses; cross-mapping would
+    /// inherit the empty feasibility and contribute nothing useful.)
+    #[test]
+    fn feasibility_disjoint_singletons_yield_empty() {
+        let per_group = vec![vec![mid("MB-A")], vec![mid("MB-B")]];
+        let unclaimed = unclaimed_set(&["MB-A", "MB-B"]);
+        assert!(strict_feasibility(&per_group, &unclaimed).is_empty());
+    }
+
+    /// One maildir, one feasible mailbox: trivial unique matching.
+    #[test]
+    fn matching_k1_unique() {
+        let f = vec![vec![mid("MB-A")]];
+        assert_eq!(unique_perfect_matching(&f), Some(vec![mid("MB-A")]));
+    }
+
+    /// Two maildirs with constraints that force a unique assignment:
+    /// maildir 0 only feasible for MB-A, maildir 1 feasible for both
+    /// but MB-A is taken, so it goes to MB-B.
+    #[test]
+    fn matching_k2_constraints_force_unique() {
+        let f = vec![vec![mid("MB-A")], vec![mid("MB-A"), mid("MB-B")]];
+        assert_eq!(
+            unique_perfect_matching(&f),
+            Some(vec![mid("MB-A"), mid("MB-B")])
+        );
+    }
+
+    /// Two maildirs, each feasible for both of two mailboxes: two
+    /// valid matchings exist, so the call refuses.
+    #[test]
+    fn matching_k2_two_valid_refuses() {
+        let f = vec![
+            vec![mid("MB-A"), mid("MB-B")],
+            vec![mid("MB-A"), mid("MB-B")],
+        ];
+        assert_eq!(unique_perfect_matching(&f), None);
+    }
+
+    /// Two maildirs both feasible only for the same single mailbox:
+    /// no perfect matching exists. Refuses.
+    #[test]
+    fn matching_k2_no_valid_refuses() {
+        let f = vec![vec![mid("MB-A")], vec![mid("MB-A")]];
+        assert_eq!(unique_perfect_matching(&f), None);
+    }
+
+    /// One maildir whose feasibility list is empty: no perfect
+    /// matching exists. Refuses.
+    #[test]
+    fn matching_empty_feasibility_refuses() {
+        let f: Vec<Vec<JmapMailboxId>> = vec![vec![]];
+        assert_eq!(unique_perfect_matching(&f), None);
+    }
+
+    /// Empty input (no maildirs to match): also None. The caller is
+    /// expected to short-circuit on empty `ambiguous` before this is
+    /// even reached; the guard exists so the helper never panics on
+    /// an unexpected input shape.
+    #[test]
+    fn matching_zero_maildirs_returns_none() {
+        let f: Vec<Vec<JmapMailboxId>> = vec![];
+        assert_eq!(unique_perfect_matching(&f), None);
+    }
+
+    /// Helper to build a `RebindFoldersPlan` for cross-mapping tests
+    /// from a list of (folder_path, per_group) ambiguous skips.
+    fn ambig_plan(skips: Vec<(PathBuf, Vec<Vec<JmapMailboxId>>)>) -> RebindFoldersPlan {
+        RebindFoldersPlan {
+            candidates: vec![],
+            remote_paths: HashMap::new(),
+            skipped: skips
+                .into_iter()
+                .map(|(p, g)| SkippedFolder {
+                    folder_path: p,
+                    reason: SkipReason::AmbiguousAcrossSamples { per_group: g },
+                })
+                .collect(),
+        }
+    }
+
+    /// Set up an on-disk state DB with no `mailbox_map` rows so
+    /// every server mailbox is "still unclaimed" from the cache's
+    /// perspective. Returns the `TempDir` alongside the connection
+    /// so the caller can keep both alive for the test's scope; the
+    /// directory drops (and the file vanishes) when the binding
+    /// goes out of scope.
+    fn empty_db() -> (tempfile::TempDir, rusqlite::Connection) {
+        let dir = tempfile::tempdir().expect("tempdir for state DB");
+        let db_path = dir.path().join("state.db");
+        let conn = crate::state::db::open_or_recreate(&db_path).expect("open state DB");
+        (dir, conn)
+    }
+
+    /// Helper: build the `remote_paths` map directly from `by_id`.
+    /// All test mailboxes are top-level (parent_id = None), so the
+    /// path is just the leaf name.
+    fn flat_remote_paths(
+        by_id: &HashMap<JmapMailboxId, &MailboxObject>,
+    ) -> HashMap<JmapMailboxId, String> {
+        by_id
+            .iter()
+            .map(|(id, mb)| (id.clone(), mb.name.clone()))
+            .collect()
+    }
+
+    /// Precondition: server mailbox count must equal on-disk maildir
+    /// count. With i != j the cross-mapping pass is a no-op.
+    #[test]
+    fn cross_resolve_noop_when_count_mismatched() {
+        let (_dir, conn) = empty_db();
+        let server = [
+            mb("MB-A", "A", None),
+            mb("MB-B", "B", None),
+            mb("MB-C", "C", None),
+        ];
+        let by_id: HashMap<JmapMailboxId, &MailboxObject> =
+            server.iter().map(|m| (m.id.clone(), m)).collect();
+        let remote_paths = flat_remote_paths(&by_id);
+        let mut plan = ambig_plan(vec![(
+            PathBuf::from("/disk/folder1"),
+            vec![vec![mid("MB-A")], vec![mid("MB-A")]],
+        )]);
+        // i_total = 3, n_disk = 1 (one ambiguous folder).
+        cross_resolve_ambiguous(&mut plan, &conn, &by_id, &remote_paths, 1)
+            .expect("no-op should not error");
+        assert!(plan.candidates.is_empty());
+        assert_eq!(plan.skipped.len(), 1, "ambiguous skip stays put");
+    }
+
+    /// Precondition: every skip must be AmbiguousAcrossSamples. A
+    /// NoMessageIds or NoServerMatches entry breaks the bijection
+    /// assumption (that folder has no server counterpart).
+    #[test]
+    fn cross_resolve_noop_when_non_ambiguous_skip_present() {
+        let (_dir, conn) = empty_db();
+        let server = [mb("MB-A", "A", None), mb("MB-B", "B", None)];
+        let by_id: HashMap<JmapMailboxId, &MailboxObject> =
+            server.iter().map(|m| (m.id.clone(), m)).collect();
+        let remote_paths = flat_remote_paths(&by_id);
+        let mut plan = RebindFoldersPlan {
+            candidates: vec![],
+            remote_paths: HashMap::new(),
+            skipped: vec![
+                SkippedFolder {
+                    folder_path: PathBuf::from("/disk/folder1"),
+                    reason: SkipReason::AmbiguousAcrossSamples {
+                        per_group: vec![vec![mid("MB-A")], vec![mid("MB-A")]],
+                    },
+                },
+                SkippedFolder {
+                    folder_path: PathBuf::from("/disk/folder2"),
+                    reason: SkipReason::NoMessageIds,
+                },
+            ],
+        };
+        cross_resolve_ambiguous(&mut plan, &conn, &by_id, &remote_paths, 2)
+            .expect("no-op should not error");
+        assert!(plan.candidates.is_empty());
+        assert_eq!(plan.skipped.len(), 2);
+    }
+
+    /// Happy path: two ambiguous maildirs, two unclaimed mailboxes,
+    /// constraints force a unique matching. Both promote to
+    /// candidates with source CrossMapping and the skips clear.
+    #[test]
+    fn cross_resolve_promotes_unique_matching_pair() {
+        let (_dir, conn) = empty_db();
+        let server = [mb("MB-A", "A", None), mb("MB-B", "B", None)];
+        let by_id: HashMap<JmapMailboxId, &MailboxObject> =
+            server.iter().map(|m| (m.id.clone(), m)).collect();
+        let remote_paths = flat_remote_paths(&by_id);
+        // Maildir 1 narrowed to {MB-A} only; maildir 2 narrowed to
+        // {MB-A, MB-B} per group. With MB-A forced to maildir 1, the
+        // unique matching sends maildir 2 to MB-B.
+        let mut plan = ambig_plan(vec![
+            (
+                PathBuf::from("/disk/folder1"),
+                vec![vec![mid("MB-A")], vec![mid("MB-A")]],
+            ),
+            (
+                PathBuf::from("/disk/folder2"),
+                vec![
+                    vec![mid("MB-A"), mid("MB-B")],
+                    vec![mid("MB-A"), mid("MB-B")],
+                ],
+            ),
+        ]);
+        // n_disk = 2 (two ambiguous folders, no consensus binds).
+        cross_resolve_ambiguous(&mut plan, &conn, &by_id, &remote_paths, 2)
+            .expect("matching succeeds");
+        assert_eq!(plan.candidates.len(), 2);
+        assert!(plan.skipped.is_empty());
+        for c in &plan.candidates {
+            assert_eq!(c.source, ResolveSource::CrossMapping);
+        }
+        let by_path: HashMap<PathBuf, JmapMailboxId> = plan
+            .candidates
+            .iter()
+            .map(|c| (c.folder_path.clone(), c.jmap_mailbox_id.clone()))
+            .collect();
+        assert_eq!(by_path[&PathBuf::from("/disk/folder1")], mid("MB-A"));
+        assert_eq!(by_path[&PathBuf::from("/disk/folder2")], mid("MB-B"));
+    }
+
+    /// Non-unique matching: two ambiguous maildirs both feasible for
+    /// both unclaimed mailboxes. The cross-mapping pass refuses,
+    /// leaves the skips intact, and adds no candidates.
+    #[test]
+    fn cross_resolve_keeps_skip_when_matching_non_unique() {
+        let (_dir, conn) = empty_db();
+        let server = [mb("MB-A", "A", None), mb("MB-B", "B", None)];
+        let by_id: HashMap<JmapMailboxId, &MailboxObject> =
+            server.iter().map(|m| (m.id.clone(), m)).collect();
+        let remote_paths = flat_remote_paths(&by_id);
+        let mut plan = ambig_plan(vec![
+            (
+                PathBuf::from("/disk/folder1"),
+                vec![vec![mid("MB-A"), mid("MB-B")]],
+            ),
+            (
+                PathBuf::from("/disk/folder2"),
+                vec![vec![mid("MB-A"), mid("MB-B")]],
+            ),
+        ]);
+        cross_resolve_ambiguous(&mut plan, &conn, &by_id, &remote_paths, 2)
+            .expect("no-op should not error");
+        assert!(plan.candidates.is_empty());
+        assert_eq!(plan.skipped.len(), 2);
+    }
+
+    /// Consensus candidates from this cycle reduce the unclaimed
+    /// pool. A maildir bound to A via consensus means the remaining
+    /// ambiguous maildir's feasibility against {A, B} narrows to
+    /// {B} alone, forcing the cross-mapping.
+    #[test]
+    fn cross_resolve_respects_cycle_consensus_claims() {
+        let (_dir, conn) = empty_db();
+        let server = [mb("MB-A", "A", None), mb("MB-B", "B", None)];
+        let by_id: HashMap<JmapMailboxId, &MailboxObject> =
+            server.iter().map(|m| (m.id.clone(), m)).collect();
+        let remote_paths = flat_remote_paths(&by_id);
+        let mut plan = RebindFoldersPlan {
+            candidates: vec![RebindCandidate {
+                folder_path: PathBuf::from("/disk/folder1"),
+                jmap_mailbox_id: mid("MB-A"),
+                server_name: "A".to_string(),
+                remote_path: "A".to_string(),
+                parent_jmap_mailbox_id: None,
+                sample_count: 4,
+                source: ResolveSource::Consensus,
+            }],
+            remote_paths: HashMap::new(),
+            skipped: vec![SkippedFolder {
+                folder_path: PathBuf::from("/disk/folder2"),
+                reason: SkipReason::AmbiguousAcrossSamples {
+                    per_group: vec![vec![mid("MB-A"), mid("MB-B")]],
+                },
+            }],
+        };
+        // n_disk = 2 (consensus bind + ambiguous folder).
+        cross_resolve_ambiguous(&mut plan, &conn, &by_id, &remote_paths, 2)
+            .expect("matching succeeds");
+        assert_eq!(plan.candidates.len(), 2);
+        assert!(plan.skipped.is_empty());
+        let promoted = plan
+            .candidates
+            .iter()
+            .find(|c| c.source == ResolveSource::CrossMapping)
+            .expect("one cross-mapping candidate");
+        assert_eq!(promoted.remote_path, "B");
     }
 }

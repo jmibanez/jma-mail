@@ -293,6 +293,15 @@ async fn wait_for_imap(port: u16) -> Result<()> {
 }
 
 pub async fn seed_inbox(fx: &JmapFixture, msgs: &[SeedMessage]) -> Result<()> {
+    seed_folder(fx, "INBOX", msgs).await
+}
+
+/// APPEND each `msg` into `folder` over the fixture's IMAP listener.
+/// Folder must already exist on the server -- IMAP APPEND does not
+/// auto-create. Caller is responsible for prior `Mailbox/set create`
+/// (or relying on Stalwart's role-mailbox auto-provisioning) for
+/// non-INBOX targets.
+pub async fn seed_folder(fx: &JmapFixture, folder: &str, msgs: &[SeedMessage]) -> Result<()> {
     let stream = TcpStream::connect((fx.imap_host.as_str(), fx.imap_port))
         .await
         .context("connect to test container IMAP")?;
@@ -314,9 +323,9 @@ pub async fn seed_inbox(fx: &JmapFixture, msgs: &[SeedMessage]) -> Result<()> {
             Some(format!("({})", msg.flags.join(" ")))
         };
         session
-            .append("INBOX", flag_clause.as_deref(), None, eml.as_bytes())
+            .append(folder, flag_clause.as_deref(), None, eml.as_bytes())
             .await
-            .with_context(|| format!("APPEND seed message {i}"))?;
+            .with_context(|| format!("APPEND seed message {i} into {folder}"))?;
     }
 
     // logout is best-effort -- the connection drops cleanly either
