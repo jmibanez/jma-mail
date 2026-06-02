@@ -22,7 +22,10 @@ use std::io::Write;
 use std::path::Path;
 
 use crate::auth;
-use crate::config::{self, ConfigTomlValues, ConflictStrategy, FolderLayout, TomlTokenSlot};
+use crate::config::{
+    self, AllowDestructiveFolderSync, ConfigTomlValues, ConflictStrategy, FolderLayout,
+    TomlTokenSlot,
+};
 
 /// Run the wizard against the controlling TTY and write the
 /// resulting config to `config_path`.
@@ -79,6 +82,7 @@ struct WizardAnswers {
     maildir_path: String,
     folder_layout: FolderLayout,
     conflict_strategy: ConflictStrategy,
+    allow_destructive_folder_sync: AllowDestructiveFolderSync,
 }
 
 /// What the wizard found out about the bearer token for this email.
@@ -215,12 +219,34 @@ fn collect_answers() -> Result<WizardAnswers> {
         _ => unreachable!("Select returned an out-of-range index"),
     };
 
+    println!();
+    let destructive_labels = [
+        "none          -- never delete a local maildir or server mailbox (recommended)",
+        "delete-local  -- mirror server-side mailbox deletions to disk",
+        "delete-remote -- mirror local maildir removals to the server",
+        "both          -- mirror folder deletions in both directions",
+    ];
+    let destructive_idx = Select::with_theme(&theme)
+        .with_prompt("Destructive folder sync")
+        .items(&destructive_labels)
+        .default(0)
+        .interact()
+        .context("Failed to read destructive folder sync policy from prompt")?;
+    let allow_destructive_folder_sync = match destructive_idx {
+        0 => AllowDestructiveFolderSync::None,
+        1 => AllowDestructiveFolderSync::DeleteLocal,
+        2 => AllowDestructiveFolderSync::DeleteRemote,
+        3 => AllowDestructiveFolderSync::Both,
+        _ => unreachable!("Select returned an out-of-range index"),
+    };
+
     Ok(WizardAnswers {
         email,
         token,
         maildir_path: maildir_path.trim().to_string(),
         folder_layout,
         conflict_strategy,
+        allow_destructive_folder_sync,
     })
 }
 
@@ -293,6 +319,12 @@ fn render_config(answers: &WizardAnswers, in_file_token: Option<&str>) -> String
         ConflictStrategy::ServerWins => "server-wins",
         ConflictStrategy::LocalWins => "local-wins",
     };
+    let allow_destructive_folder_sync = match answers.allow_destructive_folder_sync {
+        AllowDestructiveFolderSync::None => "none",
+        AllowDestructiveFolderSync::DeleteLocal => "delete-local",
+        AllowDestructiveFolderSync::DeleteRemote => "delete-remote",
+        AllowDestructiveFolderSync::Both => "both",
+    };
     config::render_config_toml(&ConfigTomlValues {
         email: &answers.email,
         token,
@@ -300,6 +332,7 @@ fn render_config(answers: &WizardAnswers, in_file_token: Option<&str>) -> String
         folder_layout,
         hierarchy_separator: '.',
         conflict_strategy,
+        allow_destructive_folder_sync,
     })
 }
 
@@ -348,6 +381,7 @@ mod tests {
             maildir_path: "~/Maildir".to_string(),
             folder_layout: FolderLayout::Flat,
             conflict_strategy: ConflictStrategy::ServerWins,
+            allow_destructive_folder_sync: AllowDestructiveFolderSync::None,
         }
     }
 
@@ -455,6 +489,27 @@ mod tests {
         assert!(
             has_uncommented_token_line(&rendered),
             "Skipped path must emit a placeholder `token = \"\"` line;\n{rendered}"
+        );
+    }
+
+    /// A non-default destructive-folder-sync choice renders into the
+    /// config and survives a reload. Pins the slot wiring so a future
+    /// edit to the prompt or the template can't silently drop the
+    /// answered policy back to the `none` default.
+    #[test]
+    fn rendered_config_round_trips_destructive_folder_sync_choice() {
+        let answers = WizardAnswers {
+            allow_destructive_folder_sync: AllowDestructiveFolderSync::Both,
+            ..sample_answers()
+        };
+        let rendered = render_config(&answers, None);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        write_with_tight_perms(&path, &rendered);
+        let cfg = Config::load(&path).expect("rendered TOML must load");
+        assert_eq!(
+            cfg.sync.allow_destructive_folder_sync,
+            AllowDestructiveFolderSync::Both
         );
     }
 

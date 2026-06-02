@@ -611,6 +611,9 @@ pub struct ConfigTomlValues<'a> {
     pub hierarchy_separator: char,
     /// Already-rendered: `"server-wins"` or `"local-wins"`.
     pub conflict_strategy: &'a str,
+    /// Already-rendered: `"none"`, `"delete-local"`, `"delete-remote"`,
+    /// or `"both"`.
+    pub allow_destructive_folder_sync: &'a str,
 }
 
 /// How the `token = ...` slot in the rendered config is filled.
@@ -700,6 +703,19 @@ folder_layout = "{folder_layout}"
 hierarchy_separator = "{separator}"
 # Conflict resolution: server-wins or local-wins
 conflict_strategy = "{conflict_strategy}"
+# Whether jma may apply destructive folder-level syncs, and in which
+# direction(s). "Destructive" means deleting an on-disk maildir when
+# its server mailbox is gone, or destroying a server mailbox when its
+# local maildir is gone. When the losing side has unsynced content,
+# conflict_strategy is the tiebreaker: server-wins proceeds (and the
+# content is lost); local-wins refuses and leaves an orphan.
+#   "none"          -- never delete either side; orphans surface via
+#                      `jma status` and cleanup goes through
+#                      `jma janitor prune` (default)
+#   "delete-local"  -- mirror server-side mailbox deletions to disk
+#   "delete-remote" -- mirror local maildir removals to the server
+#   "both"          -- both directions
+allow_destructive_folder_sync = "{allow_destructive_folder_sync}"
 # Max concurrent blob downloads during pull. Clamped to the server's
 # advertised maxConcurrentRequests (Fastmail: 10).
 download_concurrency = 8
@@ -762,6 +778,7 @@ ping_interval = 60
         folder_layout = values.folder_layout,
         separator = values.hierarchy_separator,
         conflict_strategy = values.conflict_strategy,
+        allow_destructive_folder_sync = values.allow_destructive_folder_sync,
     )
 }
 
@@ -777,6 +794,7 @@ pub fn default_config_template() -> String {
         folder_layout: "flat",
         hierarchy_separator: '.',
         conflict_strategy: "server-wins",
+        allow_destructive_folder_sync: "none",
     })
 }
 
@@ -834,6 +852,13 @@ mod template_tests {
         assert_eq!(
             cfg.sync.conflict_strategy as u8,
             ConflictStrategy::ServerWins as u8
+        );
+        // The template emits an active `allow_destructive_folder_sync`
+        // line; pin that it is well-formed and parses to the safe
+        // `none` default so a fresh config never deletes mail.
+        assert_eq!(
+            cfg.sync.allow_destructive_folder_sync,
+            AllowDestructiveFolderSync::None
         );
         // Default template ships with `mailboxes` commented out so
         // the "sync everything" branch is the out-of-the-box
