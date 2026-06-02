@@ -1190,7 +1190,10 @@ impl<'a> SyncEngine<'a> {
 /// before any descendant rename in the same cycle. The 1024 cap is
 /// a guard against pathological cyclic input -- a real account
 /// nesting that deep would already be unworkable in MUAs.
-fn parent_chain_depth(mb: &MailboxObject, by_id: &HashMap<JmapMailboxId, &MailboxObject>) -> usize {
+pub(crate) fn parent_chain_depth(
+    mb: &MailboxObject,
+    by_id: &HashMap<JmapMailboxId, &MailboxObject>,
+) -> usize {
     let mut depth = 0usize;
     let mut current = mb.parent_id.as_ref();
     while let Some(pid) = current {
@@ -1525,7 +1528,7 @@ struct MailboxesInput<'a> {
 /// topological remote_paths prep-pass and the `LocalRename` /
 /// `ConflictLocalWins` arm's post-rename `push_remote_path`
 /// computation -- both perform the same join.
-fn compose_remote_path(
+pub(crate) fn compose_remote_path(
     parent_jmap_mailbox_id: Option<&JmapMailboxId>,
     name: &str,
     remote_paths: &HashMap<JmapMailboxId, String>,

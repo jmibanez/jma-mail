@@ -784,12 +784,18 @@ async fn cmd_janitor_rebindfolders(cli: &Cli, sample_size: Option<u32>, apply: b
 
 fn render_rebindfolders_plan(plan: &jma_mail::janitor::rebindfolders::RebindFoldersPlan) {
     for c in &plan.candidates {
+        let via = match c.source {
+            jma_mail::janitor::rebindfolders::ResolveSource::Consensus => {
+                format!("consensus, {} sample(s)", c.sample_count)
+            }
+            jma_mail::janitor::rebindfolders::ResolveSource::CrossMapping => {
+                "cross-mapping".to_string()
+            }
+        };
         println!(
-            "  [REBIND] {} -> {} ({}, {} sample(s))",
+            "  [REBIND] {} -> {} ({via})",
             c.folder_path.display(),
-            c.jmap_mailbox_id,
-            c.server_name,
-            c.sample_count,
+            c.remote_path,
         );
     }
     for s in &plan.skipped {
@@ -805,8 +811,16 @@ fn render_rebindfolders_plan(plan: &jma_mail::janitor::rebindfolders::RebindFold
                     .iter()
                     .enumerate()
                     .map(|(i, ids)| {
-                        let names: Vec<&str> = ids.iter().map(|id| id.as_ref()).collect();
-                        format!("group {} -> {{{}}}", i, names.join(","))
+                        let labels: Vec<&str> = ids
+                            .iter()
+                            .map(|id| {
+                                plan.remote_paths
+                                    .get(id)
+                                    .map(String::as_str)
+                                    .unwrap_or_else(|| id.as_ref())
+                            })
+                            .collect();
+                        format!("group {} -> {{{}}}", i, labels.join(","))
                     })
                     .collect();
                 format!("ambiguous across samples ({})", groups.join("; "))
