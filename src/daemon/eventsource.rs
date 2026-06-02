@@ -19,16 +19,21 @@ enum ConnectOutcome {
 }
 
 /// Entity types whose state changes should drive a sync. Other types
-/// (Mailbox, EmailDelivery, Identity, ...) appear in StateChange
-/// payloads but have no effect on what we sync, and treating them as
-/// triggers causes a no-op sync loop. Mailbox in particular: every
-/// folder mutation that matters to jma (mail moved in or out,
-/// destroyed) also advances Email state, and `Mailbox/get` runs at
-/// the top of every cycle regardless of trigger, so the only thing
-/// Mailbox tracking would buy us is sub-cycle latency on metadata-
-/// only ops (empty-folder rename, sortOrder change). Not worth the
-/// extra cursor plumbing or the post-connect double-sync.
-const TRACKED_TYPES: &[&str] = &["Email"];
+/// (EmailDelivery, Identity, ...) appear in StateChange payloads but
+/// have no effect on what we sync, and treating them as triggers
+/// causes a no-op sync loop.
+///
+/// Mailbox is tracked because the structural folder lifecycle
+/// (create / rename / destroy on either side, with bidirectional
+/// conflict resolution) needs prompt detection: a folder mutation
+/// that doesn't co-occur with an Email change (per RFC 8621
+/// section 2, Mailbox properties such as `name`, `parentId`,
+/// `role`, and `sortOrder` can each move independently of any
+/// Email update) would otherwise wait for an unrelated trigger
+/// to wake the daemon. Under the destructive-arm policy the
+/// resulting drift between cache, server, and disk views can
+/// land silently, so the cursor-plumbing cost is worth paying.
+const TRACKED_TYPES: &[&str] = &["Email", "Mailbox"];
 
 /// Spec-mandated upper bound on a server's allowed maximum ping
 /// interval (RFC 8620 §7.3: "servers MUST NOT have ... a maximum
@@ -351,15 +356,17 @@ mod tests {
     }
 
     #[test]
-    fn mailbox_only_change_does_not_fire() {
-        // Mailbox is intentionally untracked; an event that only
-        // advances Mailbox state (e.g. empty-folder rename, sortOrder
-        // change) must not drive a sync. The next Email-driven cycle
-        // re-fetches Mailbox/get and surfaces whatever changed.
+    fn mailbox_only_change_fires() {
+        // Structural folder lifecycle relies on prompt detection:
+        // an event that advances Mailbox state without touching
+        // Email (folder rename / parent move / role / sortOrder
+        // change, all independent Mailbox properties per RFC 8621
+        // section 2) must drive a sync so the next cycle picks
+        // up the structural drift.
         let mut last = HashMap::from([("Email".to_string(), "J1".to_string())]);
         let data = make_event("acct", &[("Email", "J1"), ("Mailbox", "M2")]);
-        assert!(!decide_trigger(&data, "acct", &mut last).unwrap());
-        assert!(!last.contains_key("Mailbox"));
+        assert!(decide_trigger(&data, "acct", &mut last).unwrap());
+        assert_eq!(last.get("Mailbox").unwrap(), "M2");
     }
 
     #[test]

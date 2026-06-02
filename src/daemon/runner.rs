@@ -22,10 +22,15 @@ use crate::sync::self_writes::SelfWriteCache;
 /// paths that drove the watcher so the runner can surface them when
 /// the cycle ends up doing nothing -- diagnostic for spurious
 /// triggers, where the path list is the only clue to what wrote.
+/// `LocalStructuralChange` is pathless: a folder-level event
+/// (mailbox directory created, renamed, or removed by the user)
+/// promotes to a full-scope cycle, since the path-scope scan can't
+/// classify structural drift.
 #[derive(Debug, Clone)]
 pub enum SyncTrigger {
     RemoteChange,
     LocalChange(Vec<PathBuf>),
+    LocalStructuralChange,
     Initial,
 }
 
@@ -34,6 +39,7 @@ impl fmt::Display for SyncTrigger {
         match self {
             Self::RemoteChange => f.write_str("RemoteChange"),
             Self::LocalChange(paths) => write!(f, "LocalChange ({} FS event(s))", paths.len()),
+            Self::LocalStructuralChange => f.write_str("LocalStructuralChange"),
             Self::Initial => f.write_str("Initial"),
         }
     }
@@ -47,24 +53,27 @@ impl fmt::Display for SyncTrigger {
 ///
 /// Dominance order, broadest first: `Initial` wins if present (it's
 /// a full bootstrap, not a per-trigger delta), then `RemoteChange`
-/// (we're looking at server-side state too), otherwise
-/// `LocalChange` carrying every path from every absorbed
-/// `LocalChange` trigger. The order matches "broader scan wins" --
-/// once we've decided we need a non-LocalChange shape, the
+/// (we're looking at server-side state too), then
+/// `LocalStructuralChange` (folder-level drift forces a full local
+/// scan), otherwise `LocalChange` carrying every path from every
+/// absorbed `LocalChange` trigger. The order matches "broader scan
+/// wins" -- once we've decided we need a non-LocalChange shape, the
 /// LocalChange path set is irrelevant.
 ///
-/// The path-drop on RemoteChange/Initial assumes those triggers
-/// always imply a full local scan. If a future cycle shape ever
-/// pairs RemoteChange with path-narrowed local work, this merge
-/// becomes lossy and needs revisiting.
+/// The path-drop on RemoteChange/LocalStructuralChange/Initial
+/// assumes those triggers always imply a full local scan. If a
+/// future cycle shape ever pairs one of them with path-narrowed
+/// local work, this merge becomes lossy and needs revisiting.
 fn coalesce_triggers(first: SyncTrigger, rest: Vec<SyncTrigger>) -> SyncTrigger {
     let mut paths: Vec<PathBuf> = Vec::new();
     let mut has_initial = false;
     let mut has_remote = false;
+    let mut has_structural = false;
     for t in std::iter::once(first).chain(rest) {
         match t {
             SyncTrigger::Initial => has_initial = true,
             SyncTrigger::RemoteChange => has_remote = true,
+            SyncTrigger::LocalStructuralChange => has_structural = true,
             SyncTrigger::LocalChange(p) => paths.extend(p),
         }
     }
@@ -72,6 +81,8 @@ fn coalesce_triggers(first: SyncTrigger, rest: Vec<SyncTrigger>) -> SyncTrigger 
         SyncTrigger::Initial
     } else if has_remote {
         SyncTrigger::RemoteChange
+    } else if has_structural {
+        SyncTrigger::LocalStructuralChange
     } else {
         SyncTrigger::LocalChange(paths)
     }
@@ -363,14 +374,20 @@ impl<'a> WatchDaemon<'a> {
             // LocalChange triggers carry the FS event paths from the
             // coalesced batch; route them through ScanScope::Paths so the
             // engine classifies only the (folder, maildir_id) groups those
-            // paths touched. RemoteChange and Initial fall back to a full
-            // per-folder walk -- RemoteChange has no local hint, Initial
-            // happens once at startup, and a coalesced batch promoted to
-            // either of those by the dominance order also drops to the
-            // safe O(N) shape (see coalesce_triggers).
+            // paths touched. RemoteChange, LocalStructuralChange, and
+            // Initial fall back to a full per-folder walk --
+            // RemoteChange has no local hint, LocalStructuralChange
+            // requires the engine's discover_unbound_folders +
+            // sentinel walk (Paths-scope can't classify a structural
+            // event), Initial happens once at startup, and a
+            // coalesced batch promoted to any of those by the
+            // dominance order also drops to the safe O(N) shape
+            // (see coalesce_triggers).
             let scope = match &trigger {
                 SyncTrigger::LocalChange(paths) => ScanScope::Paths(paths.clone()),
-                SyncTrigger::RemoteChange | SyncTrigger::Initial => ScanScope::Full,
+                SyncTrigger::RemoteChange
+                | SyncTrigger::LocalStructuralChange
+                | SyncTrigger::Initial => ScanScope::Full,
             };
             match self.engine.run(false, SyncDirection::Both, scope).await {
                 Ok(outcome) => {
@@ -518,5 +535,30 @@ mod tests {
             vec![SyncTrigger::RemoteChange, SyncTrigger::Initial],
         );
         assert!(matches!(merged, SyncTrigger::Initial));
+    }
+
+    /// LocalStructuralChange dominates LocalChange paths. A
+    /// folder-level event in the batch promotes the cycle to Full
+    /// scope; the path-narrowed local set becomes irrelevant.
+    #[test]
+    fn coalesce_local_structural_dominates_local_change() {
+        let p = PathBuf::from("/Mail/INBOX/cur/file:2,S");
+        let merged = coalesce_triggers(
+            SyncTrigger::LocalChange(vec![p]),
+            vec![SyncTrigger::LocalStructuralChange],
+        );
+        assert!(matches!(merged, SyncTrigger::LocalStructuralChange));
+    }
+
+    /// RemoteChange still wins over LocalStructuralChange: server-
+    /// side state also moved, so a full bidirectional cycle is
+    /// already implied.
+    #[test]
+    fn coalesce_remote_change_dominates_local_structural() {
+        let merged = coalesce_triggers(
+            SyncTrigger::LocalStructuralChange,
+            vec![SyncTrigger::RemoteChange],
+        );
+        assert!(matches!(merged, SyncTrigger::RemoteChange));
     }
 }
