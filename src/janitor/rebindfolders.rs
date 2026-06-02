@@ -22,9 +22,19 @@
 //!    subdirectory. Drop folders whose sentinel already names a
 //!    known mailbox, and folders already bound by `mailbox_map` (the
 //!    next sync cycle's sentinel-write will backfill those).
-//! 3. For each remaining orphan, sample up to `sample_size`
-//!    `Message-ID` headers from `cur/` and `new/`.
-//! 4. One `Email/query` per folder with `Filter::or` of N
+//! 3. For each remaining orphan, sample M groups of N parseable
+//!    `Message-ID` headers from `cur/` and `new/`. Sampling is a
+//!    PRNG-shuffle of every parseable file in the folder, with the
+//!    seed derived from the folder's path. Two consequences fall
+//!    out: the same folder produces the same shuffle on every
+//!    invocation (so the CLI's report-then-apply workflow stays
+//!    convergent across the two `run()` calls), and the M groups
+//!    are independent draws from the folder's content (so a
+//!    pathological "first-N happens to all live in one non-target
+//!    mailbox" run -- thread-clustered timestamps, draft templates,
+//!    mailing-list digests with prefix-shared Message-IDs -- can't
+//!    silently rebind to the wrong mailbox).
+//! 4. One `Email/query` per folder with `Filter::or` of M*N
 //!    `header("Message-ID", Some(id))` conditions, where `id` is
 //!    jma's bracket-stripped internal form. Per RFC 8621 4.4.1
 //!    this is a substring match against the server's stored
@@ -41,31 +51,52 @@
 //!    `tests/e2e_rebindfolders.rs`.
 //! 5. `Email/get` on the resulting ids for `mailboxIds`. Bin each
 //!    returned email by which sample it EXACTLY matched (using the
-//!    returned `messageId` array's bracket-stripped form), take the
-//!    per-sample union of `mailboxIds`, then the intersection across
-//!    samples. The exact-match bin closes the false-positive prefix
-//!    risk inherent to substring matching: an email returned because
-//!    "abc@x.com" was a substring of its `<xabc@x.com>` header would
-//!    be dropped here because no sample equals `xabc@x.com`. The
-//!    per-sample union covers the draft-and-sent-copy-share-Message-
-//!    ID case; the cross-sample intersection narrows to the mailbox
-//!    every sample agrees on.
-//! 6. Intersection of size 1: rebind candidate. Empty or larger:
-//!    skip with the union in the report.
+//!    returned `messageId` array's bracket-stripped form). The
+//!    exact-match bin closes the false-positive prefix risk inherent
+//!    to substring matching: an email returned because "abc@x.com"
+//!    was a substring of its `<xabc@x.com>` header is dropped here
+//!    because no sample equals `xabc@x.com`. Then, independently
+//!    for each of the M groups, take the per-sample union of
+//!    `mailboxIds` (covers the draft-and-sent-copy-share-Message-ID
+//!    case) and the cross-sample intersection (narrows to the
+//!    mailbox every sample in the group agrees on). The result is
+//!    M independently-narrowed candidate sets.
+//! 6. Consensus check: if every group narrowed to the same
+//!    singleton {X}, X is the rebind target. Any other shape --
+//!    empty narrowed set in any group, a narrowed set of size > 1,
+//!    or two groups disagreeing on which singleton -- refuses the
+//!    rebind and surfaces the per-group results in the
+//!    `AmbiguousAcrossSamples` report. The math of intersection is
+//!    associative, so a single M*N-wide intersection would arrive
+//!    at the same {X} when consensus is met; the per-group split
+//!    exists so the operator's report shows the disagreement
+//!    instead of an opaque single-set "no decision."
 //!
-//! Sampling is "first N parseable" rather than random. A folder
-//! whose first N messages are drafts could falsely intersect to the
-//! Drafts mailbox; randomization would mitigate, but the
-//! deterministic ordering keeps the algorithm reproducible across
-//! invocations and the operator review step (default report-only)
-//! catches the misclassification before any sentinel lands.
+//! Sampling is M disjoint groups, not M iid (with-replacement)
+//! draws. The disjoint approach gives every parseable Message-ID
+//! at most one vote across all groups, so a "groups disagree"
+//! signal genuinely comes from M independent witnesses. With-
+//! overlap sampling would let a popular Message-ID contribute
+//! the same vote redundantly to multiple groups -- collapsing
+//! the independence the consensus check relies on -- and on small
+//! folders (K < M*N parseable Message-IDs) it would force the
+//! groups into high correlation by drawing repeatedly from a
+//! small pool, making "all groups agree" look stronger than it
+//! is. The disjoint scheme's small-folder fallback (truncate to
+//! K and form fewer or partial groups) honestly degrades the
+//! consensus signal in that case rather than masking the reduced
+//! coverage.
 
 use anyhow::{Context, Result};
 use jmap_client::client::Client;
 use jmap_client::core::query::Filter as CoreFilter;
 use jmap_client::email::query::Filter as EmailFilter;
+use rand::SeedableRng;
+use rand::seq::SliceRandom;
 use rusqlite::Connection;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
 
@@ -79,11 +110,25 @@ use crate::maildir_ops::namespace::is_jma_private;
 use crate::maildir_ops::sentinel::{self, MailboxMapping};
 use crate::state::queries;
 
-/// Default Message-ID sample size per orphan folder. Ten samples is
-/// well above the threshold where the intersection algorithm
-/// reliably narrows to a single mailbox in normal traffic, and well
-/// below any server's `Email/query` result cap.
-pub const DEFAULT_SAMPLE_SIZE: usize = 10;
+/// Default Message-ID sample size *per consensus group* per orphan
+/// folder. Four samples per group at `DEFAULT_GROUP_COUNT = 3`
+/// produces 12 total samples per folder -- well above the threshold
+/// where the per-group intersection narrows to a single mailbox in
+/// normal traffic, and well below any server's `Email/query` result
+/// cap. Per-group rather than total is the user-facing semantic so
+/// `--sample-size N` always yields exactly N samples in each of M
+/// groups: no integer-division truncation when N is not a multiple
+/// of M, and the operator can predict the wire cost (`N * M`
+/// conditions in the `Email/query` OR) from the flag value alone.
+pub const DEFAULT_SAMPLE_SIZE: usize = 4;
+
+/// Number of independent sample groups for the consensus check. Each
+/// group narrows to a candidate mailbox set; all groups must agree on
+/// the same singleton to rebind. Three groups is the smallest count
+/// that gives a meaningful disagreement signal -- two groups is just
+/// "do they match," three is "do all of them match" and lets a single
+/// outlier surface as the dissenter in the operator's report.
+pub(crate) const DEFAULT_GROUP_COUNT: usize = 3;
 
 /// One folder the planner decided to rebind. Carries everything
 /// `apply` needs to write the sentinel without re-querying.
@@ -110,22 +155,21 @@ pub enum SkipReason {
     /// empty folder or one that only carries jma-foreign files
     /// without RFC 5322 headers.
     NoMessageIds,
-    /// All sampled Message-IDs were unknown to the server. Could
-    /// be a server-deleted folder still living on disk; could be
-    /// a folder whose mail was all sent and removed; could be a
-    /// folder from a different account that was copied here.
+    /// All sampled Message-IDs were unknown to the server across
+    /// every consensus group. Could be a server-deleted folder
+    /// still living on disk; could be a folder whose mail was all
+    /// sent and removed; could be a folder from a different
+    /// account that was copied here.
     NoServerMatches,
-    /// The cross-sample intersection has zero or more than one
-    /// mailbox, so the planner cannot pick a single rebind
-    /// target. The vector lists candidate mailboxes in `as_ref()`
-    /// order so the operator-facing report is stable across
-    /// invocations. When the intersection had more than one
-    /// member, the vector IS the intersection -- mailboxes every
-    /// sample agreed the folder might be. When the intersection
-    /// was empty, the vector is the union of every matched
-    /// email's mailboxIds -- the broader pool the operator might
-    /// scan for the right answer.
-    AmbiguousMailboxes(Vec<JmapMailboxId>),
+    /// The consensus check failed: at least one group's narrowed
+    /// set was empty or larger than one, or the groups arrived at
+    /// different singletons. `per_group` records each group's
+    /// narrowed set in input-group order, sorted within each group
+    /// by `JmapMailboxId::as_ref()` for stable rendering. The
+    /// operator-facing report walks this to show the disagreement
+    /// (e.g. "group 0 narrowed to {Inbox}, group 1 narrowed to
+    /// {Inbox, All Mail}, group 2 narrowed to {}").
+    AmbiguousAcrossSamples { per_group: Vec<Vec<JmapMailboxId>> },
 }
 
 #[derive(Debug, Default)]
@@ -141,7 +185,7 @@ pub async fn plan(
     client: &Client,
     conn: &Connection,
     maildir_root: &Path,
-    sample_size: usize,
+    samples_per_group: usize,
 ) -> Result<RebindFoldersPlan> {
     let _phase =
         tracing::info_span!(target: crate::profile::TARGET_PHASE, "rebindfolders").entered();
@@ -162,7 +206,16 @@ pub async fn plan(
     let mut plan = RebindFoldersPlan::default();
     let get_cap = limits::max_objects_in_get(client);
     for folder_path in orphans {
-        match probe_folder(client, &folder_path, sample_size, get_cap, &by_id).await? {
+        match probe_folder(
+            client,
+            &folder_path,
+            samples_per_group,
+            DEFAULT_GROUP_COUNT,
+            get_cap,
+            &by_id,
+        )
+        .await?
+        {
             ProbeOutcome::Bind {
                 jmap_mailbox_id,
                 sample_count,
@@ -218,10 +271,10 @@ pub async fn run(
     client: &Client,
     conn: &Connection,
     maildir_root: &Path,
-    sample_size: usize,
+    samples_per_group: usize,
     dry_run: bool,
 ) -> Result<RebindFoldersPlan> {
-    let p = plan(client, conn, maildir_root, sample_size).await?;
+    let p = plan(client, conn, maildir_root, samples_per_group).await?;
     if !dry_run {
         apply(&p)?;
     }
@@ -237,21 +290,29 @@ enum ProbeOutcome {
     Skip(SkipReason),
 }
 
-/// Probe a single orphan: sample its Message-IDs, query the server,
-/// intersect mailbox memberships, return the verdict.
+/// Probe a single orphan: sample its Message-IDs in `group_count`
+/// independent PRNG-shuffled groups of `samples_per_group` each,
+/// query the server with a single flat `Email/query`, then check
+/// consensus across groups.
 async fn probe_folder(
     client: &Client,
     folder_path: &Path,
-    sample_size: usize,
+    samples_per_group: usize,
+    group_count: usize,
     get_cap: usize,
     by_id: &HashMap<JmapMailboxId, &MailboxObject>,
 ) -> Result<ProbeOutcome> {
-    let samples = sample_message_ids(folder_path, sample_size)?;
-    if samples.is_empty() {
+    let groups = sample_message_id_groups(folder_path, group_count, samples_per_group)?;
+    if groups.is_empty() {
         return Ok(ProbeOutcome::Skip(SkipReason::NoMessageIds));
     }
 
-    let candidate_ids = query_by_message_ids(client, &samples).await?;
+    // Flatten for one Email/query; the per-group split applies at the
+    // intersection step, not at the wire.
+    let flat: Vec<MessageId> = groups.iter().flatten().cloned().collect();
+    let total_samples = flat.len();
+
+    let candidate_ids = query_by_message_ids(client, &flat).await?;
     if candidate_ids.is_empty() {
         return Ok(ProbeOutcome::Skip(SkipReason::NoServerMatches));
     }
@@ -264,36 +325,46 @@ async fn probe_folder(
         emails.extend(batch);
     }
 
-    let intersection = intersect_mailboxes_by_sample(&emails, &samples);
-
-    // Drop intersection members that aren't on the server (could
-    // happen if Mailbox/get and Email/get observed different
-    // snapshots; better to fail closed than silently bind to a
-    // mailbox we can't render).
-    let mut known: Vec<JmapMailboxId> = intersection
-        .into_iter()
-        .filter(|id| by_id.contains_key(id))
+    // Per-group narrowed set, filtered to mailboxes the server still
+    // advertises (Mailbox/get and Email/get may have observed slightly
+    // different snapshots; failing closed beats binding to a mailbox
+    // we can't render). Sorted within each group for stable reporting.
+    let per_group: Vec<Vec<JmapMailboxId>> = groups
+        .iter()
+        .map(|samples| {
+            let mut narrowed: Vec<JmapMailboxId> = intersect_mailboxes_by_sample(&emails, samples)
+                .into_iter()
+                .filter(|id| by_id.contains_key(id))
+                .collect();
+            narrowed.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+            narrowed
+        })
         .collect();
-    known.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
 
-    match known.len() {
-        0 => Ok(ProbeOutcome::Skip(SkipReason::AmbiguousMailboxes(
-            mailbox_union(&emails),
-        ))),
-        1 => {
-            let id = known.into_iter().next().expect("len == 1 matched above");
+    // Consensus: every group must narrow to the SAME singleton.
+    let first = per_group
+        .first()
+        .expect("groups non-empty since flat was non-empty");
+    let consensus =
+        (first.len() == 1 && per_group.iter().all(|g| g == first)).then(|| first[0].clone());
+
+    match consensus {
+        Some(id) => {
             debug!(
-                "rebindfolders: {} -> {} (from {} sample(s))",
+                "rebindfolders: {} -> {} (consensus across {} group(s), {} sample(s) total)",
                 folder_path.display(),
                 id,
-                samples.len()
+                groups.len(),
+                total_samples,
             );
             Ok(ProbeOutcome::Bind {
                 jmap_mailbox_id: id,
-                sample_count: samples.len(),
+                sample_count: total_samples,
             })
         }
-        _ => Ok(ProbeOutcome::Skip(SkipReason::AmbiguousMailboxes(known))),
+        None => Ok(ProbeOutcome::Skip(SkipReason::AmbiguousAcrossSamples {
+            per_group,
+        })),
     }
 }
 
@@ -332,28 +403,45 @@ fn intersect_mailboxes_by_sample(
     intersection.unwrap_or_default()
 }
 
-/// Union of every mailbox any candidate email lives in. Used to
-/// populate the `AmbiguousMailboxes` skip report so the operator
-/// can see what the algorithm could not narrow down. Sorted by
-/// `as_ref()` for stable rendering across invocations.
-fn mailbox_union(emails: &[EmailObject]) -> Vec<JmapMailboxId> {
-    let mut set: HashSet<JmapMailboxId> = emails
-        .iter()
-        .flat_map(|e| e.mailbox_ids.keys().cloned())
-        .collect();
-    let mut out: Vec<JmapMailboxId> = set.drain().collect();
-    out.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
-    out
-}
+/// Collect every parseable Message-ID from a maildir folder's
+/// `cur/` and `new/` (deduped across files), PRNG-shuffle the list
+/// with a seed derived from the folder path, then partition the
+/// first `samples_per_group * group_count` IDs into up to
+/// `group_count` groups of `samples_per_group` each.
+///
+/// `samples_per_group` is the parameter directly: no integer-
+/// division surprise. `samples_per_group = 4, group_count = 3`
+/// yields 3 groups of 4 (total 12). `samples_per_group = 1` yields
+/// 3 groups of 1 (3 samples total) -- a weak but still meaningful
+/// 3-of-3 consensus on three independently-drawn votes.
+///
+/// Returns Vec<Vec<MessageId>>:
+/// - Empty when the folder has no parseable Message-IDs.
+/// - Length up to `group_count`; the last group may be shorter
+///   than `samples_per_group` if the folder ran out of unique
+///   Message-IDs.
+///
+/// Determinism: seeding from the folder path means a second
+/// invocation against the same folder produces the same partition.
+/// This is load-bearing for the CLI's report-then-apply workflow,
+/// which calls `run()` twice and assumes the second call produces
+/// the same plan as the first. The guarantee holds within a single
+/// binary: both `DefaultHasher` and `StdRng` are reproducible only
+/// across same-version builds, so a toolchain or `rand` upgrade
+/// between report and apply could shift the partition. The CLI
+/// workflow runs both passes from the same binary, so that
+/// boundary doesn't bite in practice.
+fn sample_message_id_groups(
+    folder_path: &Path,
+    group_count: usize,
+    samples_per_group: usize,
+) -> Result<Vec<Vec<MessageId>>> {
+    let group_count = group_count.max(1);
+    let samples_per_group = samples_per_group.max(1);
+    let target_total = samples_per_group * group_count;
 
-/// Sample up to `sample_size` parseable Message-IDs from a maildir
-/// folder's `cur/` and `new/`. Returns the deduplicated list (one
-/// entry per Message-ID even if multiple files share it). First-N
-/// is deterministic; see the module doc for the trade-off vs random
-/// sampling.
-fn sample_message_ids(folder_path: &Path, sample_size: usize) -> Result<Vec<MessageId>> {
     let mut seen: HashSet<MessageId> = HashSet::new();
-    let mut out: Vec<MessageId> = Vec::new();
+    let mut all_ids: Vec<MessageId> = Vec::new();
     for sub in ["cur", "new"] {
         let subdir = folder_path.join(sub);
         let Ok(entries) = std::fs::read_dir(&subdir) else {
@@ -367,10 +455,7 @@ fn sample_message_ids(folder_path: &Path, sample_size: usize) -> Result<Vec<Mess
             match parse_message_id_from_file(&path) {
                 Ok(Some(mid)) => {
                     if seen.insert(mid.clone()) {
-                        out.push(mid);
-                        if out.len() >= sample_size {
-                            return Ok(out);
-                        }
+                        all_ids.push(mid);
                     }
                 }
                 Ok(None) => continue,
@@ -381,7 +466,23 @@ fn sample_message_ids(folder_path: &Path, sample_size: usize) -> Result<Vec<Mess
             }
         }
     }
-    Ok(out)
+
+    if all_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut hasher = DefaultHasher::new();
+    folder_path.hash(&mut hasher);
+    let seed = hasher.finish();
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    all_ids.shuffle(&mut rng);
+
+    all_ids.truncate(target_total);
+
+    Ok(all_ids
+        .chunks(samples_per_group)
+        .map(|c| c.to_vec())
+        .collect())
 }
 
 /// One `Email/query` with `Filter::or` over the sampled Message-IDs
@@ -412,12 +513,13 @@ fn sample_message_ids(folder_path: &Path, sample_size: usize) -> Result<Vec<Mess
 /// without any extra configuration.
 ///
 /// No defensive clamp on the response size. The OR carries at most
-/// `sample_size` conditions (default 10), and each Message-ID
-/// matches at most a small number of server-side emails (drafts +
-/// sent copies + maybe a Receipts label), so the result set is
-/// bounded by the cardinality of the samples themselves, not by
-/// the folder's total size. Every plausible server's
-/// `maxQueryResults` cap easily absorbs that.
+/// `samples_per_group * group_count` conditions (default
+/// `DEFAULT_SAMPLE_SIZE * DEFAULT_GROUP_COUNT = 12`), and each
+/// Message-ID matches at most a small number of server-side emails
+/// (drafts, sent copies, plus maybe a Receipts label), so the
+/// result set is bounded by the cardinality of the samples
+/// themselves rather than the folder's total size. Every plausible
+/// server's `maxQueryResults` cap easily absorbs that.
 async fn query_by_message_ids(client: &Client, samples: &[MessageId]) -> Result<Vec<JmapEmailId>> {
     let conditions: Vec<EmailFilter> = samples
         .iter()
@@ -679,41 +781,104 @@ mod tests {
         assert!(got.contains(&JmapMailboxId::from("MB-ALL")));
     }
 
-    /// Sampling stops at `sample_size` even when more files are
-    /// available, and de-duplicates Message-IDs across files
-    /// (multiple maildir entries sharing a Message-ID still count
-    /// as one sample).
+    /// With enough parseable Message-IDs to fill every group, the
+    /// sampler returns exactly `group_count` groups, each of
+    /// `samples_per_group` entries, and de-duplicates Message-IDs
+    /// across files (multiple maildir entries sharing a Message-ID
+    /// still count as one sample).
     #[test]
-    fn sample_caps_and_dedupes() {
+    fn sample_groups_partitions_when_enough_ids() {
         let dir = tempfile::tempdir().unwrap();
         let folder = dir.path().join("INBOX");
         std::fs::create_dir_all(folder.join("cur")).unwrap();
         std::fs::create_dir_all(folder.join("new")).unwrap();
-        seed_msg(&folder, "cur", "1.x:2,", "a@x");
-        seed_msg(&folder, "cur", "2.x:2,", "b@x");
-        seed_msg(&folder, "cur", "3.x:2,", "a@x"); // duplicate Message-ID
-        seed_msg(&folder, "cur", "4.x:2,", "c@x");
-        seed_msg(&folder, "new", "5.x:2,", "d@x");
+        for i in 0..20 {
+            seed_msg(&folder, "cur", &format!("{i}.x:2,"), &format!("m{i}@x"));
+        }
+        // Duplicate Message-ID across two files: should count once.
+        seed_msg(&folder, "new", "dup.x:2,", "m0@x");
 
-        let three = sample_message_ids(&folder, 3).unwrap();
-        assert_eq!(three.len(), 3);
-        let unique: HashSet<_> = three.iter().cloned().collect();
-        assert_eq!(unique.len(), 3, "sampling must dedupe Message-IDs");
+        let groups = sample_message_id_groups(&folder, 3, 4).unwrap();
+        assert_eq!(groups.len(), 3, "three groups for group_count=3");
+        for g in &groups {
+            assert_eq!(g.len(), 4, "samples_per_group=4");
+        }
+        // No Message-ID appears in two groups.
+        let flat: HashSet<_> = groups.iter().flatten().cloned().collect();
+        assert_eq!(flat.len(), 12, "12 unique IDs across all groups");
+    }
 
-        let big = sample_message_ids(&folder, 100).unwrap();
-        // Four unique IDs across the five files.
-        assert_eq!(big.len(), 4);
+    /// Fewer parseable Message-IDs than `samples_per_group *
+    /// group_count`: the sampler returns up to `group_count` chunks
+    /// of `samples_per_group` each, and the final chunk may be
+    /// shorter when the source runs out.
+    #[test]
+    fn sample_groups_returns_partial_last_group_when_few_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("INBOX");
+        std::fs::create_dir_all(folder.join("cur")).unwrap();
+        // Only 5 unique Message-IDs: enough to fill 1 full group of
+        // 4 + 1 partial group of 1; the third group never forms.
+        for i in 0..5 {
+            seed_msg(&folder, "cur", &format!("{i}.x:2,"), &format!("p{i}@x"));
+        }
+        let groups = sample_message_id_groups(&folder, 3, 4).unwrap();
+        assert_eq!(groups.len(), 2, "5 IDs fill 1 full + 1 partial group");
+        assert_eq!(groups[0].len(), 4);
+        assert_eq!(groups[1].len(), 1);
+    }
+
+    /// `samples_per_group = 1`: each group has exactly one sample.
+    /// `group_count = 3` still yields three groups for the
+    /// consensus check; the per-group "intersection" degenerates
+    /// to each sample's own `mailboxIds` set, but the three-of-
+    /// three agreement requirement holds.
+    #[test]
+    fn sample_groups_handles_samples_per_group_of_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("INBOX");
+        std::fs::create_dir_all(folder.join("cur")).unwrap();
+        for i in 0..10 {
+            seed_msg(&folder, "cur", &format!("{i}.x:2,"), &format!("s{i}@x"));
+        }
+        let groups = sample_message_id_groups(&folder, 3, 1).unwrap();
+        assert_eq!(groups.len(), 3, "three single-sample groups");
+        for g in &groups {
+            assert_eq!(g.len(), 1);
+        }
+        let flat: HashSet<_> = groups.iter().flatten().cloned().collect();
+        assert_eq!(flat.len(), 3, "all three samples are distinct");
+    }
+
+    /// PRNG seeding is folder-path-deterministic: the same folder
+    /// path produces the same shuffle on every invocation. This is
+    /// the load-bearing property for the CLI's report-then-apply
+    /// workflow.
+    #[test]
+    fn sample_groups_seed_is_deterministic_for_same_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("INBOX");
+        std::fs::create_dir_all(folder.join("cur")).unwrap();
+        for i in 0..15 {
+            seed_msg(&folder, "cur", &format!("{i}.x:2,"), &format!("d{i}@x"));
+        }
+        let a = sample_message_id_groups(&folder, 3, 4).unwrap();
+        let b = sample_message_id_groups(&folder, 3, 4).unwrap();
+        assert_eq!(
+            a, b,
+            "same folder must produce same group partition across invocations"
+        );
     }
 
     /// `cur/` and `new/` files without parseable Message-IDs are
-    /// skipped; the result is empty rather than synthesized.
+    /// skipped; the result is an empty Vec rather than empty groups.
     #[test]
-    fn sample_returns_empty_for_headerless_files() {
+    fn sample_groups_returns_empty_for_headerless_files() {
         let dir = tempfile::tempdir().unwrap();
         let folder = dir.path().join("INBOX");
         std::fs::create_dir_all(folder.join("cur")).unwrap();
         std::fs::write(folder.join("cur").join("1.x:2,"), b"no headers here").unwrap();
-        let got = sample_message_ids(&folder, 10).unwrap();
+        let got = sample_message_id_groups(&folder, 3, 4).unwrap();
         assert!(got.is_empty());
     }
 

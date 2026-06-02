@@ -735,7 +735,7 @@ async fn cmd_janitor_rebindfolders(cli: &Cli, sample_size: Option<u32>, apply: b
 
     let client = session::connect(&config.account, &conn).await?;
     let maildir_root = config.maildir_path();
-    let n = sample_size
+    let samples_per_group = sample_size
         .map(|n| n as usize)
         .unwrap_or(jma_mail::janitor::rebindfolders::DEFAULT_SAMPLE_SIZE);
 
@@ -744,9 +744,14 @@ async fn cmd_janitor_rebindfolders(cli: &Cli, sample_size: Option<u32>, apply: b
     // affirmative gate so a probe that landed on the wrong mailbox
     // requires explicit acknowledgement before disk changes.
     let effective_dry_run = cli.dry_run || !apply;
-    let plan =
-        jma_mail::janitor::rebindfolders::run(&client, &conn, &maildir_root, n, effective_dry_run)
-            .await?;
+    let plan = jma_mail::janitor::rebindfolders::run(
+        &client,
+        &conn,
+        &maildir_root,
+        samples_per_group,
+        effective_dry_run,
+    )
+    .await?;
 
     render_rebindfolders_plan(&plan);
 
@@ -795,9 +800,16 @@ fn render_rebindfolders_plan(plan: &jma_mail::janitor::rebindfolders::RebindFold
             jma_mail::janitor::rebindfolders::SkipReason::NoServerMatches => {
                 "no server-side match for any sample".to_string()
             }
-            jma_mail::janitor::rebindfolders::SkipReason::AmbiguousMailboxes(union) => {
-                let names: Vec<&str> = union.iter().map(|id| id.as_ref()).collect();
-                format!("ambiguous (candidates: {})", names.join(","))
+            jma_mail::janitor::rebindfolders::SkipReason::AmbiguousAcrossSamples { per_group } => {
+                let groups: Vec<String> = per_group
+                    .iter()
+                    .enumerate()
+                    .map(|(i, ids)| {
+                        let names: Vec<&str> = ids.iter().map(|id| id.as_ref()).collect();
+                        format!("group {} -> {{{}}}", i, names.join(","))
+                    })
+                    .collect();
+                format!("ambiguous across samples ({})", groups.join("; "))
             }
         };
         println!("  [REBIND-SKIP] {} -- {}", s.folder_path.display(), detail);
