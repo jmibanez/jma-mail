@@ -3,6 +3,7 @@ pub mod headers;
 pub mod layout;
 pub mod lock;
 pub mod namespace;
+pub mod removal;
 pub mod scan;
 pub mod sentinel;
 pub mod snapshot;
