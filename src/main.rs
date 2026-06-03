@@ -75,7 +75,9 @@ async fn main() -> Result<()> {
         None
     };
 
-    let command = cli.command.clone().unwrap_or(Command::Sync);
+    let command = cli.command.clone().unwrap_or(Command::Sync {
+        args: cli.sync.clone(),
+    });
     // Capture the discriminant up front: the Auth match arm
     // partial-moves `account` out of `command`, so any later check
     // against `command` would otherwise fail to compile.
@@ -87,9 +89,9 @@ async fn main() -> Result<()> {
         Command::Init { no_interactive } => cmd_init(&cli, no_interactive).await,
         Command::Mailboxes => cmd_mailboxes(&cli).await,
         Command::Status => cmd_status(&cli).await,
-        Command::Sync => cmd_sync(&cli).await,
-        Command::Pull => cmd_pull(&cli).await,
-        Command::Push => cmd_push(&cli).await,
+        Command::Sync { args } => cmd_sync(&cli, args.dry_run).await,
+        Command::Pull { dry_run } => cmd_pull(&cli, dry_run).await,
+        Command::Push { dry_run } => cmd_push(&cli, dry_run).await,
         Command::Watch => cmd_watch(&cli, profile_sink.clone()).await,
         Command::Auth { action, account } => cmd_auth(&cli, action, account).await,
         Command::Janitor { action } => cmd_janitor(&cli, action).await,
@@ -583,32 +585,32 @@ fn acquire_mutator_locks(config: &Config) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_sync(cli: &Cli) -> Result<()> {
+async fn cmd_sync(cli: &Cli, dry_run: bool) -> Result<()> {
     let config = load_config(cli)?;
     acquire_mutator_locks(&config)?;
     let conn = state::db::open_or_recreate(&config.db_path())?;
 
-    SyncEngine::sync(&conn, &config, cli.dry_run).await?;
+    SyncEngine::sync(&conn, &config, dry_run).await?;
 
     Ok(())
 }
 
-async fn cmd_pull(cli: &Cli) -> Result<()> {
+async fn cmd_pull(cli: &Cli, dry_run: bool) -> Result<()> {
     let config = load_config(cli)?;
     acquire_mutator_locks(&config)?;
     let conn = state::db::open_or_recreate(&config.db_path())?;
 
-    SyncEngine::pull_only(&conn, &config, cli.dry_run).await?;
+    SyncEngine::pull_only(&conn, &config, dry_run).await?;
 
     Ok(())
 }
 
-async fn cmd_push(cli: &Cli) -> Result<()> {
+async fn cmd_push(cli: &Cli, dry_run: bool) -> Result<()> {
     let config = load_config(cli)?;
     acquire_mutator_locks(&config)?;
     let conn = state::db::open_or_recreate(&config.db_path())?;
 
-    SyncEngine::push_only(&conn, &config, cli.dry_run).await?;
+    SyncEngine::push_only(&conn, &config, dry_run).await?;
 
     Ok(())
 }
@@ -630,9 +632,9 @@ async fn cmd_janitor(cli: &Cli, action: Option<JanitorAction>) -> Result<()> {
     // `remotededupe` stays off the default set deliberately: it
     // talks to the server and destroys remote Email objects, so
     // it must always be invoked explicitly.
-    let action = action.unwrap_or(JanitorAction::Dedupe);
+    let action = action.unwrap_or(JanitorAction::Dedupe { apply: false });
     match action {
-        JanitorAction::Dedupe => cmd_janitor_dedupe(cli).await,
+        JanitorAction::Dedupe { apply } => cmd_janitor_dedupe(cli, apply).await,
         JanitorAction::Remotededupe { mailbox, yes } => {
             cmd_janitor_remotededupe(cli, mailbox, yes).await
         }
@@ -644,7 +646,7 @@ async fn cmd_janitor(cli: &Cli, action: Option<JanitorAction>) -> Result<()> {
     }
 }
 
-async fn cmd_janitor_dedupe(cli: &Cli) -> Result<()> {
+async fn cmd_janitor_dedupe(cli: &Cli, apply: bool) -> Result<()> {
     let config = load_config(cli)?;
     acquire_mutator_locks(&config)?;
     let conn = state::db::open_or_recreate(&config.db_path())?;
@@ -660,16 +662,17 @@ async fn cmd_janitor_dedupe(cli: &Cli) -> Result<()> {
     }
 
     let maildir_root = config.maildir_path();
-    let plan = jma_mail::janitor::dedupe::run(&maildir_root, &folders, cli.dry_run)?;
+    let plan = jma_mail::janitor::dedupe::run(&maildir_root, &folders, !apply)?;
 
     if plan.deletions.is_empty() {
         jma_mail::notify!(
             "Dedupe: no duplicates found across {} folder(s).",
             folders.len()
         );
-    } else if cli.dry_run {
+    } else if !apply {
         jma_mail::notify!(
-            "Dedupe (dry-run): would remove {} duplicate file(s):",
+            "Dedupe: {} duplicate file(s) eligible for removal; \
+             re-run with --apply to delete:",
             plan.deletions.len()
         );
         for d in &plan.deletions {
@@ -733,11 +736,11 @@ async fn cmd_janitor_remotededupe(cli: &Cli, mailbox: Option<String>, yes: bool)
 
     let client = session::connect(&config.account, &conn).await?;
 
-    // Refuse-by-default outside --dry-run: --yes is the affirmative
-    // gate for a destructive remote action. We still build the plan
-    // so the user sees what *would* have been destroyed; we just
-    // skip the apply step.
-    let effective_dry_run = cli.dry_run || !yes;
+    // Refuse-by-default: --yes is the affirmative gate for a
+    // destructive remote action. We still build the plan so the user
+    // sees what *would* have been destroyed; we just skip the apply
+    // step.
+    let effective_dry_run = !yes;
     let (plan, outcome) =
         jma_mail::janitor::remotededupe::run(&client, &conn, &folders, effective_dry_run).await?;
 
@@ -751,15 +754,7 @@ async fn cmd_janitor_remotededupe(cli: &Cli, mailbox: Option<String>, yes: bool)
         return Ok(());
     }
 
-    if cli.dry_run {
-        jma_mail::notify!(
-            "Remote dedupe (dry-run): would destroy {} id(s) across {} group(s); \
-             {} group(s) skipped. See [REMOTE-DEDUPE-SKIP] lines above for the reason on each.",
-            plan.destroy_count(),
-            plan.groups.len(),
-            plan.skipped.len(),
-        );
-    } else if !yes {
+    if !yes {
         jma_mail::notify!(
             "Remote dedupe: {} id(s) eligible for destruction across {} group(s); \
              {} group(s) skipped. Re-run with --yes to apply.",
@@ -842,10 +837,10 @@ async fn cmd_janitor_rebindfolders(
         parsed_bindings.into_iter().collect();
 
     // Sentinel writes require explicit --apply; otherwise treat as
-    // a dry run. --dry-run also forces dry; --apply is the only
-    // affirmative gate so a probe that landed on the wrong mailbox
-    // requires explicit acknowledgement before disk changes.
-    let effective_dry_run = cli.dry_run || !apply;
+    // a dry run. --apply is the only affirmative gate so a probe that
+    // landed on the wrong mailbox requires explicit acknowledgement
+    // before disk changes.
+    let effective_dry_run = !apply;
     let plan = jma_mail::janitor::rebindfolders::run(
         &client,
         &conn,
@@ -863,13 +858,7 @@ async fn cmd_janitor_rebindfolders(
         return Ok(());
     }
 
-    if cli.dry_run {
-        jma_mail::notify!(
-            "Rebindfolders (dry-run): would rebind {} folder(s); {} skipped.",
-            plan.candidates.len(),
-            plan.skipped.len(),
-        );
-    } else if !apply {
+    if !apply {
         jma_mail::notify!(
             "Rebindfolders: {} folder(s) eligible for rebind; {} skipped. Re-run with --apply to write sentinels.",
             plan.candidates.len(),

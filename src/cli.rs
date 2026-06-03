@@ -1,11 +1,16 @@
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
     name = "jma",
     version = env!("JMA_VERSION"),
-    about = "JM's Mail Agent: bidirectional JMAP-to-Maildir email sync"
+    about = "JM's Mail Agent: bidirectional JMAP-to-Maildir email sync",
+    // Bare `jma` runs sync, so accept sync's flags at the top level
+    // (`jma -n` == `jma sync -n`). args_conflicts_with_subcommands
+    // keeps those flags mutually exclusive with an explicit
+    // subcommand, so `jma -n pull` is rejected rather than ambiguous.
+    args_conflicts_with_subcommands = true
 )]
 pub struct Cli {
     /// Config file path
@@ -21,10 +26,6 @@ pub struct Cli {
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
     pub verbose: u8,
 
-    /// Show what would be done without making changes
-    #[arg(short = 'n', long, global = true)]
-    pub dry_run: bool,
-
     /// Suppress all output except errors
     #[arg(short, long, global = true)]
     pub quiet: bool,
@@ -37,18 +38,43 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub profile_json: Option<PathBuf>,
 
+    /// Options for the implicit bidirectional sync that runs when no
+    /// subcommand is given (`jma` == `jma sync`).
+    #[command(flatten)]
+    pub sync: SyncArgs,
+
     #[command(subcommand)]
     pub command: Option<Command>,
+}
+
+/// Flags for bidirectional sync, shared between the implicit `jma`
+/// invocation and the explicit `jma sync` subcommand.
+#[derive(Args, Clone)]
+pub struct SyncArgs {
+    /// Show what would be done without making changes
+    #[arg(short = 'n', long)]
+    pub dry_run: bool,
 }
 
 #[derive(Subcommand, Clone)]
 pub enum Command {
     /// Run bidirectional sync (default if no command given)
-    Sync,
+    Sync {
+        #[command(flatten)]
+        args: SyncArgs,
+    },
     /// One-way sync: server -> local only
-    Pull,
+    Pull {
+        /// Show what would be done without making changes
+        #[arg(short = 'n', long)]
+        dry_run: bool,
+    },
     /// One-way sync: local -> server only
-    Push,
+    Push {
+        /// Show what would be done without making changes
+        #[arg(short = 'n', long)]
+        dry_run: bool,
+    },
     /// Daemon mode: continuous sync on server + local changes
     Watch,
     /// Initialize config file. Runs the interactive setup wizard by
@@ -95,14 +121,22 @@ pub enum AuthAction {
 
 #[derive(Subcommand, Clone)]
 pub enum JanitorAction {
-    /// Scan and remove per-folder Message-ID duplicates
-    Dedupe,
+    /// Scan and remove per-folder Message-ID duplicates. Default
+    /// mode prints the duplicate plan without removing anything.
+    /// Pass --apply to delete the redundant files.
+    Dedupe {
+        /// Apply deletions. Without this flag the duplicate plan is
+        /// printed and disk stays untouched.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Scan the server for per-mailbox Message-ID duplicates and
     /// destroy the extras via Email/set. Two-tier safety check:
     /// refuses groups whose members disagree on Email/get `size`
     /// (cheap pre-check) or, for groups passing size, on the byte-
     /// for-byte content of their downloaded blobs (forgery
-    /// defense). Requires --yes to apply outside of --dry-run.
+    /// defense). Requires --yes to apply; without it the plan is
+    /// printed and nothing is destroyed.
     Remotededupe {
         /// Limit the scan to one maildir folder name (as it
         /// appears in `mailbox_map.maildir_folder` -- e.g. INBOX,
@@ -110,9 +144,8 @@ pub enum JanitorAction {
         /// known to the state DB.
         #[arg(long, value_name = "FOLDER")]
         mailbox: Option<String>,
-        /// Apply the destroy plan. Without this flag (and without
-        /// --dry-run) the plan is printed and the command refuses
-        /// to destroy anything.
+        /// Apply the destroy plan. Without this flag the plan is
+        /// printed and the command refuses to destroy anything.
         #[arg(long)]
         yes: bool,
     },
