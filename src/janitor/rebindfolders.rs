@@ -1057,8 +1057,8 @@ fn walk_for_orphans(
 }
 
 /// Recursive maildir-tree walk. Mirrors the helper used by the
-/// `status` drift report (`main.rs::find_maildir_folders`); kept
-/// local because the two callers want subtly different return
+/// `status` drift report (`maildir_ops::drift::find_maildir_folders`);
+/// kept local because the two callers want subtly different return
 /// shapes (drift wants relative strings for set differencing;
 /// rebindfolders wants absolute paths for `sentinel::read`).
 fn walk_for_maildirs(dir: &Path, found: &mut Vec<PathBuf>) {
