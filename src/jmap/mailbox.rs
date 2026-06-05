@@ -65,39 +65,69 @@ fn validate_mailbox_name(name: &str, cap: usize) -> Result<()> {
     }
 }
 
-/// JMAP-side hierarchy path for `mb`, root-first segments joined with
-/// `/`. Used for log lines and other diagnostic output where we want
-/// to show how the *server* sees the mailbox tree, distinct from
-/// whatever flattened on-disk shape the maildir layout chooses. A
-/// cycle in the parent chain or an unknown `parent_id` truncates the
-/// walk; we render whatever ancestors we did manage to resolve. This
-/// is intentionally separate from `maildir_ops::layout::resolve_folder_path`
-/// even though the algorithms overlap: that helper owns the
-/// layout-aware on-disk path, this one owns the protocol-side
-/// display. They diverge if a user picks a layout other than `Fs` or
-/// configures a non-`/` separator.
-fn jmap_hierarchy_path(
+/// Cycle/runaway guard for the parent-chain walk -- not a real nesting
+/// limit. No mailbox tree this deep could be stored on disk: the
+/// `flat` layout flattens a depth-N mailbox into a single filename of
+/// at least 2N-1 bytes (single-char segments + separators), so against
+/// a 255-byte NAME_MAX a storable tree caps out near 128, and real
+/// names blow that far shallower. 64 keeps ample headroom over any
+/// realistic tree (a handful of levels) while terminating a forged
+/// parent cycle quickly.
+const MAX_MAILBOX_CHAIN_DEPTH: usize = 64;
+
+/// Walk a mailbox's parent chain through `by_id` and return how many
+/// ancestors it has (0 for a top-level mailbox). Used to order mailbox
+/// processing shallowest-first (e.g. so a parent rename runs before a
+/// descendant's in the same cycle). The walk is bounded by
+/// `MAX_MAILBOX_CHAIN_DEPTH` so a forged parent cycle can't loop
+/// forever.
+pub(crate) fn parent_chain_depth(
     mb: &MailboxObject,
-    by_id: &HashMap<&JmapMailboxId, &MailboxObject>,
-) -> String {
-    let mut chain: Vec<&str> = Vec::new();
-    let mut seen: HashSet<&JmapMailboxId> = HashSet::new();
-    let mut cur: &MailboxObject = mb;
-    loop {
-        if !seen.insert(&cur.id) {
+    by_id: &HashMap<JmapMailboxId, &MailboxObject>,
+) -> usize {
+    let mut depth = 0usize;
+    let mut current = mb.parent_id.as_ref();
+    while let Some(pid) = current {
+        depth += 1;
+        if depth > MAX_MAILBOX_CHAIN_DEPTH {
             break;
         }
-        chain.push(&cur.name);
-        match &cur.parent_id {
-            None => break,
-            Some(pid) => match by_id.get(pid) {
-                Some(parent) => cur = *parent,
-                None => break,
-            },
-        }
+        current = by_id.get(pid).and_then(|p| p.parent_id.as_ref());
     }
-    chain.reverse();
-    chain.join("/")
+    depth
+}
+
+/// Join the parent's already-resolved server path with the leaf
+/// `name`, falling back to the bare name when the parent is absent or
+/// not yet in `remote_paths`.
+pub(crate) fn compose_remote_path(
+    parent_jmap_mailbox_id: Option<&JmapMailboxId>,
+    name: &str,
+    remote_paths: &HashMap<JmapMailboxId, String>,
+) -> String {
+    match parent_jmap_mailbox_id.and_then(|p| remote_paths.get(p)) {
+        Some(parent_path) => format!("{}/{}", parent_path, name),
+        None => name.to_string(),
+    }
+}
+
+/// Build every mailbox's slash-joined server-name path (root-first),
+/// keyed by id. The single definition of "JMAP mailbox tree -> remote
+/// paths", so independent copies of the computation can't drift.
+pub(crate) fn build_remote_paths(
+    by_id: &HashMap<JmapMailboxId, &MailboxObject>,
+) -> HashMap<JmapMailboxId, String> {
+    // Compose parents before children so each mailbox sees its
+    // parent's already-built path; sibling order doesn't affect the
+    // result, so the HashMap-iteration source is fine.
+    let mut ordered: Vec<&MailboxObject> = by_id.values().copied().collect();
+    ordered.sort_by_key(|mb| parent_chain_depth(mb, by_id));
+    let mut remote_paths: HashMap<JmapMailboxId, String> = HashMap::new();
+    for mb in &ordered {
+        let path = compose_remote_path(mb.parent_id.as_ref(), &mb.name, &remote_paths);
+        remote_paths.insert(mb.id.clone(), path);
+    }
+    remote_paths
 }
 
 /// Decide whether `mb` matches any entry in the user's configured
@@ -255,12 +285,16 @@ pub async fn get_all(client: &Client) -> Result<Vec<MailboxObject>> {
         // JMAP-side ancestry path. Separate from the per-row debug
         // above because the closure can't see siblings; both fire on a
         // successful batch.
-        let by_id: HashMap<&JmapMailboxId, &MailboxObject> =
-            mailboxes.iter().map(|m| (&m.id, m)).collect();
+        let by_id: HashMap<JmapMailboxId, &MailboxObject> =
+            mailboxes.iter().map(|m| (m.id.clone(), m)).collect();
+        let remote_paths = build_remote_paths(&by_id);
         for mb in &mailboxes {
             debug!(
                 "Mailbox tree path: {} (id={})",
-                jmap_hierarchy_path(mb, &by_id),
+                remote_paths
+                    .get(&mb.id)
+                    .map(String::as_str)
+                    .unwrap_or_default(),
                 mb.id
             );
         }
@@ -458,6 +492,110 @@ mod tests {
 
     fn build_index(mbs: &[MailboxObject]) -> HashMap<JmapMailboxId, &MailboxObject> {
         mbs.iter().map(|m| (m.id.clone(), m)).collect()
+    }
+
+    /// A top-level mailbox with a distinct id (the `mb` helper fixes
+    /// the id to `mb1`, which collides when a test needs several).
+    fn mb_root(id: &str, name: &str) -> MailboxObject {
+        MailboxObject {
+            id: JmapMailboxId::from(id),
+            name: name.to_string(),
+            parent_id: None,
+            role: None,
+            sort_order: 0,
+            total_emails: 0,
+            unread_emails: 0,
+        }
+    }
+
+    fn path_of<'a>(paths: &'a HashMap<JmapMailboxId, String>, id: &str) -> Option<&'a str> {
+        paths.get(&JmapMailboxId::from(id)).map(String::as_str)
+    }
+
+    /// Core contract: each path is its ancestors' names joined
+    /// root-first with `/`. `build_remote_paths` sorts by depth
+    /// internally, so the `by_id` HashMap's iteration order doesn't
+    /// affect the result -- the full `A/B/C` chain only resolves if
+    /// every parent is composed before its child.
+    #[test]
+    fn build_remote_paths_joins_ancestors_root_first() {
+        let mbs = vec![
+            mb_root("a", "A"),
+            mb_child("b", "B", "a", None),
+            mb_child("c", "C", "b", None),
+        ];
+        let paths = build_remote_paths(&build_index(&mbs));
+        assert_eq!(path_of(&paths, "a"), Some("A"));
+        assert_eq!(path_of(&paths, "b"), Some("A/B"));
+        assert_eq!(path_of(&paths, "c"), Some("A/B/C"));
+    }
+
+    #[test]
+    fn build_remote_paths_top_level_is_bare_name() {
+        let mbs = vec![mb_root("a", "Archive")];
+        let paths = build_remote_paths(&build_index(&mbs));
+        assert_eq!(path_of(&paths, "a"), Some("Archive"));
+    }
+
+    /// A `parent_id` pointing at a mailbox not in the set can't be
+    /// joined, so the mailbox falls back to its bare leaf name (the
+    /// `compose_remote_path` None arm). Mirrors a dangling parent ref.
+    #[test]
+    fn build_remote_paths_unknown_parent_falls_back_to_name() {
+        let mbs = vec![mb_child("c", "C", "missing", None)];
+        let paths = build_remote_paths(&build_index(&mbs));
+        assert_eq!(path_of(&paths, "c"), Some("C"));
+    }
+
+    /// A forged parent cycle must terminate (no infinite loop) and
+    /// still yield an entry for every mailbox -- best-effort paths for
+    /// input no real server would send.
+    #[test]
+    fn build_remote_paths_terminates_on_cycle() {
+        let mbs = vec![mb_child("a", "A", "b", None), mb_child("b", "B", "a", None)];
+        let paths = build_remote_paths(&build_index(&mbs));
+        assert!(path_of(&paths, "a").is_some());
+        assert!(path_of(&paths, "b").is_some());
+    }
+
+    #[test]
+    fn compose_remote_path_joins_or_falls_back() {
+        let mut paths = HashMap::new();
+        paths.insert(JmapMailboxId::from("p"), "Parent".to_string());
+        assert_eq!(
+            compose_remote_path(Some(&JmapMailboxId::from("p")), "Child", &paths),
+            "Parent/Child"
+        );
+        // Parent missing from the map -> bare name.
+        assert_eq!(
+            compose_remote_path(Some(&JmapMailboxId::from("missing")), "Child", &paths),
+            "Child"
+        );
+        // No parent -> bare name.
+        assert_eq!(compose_remote_path(None, "Top", &paths), "Top");
+    }
+
+    #[test]
+    fn parent_chain_depth_counts_ancestors() {
+        let mbs = vec![
+            mb_root("a", "A"),
+            mb_child("b", "B", "a", None),
+            mb_child("c", "C", "b", None),
+        ];
+        let idx = build_index(&mbs);
+        assert_eq!(parent_chain_depth(&mbs[0], &idx), 0);
+        assert_eq!(parent_chain_depth(&mbs[1], &idx), 1);
+        assert_eq!(parent_chain_depth(&mbs[2], &idx), 2);
+    }
+
+    /// The cap bounds a forged cycle so the walk terminates rather than
+    /// looping forever. Also guards against the cap being removed: that
+    /// would hang this test instead of returning.
+    #[test]
+    fn parent_chain_depth_terminates_on_cycle() {
+        let mbs = vec![mb_child("a", "A", "b", None), mb_child("b", "B", "a", None)];
+        let idx = build_index(&mbs);
+        assert!(parent_chain_depth(&mbs[0], &idx) > MAX_MAILBOX_CHAIN_DEPTH);
     }
 
     #[test]

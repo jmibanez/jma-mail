@@ -1185,28 +1185,6 @@ impl<'a> SyncEngine<'a> {
     }
 }
 
-/// Walk a mailbox's parent chain through `by_id` and return how
-/// many ancestors it has. Used to order `resolve_mailboxes`'s loop
-/// shallowest-first so a parent rename under `LAYOUT=fs` runs
-/// before any descendant rename in the same cycle. The 1024 cap is
-/// a guard against pathological cyclic input -- a real account
-/// nesting that deep would already be unworkable in MUAs.
-pub(crate) fn parent_chain_depth(
-    mb: &MailboxObject,
-    by_id: &HashMap<JmapMailboxId, &MailboxObject>,
-) -> usize {
-    let mut depth = 0usize;
-    let mut current = mb.parent_id.as_ref();
-    while let Some(pid) = current {
-        depth += 1;
-        if depth > 1024 {
-            break;
-        }
-        current = by_id.get(pid).and_then(|p| p.parent_id.as_ref());
-    }
-    depth
-}
-
 /// Compare each synced folder's current `(cur, new)` snapshot
 /// against the row written by the last successful cycle. Returns
 /// the folders whose snapshot differs (or whose checkpoint row is
@@ -1523,23 +1501,6 @@ struct MailboxesInput<'a> {
     unchanged_disk_states: &'a HashMap<JmapMailboxId, UnchangedDiskState>,
 }
 
-/// Join the parent's already-resolved server path with the leaf
-/// `name`, falling back to the bare name when the parent is
-/// absent or not yet in `remote_paths`. Shared between the
-/// topological remote_paths prep-pass and the `LocalRename` /
-/// `ConflictLocalWins` arm's post-rename `push_remote_path`
-/// computation -- both perform the same join.
-pub(crate) fn compose_remote_path(
-    parent_jmap_mailbox_id: Option<&JmapMailboxId>,
-    name: &str,
-    remote_paths: &HashMap<JmapMailboxId, String>,
-) -> String {
-    match parent_jmap_mailbox_id.and_then(|p| remote_paths.get(p)) {
-        Some(parent_path) => format!("{}/{}", parent_path, name),
-        None => name.to_string(),
-    }
-}
-
 /// Translate a `MailboxDecision` into the action-level builder
 /// calls. The first match inside the per-mailbox loop already
 /// emitted the per-id `MailboxRecord` (`push_mailbox_metadata_write`
@@ -1608,8 +1569,11 @@ fn dispatch_decision_to_builder(
             // both slots so the executor's
             // `rename_remote_mailboxes` reads it as the DB-rewrite
             // source via `action.from_folder`.
-            let push_remote_path =
-                compose_remote_path(new_parent_jmap_mailbox_id.as_ref(), new_name, remote_paths);
+            let push_remote_path = jmap_mailbox::compose_remote_path(
+                new_parent_jmap_mailbox_id.as_ref(),
+                new_name,
+                remote_paths,
+            );
             synced.push_renamed_mailbox(
                 RenameDirection::Push,
                 from_folder.clone(),
@@ -1797,13 +1761,9 @@ fn compute_mailbox_resolution(
         .map(|r| (r.maildir_folder.as_str(), &r.jmap_mailbox_id))
         .collect();
     let mut ordered: Vec<&MailboxObject> = input.remote_mailboxes.iter().collect();
-    ordered.sort_by_key(|mb| parent_chain_depth(mb, &by_id));
+    ordered.sort_by_key(|mb| jmap_mailbox::parent_chain_depth(mb, &by_id));
 
-    let mut remote_paths: HashMap<JmapMailboxId, String> = HashMap::new();
-    for mb in &ordered {
-        let path = compose_remote_path(mb.parent_id.as_ref(), &mb.name, &remote_paths);
-        remote_paths.insert(mb.id.clone(), path);
-    }
+    let remote_paths = jmap_mailbox::build_remote_paths(&by_id);
 
     let mut synced = MailboxBindings::builder();
 
@@ -1832,9 +1792,8 @@ fn compute_mailbox_resolution(
             .map(|r| r.maildir_folder.as_str());
         let disk_folder = input.disk_sentinels.get(&mb.id).map(String::as_str);
 
-        // remote_path was computed for every server-known
-        // mailbox in the pre-pass above; the synced-set entry
-        // must be there.
+        // `build_remote_paths` above populated an entry for every
+        // server-known mailbox; the synced-set entry must be there.
         let remote_path = remote_paths
             .get(&mb.id)
             .cloned()
