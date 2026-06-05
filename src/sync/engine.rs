@@ -819,14 +819,23 @@ impl<'a> SyncEngine<'a> {
             .iter()
             .map(|mb| (mb.id.clone(), mb))
             .collect();
+        let remote_paths = jmap_mailbox::build_remote_paths(&by_id);
+        let selection_inputs: Vec<jmap_mailbox::MailboxSelectionInput> = remote_mailboxes
+            .iter()
+            .map(|mb| jmap_mailbox::MailboxSelectionInput {
+                path: &remote_paths[&mb.id],
+                role: mb.role.as_deref(),
+            })
+            .collect();
+        let selected = jmap_mailbox::get_selected_mailboxes(
+            &self.config.sync.mailboxes,
+            &selection_inputs,
+            self.config.sync.case_insensitive_match,
+            true,
+        );
         let mut unchanged_disk_states: HashMap<JmapMailboxId, UnchangedDiskState> = HashMap::new();
         for mb in &remote_mailboxes {
-            if !jmap_mailbox::is_mailbox_synced(
-                &self.config.sync.mailboxes,
-                mb,
-                &by_id,
-                self.config.sync.case_insensitive_match,
-            ) {
+            if !selected.contains(remote_paths[&mb.id].as_str()) {
                 continue;
             }
             let server_folder = resolve_folder_path(mb, &by_id, &layout_definition)?;
@@ -1765,19 +1774,26 @@ fn compute_mailbox_resolution(
 
     let remote_paths = jmap_mailbox::build_remote_paths(&by_id);
 
+    let selection_inputs: Vec<jmap_mailbox::MailboxSelectionInput> = ordered
+        .iter()
+        .map(|mb| jmap_mailbox::MailboxSelectionInput {
+            path: &remote_paths[&mb.id],
+            role: mb.role.as_deref(),
+        })
+        .collect();
+    let selected = jmap_mailbox::get_selected_mailboxes(
+        &sync_config.mailboxes,
+        &selection_inputs,
+        sync_config.case_insensitive_match,
+        true,
+    );
+
     let mut synced = MailboxBindings::builder();
 
     for mb in ordered {
-        // Parent-aware filter: a config entry naming any ancestor
-        // (or the mailbox itself) includes this mailbox. So
-        // `mailboxes = ["[Airmail]"]` syncs `[Airmail]` plus every
-        // descendant. Empty filter means "sync everything".
-        if !jmap_mailbox::is_mailbox_synced(
-            &sync_config.mailboxes,
-            mb,
-            &by_id,
-            sync_config.case_insensitive_match,
-        ) {
+        // Sync the configured mailboxes plus their subtrees; an empty
+        // filter syncs everything.
+        if !selected.contains(remote_paths[&mb.id].as_str()) {
             continue;
         }
 

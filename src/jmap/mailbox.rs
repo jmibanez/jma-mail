@@ -114,7 +114,7 @@ pub(crate) fn compose_remote_path(
 /// Build every mailbox's slash-joined server-name path (root-first),
 /// keyed by id. The single definition of "JMAP mailbox tree -> remote
 /// paths", so independent copies of the computation can't drift.
-pub(crate) fn build_remote_paths(
+pub fn build_remote_paths(
     by_id: &HashMap<JmapMailboxId, &MailboxObject>,
 ) -> HashMap<JmapMailboxId, String> {
     // Compose parents before children so each mailbox sees its
@@ -130,63 +130,105 @@ pub(crate) fn build_remote_paths(
     remote_paths
 }
 
-/// Decide whether `mb` matches any entry in the user's configured
-/// mailbox list. An empty list means "sync everything".
-///
-/// `INBOX` is treated as a magic alias for the JMAP inbox role -- this
-/// is the IMAP convention and matches what most users expect when they
-/// see "INBOX" in a config file. Other entries match by name, exactly
-/// or case-insensitively depending on `case_insensitive`.
-///
-/// The match walks the `parent_id` chain: a config entry that names
-/// the mailbox itself or any of its ancestors includes the mailbox.
-/// So `mailboxes = ["[Airmail]"]` picks up `[Airmail]` itself plus
-/// every descendant under it, matching the "select this folder and
-/// its subfolders" intuition users get from mbsync's pattern
-/// directives. To exclude a specific descendant the user would need
-/// a finer filter (not yet supported); today it's all-or-none per
-/// subtree.
-///
-/// Cycle in the parent chain (forged by a malicious server) breaks
-/// the walk and returns `false`. The cycle is also caught with a
-/// clearer error inside `maildir_ops::layout::resolve_folder_path`,
-/// which runs immediately after this filter.
-pub fn is_mailbox_synced(
+/// One mailbox as the sync-set selection sees it: its slash-joined
+/// server-name path (root-first) and its role. Paths are unique per
+/// account, so selection is expressed in terms of them.
+#[derive(Clone, Copy)]
+pub struct MailboxSelectionInput<'a> {
+    pub path: &'a str,
+    pub role: Option<&'a str>,
+}
+
+/// Whether `path`/`role` exactly matches a sync-filter entry: an entry
+/// equal to the whole path (case-sensitive unless `case_insensitive`),
+/// or the `INBOX` alias when the mailbox carries the inbox role. Exact
+/// match only -- subtree inclusion is layered on separately by
+/// `get_matching_mailbox_subtrees`.
+fn matches_filter_entry(
     config_entries: &[String],
-    mb: &MailboxObject,
-    by_id: &HashMap<JmapMailboxId, &MailboxObject>,
+    path: &str,
+    role: Option<&str>,
     case_insensitive: bool,
 ) -> bool {
+    config_entries.iter().any(|entry| {
+        if entry == "INBOX" && role == Some("inbox") {
+            return true;
+        }
+        if case_insensitive {
+            entry.eq_ignore_ascii_case(path)
+        } else {
+            entry == path
+        }
+    })
+}
+
+/// Whether `path` is a strict descendant of `ancestor` -- `ancestor`
+/// followed by `/` and at least one more segment. The separator check
+/// is what keeps an entry of `Foo` from sweeping in `Bar/Foo` (not a
+/// descendant) or `Foobar` (shares a prefix but no path boundary).
+fn is_path_under(path: &str, ancestor: &str) -> bool {
+    path.len() > ancestor.len()
+        && path.as_bytes()[ancestor.len()] == b'/'
+        && path.starts_with(ancestor)
+}
+
+/// The paths that exactly match a sync-filter entry (see
+/// `matches_filter_entry`). An empty filter selects every mailbox.
+pub(crate) fn get_matching_mailboxes(
+    config_entries: &[String],
+    mailboxes: &[MailboxSelectionInput],
+    case_insensitive: bool,
+) -> HashSet<String> {
     if config_entries.is_empty() {
-        return true;
+        return mailboxes.iter().map(|m| m.path.to_string()).collect();
     }
-    let mut seen: HashSet<JmapMailboxId> = HashSet::new();
-    let mut cur: &MailboxObject = mb;
-    loop {
-        if !seen.insert(cur.id.clone()) {
-            return false;
-        }
-        for entry in config_entries {
-            if entry == "INBOX" && cur.role.as_deref() == Some("inbox") {
-                return true;
-            }
-            let matches_name = if case_insensitive {
-                entry.eq_ignore_ascii_case(&cur.name)
-            } else {
-                entry == &cur.name
-            };
-            if matches_name {
-                return true;
-            }
-        }
-        match &cur.parent_id {
-            None => return false,
-            Some(pid) => match by_id.get(pid) {
-                Some(parent) => cur = *parent,
-                None => return false,
-            },
-        }
+    mailboxes
+        .iter()
+        .filter(|m| matches_filter_entry(config_entries, m.path, m.role, case_insensitive))
+        .map(|m| m.path.to_string())
+        .collect()
+}
+
+/// The paths that lie under an already-`matched` path -- the subtrees
+/// of the matched mailboxes. Path comparison is exact (both sides are
+/// server paths), independent of the filter's case sensitivity.
+pub(crate) fn get_matching_mailbox_subtrees(
+    matched: &HashSet<String>,
+    mailboxes: &[MailboxSelectionInput],
+) -> HashSet<String> {
+    mailboxes
+        .iter()
+        .filter(|m| !matched.contains(m.path))
+        .filter(|m| {
+            matched
+                .iter()
+                .any(|ancestor| is_path_under(m.path, ancestor))
+        })
+        .map(|m| m.path.to_string())
+        .collect()
+}
+
+/// The set of mailbox paths selected by `config_entries`: the exact
+/// matches, plus their subtrees when `include_subtrees`. An empty
+/// filter selects every mailbox.
+///
+/// `INBOX` matches the inbox mailbox by role (whatever its localized
+/// name); with `include_subtrees` its descendants come along like any
+/// other selected subtree. A multi-segment entry (`Foo/Bar`) selects
+/// exactly that path and, with subtrees on, everything beneath it --
+/// so a bare `Foo` selects `Foo` and its subtree but never an
+/// unrelated `Bar/Foo`.
+pub fn get_selected_mailboxes(
+    config_entries: &[String],
+    mailboxes: &[MailboxSelectionInput],
+    case_insensitive: bool,
+    include_subtrees: bool,
+) -> HashSet<String> {
+    let mut selected = get_matching_mailboxes(config_entries, mailboxes, case_insensitive);
+    if include_subtrees {
+        selected.extend(get_matching_mailbox_subtrees(&selected, mailboxes));
     }
+    selected
 }
 
 /// Fetch all mailboxes from the server using the convenience helper.
@@ -460,18 +502,6 @@ mod tests {
     use super::*;
     use crate::jmap::limits::MAX_MAILBOX_NAME_LEN;
 
-    fn mb(name: &str, role: Option<&str>) -> MailboxObject {
-        MailboxObject {
-            id: JmapMailboxId::from("mb1"),
-            name: name.to_string(),
-            parent_id: None,
-            role: role.map(str::to_string),
-            sort_order: 0,
-            total_emails: 0,
-            unread_emails: 0,
-        }
-    }
-
     fn mb_child(id: &str, name: &str, parent: &str, role: Option<&str>) -> MailboxObject {
         MailboxObject {
             id: JmapMailboxId::from(id),
@@ -482,12 +512,6 @@ mod tests {
             total_emails: 0,
             unread_emails: 0,
         }
-    }
-
-    /// For single-mailbox tests where the parent chain doesn't matter
-    /// (no `parent_id` set, so the walk terminates immediately).
-    fn empty_index() -> HashMap<JmapMailboxId, &'static MailboxObject> {
-        HashMap::new()
     }
 
     fn build_index(mbs: &[MailboxObject]) -> HashMap<JmapMailboxId, &MailboxObject> {
@@ -598,185 +622,155 @@ mod tests {
         assert!(parent_chain_depth(&mbs[0], &idx) > MAX_MAILBOX_CHAIN_DEPTH);
     }
 
+    /// Run `get_selected_mailboxes` over `(path, role)` pairs and
+    /// return the selected paths.
+    fn selected(
+        entries: &[&str],
+        mailboxes: &[(&str, Option<&str>)],
+        case_insensitive: bool,
+        include_subtrees: bool,
+    ) -> HashSet<String> {
+        let entries: Vec<String> = entries.iter().map(|s| s.to_string()).collect();
+        let inputs: Vec<MailboxSelectionInput> = mailboxes
+            .iter()
+            .copied()
+            .map(|(path, role)| MailboxSelectionInput { path, role })
+            .collect();
+        get_selected_mailboxes(&entries, &inputs, case_insensitive, include_subtrees)
+    }
+
+    fn paths(items: &[&str]) -> HashSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
-    fn empty_config_syncs_everything() {
-        let idx = empty_index();
-        assert!(is_mailbox_synced(
+    fn empty_filter_selects_every_path() {
+        let got = selected(
             &[],
-            &mb("Inbox", Some("inbox")),
-            &idx,
-            false
-        ));
-        assert!(is_mailbox_synced(&[], &mb("Random", None), &idx, false));
+            &[("INBOX", Some("inbox")), ("Archive", None)],
+            false,
+            true,
+        );
+        assert_eq!(got, paths(&["INBOX", "Archive"]));
+    }
+
+    /// The inbox is matched by role even when the server localized its
+    /// name, so `INBOX` selects it without a literal path match.
+    #[test]
+    fn inbox_alias_selects_inbox_by_role() {
+        let got = selected(&["INBOX"], &[("Indbakke", Some("inbox"))], false, true);
+        assert_eq!(got, paths(&["Indbakke"]));
     }
 
     #[test]
-    fn inbox_alias_matches_inbox_role() {
-        let entries = vec!["INBOX".to_string()];
-        let idx = empty_index();
-        assert!(is_mailbox_synced(
-            &entries,
-            &mb("Inbox", Some("inbox")),
-            &idx,
-            false
-        ));
-        // Even if the server localized the name:
-        assert!(is_mailbox_synced(
-            &entries,
-            &mb("Indbakke", Some("inbox")),
-            &idx,
-            false
-        ));
+    fn inbox_alias_ignores_non_inbox_role() {
+        let got = selected(
+            &["INBOX"],
+            &[("Inbox", Some("archive")), ("Other", None)],
+            false,
+            true,
+        );
+        assert!(got.is_empty());
     }
 
     #[test]
-    fn inbox_alias_does_not_match_non_inbox_role() {
-        let entries = vec!["INBOX".to_string()];
-        let idx = empty_index();
-        assert!(!is_mailbox_synced(
-            &entries,
-            &mb("Inbox", Some("archive")),
-            &idx,
-            false
-        ));
-        assert!(!is_mailbox_synced(
-            &entries,
-            &mb("Inbox", None),
-            &idx,
-            false
-        ));
+    fn exact_path_match_is_case_sensitive_by_default() {
+        assert_eq!(
+            selected(&["Archive"], &[("Archive", None)], false, true),
+            paths(&["Archive"])
+        );
+        assert!(selected(&["Archive"], &[("archive", None)], false, true).is_empty());
     }
 
     #[test]
-    fn exact_name_match_is_case_sensitive_by_default() {
-        let entries = vec!["Archive".to_string()];
-        let idx = empty_index();
-        assert!(is_mailbox_synced(
-            &entries,
-            &mb("Archive", Some("archive")),
-            &idx,
-            false
-        ));
-        assert!(!is_mailbox_synced(
-            &entries,
-            &mb("archive", Some("archive")),
-            &idx,
-            false
-        ));
+    fn case_insensitive_flag_loosens_path_match() {
+        assert_eq!(
+            selected(&["archive"], &[("Archive", None)], true, true),
+            paths(&["Archive"])
+        );
+        assert!(selected(&["archive"], &[("Archive", None)], false, true).is_empty());
     }
 
+    /// `[Airmail]` selects itself and, with subtrees on, `[Airmail]/Sent`.
     #[test]
-    fn case_insensitive_flag_loosens_name_match() {
-        let entries = vec!["archive".to_string()];
-        let idx = empty_index();
-        assert!(is_mailbox_synced(
-            &entries,
-            &mb("Archive", Some("archive")),
-            &idx,
-            true
-        ));
-        assert!(!is_mailbox_synced(
-            &entries,
-            &mb("Archive", Some("archive")),
-            &idx,
-            false
-        ));
+    fn subtree_included_when_on() {
+        let got = selected(
+            &["[Airmail]"],
+            &[("[Airmail]", None), ("[Airmail]/Sent", None)],
+            false,
+            true,
+        );
+        assert_eq!(got, paths(&["[Airmail]", "[Airmail]/Sent"]));
     }
 
+    /// With subtrees off the user can pick a parent without its
+    /// children -- the case the old all-or-none filter couldn't express.
     #[test]
-    fn unmatched_entry_does_not_sync() {
-        let entries = vec!["Sent".to_string(), "Drafts".to_string()];
-        let idx = empty_index();
-        assert!(!is_mailbox_synced(
-            &entries,
-            &mb("Spam", Some("junk")),
-            &idx,
-            false
-        ));
-        assert!(!is_mailbox_synced(
-            &entries,
-            &mb("Spam", Some("junk")),
-            &idx,
-            true
-        ));
+    fn subtree_excluded_when_off() {
+        let got = selected(&["Foo"], &[("Foo", None), ("Foo/Bar", None)], false, false);
+        assert_eq!(got, paths(&["Foo"]));
     }
 
-    /// `mailboxes = ["[Airmail]"]` matches `[Airmail]/Sent` because
-    /// the walk finds the parent in the index. This is the core
-    /// "select a folder and its subfolders" semantic.
+    /// Regression: a bare `Foo` selects `Foo` and its subtree but never
+    /// an unrelated `Bar/Foo` that merely shares the leaf name -- the
+    /// old per-ancestor leaf-name match swept that in.
     #[test]
-    fn parent_match_includes_descendants() {
-        let entries = vec!["[Airmail]".to_string()];
-        let mbs = vec![
-            MailboxObject {
-                id: JmapMailboxId::from("p"),
-                name: "[Airmail]".to_string(),
-                parent_id: None,
-                role: None,
-                sort_order: 0,
-                total_emails: 0,
-                unread_emails: 0,
-            },
-            mb_child("c", "Sent", "p", None),
-        ];
-        let idx = build_index(&mbs);
-        assert!(is_mailbox_synced(&entries, &mbs[1], &idx, false));
+    fn nested_same_name_is_not_swept_in() {
+        let got = selected(
+            &["Foo"],
+            &[("Foo", None), ("Foo/Bar", None), ("Bar/Foo", None)],
+            false,
+            true,
+        );
+        assert_eq!(got, paths(&["Foo", "Foo/Bar"]));
     }
 
-    /// INBOX alias matches at any depth, so a child of the inbox is
-    /// included by `mailboxes = ["INBOX"]` even though only its parent
-    /// has the inbox role.
+    /// A shared prefix without a path boundary is not a subtree: `Foo`
+    /// does not select `Foobar`.
     #[test]
-    fn inbox_alias_matches_via_ancestor() {
-        let entries = vec!["INBOX".to_string()];
-        let mbs = vec![
-            MailboxObject {
-                id: JmapMailboxId::from("i"),
-                name: "Indbakke".to_string(),
-                parent_id: None,
-                role: Some("inbox".to_string()),
-                sort_order: 0,
-                total_emails: 0,
-                unread_emails: 0,
-            },
-            mb_child("c", "Receipts", "i", None),
-        ];
-        let idx = build_index(&mbs);
-        assert!(is_mailbox_synced(&entries, &mbs[1], &idx, false));
+    fn shared_prefix_without_separator_is_not_a_subtree() {
+        let got = selected(&["Foo"], &[("Foo", None), ("Foobar", None)], false, true);
+        assert_eq!(got, paths(&["Foo"]));
     }
 
-    /// A descendant whose ancestors don't match any config entry
-    /// stays excluded -- the parent walk doesn't accidentally sweep
-    /// in unrelated folders.
+    /// Subtree inclusion attaches to a case-insensitively matched
+    /// parent: the parent matches via the ci flag, and its descendant
+    /// comes along through the (exact, case-preserving) subtree check.
     #[test]
-    fn descendant_with_no_matching_ancestor_does_not_sync() {
-        let entries = vec!["Archive".to_string()];
-        let mbs = vec![
-            MailboxObject {
-                id: JmapMailboxId::from("p"),
-                name: "[Airmail]".to_string(),
-                parent_id: None,
-                role: None,
-                sort_order: 0,
-                total_emails: 0,
-                unread_emails: 0,
-            },
-            mb_child("c", "Sent", "p", None),
-        ];
-        let idx = build_index(&mbs);
-        assert!(!is_mailbox_synced(&entries, &mbs[1], &idx, false));
+    fn case_insensitive_match_still_pulls_in_subtree() {
+        let got = selected(
+            &["archive"],
+            &[("Archive", None), ("Archive/Old", None)],
+            true,
+            true,
+        );
+        assert_eq!(got, paths(&["Archive", "Archive/Old"]));
     }
 
-    /// A cycle in the parent chain (forged by a malicious server)
-    /// terminates the walk and returns `false`. Defense-in-depth
-    /// against an infinite loop here -- `resolve_folder_path` will
-    /// reject the same input with a clearer error immediately after.
+    /// A multi-segment entry selects exactly that path and its subtree.
     #[test]
-    fn parent_chain_cycle_does_not_loop() {
-        let entries = vec!["Anything".to_string()];
-        let mbs = vec![mb_child("a", "A", "b", None), mb_child("b", "B", "a", None)];
-        let idx = build_index(&mbs);
-        assert!(!is_mailbox_synced(&entries, &mbs[0], &idx, false));
+    fn multi_segment_entry_selects_that_subtree() {
+        let got = selected(
+            &["Foo/Bar"],
+            &[("Foo", None), ("Foo/Bar", None), ("Foo/Bar/Baz", None)],
+            false,
+            true,
+        );
+        assert_eq!(got, paths(&["Foo/Bar", "Foo/Bar/Baz"]));
+    }
+
+    /// The inbox's subtree comes along under `INBOX` even for a
+    /// localized inbox: once the inbox is matched by role, its
+    /// descendants fall out of the general subtree mechanism.
+    #[test]
+    fn inbox_subtree_included_for_localized_inbox() {
+        let got = selected(
+            &["INBOX"],
+            &[("Posteingang", Some("inbox")), ("Posteingang/Sub", None)],
+            false,
+            true,
+        );
+        assert_eq!(got, paths(&["Posteingang", "Posteingang/Sub"]));
     }
 
     #[test]

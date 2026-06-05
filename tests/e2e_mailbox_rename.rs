@@ -50,10 +50,10 @@ fn test_config(fx: &common::JmapFixture, maildir_root: &std::path::Path) -> Conf
         },
         sync: SyncConfig {
             maildir_path: maildir_root.to_string_lossy().into_owned(),
-            // Whole-account sync. `vec!["Archive"]` would match
-            // the pre-rename name and drop the mailbox out of the
-            // synced set after the rename (`is_mailbox_synced`
-            // matches on the server's current `name`, not the
+            // Whole-account sync. `vec!["Archive"]` would match the
+            // pre-rename path and drop the mailbox out of the synced
+            // set after the rename (the sync filter matches on the
+            // server path, which changes on rename, not the stable
             // mailbox id), making the post-rename assertions
             // unreachable.
             mailboxes: vec![],
