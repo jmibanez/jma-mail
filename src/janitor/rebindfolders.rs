@@ -258,21 +258,9 @@ pub async fn plan(
         .map(|mb| (mb.id.clone(), mb))
         .collect();
 
-    // Reuse `sync::engine`'s remote_path primitives: sort by parent
-    // chain depth so each iteration sees its parent's already-
-    // computed path, then compose per mailbox. Same shape as the
-    // engine's topological pre-pass in `resolve_mailboxes`.
-    let mut ordered: Vec<&MailboxObject> = by_id.values().copied().collect();
-    ordered.sort_by_key(|mb| crate::sync::engine::parent_chain_depth(mb, &by_id));
-    let mut remote_paths: HashMap<JmapMailboxId, String> = HashMap::new();
-    for mb in &ordered {
-        let path = crate::sync::engine::compose_remote_path(
-            mb.parent_id.as_ref(),
-            &mb.name,
-            &remote_paths,
-        );
-        remote_paths.insert(mb.id.clone(), path);
-    }
+    // Build the by-id remote-path map via the shared engine helper so
+    // it can't drift from the engine's own path computation.
+    let remote_paths = crate::jmap::mailbox::build_remote_paths(&by_id);
 
     let bound_folders: HashSet<String> = queries::list_known_maildir_folders(conn)?
         .into_iter()
@@ -1581,18 +1569,6 @@ mod tests {
         (dir, conn)
     }
 
-    /// Helper: build the `remote_paths` map directly from `by_id`.
-    /// All test mailboxes are top-level (parent_id = None), so the
-    /// path is just the leaf name.
-    fn flat_remote_paths(
-        by_id: &HashMap<JmapMailboxId, &MailboxObject>,
-    ) -> HashMap<JmapMailboxId, String> {
-        by_id
-            .iter()
-            .map(|(id, mb)| (id.clone(), mb.name.clone()))
-            .collect()
-    }
-
     /// Precondition: server mailbox count must equal on-disk maildir
     /// count. With i != j the cross-mapping pass is a no-op.
     #[test]
@@ -1605,7 +1581,7 @@ mod tests {
         ];
         let by_id: HashMap<JmapMailboxId, &MailboxObject> =
             server.iter().map(|m| (m.id.clone(), m)).collect();
-        let remote_paths = flat_remote_paths(&by_id);
+        let remote_paths = crate::jmap::mailbox::build_remote_paths(&by_id);
         let mut plan = ambig_plan(vec![(
             PathBuf::from("/disk/folder1"),
             vec![vec![mid("MB-A")], vec![mid("MB-A")]],
@@ -1626,7 +1602,7 @@ mod tests {
         let server = [mb("MB-A", "A", None), mb("MB-B", "B", None)];
         let by_id: HashMap<JmapMailboxId, &MailboxObject> =
             server.iter().map(|m| (m.id.clone(), m)).collect();
-        let remote_paths = flat_remote_paths(&by_id);
+        let remote_paths = crate::jmap::mailbox::build_remote_paths(&by_id);
         let mut plan = RebindFoldersPlan {
             candidates: vec![],
             remote_paths: HashMap::new(),
@@ -1658,7 +1634,7 @@ mod tests {
         let server = [mb("MB-A", "A", None), mb("MB-B", "B", None)];
         let by_id: HashMap<JmapMailboxId, &MailboxObject> =
             server.iter().map(|m| (m.id.clone(), m)).collect();
-        let remote_paths = flat_remote_paths(&by_id);
+        let remote_paths = crate::jmap::mailbox::build_remote_paths(&by_id);
         // Maildir 1 narrowed to {MB-A} only; maildir 2 narrowed to
         // {MB-A, MB-B} per group. With MB-A forced to maildir 1, the
         // unique matching sends maildir 2 to MB-B.
@@ -1701,7 +1677,7 @@ mod tests {
         let server = [mb("MB-A", "A", None), mb("MB-B", "B", None)];
         let by_id: HashMap<JmapMailboxId, &MailboxObject> =
             server.iter().map(|m| (m.id.clone(), m)).collect();
-        let remote_paths = flat_remote_paths(&by_id);
+        let remote_paths = crate::jmap::mailbox::build_remote_paths(&by_id);
         let mut plan = ambig_plan(vec![
             (
                 PathBuf::from("/disk/folder1"),
@@ -1728,7 +1704,7 @@ mod tests {
         let server = [mb("MB-A", "A", None), mb("MB-B", "B", None)];
         let by_id: HashMap<JmapMailboxId, &MailboxObject> =
             server.iter().map(|m| (m.id.clone(), m)).collect();
-        let remote_paths = flat_remote_paths(&by_id);
+        let remote_paths = crate::jmap::mailbox::build_remote_paths(&by_id);
         let mut plan = RebindFoldersPlan {
             candidates: vec![RebindCandidate {
                 folder_path: PathBuf::from("/disk/folder1"),
