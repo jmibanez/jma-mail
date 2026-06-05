@@ -282,11 +282,28 @@ async fn cmd_mailboxes(cli: &Cli) -> Result<()> {
 
     let mailboxes = jma_mail::jmap::mailbox::get_all(&client).await?;
 
-    // Index by id so `is_mailbox_synced` can walk the parent chain
-    // and `resolve_folder_path` can compute the on-disk name.
+    // Index by id so `resolve_folder_path` can compute the on-disk
+    // name and `build_remote_paths` can resolve each server path.
     let by_id: std::collections::HashMap<_, _> =
         mailboxes.iter().map(|mb| (mb.id.clone(), mb)).collect();
     let name_cap = jma_mail::jmap::limits::max_size_mailbox_name(&client);
+
+    // Mark which mailboxes the sync filter selects (exact matches plus
+    // their subtrees), computed once over every server path.
+    let remote_paths = jma_mail::jmap::mailbox::build_remote_paths(&by_id);
+    let selection_inputs: Vec<jma_mail::jmap::mailbox::MailboxSelectionInput> = mailboxes
+        .iter()
+        .map(|mb| jma_mail::jmap::mailbox::MailboxSelectionInput {
+            path: &remote_paths[&mb.id],
+            role: mb.role.as_deref(),
+        })
+        .collect();
+    let selected = jma_mail::jmap::mailbox::get_selected_mailboxes(
+        &config.sync.mailboxes,
+        &selection_inputs,
+        config.sync.case_insensitive_match,
+        true,
+    );
 
     println!(
         "{:<40} {:>8} {:>8}  Role",
@@ -295,12 +312,7 @@ async fn cmd_mailboxes(cli: &Cli) -> Result<()> {
     println!("{}", "-".repeat(70));
     let layout_definition = FolderLayoutDefinition::from_config(&config, name_cap);
     for mb in &mailboxes {
-        let synced = if jma_mail::jmap::mailbox::is_mailbox_synced(
-            &config.sync.mailboxes,
-            mb,
-            &by_id,
-            config.sync.case_insensitive_match,
-        ) {
+        let synced = if selected.contains(remote_paths[&mb.id].as_str()) {
             "*"
         } else {
             " "
