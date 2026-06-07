@@ -1,23 +1,24 @@
-//! Maildir-vs-DB drift: compare the `mailbox_map` folder set against
-//! the maildir tree on disk.
+//! Maildir-vs-DB drift: classify the discrepancies between the
+//! `mailbox_map` rows and the maildir tree on disk.
 //!
 //! `compute_drift` is a pure read over the state DB and the
 //! filesystem -- no network, no mutation -- returning a structured
-//! result rather than printing. `cmd_status` renders it for the
-//! human-facing drift report. Keeping the computation here, separate
-//! from the status command's presentation, lets any caller reason
+//! classification rather than printing, so any caller can reason
 //! about drift from one definition instead of re-deriving it.
 
 use anyhow::Result;
 use rusqlite::Connection;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
+use crate::ids::JmapMailboxId;
+use crate::jmap::mailbox::{MailboxSelectionInput, get_selected_mailboxes};
 use crate::maildir_ops::namespace::is_jma_private;
-use crate::state::queries;
+use crate::maildir_ops::sentinel;
+use crate::state::queries::{self, MailboxRecord};
 
-/// Outcome of comparing the cached `mailbox_map` folder set against
-/// the on-disk maildir tree.
+/// Outcome of comparing the cached `mailbox_map` rows against the
+/// on-disk maildir tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DriftReport {
     /// The maildir root directory does not exist -- there is nothing
@@ -26,56 +27,155 @@ pub enum DriftReport {
     /// `mailbox_map` has no rows yet, so the DB has no record of any
     /// synced folder to compare against disk.
     NoMailboxMap,
-    /// Neither degenerate precondition applies (root exists and the
-    /// mailbox map is non-empty), so the two sides were compared.
-    /// Either vector may be empty; two empty vectors means the maildir
-    /// tree and the DB agree.
-    Drift {
-        /// Folders found on disk that have no `mailbox_map` row.
-        only_disk: Vec<String>,
-        /// Folders recorded in `mailbox_map` whose maildir is absent
-        /// from disk.
-        only_db: Vec<String>,
-    },
+    /// The two sides were compared. Every field of `DriftClasses` may
+    /// be empty; all empty means the maildir tree and the DB agree and
+    /// nothing has dropped out of the sync set.
+    Drift(DriftClasses),
 }
 
-/// Compare the folders recorded in `mailbox_map` against the maildir
-/// directories under `maildir_root`. When both degenerate conditions
-/// hold, `MaildirRootMissing` takes priority over `NoMailboxMap`.
-pub fn compute_drift(conn: &Connection, maildir_root: &Path) -> Result<DriftReport> {
-    let known: BTreeSet<String> = queries::list_known_maildir_folders(conn)?
-        .into_iter()
-        .collect();
+/// The classified discrepancies between `mailbox_map` and the maildir
+/// tree.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DriftClasses {
+    /// Folders on disk with no `mailbox_map` row, not part of a
+    /// pending local rename -- untracked strays.
+    pub disk_only: Vec<String>,
+    /// `mailbox_map` rows whose maildir is absent from disk, not part
+    /// of a pending local rename -- orphaned cache rows.
+    pub db_only: Vec<String>,
+    /// Folders present on both sides whose mailbox is no longer
+    /// selected by `[sync].mailboxes`. Always empty when the config
+    /// syncs every mailbox (empty list).
+    pub config_dropped: Vec<String>,
+    /// Local folder renames not yet pushed to the server: the maildir
+    /// moved from `db_folder` (where `mailbox_map` still points) to
+    /// `disk_folder` (where the `.jma.mapping` sentinel now lives),
+    /// both bound to the same mailbox id.
+    pub rename_in_flight: Vec<RenameInFlight>,
+}
 
+/// A local rename detected from disk: `mailbox_map` still names
+/// `db_folder`, but the sentinel for that mailbox id now lives under
+/// `disk_folder`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenameInFlight {
+    pub db_folder: String,
+    pub disk_folder: String,
+}
+
+/// Compare the `mailbox_map` rows against the maildir directories under
+/// `maildir_root`, classifying each discrepancy. `mailboxes` /
+/// `case_insensitive` are the `[sync]` selection, used to flag folders
+/// that have dropped out of the sync set. When both degenerate
+/// conditions hold, `MaildirRootMissing` takes priority over
+/// `NoMailboxMap`.
+pub fn compute_drift(
+    conn: &Connection,
+    maildir_root: &Path,
+    mailboxes: &[String],
+    case_insensitive: bool,
+) -> Result<DriftReport> {
     if !maildir_root.exists() {
         return Ok(DriftReport::MaildirRootMissing);
     }
-    if known.is_empty() {
+    let rows = queries::get_all_mailboxes(conn)?;
+    if rows.is_empty() {
         return Ok(DriftReport::NoMailboxMap);
     }
 
-    // Walk recursively to find every directory that looks like a
-    // maildir (has `cur/` underneath). This is the only shape that
-    // works across all three folder layouts:
-    //   - Flat:      <root>/foo.bar/cur                (depth 1)
-    //   - MaildirPP: <root>/.foo.bar/cur               (depth 1, leading dot)
-    //   - Fs:        <root>/foo/bar/cur                (depth N>=1)
     let on_disk = find_maildir_folders(maildir_root);
+    let known: BTreeSet<String> = rows.iter().map(|r| r.maildir_folder.clone()).collect();
 
-    let only_disk: Vec<String> = on_disk.difference(&known).cloned().collect();
-    // For "in DB not on disk", trust the per-folder existence check
-    // rather than set-difference: it's layout-independent (a stored
-    // `maildir_folder` of `parent/child` joins onto the root with the
-    // FS separator, regardless of whether the *layout* uses `/` or
-    // `.`) and avoids being fooled by a recursive walk that missed
-    // something.
-    let only_db: Vec<String> = known
+    // A row's maildir is present when its `<folder>/cur` exists. This
+    // per-folder check is layout-independent (the stored
+    // `maildir_folder` joins onto the root with the FS separator) and
+    // isn't fooled by a recursive walk that missed something.
+    let present = |folder: &str| maildir_root.join(folder).join("cur").is_dir();
+
+    // Raw discrepancies, before pulling out rename pairs.
+    let disk_orphans: Vec<String> = on_disk.difference(&known).cloned().collect();
+    let db_orphans: Vec<&MailboxRecord> = rows
         .iter()
-        .filter(|f| !maildir_root.join(f).join("cur").is_dir())
-        .cloned()
+        .filter(|r| !present(&r.maildir_folder))
         .collect();
 
-    Ok(DriftReport::Drift { only_disk, only_db })
+    // A local rename not yet pushed shows up as a disk orphan (the new
+    // path) paired with a db orphan (the old path) whose `mailbox_map`
+    // id matches the new path's `.jma.mapping` sentinel.
+    let db_orphan_by_id: HashMap<JmapMailboxId, &MailboxRecord> = db_orphans
+        .iter()
+        .map(|r| (r.jmap_mailbox_id.clone(), *r))
+        .collect();
+    let mut rename_in_flight = Vec::new();
+    let mut paired_disk: HashSet<String> = HashSet::new();
+    let mut paired_db_ids: HashSet<JmapMailboxId> = HashSet::new();
+    for disk_folder in &disk_orphans {
+        let Some(mapping) = sentinel::read(&maildir_root.join(disk_folder))? else {
+            continue;
+        };
+        if paired_db_ids.contains(&mapping.jmap_mailbox_id) {
+            continue;
+        }
+        if let Some(db_row) = db_orphan_by_id.get(&mapping.jmap_mailbox_id) {
+            rename_in_flight.push(RenameInFlight {
+                db_folder: db_row.maildir_folder.clone(),
+                disk_folder: disk_folder.clone(),
+            });
+            paired_disk.insert(disk_folder.clone());
+            paired_db_ids.insert(mapping.jmap_mailbox_id.clone());
+        }
+    }
+
+    let disk_only: Vec<String> = disk_orphans
+        .into_iter()
+        .filter(|f| !paired_disk.contains(f))
+        .collect();
+    let db_only: Vec<String> = db_orphans
+        .iter()
+        .filter(|r| !paired_db_ids.contains(&r.jmap_mailbox_id))
+        .map(|r| r.maildir_folder.clone())
+        .collect();
+
+    // Folders present on both sides but no longer selected by the sync
+    // config, computed with the same path-based selection the engine
+    // uses (so status can't disagree with what sync would sync).
+    // Skipped when the config syncs everything; rows with no cached
+    // remote_path can't be tested, so they're left unflagged.
+    let config_dropped: Vec<String> = if mailboxes.is_empty() {
+        Vec::new()
+    } else {
+        // Build inputs from every row with a remote_path, not just the
+        // present ones: subtree selection needs ancestors in the set
+        // even when an ancestor's own maildir is gone. The present()
+        // filter below keeps absent rows (db-orphans) out of the
+        // result.
+        let inputs: Vec<MailboxSelectionInput> = rows
+            .iter()
+            .filter_map(|r| {
+                r.remote_path.as_deref().map(|path| MailboxSelectionInput {
+                    path,
+                    role: r.role.as_deref(),
+                })
+            })
+            .collect();
+        let selected = get_selected_mailboxes(mailboxes, &inputs, case_insensitive, true);
+        rows.iter()
+            .filter(|r| present(&r.maildir_folder))
+            .filter(|r| {
+                r.remote_path
+                    .as_deref()
+                    .is_some_and(|path| !selected.contains(path))
+            })
+            .map(|r| r.maildir_folder.clone())
+            .collect()
+    };
+
+    Ok(DriftReport::Drift(DriftClasses {
+        disk_only,
+        db_only,
+        config_dropped,
+        rename_in_flight,
+    }))
 }
 
 /// Return the relative path of every maildir-shaped folder under
@@ -128,6 +228,8 @@ fn walk_for_maildirs(root: &Path, dir: &Path, found: &mut BTreeSet<String>) {
 mod tests {
     use super::*;
 
+    use crate::state::db;
+
     /// Build a fake maildir at `<root>/<folder>` with the cur/new/tmp
     /// triplet that `find_maildir_folders` keys on.
     fn touch_maildir(root: &Path, folder: &str) {
@@ -135,6 +237,158 @@ mod tests {
         for sub in ["cur", "new", "tmp"] {
             std::fs::create_dir_all(path.join(sub)).unwrap();
         }
+    }
+
+    /// Insert a top-level `mailbox_map` row whose `remote_path` equals
+    /// its folder name (the top-level case where path == leaf).
+    fn upsert_mailbox(conn: &Connection, id: &str, name: &str, folder: &str, role: Option<&str>) {
+        queries::upsert_mailbox(
+            conn,
+            &MailboxRecord {
+                jmap_mailbox_id: id.into(),
+                name: name.to_string(),
+                role: role.map(String::from),
+                parent_id: None,
+                maildir_folder: folder.to_string(),
+                sort_order: 0,
+                remote_path: Some(folder.to_string()),
+            },
+        )
+        .unwrap();
+    }
+
+    /// Write a `.jma.mapping` sentinel binding `folder` to mailbox `id`.
+    fn write_sentinel(root: &Path, folder: &str, id: &str, server_name: &str) {
+        sentinel::write(
+            &root.join(folder),
+            &sentinel::MailboxMapping {
+                jmap_mailbox_id: id.into(),
+                parent_jmap_mailbox_id: None,
+                server_name: server_name.to_string(),
+            },
+        )
+        .unwrap();
+    }
+
+    /// Unwrap `DriftReport::Drift`; the classification tests never hit
+    /// the degenerate variants.
+    fn classes(report: DriftReport) -> DriftClasses {
+        match report {
+            DriftReport::Drift(c) => c,
+            other => panic!("expected Drift, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn in_sync_reports_no_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open_in_memory().unwrap();
+        touch_maildir(dir.path(), "INBOX");
+        upsert_mailbox(&conn, "M1", "INBOX", "INBOX", Some("inbox"));
+
+        let c = classes(compute_drift(&conn, dir.path(), &[], false).unwrap());
+        assert_eq!(c, DriftClasses::default());
+    }
+
+    #[test]
+    fn empty_mailbox_map_is_no_mailbox_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open_in_memory().unwrap();
+        assert_eq!(
+            compute_drift(&conn, dir.path(), &[], false).unwrap(),
+            DriftReport::NoMailboxMap
+        );
+    }
+
+    #[test]
+    fn disk_only_folder_is_a_stray() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open_in_memory().unwrap();
+        upsert_mailbox(&conn, "M1", "INBOX", "INBOX", Some("inbox"));
+        touch_maildir(dir.path(), "INBOX");
+        touch_maildir(dir.path(), "Stray");
+
+        let c = classes(compute_drift(&conn, dir.path(), &[], false).unwrap());
+        assert_eq!(c.disk_only, vec!["Stray".to_string()]);
+        assert!(c.db_only.is_empty());
+        assert!(c.config_dropped.is_empty());
+        assert!(c.rename_in_flight.is_empty());
+    }
+
+    #[test]
+    fn db_row_without_maildir_is_an_orphan() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open_in_memory().unwrap();
+        upsert_mailbox(&conn, "M1", "Archive", "Archive", None);
+
+        let c = classes(compute_drift(&conn, dir.path(), &[], false).unwrap());
+        assert_eq!(c.db_only, vec!["Archive".to_string()]);
+        assert!(c.disk_only.is_empty());
+        assert!(c.rename_in_flight.is_empty());
+    }
+
+    #[test]
+    fn folder_dropped_from_config_is_flagged() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open_in_memory().unwrap();
+        touch_maildir(dir.path(), "INBOX");
+        touch_maildir(dir.path(), "Archive");
+        upsert_mailbox(&conn, "M1", "INBOX", "INBOX", Some("inbox"));
+        upsert_mailbox(&conn, "M2", "Archive", "Archive", None);
+
+        // Config selects only INBOX; Archive is present on both sides
+        // but no longer in the sync set.
+        let c = classes(compute_drift(&conn, dir.path(), &["INBOX".to_string()], false).unwrap());
+        assert_eq!(c.config_dropped, vec!["Archive".to_string()]);
+        assert!(c.disk_only.is_empty());
+        assert!(c.db_only.is_empty());
+        assert!(c.rename_in_flight.is_empty());
+    }
+
+    #[test]
+    fn empty_config_never_flags_config_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open_in_memory().unwrap();
+        touch_maildir(dir.path(), "INBOX");
+        touch_maildir(dir.path(), "Archive");
+        upsert_mailbox(&conn, "M1", "INBOX", "INBOX", Some("inbox"));
+        upsert_mailbox(&conn, "M2", "Archive", "Archive", None);
+
+        let c = classes(compute_drift(&conn, dir.path(), &[], false).unwrap());
+        assert_eq!(
+            c,
+            DriftClasses::default(),
+            "sync-all (empty config) must not flag config-dropped or any other drift"
+        );
+    }
+
+    #[test]
+    fn local_rename_pairs_disk_and_db_orphans() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open_in_memory().unwrap();
+        // mailbox_map still points id M9 at the old folder; no maildir
+        // there. The maildir now lives at "New" with a sentinel binding
+        // it back to M9.
+        upsert_mailbox(&conn, "M9", "Old", "Old", None);
+        touch_maildir(dir.path(), "New");
+        write_sentinel(dir.path(), "New", "M9", "Old");
+
+        let c = classes(compute_drift(&conn, dir.path(), &[], false).unwrap());
+        assert_eq!(
+            c.rename_in_flight,
+            vec![RenameInFlight {
+                db_folder: "Old".to_string(),
+                disk_folder: "New".to_string(),
+            }]
+        );
+        assert!(
+            c.disk_only.is_empty(),
+            "the renamed-to folder is not a stray"
+        );
+        assert!(
+            c.db_only.is_empty(),
+            "the renamed-from row is not an orphan"
+        );
     }
 
     #[test]
