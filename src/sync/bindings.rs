@@ -286,6 +286,13 @@ impl MailboxBindings {
         MailboxBindingsBuilder(self)
     }
 
+    /// The composed lookup core. Hand a `&MailboxIndex` to consumers
+    /// that only need folder/id resolution (e.g. `maildir_ops::scan`)
+    /// so they don't depend on the sync-side resolution bookkeeping.
+    pub fn index(&self) -> &MailboxIndex {
+        &self.index
+    }
+
     pub fn by_id(&self, id: &JmapMailboxId) -> Option<&Arc<MailboxFolderBinding>> {
         self.index.by_id(id)
     }

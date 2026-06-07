@@ -378,7 +378,7 @@ impl<'a> SyncEngine<'a> {
                     changes.extend(scan::discover_unbound_folders(
                         &maildir_root,
                         self.config.sync.folder_layout,
-                        &mailboxes,
+                        mailboxes.index(),
                     ));
                     (changes, local_flags)
                 }
@@ -413,7 +413,7 @@ impl<'a> SyncEngine<'a> {
                         &maildir_root,
                         paths,
                         &known_states,
-                        &mailboxes,
+                        mailboxes.index(),
                         self.config.sync.folder_layout,
                     )?;
                     (result.changes, result.local_flags)

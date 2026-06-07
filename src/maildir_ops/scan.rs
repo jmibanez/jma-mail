@@ -6,12 +6,11 @@ use std::sync::Arc;
 use tracing::{debug, error};
 
 use crate::config::FolderLayout;
-use crate::domain::MailboxFolderBinding;
+use crate::domain::{MailboxFolderBinding, MailboxIndex};
 use crate::ids::{JmapMailboxId, MaildirId, MessageId};
 use crate::maildir_ops::headers::parse_message_id_from_file;
 use crate::maildir_ops::namespace::is_jma_private;
 use crate::maildir_ops::sentinel::MailboxMapping;
-use crate::sync::bindings::MailboxBindings;
 
 /// One live `cur/` entry passed into `classify_changes`. Both
 /// `scan_folder` (full enumeration via the maildir crate) and
@@ -64,7 +63,7 @@ pub enum LocalChange {
         /// (`classify_changes` has it in hand); downstream consumers
         /// read `binding.maildir_folder` for filesystem ops and
         /// `binding.jmap_mailbox_id.expect_resolved(...)` for DB
-        /// writes without re-resolving via `bindings.by_folder(...)`.
+        /// writes without re-resolving via `index.by_folder(...)`.
         /// `Arc` so emission stays a refcount bump rather than a
         /// three-String clone.
         binding: Arc<MailboxFolderBinding>,
@@ -92,7 +91,7 @@ pub enum LocalChange {
         new_flags: String,
     },
     /// A maildir-shaped directory appeared under the configured
-    /// maildir root that no `MailboxBindings` entry covers. No
+    /// maildir root that no `MailboxIndex` entry covers. No
     /// `Arc<MailboxFolderBinding>` because the server-side JMAP id
     /// isn't known yet: the consumer routes it via one of two paths
     /// depending on `sentinel`, the result of reading
@@ -106,7 +105,7 @@ pub enum LocalChange {
     /// per cycle for Full-scope scans, walking layout-eligible
     /// maildir-shaped directories under the configured root and
     /// emitting one event per directory not in
-    /// `MailboxBindings::by_folder`. `scan_paths` is the per-event
+    /// `MailboxIndex::by_folder`. `scan_paths` is the per-event
     /// path, emitting the same variant for unbound layout-eligible
     /// folders surfaced live by a watcher event (deduped to once
     /// per folder per call via `discovered_folders`). Both paths
@@ -404,7 +403,7 @@ pub fn scan_paths(
     maildir_root: &Path,
     event_paths: &[PathBuf],
     known_states: &HashMap<String, HashMap<MaildirId, (JmapMailboxId, String)>>,
-    bindings: &MailboxBindings,
+    index: &MailboxIndex,
     layout: FolderLayout,
 ) -> Result<ScanResult> {
     // (subdir, flags, raw on-disk path) for one event hitting a
@@ -435,7 +434,7 @@ pub fn scan_paths(
             continue;
         };
         if !known_states.contains_key(&folder) {
-            if bindings.by_folder(&folder).is_none()
+            if index.by_folder(&folder).is_none()
                 && layout_eligible_folder(&folder, layout)
                 && discovered_folders.insert(folder.clone())
             {
@@ -503,7 +502,7 @@ pub fn scan_paths(
             }
             None => {
                 if let Some((known_mailbox_id, _)) = known_state.get(&maildir_id)
-                    && let Some(b) = bindings.by_folder(&folder)
+                    && let Some(b) = index.by_folder(&folder)
                     && known_mailbox_id
                         == b.jmap_mailbox_id
                             .expect_resolved("scan::scan_paths -- known state compare")
@@ -536,7 +535,7 @@ pub fn scan_paths(
         for id in &new {
             local_flags.entry(id.clone()).or_default();
         }
-        let Some(binding) = bindings.by_folder(&folder) else {
+        let Some(binding) = index.by_folder(&folder) else {
             debug!(
                 "scan_paths: bindings missing folder {} at classify; skipping",
                 folder
@@ -586,7 +585,7 @@ pub fn scan_paths(
 pub fn discover_unbound_folders(
     maildir_root: &Path,
     layout: FolderLayout,
-    bindings: &MailboxBindings,
+    index: &MailboxIndex,
 ) -> Vec<LocalChange> {
     let mut found = Vec::new();
     match layout {
@@ -600,7 +599,7 @@ pub fn discover_unbound_folders(
         .filter_map(|abs_path| {
             let rel = abs_path.strip_prefix(maildir_root).ok()?;
             let rel_str = rel.to_string_lossy();
-            if bindings.by_folder(rel_str.as_ref()).is_some() {
+            if index.by_folder(rel_str.as_ref()).is_some() {
                 return None;
             }
             let sentinel = match crate::maildir_ops::sentinel::read(&abs_path) {
@@ -819,7 +818,7 @@ mod tests {
     /// conventionally tag a folder "INBOX" / "Spam" / "Archive" with
     /// mailbox id "MB-INBOX" / "MB-SPAM" / "MB-ARCH"; the helper
     /// keeps the assertion sites readable without pulling in the
-    /// full MailboxBindings shape every time. Returns an `Arc` so
+    /// full MailboxIndex shape every time. Returns an `Arc` so
     /// the test sites match `scan_folder`'s `&Arc<...>` signature.
     fn binding(folder: &str, mailbox_id: &str) -> Arc<MailboxFolderBinding> {
         Arc::new(MailboxFolderBinding {
@@ -830,18 +829,18 @@ mod tests {
         })
     }
 
-    /// `MailboxBindings` with the single folder/id pair the
-    /// scan_paths tests need to resolve event-path folders to JMAP
-    /// mailbox ids inside classify_changes.
-    fn bindings_with(folder: &str, mailbox_id: &str) -> MailboxBindings {
-        let mut b = MailboxBindings::builder();
-        b.insert(MailboxFolderBinding {
+    /// `MailboxIndex` with the single folder/id pair the scan_paths
+    /// tests need to resolve event-path folders to JMAP mailbox ids
+    /// inside classify_changes.
+    fn bindings_with(folder: &str, mailbox_id: &str) -> MailboxIndex {
+        let mut index = MailboxIndex::default();
+        index.insert(MailboxFolderBinding {
             jmap_mailbox_id: MaybeReference::Value(mailbox_id.into()),
             server_name: folder.to_string(),
             maildir_folder: folder.to_string(),
             remote_path: folder.to_string(),
         });
-        b.build()
+        index
     }
 
     /// `ScanResult.local_flags` is the contract reconcile reads at
@@ -1543,7 +1542,7 @@ mod tests {
             spam_path.join("cur").join(format!("{unique}:2,FS")),
         ];
 
-        let mut bindings = MailboxBindings::builder();
+        let mut bindings = MailboxIndex::default();
         bindings.insert(MailboxFolderBinding {
             jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
             server_name: "INBOX".to_string(),
@@ -1556,7 +1555,6 @@ mod tests {
             maildir_folder: "Spam".to_string(),
             remote_path: "Spam".to_string(),
         });
-        let bindings = bindings.build();
         let mut changes = scan_paths(
             tmp.path(),
             &event_paths,
@@ -1971,14 +1969,13 @@ mod tests {
         let _child = ensure_maildir(&child).unwrap();
         write_message(&child, "cur", "1.x:2,", "Message-ID: <a@x>\r\n\r\nbody\r\n");
 
-        let mut bindings = MailboxBindings::builder();
+        let mut bindings = MailboxIndex::default();
         bindings.insert(MailboxFolderBinding {
             jmap_mailbox_id: MaybeReference::Value("MB-ARCH".into()),
             server_name: "Archive".to_string(),
             maildir_folder: "Archive".to_string(),
             remote_path: "Archive".to_string(),
         });
-        let bindings = bindings.build();
         let known = known_for("Archive", &[]);
         let event_paths = vec![child.join("cur").join("1.x:2,")];
 
@@ -2003,7 +2000,7 @@ mod tests {
     #[test]
     fn discover_unbound_folders_empty_root() {
         let tmp = TempDir::new().unwrap();
-        let bindings = MailboxBindings::builder().build();
+        let bindings = MailboxIndex::default();
         for layout in [
             FolderLayout::Flat,
             FolderLayout::MaildirPP,
@@ -2027,7 +2024,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let folder = tmp.path().join("[Airmail].Sent");
         ensure_maildir(&folder).unwrap();
-        let bindings = MailboxBindings::builder().build();
+        let bindings = MailboxIndex::default();
         let changes = discover_unbound_folders(tmp.path(), FolderLayout::Flat, &bindings);
         assert_eq!(changes.len(), 1);
         match &changes[0] {
@@ -2056,7 +2053,7 @@ mod tests {
             },
         )
         .unwrap();
-        let bindings = MailboxBindings::builder().build();
+        let bindings = MailboxIndex::default();
         let changes = discover_unbound_folders(tmp.path(), FolderLayout::Flat, &bindings);
         assert_eq!(changes.len(), 1);
         match &changes[0] {
@@ -2069,7 +2066,7 @@ mod tests {
         }
     }
 
-    /// A folder already covered by `MailboxBindings` is excluded
+    /// A folder already covered by `MailboxIndex` is excluded
     /// from discovery -- the per-binding scan loop handles it.
     /// Layout-agnostic behaviour; exercise under Flat where the
     /// `bindings_with` helper is already set up.
@@ -2124,7 +2121,7 @@ mod tests {
         let stray = tmp.path().join("INBOX");
         ensure_maildir(&dotted).unwrap();
         ensure_maildir(&stray).unwrap();
-        let bindings = MailboxBindings::builder().build();
+        let bindings = MailboxIndex::default();
         let changes = discover_unbound_folders(tmp.path(), FolderLayout::MaildirPP, &bindings);
         assert_eq!(
             changes.len(),
@@ -2167,7 +2164,7 @@ mod tests {
     fn discover_unbound_folders_ignores_non_maildir_dirs() {
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir(tmp.path().join("Projects")).unwrap();
-        let bindings = MailboxBindings::builder().build();
+        let bindings = MailboxIndex::default();
         for layout in [
             FolderLayout::Flat,
             FolderLayout::MaildirPP,
@@ -2195,7 +2192,7 @@ mod tests {
         ensure_maildir(&folder).unwrap();
         std::fs::write(folder.join(".jma.mapping"), b"this is not toml { broken")
             .expect("plant malformed sentinel");
-        let bindings = MailboxBindings::builder().build();
+        let bindings = MailboxIndex::default();
         let changes = discover_unbound_folders(tmp.path(), FolderLayout::Flat, &bindings);
         assert_eq!(changes.len(), 1);
         match &changes[0] {
@@ -2219,7 +2216,7 @@ mod tests {
     fn discover_unbound_folders_skips_jma_namespace() {
         let tmp = TempDir::new().unwrap();
         ensure_maildir(&tmp.path().join(".jma.something")).unwrap();
-        let bindings = MailboxBindings::builder().build();
+        let bindings = MailboxIndex::default();
         for layout in [
             FolderLayout::Flat,
             FolderLayout::MaildirPP,
