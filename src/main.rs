@@ -366,7 +366,7 @@ async fn cmd_status(cli: &Cli) -> Result<()> {
     print_account_cursors(&conn)?;
 
     println!();
-    print_maildir_drift(&conn, &config.maildir_path())?;
+    print_maildir_drift(&conn, &config)?;
 
     Ok(())
 }
@@ -466,21 +466,41 @@ fn ago_phrase(sqlite_ts: &str, now: &chrono::DateTime<chrono::Utc>) -> Result<St
     })
 }
 
-fn print_maildir_drift(conn: &rusqlite::Connection, maildir_root: &std::path::Path) -> Result<()> {
+fn print_maildir_drift(conn: &rusqlite::Connection, config: &Config) -> Result<()> {
     use jma_mail::maildir_ops::drift::{DriftReport, compute_drift};
 
+    let maildir_root = config.maildir_path();
     println!("Maildir vs DB drift (under {}):", maildir_root.display());
 
-    match compute_drift(conn, maildir_root)? {
+    match compute_drift(
+        conn,
+        &maildir_root,
+        &config.sync.mailboxes,
+        config.sync.case_insensitive_match,
+    )? {
         DriftReport::MaildirRootMissing => {
             println!("  Maildir root does not exist -- nothing to compare.");
         }
         DriftReport::NoMailboxMap => {
             println!("  No mailbox map yet -- DB has no record of synced folders.");
         }
-        DriftReport::Drift { only_disk, only_db } => {
-            print_drift_line("  Folders on disk not in DB: ", &only_disk);
-            print_drift_line("  Folders in DB not on disk: ", &only_db);
+        DriftReport::Drift(classes) => {
+            print_drift_line("  Folders on disk not in DB: ", &classes.disk_only);
+            print_drift_line("  Folders in DB not on disk: ", &classes.db_only);
+            print_drift_line(
+                "  Folders no longer in [sync].mailboxes: ",
+                &classes.config_dropped,
+            );
+            if classes.rename_in_flight.is_empty() {
+                println!("  Local renames pending sync: (none)");
+            } else {
+                for r in &classes.rename_in_flight {
+                    println!(
+                        "  Local rename pending sync: {} -> {} (not yet pushed to server)",
+                        r.db_folder, r.disk_folder
+                    );
+                }
+            }
         }
     }
 
