@@ -5,19 +5,17 @@
 //! (scan, reconcile, execute) that needs to ask "what's the folder
 //! for this mailbox id?" or vice versa.
 //!
-//! O(1) lookup in both directions. The `by_folder` index stores
-//! only the `JmapMailboxId`, pointing into `by_id` for the full
-//! binding. The two indices stay coherent by construction -- there
-//! is no second copy of the binding to fall out of sync.
+//! The O(1) two-way lookup core lives in `domain::MailboxIndex`,
+//! composed here as the `index` field. `MailboxBindings` delegates
+//! its lookup readers to it and adds the per-cycle resolution
+//! bookkeeping (new mailboxes, renames, orphans, staged cache
+//! writes) the engine threads alongside the live set.
 //!
-//! Collisions (two bindings sharing a `maildir_folder`) are not
-//! rejected: last-writer-wins on both indices. The struct exposes
-//! no way to mutate the maps outside of `insert`, so callers cannot
-//! get the indices into a corrupt state, but they can silently lose
-//! a binding by inserting two with the same folder. A server-rename
-//! that collides with an existing local folder under the configured
-//! layout (or via a rename rule) is one path that produces this
-//! shape; detecting it sits outside the scope of this type today.
+//! Collision behavior is `MailboxIndex`'s (last-writer-wins on a
+//! shared `maildir_folder`). A server-rename that collides with an
+//! existing local folder under the configured layout (or via a
+//! rename rule) is one path that produces that shape; detecting it
+//! sits outside the scope of this type today.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -25,28 +23,21 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::domain::MailboxFolderBinding;
+use crate::domain::{MailboxFolderBinding, MailboxIndex};
 use crate::ids::{JmapEmailId, JmapMailboxId, MaildirId, MessageId};
 use crate::state::queries::MailboxRecord;
 
-/// `by_id` is the authoritative store; `by_folder` is a secondary
-/// index that `MailboxBindingsBuilder::insert` maintains alongside
-/// it. Both fields are private and the only mutator (on the builder)
-/// is `insert`, so the secondary index cannot drift from the
-/// authoritative one.
+/// The id/folder lookup core lives in `domain::MailboxIndex`,
+/// composed here as the `index` field; the lookup readers
+/// (`by_id`, `by_folder`, `iter`, `ids`, `folders`, `len`,
+/// `is_empty`) delegate to it, and `MailboxBindingsBuilder::insert`
+/// forwards into it.
 ///
 /// `MailboxBindings` itself is immutable -- once
 /// `MailboxBindingsBuilder::build` hands one back, no method on the
 /// type mutates state. Construction goes through
 /// `MailboxBindings::builder()` (fresh) or
 /// `MailboxBindings::into_builder()` (transform an existing one).
-///
-/// Bindings are stored as `Arc<MailboxFolderBinding>` so downstream
-/// in-memory event types (`LocalChange`, `SyncAction`) that need to
-/// name a mailbox can hold an `Arc` clone instead of a fresh
-/// `(JmapMailboxId, String, String)` triple per emission. The Arc
-/// also lets `by_id` and `by_folder` share the same allocation
-/// rather than keeping parallel copies.
 ///
 /// The `new_mailboxes` slot rides along as a byproduct of the
 /// cache-vs-server diff `resolve_mailboxes` performs to build the
@@ -111,8 +102,7 @@ use crate::state::queries::MailboxRecord;
 /// other slots.
 #[derive(Debug, Default)]
 pub struct MailboxBindings {
-    by_id: HashMap<JmapMailboxId, Arc<MailboxFolderBinding>>,
-    by_folder: HashMap<String, JmapMailboxId>,
+    index: MailboxIndex,
     new_mailboxes: Vec<NewMailboxRecord>,
     renamed_mailboxes: Vec<RenamedMailboxRecord>,
     local_orphans: Vec<LocalOrphanRecord>,
@@ -297,24 +287,23 @@ impl MailboxBindings {
     }
 
     pub fn by_id(&self, id: &JmapMailboxId) -> Option<&Arc<MailboxFolderBinding>> {
-        self.by_id.get(id)
+        self.index.by_id(id)
     }
 
     pub fn by_folder(&self, folder: &str) -> Option<&Arc<MailboxFolderBinding>> {
-        let id = self.by_folder.get(folder)?;
-        self.by_id.get(id)
+        self.index.by_folder(folder)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &Arc<MailboxFolderBinding>> {
-        self.by_id.values()
+        self.index.iter()
     }
 
     pub fn ids(&self) -> impl Iterator<Item = &JmapMailboxId> {
-        self.by_id.keys()
+        self.index.ids()
     }
 
     pub fn folders(&self) -> impl Iterator<Item = &str> {
-        self.by_folder.keys().map(String::as_str)
+        self.index.folders()
     }
 
     /// The set of bindings scan should walk this cycle. With
@@ -332,7 +321,7 @@ impl MailboxBindings {
     /// through the conflict-strategy path. Bindings come back
     /// by `Arc` refcount-bump; no allocation per scan.
     pub fn scan_set(&self, include_orphans: bool) -> Vec<Arc<MailboxFolderBinding>> {
-        let mut out: Vec<Arc<MailboxFolderBinding>> = self.by_id.values().cloned().collect();
+        let mut out: Vec<Arc<MailboxFolderBinding>> = self.index.iter().cloned().collect();
         if include_orphans {
             out.extend(self.local_orphans.iter().map(|o| Arc::clone(&o.binding)));
         }
@@ -424,11 +413,11 @@ impl MailboxBindings {
     }
 
     pub fn len(&self) -> usize {
-        self.by_id.len()
+        self.index.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.by_id.is_empty()
+        self.index.is_empty()
     }
 }
 
@@ -451,23 +440,11 @@ impl MailboxBindingsBuilder {
         self.0
     }
 
-    /// Insert a binding, updating both indices. Last writer wins on
-    /// collisions (same `jmap_mailbox_id` or same `maildir_folder`
-    /// as an existing entry overwrites it on the relevant index).
-    /// The live binding set only ever holds resolved ids -- bindings
-    /// in the cache snapshot come from `resolve_mailboxes` which
-    /// builds them from server-known `MailboxObject`s, and emitted
-    /// bindings (e.g. resurrect-path uploads with `Reference` ids)
-    /// flow through `SyncAction` payloads rather than the live set.
+    /// Insert a binding into the live set. Forwards to
+    /// `MailboxIndex::insert`, which maintains both indices and
+    /// applies last-writer-wins on collisions.
     pub(crate) fn insert(&mut self, binding: MailboxFolderBinding) {
-        let id = binding
-            .jmap_mailbox_id
-            .expect_resolved("MailboxBindingsBuilder::insert -- live set holds only resolved ids")
-            .clone();
-        self.0
-            .by_folder
-            .insert(binding.maildir_folder.clone(), id.clone());
-        self.0.by_id.insert(id, Arc::new(binding));
+        self.0.index.insert(binding);
     }
 
     /// Record a server-known binding that had no `mailbox_map` row

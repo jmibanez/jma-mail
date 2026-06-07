@@ -14,6 +14,9 @@
 //! import `jmap`, `maildir_ops`, `state`, or `sync`, or it would
 //! reintroduce the cross-layer edge it exists to remove.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use crate::ids::JmapMailboxId;
 
 /// Represents a JMAP Mailbox object.
@@ -153,5 +156,77 @@ impl<T: std::fmt::Display> std::fmt::Display for MaybeReference<T> {
             MaybeReference::Reference(name) => write!(f, "#{}", name),
             MaybeReference::Value(v) => write!(f, "{}", v),
         }
+    }
+}
+
+/// O(1) two-way lookup over a set of `MailboxFolderBinding`s: id ->
+/// binding and folder -> binding. `by_id` is the authoritative
+/// store; `by_folder` holds only the `JmapMailboxId`, pointing into
+/// `by_id` for the full binding, so the two cannot drift -- there is
+/// no second copy of the binding to fall out of sync. `insert` is the
+/// sole mutator, so callers cannot get the maps into a corrupt state.
+///
+/// Bindings are stored as `Arc<MailboxFolderBinding>` so downstream
+/// in-memory event types (`LocalChange`, `SyncAction`) that name a
+/// mailbox can hold an `Arc` clone instead of a fresh
+/// `(JmapMailboxId, String, String)` triple per emission, and so the
+/// two maps share one allocation rather than keeping parallel copies.
+///
+/// Collisions (two bindings sharing a `maildir_folder`) are not
+/// rejected: last-writer-wins on both indices. The index exposes no
+/// way to mutate the maps outside `insert`, so callers cannot corrupt
+/// it, but they can silently lose a binding by inserting two with the
+/// same folder. Detecting that collision sits outside this type.
+#[derive(Debug, Default)]
+pub struct MailboxIndex {
+    by_id: HashMap<JmapMailboxId, Arc<MailboxFolderBinding>>,
+    by_folder: HashMap<String, JmapMailboxId>,
+}
+
+impl MailboxIndex {
+    pub fn by_id(&self, id: &JmapMailboxId) -> Option<&Arc<MailboxFolderBinding>> {
+        self.by_id.get(id)
+    }
+
+    pub fn by_folder(&self, folder: &str) -> Option<&Arc<MailboxFolderBinding>> {
+        let id = self.by_folder.get(folder)?;
+        self.by_id.get(id)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &Arc<MailboxFolderBinding>> {
+        self.by_id.values()
+    }
+
+    pub fn ids(&self) -> impl Iterator<Item = &JmapMailboxId> {
+        self.by_id.keys()
+    }
+
+    pub fn folders(&self) -> impl Iterator<Item = &str> {
+        self.by_folder.keys().map(String::as_str)
+    }
+
+    /// Insert a binding, updating both indices. Last writer wins on
+    /// collisions (same `jmap_mailbox_id` or same `maildir_folder`
+    /// as an existing entry overwrites it on the relevant index).
+    /// The index only ever holds resolved ids -- bindings come from
+    /// `resolve_mailboxes`, which builds them from server-known
+    /// `MailboxObject`s; emitted bindings carrying a `Reference` id
+    /// flow through `SyncAction` payloads, never the live set.
+    pub fn insert(&mut self, binding: MailboxFolderBinding) {
+        let id = binding
+            .jmap_mailbox_id
+            .expect_resolved("MailboxIndex::insert -- live set holds only resolved ids")
+            .clone();
+        self.by_folder
+            .insert(binding.maildir_folder.clone(), id.clone());
+        self.by_id.insert(id, Arc::new(binding));
+    }
+
+    pub fn len(&self) -> usize {
+        self.by_id.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_id.is_empty()
     }
 }
