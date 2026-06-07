@@ -17,7 +17,6 @@ use crate::ids::{JmapBlobId, JmapEmailId, JmapMailboxId, JmapThreadId, MessageId
 use crate::jmap::limits;
 use crate::jmap::retry::with_retry;
 use crate::jmap::types::{ChangesResponse, EmailObject};
-use crate::sync::plan::LocalId;
 
 /// True iff `err`'s anyhow chain carries a JMAP method-level
 /// `cannotCalculateChanges`. Walks the chain and downcasts to
@@ -595,7 +594,7 @@ pub async fn import_email(
     raw_message: &[u8],
     mailbox_id: &str,
     folder_name: &str,
-    local: &LocalId,
+    local: &impl std::fmt::Display,
     keywords: &HashMap<String, bool>,
 ) -> Result<ImportResult> {
     tracing::Span::current().record("bytes", raw_message.len() as u64);
