@@ -93,13 +93,14 @@ pub enum FolderLayout {
 pub struct SyncConfig {
     /// Root directory for local maildir storage
     pub maildir_path: String,
-    /// Which mailboxes to sync. Empty means all.
+    /// Which mailboxes to sync, matched by full server path with the
+    /// matched path's subtree included. Empty means all.
     #[serde(default)]
     pub mailboxes: Vec<String>,
     /// Conflict resolution strategy
     #[serde(default)]
     pub conflict_strategy: ConflictStrategy,
-    /// If true, match `mailboxes` entries against server names case-insensitively.
+    /// If true, match `mailboxes` entries against server paths case-insensitively.
     /// `INBOX` is always treated as an alias for the inbox role regardless.
     #[serde(default)]
     pub case_insensitive_match: bool,
@@ -683,10 +684,12 @@ maildir_path = {maildir_path}
 # mailbox -- the right default for most users. Uncomment and curate
 # this list only if you want a subset. The literal "INBOX" is a magic
 # alias for whichever mailbox has the JMAP "inbox" role; other entries
-# match the mailbox's name (case-sensitively unless
-# case_insensitive_match is true).
+# match the mailbox's full server path -- root-first and slash-joined,
+# e.g. "[Gmail]/Sent" -- and pull in that path's subtree too
+# (case-sensitively unless case_insensitive_match is true). A bare
+# leaf name matches only a top-level mailbox.
 # mailboxes = ["INBOX", "Archive", "Sent", "Drafts", "Trash"]
-# Match `mailboxes` entries case-insensitively against server names.
+# Match `mailboxes` entries case-insensitively against server paths.
 case_insensitive_match = false
 # On-disk layout for hierarchical mailboxes:
 #   "flat"      -- mbsync Flatten=<sep>: <root>/parent.child/
