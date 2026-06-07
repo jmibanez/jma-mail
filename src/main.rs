@@ -912,10 +912,15 @@ fn cmd_janitor_prune(
     for (folder, safety) in &outcome.skipped {
         println!("  [PRUNE-SKIP] {folder}/  ({})", prune_safety_hint(*safety));
     }
+    for folder in &outcome.deferred {
+        println!("  [PRUNE-SKIP] {folder}/  (removal could not complete; left for retry, see log)");
+    }
     jma_mail::notify!(
-        "Prune: removed {} folder(s); skipped {} needing a force flag.",
+        "Prune: removed {} folder(s); skipped {} needing a force flag; \
+         deferred {} that could not be removed.",
         outcome.removed.len(),
         outcome.skipped.len(),
+        outcome.deferred.len(),
     );
     Ok(())
 }

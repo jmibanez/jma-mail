@@ -17,6 +17,26 @@ use crate::ids::{JmapMailboxId, MaildirId};
 use crate::maildir_ops::{namespace, store};
 use crate::state::queries;
 
+/// Whether `remove_maildir_tree` actually took the folder down.
+///
+/// The distinction is load-bearing for callers that drop the
+/// `mailbox_map` row afterwards: a row may only be dropped once the
+/// tree is gone and its cascade has run. Dropping it on a `Skipped`
+/// outcome would orphan the folder on disk and its `message_map`
+/// rows while losing the id binding, defeating the retry the skip
+/// leaves room for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemovalOutcome {
+    /// The tree is gone (removed here, or already absent) and the
+    /// state-DB cascade ran. Safe for the caller to drop the
+    /// `mailbox_map` row.
+    Removed,
+    /// The removal was refused or aborted; the folder and its rows
+    /// are left intact for a later retry. The caller must not drop
+    /// the `mailbox_map` row.
+    Skipped,
+}
+
 /// Delete an entire maildir folder tree and cascade the state-DB rows
 /// that reference it (`message_map`, `local_state`,
 /// `folder_checkpoint`). `maildir_root_canon` is the caller's
@@ -28,22 +48,24 @@ use crate::state::queries;
 /// that.
 ///
 /// Caller-visible guarantees:
-/// - Refuses (no-op) if `folder` resolves outside `maildir_root`, so
-///   a bad path can't escape the tree.
+/// - Refuses (`Skipped`) if `folder` resolves outside `maildir_root`,
+///   so a bad path can't escape the tree.
 /// - Never silently drops a file the DB doesn't know about: unmapped
 ///   files are moved to the rescue maildir first, and a rescue
 ///   failure leaves the folder intact for a later retry.
-/// - Idempotent: an already-absent folder still drains its rows.
+/// - Idempotent: an already-absent folder still drains its rows and
+///   reports `Removed`.
 ///
-/// `Ok` covers success and the skip/refuse cases (which log); `Err`
-/// is reserved for state-DB failures.
+/// Returns `Removed` when the tree is gone and the cascade ran, or
+/// `Skipped` (which also logs the reason) when the removal was
+/// refused or aborted. `Err` is reserved for state-DB failures.
 pub(crate) fn remove_maildir_tree(
     conn: &Connection,
     maildir_root: &Path,
     maildir_root_canon: &Path,
     folder: &str,
     mailbox_id: Option<&JmapMailboxId>,
-) -> Result<()> {
+) -> Result<RemovalOutcome> {
     let target = maildir_root.join(folder);
     // Path-safety guard. `canonicalize` follows symlinks so a
     // sibling-rooted symlink can't smuggle the remove outside the
@@ -67,7 +89,7 @@ pub(crate) fn remove_maildir_tree(
                 target.display(),
                 e
             );
-            return Ok(());
+            return Ok(RemovalOutcome::Skipped);
         }
     };
     if escaped {
@@ -77,7 +99,7 @@ pub(crate) fn remove_maildir_tree(
             target.display(),
             maildir_root_canon.display()
         );
-        return Ok(());
+        return Ok(RemovalOutcome::Skipped);
     }
     // A row-less folder (a stray) has no id to show in the logs.
     let id_label = mailbox_id.map_or_else(|| "-".to_string(), |id| id.to_string());
@@ -99,7 +121,7 @@ pub(crate) fn remove_maildir_tree(
                  dir is writable",
                 folder, id_label, e
             );
-            return Ok(());
+            return Ok(RemovalOutcome::Skipped);
         }
     }
     match std::fs::remove_dir_all(&target) {
@@ -113,7 +135,7 @@ pub(crate) fn remove_maildir_tree(
                 target.display(),
                 e
             );
-            return Ok(());
+            return Ok(RemovalOutcome::Skipped);
         }
     }
     // Per-folder transaction so an fs failure on folder N+1 doesn't
@@ -133,7 +155,7 @@ pub(crate) fn remove_maildir_tree(
          message_map row(s) and {} local_state row(s)",
         folder, id_label, messages_removed, state_removed
     );
-    Ok(())
+    Ok(RemovalOutcome::Removed)
 }
 
 /// Move any file in `folder_path` that the state DB doesn't know
@@ -208,7 +230,12 @@ mod tests {
 
     /// Canonicalize the root the way the batch caller does, then
     /// drive `remove_maildir_tree` for one folder bound to `mailbox_id`.
-    fn remove_one(conn: &Connection, maildir_root: &Path, folder: &str, mailbox_id: &str) {
+    fn remove_one(
+        conn: &Connection,
+        maildir_root: &Path,
+        folder: &str,
+        mailbox_id: &str,
+    ) -> RemovalOutcome {
         let root_canon = std::fs::canonicalize(maildir_root).unwrap();
         remove_maildir_tree(
             conn,
@@ -217,7 +244,7 @@ mod tests {
             folder,
             Some(&JmapMailboxId::from(mailbox_id)),
         )
-        .unwrap();
+        .unwrap()
     }
 
     /// A row-less folder (`mailbox_id = None`, an untracked stray) has
@@ -238,8 +265,9 @@ mod tests {
         .unwrap();
 
         let root_canon = std::fs::canonicalize(maildir_root).unwrap();
-        remove_maildir_tree(&conn, maildir_root, &root_canon, folder, None).unwrap();
+        let outcome = remove_maildir_tree(&conn, maildir_root, &root_canon, folder, None).unwrap();
 
+        assert_eq!(outcome, RemovalOutcome::Removed);
         assert!(!folder_path.exists(), "stray maildir must be removed");
         let rescue_cur = maildir_root.join(namespace::RESCUE_FOLDER_NAME).join("cur");
         let rescued: Vec<String> = std::fs::read_dir(&rescue_cur)
@@ -298,7 +326,10 @@ mod tests {
         .unwrap();
         queries::upsert_local_state(&conn, &maildir_id, folder, "", None).unwrap();
 
-        remove_one(&conn, maildir_root, folder, "MB-ARCH");
+        assert_eq!(
+            remove_one(&conn, maildir_root, folder, "MB-ARCH"),
+            RemovalOutcome::Removed
+        );
 
         assert!(!folder_path.exists(), "maildir tree must be removed");
         assert!(
@@ -340,7 +371,10 @@ mod tests {
         let canary = sibling.join("canary");
         std::fs::write(&canary, b"must survive").unwrap();
 
-        remove_one(&conn, &maildir_root, "../sibling", "MB-EVIL");
+        assert_eq!(
+            remove_one(&conn, &maildir_root, "../sibling", "MB-EVIL"),
+            RemovalOutcome::Skipped
+        );
 
         assert!(
             canary.exists(),
@@ -380,7 +414,10 @@ mod tests {
         )
         .unwrap();
 
-        remove_one(&conn, &maildir_root, "../missing", "MB-EVIL");
+        assert_eq!(
+            remove_one(&conn, &maildir_root, "../missing", "MB-EVIL"),
+            RemovalOutcome::Skipped
+        );
 
         assert!(
             queries::get_message_by_jmap_id(&conn, &"E-canary".into())
@@ -423,7 +460,10 @@ mod tests {
         // directory; the call targets `link/child`.
         std::os::unix::fs::symlink(dir.path().join("external"), maildir_root.join("link")).unwrap();
 
-        remove_one(&conn, &maildir_root, "link/child", "MB-LINK");
+        assert_eq!(
+            remove_one(&conn, &maildir_root, "link/child", "MB-LINK"),
+            RemovalOutcome::Skipped
+        );
 
         assert!(
             canary.exists(),
@@ -462,7 +502,11 @@ mod tests {
         queries::upsert_local_state(&conn, &MaildirId::from("FOO.host"), "Archive", "", None)
             .unwrap();
 
-        remove_one(&conn, maildir_root, "Archive", "MB-ARCH");
+        assert_eq!(
+            remove_one(&conn, maildir_root, "Archive", "MB-ARCH"),
+            RemovalOutcome::Removed,
+            "an already-absent folder still reaches the desired end state"
+        );
 
         assert!(
             queries::get_message_by_jmap_id(&conn, &"E1".into())
@@ -645,7 +689,11 @@ mod tests {
         )
         .unwrap();
 
-        remove_one(&conn, maildir_root, folder, "MB-ARCH");
+        assert_eq!(
+            remove_one(&conn, maildir_root, folder, "MB-ARCH"),
+            RemovalOutcome::Skipped,
+            "a rescue failure must report Skipped so the caller keeps the row"
+        );
 
         assert!(
             folder_path.exists(),
