@@ -7,13 +7,15 @@
 //! labelled plan. The split keeps the same safety labels driving both
 //! the preview and the apply-side gate.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::ids::JmapMailboxId;
 use crate::jmap::mailbox::{MailboxSelectionInput, get_selected_mailboxes};
 use crate::maildir_ops::drift::{DriftReport, RenameInFlight, compute_drift};
+use crate::maildir_ops::removal::remove_maildir_tree;
 use crate::maildir_ops::store;
 use crate::state::queries;
 
@@ -179,12 +181,88 @@ fn count_folder_files(maildir_root: &Path, folder: &str) -> usize {
     }
 }
 
+/// Which force gates the caller has opted into.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PruneApplyOptions {
+    pub force_non_empty: bool,
+    pub force_in_config: bool,
+}
+
+/// What an `apply` run did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PruneOutcome {
+    /// Folders pruned: disk removed where applicable, rows cascaded.
+    pub removed: Vec<String>,
+    /// Entries left in place for lack of the force flag their safety
+    /// label requires, paired with that label.
+    pub skipped: Vec<(String, PruneSafety)>,
+}
+
+/// Apply `plan`: remove each permitted entry and clear its DB rows. An
+/// entry is permitted when its `PruneSafety` is `Safe`, or when the
+/// matching force flag in `opts` is set; otherwise it lands in
+/// `skipped`. `plan.skipped_renames` are never touched.
+///
+/// Each removal goes through `remove_maildir_tree` (path guard, rescue
+/// of unmapped files, NotFound-tolerant disk removal, and the
+/// message/local_state/checkpoint cascade), after which the entry's
+/// `mailbox_map` row is dropped -- the one piece that helper leaves to
+/// its caller. A row-less stray has no such row to drop.
+pub fn apply(
+    conn: &Connection,
+    maildir_root: &Path,
+    plan: &PrunePlan,
+    opts: PruneApplyOptions,
+) -> Result<PruneOutcome> {
+    let mut outcome = PruneOutcome::default();
+    if plan.entries.is_empty() {
+        return Ok(outcome);
+    }
+    let maildir_root_canon = std::fs::canonicalize(maildir_root)
+        .with_context(|| format!("canonicalize maildir root {}", maildir_root.display()))?;
+    let rows = queries::get_all_mailboxes(conn)?;
+    let id_by_folder: HashMap<&str, &JmapMailboxId> = rows
+        .iter()
+        .map(|r| (r.maildir_folder.as_str(), &r.jmap_mailbox_id))
+        .collect();
+
+    for entry in &plan.entries {
+        if !permitted(entry.safety, &opts) {
+            outcome.skipped.push((entry.folder.clone(), entry.safety));
+            continue;
+        }
+        let mailbox_id = id_by_folder.get(entry.folder.as_str()).copied();
+        remove_maildir_tree(
+            conn,
+            maildir_root,
+            &maildir_root_canon,
+            &entry.folder,
+            mailbox_id,
+        )?;
+        // remove_maildir_tree drains message_map/local_state/
+        // folder_checkpoint but leaves the mailbox_map row to us.
+        if let Some(id) = mailbox_id {
+            queries::delete_mailbox(conn, id)?;
+        }
+        outcome.removed.push(entry.folder.clone());
+    }
+    Ok(outcome)
+}
+
+fn permitted(safety: PruneSafety, opts: &PruneApplyOptions) -> bool {
+    match safety {
+        PruneSafety::Safe => true,
+        PruneSafety::NeedsForceNonEmpty => opts.force_non_empty,
+        PruneSafety::NeedsForceInConfig => opts.force_in_config,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::maildir_ops::sentinel;
     use crate::state::db;
-    use crate::state::queries::MailboxRecord;
+    use crate::state::queries::{MailboxRecord, MessageRecord};
     use tempfile::tempdir;
 
     fn upsert_mailbox(conn: &Connection, id: &str, name: &str, folder: &str, role: Option<&str>) {
@@ -348,5 +426,159 @@ mod tests {
         assert_eq!(p.skipped_renames.len(), 1);
         assert_eq!(p.skipped_renames[0].db_folder, "Old");
         assert_eq!(p.skipped_renames[0].disk_folder, "New");
+    }
+
+    fn rescue_count(root: &Path) -> usize {
+        let cur = root
+            .join(crate::maildir_ops::namespace::RESCUE_FOLDER_NAME)
+            .join("cur");
+        std::fs::read_dir(&cur).map(|rd| rd.count()).unwrap_or(0)
+    }
+
+    #[test]
+    fn apply_removes_safe_stray_without_force() {
+        let dir = tempdir().unwrap();
+        let conn = db::open_in_memory().unwrap();
+        upsert_mailbox(&conn, "M1", "INBOX", "INBOX", Some("inbox"));
+        touch_maildir(dir.path(), "INBOX");
+        touch_maildir(dir.path(), "EmptyStray");
+
+        let p = plan(&conn, dir.path(), &[], false).unwrap();
+        let out = apply(&conn, dir.path(), &p, PruneApplyOptions::default()).unwrap();
+
+        assert_eq!(out.removed, vec!["EmptyStray".to_string()]);
+        assert!(out.skipped.is_empty());
+        assert!(!dir.path().join("EmptyStray").exists());
+        assert!(
+            dir.path().join("INBOX").exists(),
+            "in-sync folder untouched"
+        );
+    }
+
+    #[test]
+    fn apply_gates_non_empty_stray_on_force_non_empty() {
+        let dir = tempdir().unwrap();
+        let conn = db::open_in_memory().unwrap();
+        upsert_mailbox(&conn, "M1", "INBOX", "INBOX", Some("inbox"));
+        touch_maildir(dir.path(), "INBOX");
+        touch_maildir(dir.path(), "FullStray");
+        seed_file(dir.path(), "FullStray", "1");
+
+        // Without the flag: skipped, still on disk.
+        let p = plan(&conn, dir.path(), &[], false).unwrap();
+        let out = apply(&conn, dir.path(), &p, PruneApplyOptions::default()).unwrap();
+        assert!(out.removed.is_empty());
+        assert_eq!(
+            out.skipped,
+            vec![("FullStray".to_string(), PruneSafety::NeedsForceNonEmpty)]
+        );
+        assert!(dir.path().join("FullStray").exists());
+
+        // With the flag: removed, the unmapped file rescued.
+        let p = plan(&conn, dir.path(), &[], false).unwrap();
+        let out = apply(
+            &conn,
+            dir.path(),
+            &p,
+            PruneApplyOptions {
+                force_non_empty: true,
+                force_in_config: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(out.removed, vec!["FullStray".to_string()]);
+        assert!(!dir.path().join("FullStray").exists());
+        assert_eq!(rescue_count(dir.path()), 1, "stray file must be rescued");
+    }
+
+    #[test]
+    fn apply_db_orphan_drops_row_with_force_in_config() {
+        let dir = tempdir().unwrap();
+        let conn = db::open_in_memory().unwrap();
+        touch_maildir(dir.path(), "INBOX");
+        upsert_mailbox(&conn, "M1", "INBOX", "INBOX", Some("inbox"));
+        // Archive: row, no maildir, still in config -> NeedsForceInConfig.
+        upsert_mailbox(&conn, "M2", "Archive", "Archive", None);
+        queries::upsert_message(
+            &conn,
+            &MessageRecord {
+                jmap_email_id: "E1".into(),
+                jmap_blob_id: None,
+                jmap_thread_id: None,
+                jmap_mailbox_id: "M2".into(),
+                maildir_id: Some("FOO.host".into()),
+                message_id: "a@example.com".into(),
+                flags: String::new(),
+                jmap_keywords: "{}".into(),
+            },
+        )
+        .unwrap();
+        let cfg = vec!["INBOX".to_string(), "Archive".to_string()];
+
+        // Without the flag: skipped, row + message rows survive.
+        let p = plan(&conn, dir.path(), &cfg, false).unwrap();
+        let out = apply(&conn, dir.path(), &p, PruneApplyOptions::default()).unwrap();
+        assert_eq!(
+            out.skipped,
+            vec![("Archive".to_string(), PruneSafety::NeedsForceInConfig)]
+        );
+        assert!(queries::get_mailbox(&conn, &"M2".into()).unwrap().is_some());
+
+        // With the flag: row dropped and message_map cascaded.
+        let p = plan(&conn, dir.path(), &cfg, false).unwrap();
+        let out = apply(
+            &conn,
+            dir.path(),
+            &p,
+            PruneApplyOptions {
+                force_non_empty: false,
+                force_in_config: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(out.removed, vec!["Archive".to_string()]);
+        assert!(
+            queries::get_mailbox(&conn, &"M2".into()).unwrap().is_none(),
+            "mailbox_map row must be dropped"
+        );
+        assert!(
+            queries::get_message_by_jmap_id(&conn, &"E1".into())
+                .unwrap()
+                .is_none(),
+            "message_map row must be cascaded"
+        );
+    }
+
+    #[test]
+    fn apply_ignores_pending_renames() {
+        let dir = tempdir().unwrap();
+        let conn = db::open_in_memory().unwrap();
+        upsert_mailbox(&conn, "M9", "Old", "Old", None);
+        touch_maildir(dir.path(), "New");
+        sentinel::write(
+            &dir.path().join("New"),
+            &sentinel::MailboxMapping {
+                jmap_mailbox_id: "M9".into(),
+                parent_jmap_mailbox_id: None,
+                server_name: "Old".to_string(),
+            },
+        )
+        .unwrap();
+
+        let p = plan(&conn, dir.path(), &[], false).unwrap();
+        let out = apply(
+            &conn,
+            dir.path(),
+            &p,
+            PruneApplyOptions {
+                force_non_empty: true,
+                force_in_config: true,
+            },
+        )
+        .unwrap();
+
+        assert!(out.removed.is_empty(), "a pending rename is never pruned");
+        assert!(out.skipped.is_empty());
+        assert!(dir.path().join("New").exists(), "renamed maildir untouched");
     }
 }

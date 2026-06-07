@@ -1729,7 +1729,7 @@ fn delete_local_folders(
             maildir_root,
             &maildir_root_canon,
             &binding.maildir_folder,
-            mailbox_id,
+            Some(mailbox_id),
         )?;
     }
     Ok(())

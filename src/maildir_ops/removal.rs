@@ -20,7 +20,12 @@ use crate::state::queries;
 /// Delete an entire maildir folder tree and cascade the state-DB rows
 /// that reference it (`message_map`, `local_state`,
 /// `folder_checkpoint`). `maildir_root_canon` is the caller's
-/// already-canonicalized `maildir_root`.
+/// already-canonicalized `maildir_root`. `mailbox_id` is the folder's
+/// bound mailbox, or `None` for a row-less folder (an untracked
+/// stray): with `None` every file is treated as unmapped (so all are
+/// rescued) and the `message_map` cascade is skipped. The
+/// `mailbox_map` row itself is not touched here -- the caller owns
+/// that.
 ///
 /// Caller-visible guarantees:
 /// - Refuses (no-op) if `folder` resolves outside `maildir_root`, so
@@ -37,7 +42,7 @@ pub(crate) fn remove_maildir_tree(
     maildir_root: &Path,
     maildir_root_canon: &Path,
     folder: &str,
-    mailbox_id: &JmapMailboxId,
+    mailbox_id: Option<&JmapMailboxId>,
 ) -> Result<()> {
     let target = maildir_root.join(folder);
     // Path-safety guard. `canonicalize` follows symlinks so a
@@ -74,13 +79,15 @@ pub(crate) fn remove_maildir_tree(
         );
         return Ok(());
     }
+    // A row-less folder (a stray) has no id to show in the logs.
+    let id_label = mailbox_id.map_or_else(|| "-".to_string(), |id| id.to_string());
     match rescue_unmapped_files(conn, maildir_root, &target, mailbox_id) {
         Ok(0) => {}
         Ok(n) => {
             info!(
                 "remove_maildir_tree {}/ (id {}): rescued {} unmapped file(s) to {}/",
                 folder,
-                mailbox_id,
+                id_label,
                 n,
                 namespace::RESCUE_FOLDER_NAME
             );
@@ -90,7 +97,7 @@ pub(crate) fn remove_maildir_tree(
                 "remove_maildir_tree {}/ (id {}): rescue failed: {}; aborting \
                  destroy this cycle, will retry next cycle once the rescue \
                  dir is writable",
-                folder, mailbox_id, e
+                folder, id_label, e
             );
             return Ok(());
         }
@@ -114,14 +121,17 @@ pub(crate) fn remove_maildir_tree(
     // point and is irreversible; a wide txn that included it would
     // leave a half-deleted state on partial failure.
     let txn = conn.unchecked_transaction()?;
-    let messages_removed = queries::delete_messages_by_jmap_mailbox_id(&txn, mailbox_id)?;
+    let messages_removed = match mailbox_id {
+        Some(id) => queries::delete_messages_by_jmap_mailbox_id(&txn, id)?,
+        None => 0,
+    };
     let state_removed = queries::delete_local_state_by_folder(&txn, folder)?;
     queries::delete_folder_checkpoint(&txn, folder)?;
     txn.commit()?;
     info!(
         "remove_maildir_tree {}/ (id {}): removed maildir, dropped {} \
          message_map row(s) and {} local_state row(s)",
-        folder, mailbox_id, messages_removed, state_removed
+        folder, id_label, messages_removed, state_removed
     );
     Ok(())
 }
@@ -136,16 +146,20 @@ fn rescue_unmapped_files(
     conn: &Connection,
     maildir_root: &Path,
     folder_path: &Path,
-    jmap_mailbox_id: &JmapMailboxId,
+    jmap_mailbox_id: Option<&JmapMailboxId>,
 ) -> Result<usize> {
     let Some(maildir) = store::try_open_maildir(folder_path) else {
         return Ok(0);
     };
-    let known: HashSet<MaildirId> =
-        queries::get_messages_by_jmap_mailbox_id(conn, jmap_mailbox_id)?
+    // A row-less folder has no mapped files, so the known set is empty
+    // and every file is rescued.
+    let known: HashSet<MaildirId> = match jmap_mailbox_id {
+        Some(id) => queries::get_messages_by_jmap_mailbox_id(conn, id)?
             .into_iter()
             .filter_map(|m| m.maildir_id)
-            .collect();
+            .collect(),
+        None => HashSet::new(),
+    };
     let rescue_root = maildir_root.join(namespace::RESCUE_FOLDER_NAME);
     let mut rescued = 0usize;
     let mut rescue_dir_created = false;
@@ -193,7 +207,7 @@ mod tests {
     use tempfile::tempdir;
 
     /// Canonicalize the root the way the batch caller does, then
-    /// drive `remove_maildir_tree` for one folder.
+    /// drive `remove_maildir_tree` for one folder bound to `mailbox_id`.
     fn remove_one(conn: &Connection, maildir_root: &Path, folder: &str, mailbox_id: &str) {
         let root_canon = std::fs::canonicalize(maildir_root).unwrap();
         remove_maildir_tree(
@@ -201,9 +215,44 @@ mod tests {
             maildir_root,
             &root_canon,
             folder,
-            &JmapMailboxId::from(mailbox_id),
+            Some(&JmapMailboxId::from(mailbox_id)),
         )
         .unwrap();
+    }
+
+    /// A row-less folder (`mailbox_id = None`, an untracked stray) has
+    /// no mapped files, so every file is rescued and the tree removed.
+    #[test]
+    fn row_less_folder_rescues_all_files() {
+        let dir = tempdir().unwrap();
+        let conn = db::open_in_memory().unwrap();
+        let maildir_root = dir.path();
+        let folder = "Stray";
+        let folder_path = maildir_root.join(folder);
+        let maildir = ensure_maildir(&folder_path).unwrap();
+        let id = store_message(
+            &maildir,
+            b"Message-ID: <s@example.com>\r\nSubject: x\r\n\r\nbody\r\n",
+            "",
+        )
+        .unwrap();
+
+        let root_canon = std::fs::canonicalize(maildir_root).unwrap();
+        remove_maildir_tree(&conn, maildir_root, &root_canon, folder, None).unwrap();
+
+        assert!(!folder_path.exists(), "stray maildir must be removed");
+        let rescue_cur = maildir_root.join(namespace::RESCUE_FOLDER_NAME).join("cur");
+        let rescued: Vec<String> = std::fs::read_dir(&rescue_cur)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            rescued.len(),
+            1,
+            "the stray's file is unmapped -> rescued; got {rescued:?}"
+        );
+        assert!(rescued[0].contains(id.as_ref()));
     }
 
     /// Happy path: maildir exists with one bound file + matching DB
