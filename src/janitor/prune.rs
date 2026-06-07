@@ -15,7 +15,7 @@ use std::path::Path;
 use crate::ids::JmapMailboxId;
 use crate::jmap::mailbox::{MailboxSelectionInput, get_selected_mailboxes};
 use crate::maildir_ops::drift::{DriftReport, RenameInFlight, compute_drift};
-use crate::maildir_ops::removal::remove_maildir_tree;
+use crate::maildir_ops::removal::{RemovalOutcome, remove_maildir_tree};
 use crate::maildir_ops::store;
 use crate::state::queries;
 
@@ -196,6 +196,12 @@ pub struct PruneOutcome {
     /// Entries left in place for lack of the force flag their safety
     /// label requires, paired with that label.
     pub skipped: Vec<(String, PruneSafety)>,
+    /// Entries that were permitted and attempted, but whose removal
+    /// could not complete (path-escape refusal, rescue failure, or a
+    /// filesystem error). The folder and its `mailbox_map` row are
+    /// left intact for a later retry; `remove_maildir_tree` logs the
+    /// specific reason.
+    pub deferred: Vec<String>,
 }
 
 /// Apply `plan`: remove each permitted entry and clear its DB rows. An
@@ -205,9 +211,13 @@ pub struct PruneOutcome {
 ///
 /// Each removal goes through `remove_maildir_tree` (path guard, rescue
 /// of unmapped files, NotFound-tolerant disk removal, and the
-/// message/local_state/checkpoint cascade), after which the entry's
-/// `mailbox_map` row is dropped -- the one piece that helper leaves to
-/// its caller. A row-less stray has no such row to drop.
+/// message/local_state/checkpoint cascade). Only when that helper
+/// reports `Removed` does the entry's `mailbox_map` row get dropped --
+/// the one piece it leaves to its caller -- and the folder land in
+/// `removed`. A `Skipped` outcome (the helper refused or aborted and
+/// left the tree intact) keeps the row and routes the folder to
+/// `deferred` for a later retry, so a prune that didn't happen is
+/// never reported as one. A row-less stray has no row to drop.
 pub fn apply(
     conn: &Connection,
     maildir_root: &Path,
@@ -232,19 +242,27 @@ pub fn apply(
             continue;
         }
         let mailbox_id = id_by_folder.get(entry.folder.as_str()).copied();
-        remove_maildir_tree(
+        let removal = remove_maildir_tree(
             conn,
             maildir_root,
             &maildir_root_canon,
             &entry.folder,
             mailbox_id,
         )?;
-        // remove_maildir_tree drains message_map/local_state/
-        // folder_checkpoint but leaves the mailbox_map row to us.
-        if let Some(id) = mailbox_id {
-            queries::delete_mailbox(conn, id)?;
+        match removal {
+            RemovalOutcome::Removed => {
+                // The tree is gone and its message_map/local_state/
+                // folder_checkpoint rows are cascaded; drop the
+                // mailbox_map row remove_maildir_tree leaves to us.
+                if let Some(id) = mailbox_id {
+                    queries::delete_mailbox(conn, id)?;
+                }
+                outcome.removed.push(entry.folder.clone());
+            }
+            // The helper refused or aborted and left the tree intact;
+            // keep the mailbox_map row so a retry has the same input.
+            RemovalOutcome::Skipped => outcome.deferred.push(entry.folder.clone()),
         }
-        outcome.removed.push(entry.folder.clone());
     }
     Ok(outcome)
 }
@@ -546,6 +564,57 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "message_map row must be cascaded"
+        );
+    }
+
+    /// A permitted entry whose removal can't complete (here: rescue of
+    /// an unmapped file fails) must keep its `mailbox_map` row and be
+    /// reported as `deferred`, not `removed`. Otherwise apply would
+    /// drop the binding while the tree is still on disk, turning a
+    /// tracked folder into a row-less stray with orphaned message rows.
+    #[test]
+    fn apply_defers_when_removal_cannot_complete() {
+        let dir = tempdir().unwrap();
+        let conn = db::open_in_memory().unwrap();
+        upsert_mailbox(&conn, "M1", "INBOX", "INBOX", Some("inbox"));
+        touch_maildir(dir.path(), "INBOX");
+        // Archive: tracked (row M2) + on disk with one unmapped file,
+        // and dropped from the config -> ConfigDropped /
+        // NeedsForceNonEmpty.
+        upsert_mailbox(&conn, "M2", "Archive", "Archive", None);
+        touch_maildir(dir.path(), "Archive");
+        seed_file(dir.path(), "Archive", "1");
+        // Force the rescue to fail: pre-create a directory where the
+        // unmapped file would be renamed (rename onto a dir is EISDIR),
+        // which makes remove_maildir_tree abort with Skipped.
+        let rescue_cur = dir
+            .path()
+            .join(crate::maildir_ops::namespace::RESCUE_FOLDER_NAME)
+            .join("cur");
+        std::fs::create_dir_all(rescue_cur.join("1.host:2,")).unwrap();
+
+        let p = plan(&conn, dir.path(), &["INBOX".to_string()], false).unwrap();
+        let out = apply(
+            &conn,
+            dir.path(),
+            &p,
+            PruneApplyOptions {
+                force_non_empty: true,
+                force_in_config: false,
+            },
+        )
+        .unwrap();
+
+        assert!(out.removed.is_empty(), "removal did not complete");
+        assert!(out.skipped.is_empty(), "the force gate was satisfied");
+        assert_eq!(out.deferred, vec!["Archive".to_string()]);
+        assert!(
+            dir.path().join("Archive").exists(),
+            "the folder must remain on disk after a failed removal"
+        );
+        assert!(
+            queries::get_mailbox(&conn, &"M2".into()).unwrap().is_some(),
+            "the mailbox_map row must survive so a retry has the same input"
         );
     }
 
