@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use jma_mail::ids::JmapBlobId;
 use jma_mail::jmap::email::{build_blob_http_client, download_blob};
-use jma_mail::maildir_ops::store::ensure_maildir;
+use jma_mail::maildir_ops::store::{ensure_maildir, open_tmp};
 use jmap_client::client::{Client, Credentials};
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -126,7 +126,7 @@ async fn download_blob_retries_503_then_succeeds() {
     // all 5 attempts get exercised (500+1000+2000+4000 = 7.5s of sleeps).
     let tmp = tokio::time::timeout(
         std::time::Duration::from_secs(15),
-        download_blob(&http, &client, &blob_id, &maildir),
+        download_blob(&http, &client, &blob_id, || open_tmp(&maildir)),
     )
     .await
     .expect("download_blob should not exceed timeout")
@@ -185,7 +185,7 @@ async fn download_blob_does_not_retry_404() {
 
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        download_blob(&http, &client, &blob_id, &maildir),
+        download_blob(&http, &client, &blob_id, || open_tmp(&maildir)),
     )
     .await
     .expect("download_blob should not exceed timeout");
@@ -249,7 +249,7 @@ async fn download_blob_url_matches_jmap_client() {
     let http = build_blob_http_client(&client).expect("build blob http client");
     let tempdir = tempfile::tempdir().expect("tempdir for maildir");
     let maildir = ensure_maildir(tempdir.path()).expect("ensure_maildir");
-    download_blob(&http, &client, &blob_id, &maildir)
+    download_blob(&http, &client, &blob_id, || open_tmp(&maildir))
         .await
         .expect("our download_blob");
 

@@ -6,7 +6,6 @@ use jmap_client::client::Client;
 use jmap_client::core::error::MethodErrorType;
 use jmap_client::core::session::URLPart;
 use jmap_client::email;
-use maildir::{Maildir, TemporaryMailFile};
 use reqwest::Client as HttpClient;
 use reqwest::header::CONTENT_TYPE;
 use std::collections::HashMap;
@@ -18,7 +17,6 @@ use crate::ids::{JmapBlobId, JmapEmailId, JmapMailboxId, JmapThreadId, MessageId
 use crate::jmap::limits;
 use crate::jmap::retry::with_retry;
 use crate::jmap::types::{ChangesResponse, EmailObject};
-use crate::maildir_ops::store;
 use crate::sync::plan::LocalId;
 
 /// True iff `err`'s anyhow chain carries a JMAP method-level
@@ -731,19 +729,21 @@ pub(crate) fn build_download_url(jmap: &Client, blob_id: &str) -> String {
     url
 }
 
-/// Download the raw blob of an email straight into a freshly-opened
-/// `tmp/` file under `maildir`. The returned `TemporaryMailFile` is
-/// the producer half of the streaming download path: the consumer
-/// passes it to `store::finalize_message` (F_BARRIERFSYNC + rename to
-/// `new/`/`cur/`) and then commits the per-message DB transaction.
+/// Download the raw blob of an email, streaming HTTP response chunks
+/// into a caller-provided sink. The sink factory `open_sink` is
+/// called once per retry attempt; a mid-stream HTTP failure drops the
+/// handle produced by the failed attempt (letting the caller's `Drop`
+/// impl clean up partial writes) and the next attempt opens a fresh
+/// one.
+///
 /// Peak memory per in-flight blob is one HTTP chunk (~16 KB) plus
-/// the open-file handle, instead of the full message size that a
+/// the open sink handle, instead of the full message size that a
 /// buffered `Vec<u8>` would hold.
 ///
-/// Each `with_retry` attempt opens a fresh tmp file. A mid-stream
-/// HTTP failure on an earlier attempt drops its tmp handle, whose
-/// `Drop` guard unlinks the partial file -- so retries don't leak
-/// orphans into `tmp/`.
+/// The `Send + 'static` bound on `W` is load-bearing: each HTTP
+/// chunk is written via `tokio::task::spawn_blocking` so a slow
+/// filesystem doesn't stall the producer task's
+/// `buffer_unordered` concurrency.
 ///
 /// The download URL is derived from the JMAP session metadata
 /// `jmap_client::Client::download` uses internally
@@ -753,19 +753,22 @@ pub(crate) fn build_download_url(jmap: &Client, blob_id: &str) -> String {
 #[instrument(
     target = "jma::profile::blob",
     name = "blob.download",
-    skip(http, jmap, maildir),
+    skip(http, jmap, open_sink),
     fields(bytes = Empty),
 )]
-pub async fn download_blob(
+pub async fn download_blob<W, F>(
     http: &HttpClient,
     jmap: &Client,
     blob_id: &JmapBlobId,
-    maildir: &Maildir,
-) -> Result<TemporaryMailFile> {
+    open_sink: F,
+) -> Result<W>
+where
+    W: Write + Send + 'static,
+    F: Fn() -> Result<W>,
+{
     let url = build_download_url(jmap, blob_id.as_ref());
-    let (tmp, bytes) = with_retry("Email/blob", || async {
-        let mut tmp = store::open_tmp(maildir)
-            .with_context(|| format!("Allocating tmp/ for blob {}", blob_id))?;
+    let (sink, bytes) = with_retry("Email/blob", || async {
+        let mut sink = open_sink().with_context(|| format!("Opening sink for blob {}", blob_id))?;
         let resp = http
             .get(&url)
             .send()
@@ -779,30 +782,30 @@ pub async fn download_blob(
             let chunk =
                 chunk.with_context(|| format!("Failed to read body chunk for blob {}", blob_id))?;
             total += chunk.len() as u64;
-            // `TemporaryMailFile::write_all` is sync. Hop to the
-            // blocking pool so a slow filesystem (NFS, sshfs, SMB)
-            // doesn't stall the producer task's internal
-            // `buffer_unordered` concurrency -- all in-flight blob
-            // futures share this task, so a multi-millisecond write
-            // would otherwise serialize them. Ownership of `tmp`
-            // round-trips through the closure so the handle's Drop
-            // (which unlinks on the error path) stays correct.
+            // `Write::write_all` is sync. Hop to the blocking pool
+            // so a slow filesystem (NFS, sshfs, SMB) doesn't stall
+            // the producer task's internal `buffer_unordered`
+            // concurrency -- all in-flight blob futures share this
+            // task, so a multi-millisecond write would otherwise
+            // serialize them. Ownership of `sink` round-trips
+            // through the closure so the handle's Drop (which may
+            // clean up on the error path) stays correct.
             let (returned, write_res) = tokio::task::spawn_blocking(move || {
-                let res = tmp.write_all(&chunk);
-                (tmp, res)
+                let res = sink.write_all(&chunk);
+                (sink, res)
             })
             .await
             .expect("blob-write blocking task panicked");
-            tmp = returned;
-            write_res.with_context(|| format!("Failed to write blob {} into tmp/", blob_id))?;
+            sink = returned;
+            write_res.with_context(|| format!("Failed to write blob {} to sink", blob_id))?;
         }
-        Ok::<_, anyhow::Error>((tmp, total))
+        Ok::<_, anyhow::Error>((sink, total))
     })
     .await?;
 
     tracing::Span::current().record("bytes", bytes);
     debug!("Downloaded blob {} ({} bytes)", blob_id, bytes);
-    Ok(tmp)
+    Ok(sink)
 }
 
 /// Reject rows where the server omitted any of `id`/`blobId`/

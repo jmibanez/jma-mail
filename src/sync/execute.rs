@@ -1615,7 +1615,10 @@ async fn download_producer(
         async move {
             let maildir_path = maildir_root.join(&maildir_folder);
             let res = match store::ensure_maildir(&maildir_path) {
-                Ok(maildir) => jmap_email::download_blob(&http, &jmap, &blob_id, &maildir).await,
+                Ok(maildir) => {
+                    jmap_email::download_blob(&http, &jmap, &blob_id, || store::open_tmp(&maildir))
+                        .await
+                }
                 Err(e) => Err(e),
             };
             (action, res)
