@@ -10,6 +10,7 @@ use anyhow::Result;
 use rusqlite::Connection;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
+use tracing::warn;
 
 use crate::ids::JmapMailboxId;
 use crate::jmap::mailbox::{MailboxSelectionInput, get_selected_mailboxes};
@@ -110,8 +111,20 @@ pub fn compute_drift(
     let mut paired_disk: HashSet<String> = HashSet::new();
     let mut paired_db_ids: HashSet<JmapMailboxId> = HashSet::new();
     for disk_folder in &disk_orphans {
-        let Some(mapping) = sentinel::read(&maildir_root.join(disk_folder))? else {
-            continue;
+        // Best-effort: an unreadable sentinel (permission denied, EIO)
+        // can't tell us whether this disk orphan is a rename target, so
+        // treat it like a missing sentinel -- leave the folder unpaired
+        // and let it fall through to `disk_only` rather than aborting
+        // the whole drift report over one stray folder.
+        let mapping = match sentinel::read(&maildir_root.join(disk_folder)) {
+            Ok(Some(m)) => m,
+            Ok(None) => continue,
+            Err(e) => {
+                warn!(
+                    "Failed to read sentinel under {disk_folder}; treating as an unpaired stray for drift ({e:#})"
+                );
+                continue;
+            }
         };
         if paired_db_ids.contains(&mapping.jmap_mailbox_id) {
             continue;
@@ -389,6 +402,27 @@ mod tests {
             c.db_only.is_empty(),
             "the renamed-from row is not an orphan"
         );
+    }
+
+    /// A disk orphan whose sentinel can't be read (here the sentinel
+    /// path is a directory, which makes `std::fs::read` fail with an
+    /// I/O error rather than NotFound) must not abort the whole drift
+    /// report. Best-effort: the folder is left unpaired and surfaces
+    /// as a stray in `disk_only`.
+    #[test]
+    fn unreadable_sentinel_does_not_abort_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open_in_memory().unwrap();
+        upsert_mailbox(&conn, "M1", "INBOX", "INBOX", Some("inbox"));
+        touch_maildir(dir.path(), "INBOX");
+        touch_maildir(dir.path(), "Stray");
+        // Force `sentinel::read` down its Err arm: a directory at the
+        // sentinel path reads back as EISDIR, not NotFound.
+        std::fs::create_dir_all(sentinel::sentinel_path_for(&dir.path().join("Stray"))).unwrap();
+
+        let c = classes(compute_drift(&conn, dir.path(), &[], false).unwrap());
+        assert_eq!(c.disk_only, vec!["Stray".to_string()]);
+        assert!(c.rename_in_flight.is_empty());
     }
 
     #[test]
