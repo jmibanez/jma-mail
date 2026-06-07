@@ -187,6 +187,7 @@ Commands:
   mailboxes  List remote mailboxes and their local mapping
   status     Show sync staleness, cursor health, and maildir drift
   auth       Manage account credentials and the JMAP discovery cache
+  janitor    Run maintenance tasks against the maildir tree and state DB
   help       Print this message or the help of the given subcommand(s)
 
 Options:
@@ -283,13 +284,15 @@ JMAP cursors (account a1b2c3d4e):
 Maildir vs DB drift (under /Users/foo/Mail):
   Folders on disk not in DB: SomeNewFolder
   Folders in DB not on disk: (none)
+  Folders no longer in [sync].mailboxes: (none)
+  Local renames pending sync: (none)
 ```
 
 What each section is for:
 
   * **Last cursor write.** "When did the JMAP cursor for this account last advance?" Answers the staleness question without going online. The semantic is "last cursor write," not "last sync attempt completed" -- a sync run that produces no state change is invisible here, since we don't write a row when there's nothing to write. Reasonable proxy for "is this account stale, should I run sync?" but not a sync-attempt log.
   * **Cursor health.** Each tracked entity (`Email`, `Mailbox`) is either `healthy` (a state cookie is set) or `FORCED RESYNC`. The latter means the cursor was tripped by a `cannotCalculateChanges` error from the server, and the next mutating run (`sync`/`pull`/`watch`) will do a full re-pull instead of a delta. Surfaced here so a slow next cycle isn't a surprise.
-  * **Maildir vs DB drift.** Folders on disk that aren't in `mailbox_map`, and folders in `mailbox_map` that aren't on disk. Diagnostic for "I `mkdir`'d a folder, why hasn't jma noticed" and the symmetric "the DB thinks I have a folder I don't." Compares immediate non-hidden subdirectories of the maildir root.
+  * **Maildir vs DB drift.** Four classes of disagreement between the maildir tree and `mailbox_map`: folders on disk with no DB row ("I `mkdir`'d a folder, why hasn't jma noticed"), DB rows with no folder on disk ("the DB thinks I have a folder I don't"), folders still on both sides but no longer selected by `[sync].mailboxes` (you shrank the sync set), and local renames not yet pushed to the server. `status` only reports these; `janitor prune` is the command that clears them.
   * **DB metadata.** Path, size, and schema version of the state DB. Useful for bug reports and for noticing when the DB has gotten unexpectedly large.
 
 The JMAP account ID is shown raw rather than mapped to an email -- mapping back would need either a JMAP roundtrip (which would defeat the offline-capable design) or a new column to remember the email-to-ID binding. The configured email prints once at the top so you can match the section to the account it belongs to.
@@ -303,6 +306,28 @@ The JMAP account ID is shown raw rather than mapped to an email -- mapping back 
   * `auth rediscover --account <email>` -- Clear the cached JMAP session URL for this account's email domain and re-run autodiscovery (DNS SRV `_jmap._tcp.<domain>`, then `/.well-known/jmap`), printing the result. Use this when your provider changes their session endpoint. If `[account].session_url` is set explicitly in the config, sync bypasses the discovery cache anyway -- `rediscover` still updates the cache, but the new value only takes effect once you remove the override; the command warns you about this.
 
 `auth` does not take the maildir or state-DB locks, so it can run alongside a `watch` daemon on the same account. Token rotations land in the keychain immediately; the running daemon will pick the new token up on its next reconnect (see [watch](#watch--push-email-and-continuous-sync)).
+
+### janitor : Maintenance tasks
+
+`janitor` groups offline maintenance tasks that operate on the maildir tree and state DB outside a sync cycle: `dedupe` (remove per-folder Message-ID duplicates), `remotededupe` (server-side dedupe via `Email/set`), `rebindfolders` (rebind sentinel-less maildirs by Message-ID probing), and `prune` (below). Each takes the same maildir and state-DB locks a sync does, so it won't run concurrently with one.
+
+#### janitor prune : Clear maildir/DB drift
+
+`prune` remediates the drift that `status` reports but can't fix. It is offline -- it reads the state DB, the maildir tree, and `[sync].mailboxes`, and never goes to the server. Default mode prints a plan and removes nothing; pass `--apply` to act.
+
+It classifies each drifted folder and labels how risky removing it is:
+
+  * **On disk, no DB row** (an untracked stray). Removing it deletes the maildir; any local-only files are first moved to a rescue maildir, never destroyed.
+  * **Dropped from `[sync].mailboxes`** (present on both sides, no longer selected). Removing it deletes the maildir and its DB rows.
+  * **DB row, no maildir** (the folder was deleted on disk). Removing it is a DB-cleanup only.
+  * **Local rename pending sync.** Never pruned -- the next sync settles it; surfaced so the skip is explained.
+
+Two force flags gate the risky removals, on orthogonal axes:
+
+  * `--force-non-empty` -- required to remove a maildir that still contains mail. Without it, non-empty folders are listed but left in place.
+  * `--force-in-config` -- required to clear DB rows for a folder still selected by `[sync].mailboxes` (clearing them otherwise just makes the next sync re-download it).
+
+`--mailbox <FOLDER>` limits the run to one folder; `--only disk` or `--only db` limits it to on-disk folders or stale DB rows respectively.
 
 ## A short note on this project's name
 
