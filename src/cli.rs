@@ -165,4 +165,31 @@ pub enum JanitorAction {
         #[arg(long)]
         apply: bool,
     },
+    /// Remediate the maildir/DB drift that `jma status` reports.
+    Prune {
+        /// Limit to one maildir folder.
+        #[arg(long, value_name = "FOLDER")]
+        mailbox: Option<String>,
+        /// Limit to one drift side: disk or db.
+        #[arg(long, value_enum)]
+        only: Option<PruneOnly>,
+        /// Apply the plan instead of only printing it.
+        #[arg(long)]
+        apply: bool,
+        /// Allow removing a maildir that still has mail.
+        #[arg(long)]
+        force_non_empty: bool,
+        /// Allow clearing rows for a folder still in [sync].mailboxes.
+        #[arg(long)]
+        force_in_config: bool,
+    },
+}
+
+/// Which side of the maildir/DB drift `janitor prune` acts on.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub enum PruneOnly {
+    /// Stray and dropped folders on disk.
+    Disk,
+    /// Stale DB rows whose maildir is gone.
+    Db,
 }

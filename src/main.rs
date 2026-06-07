@@ -5,7 +5,7 @@ use std::time::Duration;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 
-use jma_mail::cli::{AuthAction, Cli, Command, JanitorAction};
+use jma_mail::cli::{AuthAction, Cli, Command, JanitorAction, PruneOnly};
 use jma_mail::config::{self, Config};
 use jma_mail::daemon;
 use jma_mail::jmap::retry::{self, RetryConfig};
@@ -600,6 +600,13 @@ async fn cmd_janitor(cli: &Cli, action: Option<JanitorAction>) -> Result<()> {
             bind,
             apply,
         } => cmd_janitor_rebindfolders(cli, sample_size, bind, apply).await,
+        JanitorAction::Prune {
+            mailbox,
+            only,
+            apply,
+            force_non_empty,
+            force_in_config,
+        } => cmd_janitor_prune(cli, mailbox, only, apply, force_non_empty, force_in_config),
     }
 }
 
@@ -829,6 +836,129 @@ async fn cmd_janitor_rebindfolders(
         );
     }
     Ok(())
+}
+
+/// Offline drift remediation: classify the maildir/DB drift, print the
+/// plan, and (with --apply) remove the permitted entries. Scope filters
+/// (`--mailbox`, `--only`) narrow the plan before it is shown or acted
+/// on; force flags lift the safety gates.
+fn cmd_janitor_prune(
+    cli: &Cli,
+    mailbox: Option<String>,
+    only: Option<PruneOnly>,
+    apply: bool,
+    force_non_empty: bool,
+    force_in_config: bool,
+) -> Result<()> {
+    use jma_mail::janitor::prune::{self, PruneApplyOptions};
+
+    let config = load_config(cli)?;
+    acquire_mutator_locks(&config)?;
+    let conn = state::db::open_or_recreate(&config.db_path())?;
+    let maildir_root = config.maildir_path();
+
+    let mut plan = prune::plan(
+        &conn,
+        &maildir_root,
+        &config.sync.mailboxes,
+        config.sync.case_insensitive_match,
+    )?;
+
+    if let Some(folder) = mailbox.as_deref() {
+        plan.entries.retain(|e| e.folder == folder);
+        plan.skipped_renames
+            .retain(|r| r.db_folder == folder || r.disk_folder == folder);
+    }
+    if let Some(only) = only {
+        let want_disk = matches!(only, PruneOnly::Disk);
+        plan.entries.retain(|e| e.removes_disk == want_disk);
+        // Pending renames are a disk-side concern; drop them under
+        // `--only db`.
+        if !want_disk {
+            plan.skipped_renames.clear();
+        }
+    }
+
+    if plan.entries.is_empty() && plan.skipped_renames.is_empty() {
+        jma_mail::notify!("Prune: no drift to clean up.");
+        return Ok(());
+    }
+
+    render_prune_plan(&plan);
+
+    if !apply {
+        jma_mail::notify!(
+            "Prune: {} entr{} eligible; re-run with --apply to act \
+             (add --force-non-empty / --force-in-config to lift the gates).",
+            plan.entries.len(),
+            if plan.entries.len() == 1 { "y" } else { "ies" },
+        );
+        return Ok(());
+    }
+
+    let outcome = prune::apply(
+        &conn,
+        &maildir_root,
+        &plan,
+        PruneApplyOptions {
+            force_non_empty,
+            force_in_config,
+        },
+    )?;
+
+    for folder in &outcome.removed {
+        println!("  [PRUNED] {folder}/");
+    }
+    for (folder, safety) in &outcome.skipped {
+        println!("  [PRUNE-SKIP] {folder}/  ({})", prune_safety_hint(*safety));
+    }
+    jma_mail::notify!(
+        "Prune: removed {} folder(s); skipped {} needing a force flag.",
+        outcome.removed.len(),
+        outcome.skipped.len(),
+    );
+    Ok(())
+}
+
+fn render_prune_plan(plan: &jma_mail::janitor::prune::PrunePlan) {
+    for e in &plan.entries {
+        let files = if e.removes_disk {
+            format!(" ({} file(s))", e.file_count)
+        } else {
+            String::new()
+        };
+        println!(
+            "  [PRUNE] {}/  {}{}  -- {}",
+            e.folder,
+            prune_class_desc(e.class),
+            files,
+            prune_safety_hint(e.safety),
+        );
+    }
+    for r in &plan.skipped_renames {
+        println!(
+            "  [PRUNE-SKIP] {} -> {}  -- pending local rename (settles on next sync)",
+            r.db_folder, r.disk_folder
+        );
+    }
+}
+
+fn prune_class_desc(class: jma_mail::janitor::prune::PruneClass) -> &'static str {
+    use jma_mail::janitor::prune::PruneClass;
+    match class {
+        PruneClass::DiskOnlyStray => "on disk, no DB row",
+        PruneClass::DbOnlyOrphan => "DB row, no maildir",
+        PruneClass::ConfigDropped => "dropped from [sync].mailboxes",
+    }
+}
+
+fn prune_safety_hint(safety: jma_mail::janitor::prune::PruneSafety) -> &'static str {
+    use jma_mail::janitor::prune::PruneSafety;
+    match safety {
+        PruneSafety::Safe => "safe",
+        PruneSafety::NeedsForceNonEmpty => "non-empty; needs --force-non-empty",
+        PruneSafety::NeedsForceInConfig => "still in [sync].mailboxes; needs --force-in-config",
+    }
 }
 
 fn render_rebindfolders_plan(plan: &jma_mail::janitor::rebindfolders::RebindFoldersPlan) {
