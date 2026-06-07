@@ -6,8 +6,8 @@ use std::sync::Arc;
 use tracing::{debug, error};
 
 use crate::config::FolderLayout;
+use crate::domain::MailboxFolderBinding;
 use crate::ids::{JmapMailboxId, MaildirId, MessageId};
-use crate::jmap::types::MailboxFolderBinding;
 use crate::maildir_ops::headers::parse_message_id_from_file;
 use crate::maildir_ops::namespace::is_jma_private;
 use crate::maildir_ops::sentinel::MailboxMapping;
@@ -804,7 +804,7 @@ fn require_message_id(maildir_id: &MaildirId, path: &Path) -> Result<Option<Mess
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jmap::types::MaybeReference;
+    use crate::domain::MaybeReference;
     use crate::maildir_ops::store::ensure_maildir;
     use std::fs;
     use std::path::Path;

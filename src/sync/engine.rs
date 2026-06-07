@@ -8,10 +8,11 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
+use crate::domain::{MailboxFolderBinding, MailboxObject, MaybeReference};
 use crate::ids::{JmapAccountId, JmapEmailId, JmapMailboxId, MaildirId};
 use crate::jmap::{
     email as jmap_email, limits, mailbox as jmap_mailbox, session,
-    types::{EmailObject, MailboxFolderBinding, MailboxObject, MaybeReference, SessionInfo},
+    types::{EmailObject, SessionInfo},
 };
 use crate::maildir_ops::layout::{
     FolderLayoutDefinition, decompose_folder_string, resolve_folder_path,

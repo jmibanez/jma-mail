@@ -3,8 +3,8 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::domain::{MailboxFolderBinding, MaybeReference};
 use crate::ids::{JmapBlobId, JmapEmailId, JmapMailboxId, JmapThreadId, MaildirId, MessageId};
-use crate::jmap::types::{MailboxFolderBinding, MaybeReference};
 
 /// A message known by its local maildir handle. The Message-ID rides
 /// along so logs can name the message in human-readable form, and so

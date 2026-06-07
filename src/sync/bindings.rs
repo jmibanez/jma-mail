@@ -25,8 +25,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
+use crate::domain::MailboxFolderBinding;
 use crate::ids::{JmapEmailId, JmapMailboxId, MaildirId, MessageId};
-use crate::jmap::types::MailboxFolderBinding;
 use crate::state::queries::MailboxRecord;
 
 /// `by_id` is the authoritative store; `by_folder` is a secondary
@@ -390,7 +390,7 @@ impl MailboxBindings {
     pub fn is_new_mailbox(&self, id: &JmapMailboxId) -> bool {
         self.new_mailboxes.iter().any(|nm| {
             matches!(&nm.binding.jmap_mailbox_id,
-                crate::jmap::types::MaybeReference::Value(v) if v == id)
+                crate::domain::MaybeReference::Value(v) if v == id)
         })
     }
 

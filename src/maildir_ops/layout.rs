@@ -27,8 +27,8 @@ use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 
 use crate::config::{CompiledRenameRule, Config, FolderLayout};
+use crate::domain::MailboxObject;
 use crate::ids::JmapMailboxId;
-use crate::jmap::types::MailboxObject;
 
 pub struct FolderLayoutDefinition {
     layout: FolderLayout,

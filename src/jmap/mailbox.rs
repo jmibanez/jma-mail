@@ -5,10 +5,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path};
 use tracing::{debug, info};
 
+use crate::domain::MailboxObject;
 use crate::ids::JmapMailboxId;
 use crate::jmap::limits;
 use crate::jmap::retry::with_retry;
-use crate::jmap::types::MailboxObject;
 
 /// Validate a mailbox name received from the JMAP server before it is
 /// joined onto the local maildir root. A malicious or compromised

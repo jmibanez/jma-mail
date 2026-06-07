@@ -2165,7 +2165,7 @@ async fn create_remote_mailbox_issues_mailbox_set_per_action() {
             },
             SyncAction::CreateRemoteMailbox {
                 name: "Foo".to_string(),
-                parent_jmap_mailbox_id: Some(jma_mail::jmap::types::MaybeReference::Value(
+                parent_jmap_mailbox_id: Some(jma_mail::domain::MaybeReference::Value(
                     JmapMailboxId::from("MB-INBOX"),
                 )),
                 role: None,
@@ -2313,7 +2313,7 @@ async fn create_remote_mailbox_chained_create_resolves_parent_reference() {
             },
             SyncAction::CreateRemoteMailbox {
                 name: "Notes".to_string(),
-                parent_jmap_mailbox_id: Some(jma_mail::jmap::types::MaybeReference::Reference(
+                parent_jmap_mailbox_id: Some(jma_mail::domain::MaybeReference::Reference(
                     "Personal".to_string(),
                 )),
                 role: None,
@@ -2424,7 +2424,7 @@ async fn create_remote_mailbox_skips_child_when_parent_reference_unresolved() {
     let plan = SyncPlan {
         actions: vec![SyncAction::CreateRemoteMailbox {
             name: "Notes".to_string(),
-            parent_jmap_mailbox_id: Some(jma_mail::jmap::types::MaybeReference::Reference(
+            parent_jmap_mailbox_id: Some(jma_mail::domain::MaybeReference::Reference(
                 "Personal".to_string(),
             )),
             role: None,
@@ -2451,7 +2451,7 @@ async fn create_remote_mailbox_skips_child_when_parent_reference_unresolved() {
 /// the on-the-wire call shape and the in-cycle DB cleanup.
 #[tokio::test]
 async fn destroy_remote_mailbox_issues_mailbox_set_per_action_and_drops_cache_row() {
-    use jma_mail::jmap::types::{MailboxFolderBinding, MaybeReference};
+    use jma_mail::domain::{MailboxFolderBinding, MaybeReference};
     use jma_mail::state::queries;
     use jma_mail::state::queries::MailboxRecord;
     use jma_mail::sync::execute::Executor;
@@ -2552,7 +2552,7 @@ async fn destroy_remote_mailbox_issues_mailbox_set_per_action_and_drops_cache_ro
 /// `Executor::destroy_remote_mailboxes`.
 #[tokio::test]
 async fn destroy_remote_mailbox_keeps_cache_row_on_rejection_and_continues() {
-    use jma_mail::jmap::types::{MailboxFolderBinding, MaybeReference};
+    use jma_mail::domain::{MailboxFolderBinding, MaybeReference};
     use jma_mail::state::queries;
     use jma_mail::state::queries::MailboxRecord;
     use jma_mail::sync::execute::Executor;

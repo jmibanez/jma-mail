@@ -2,6 +2,7 @@ pub mod auth;
 pub mod cli;
 pub mod config;
 pub mod daemon;
+pub mod domain;
 pub mod ids;
 pub mod janitor;
 pub mod jmap;

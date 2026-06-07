@@ -12,11 +12,11 @@ use tokio::sync::mpsc;
 use tracing::{Instrument, debug, error, info, warn};
 
 use crate::config::Config;
+use crate::domain::{MailboxFolderBinding, MaybeReference};
 use crate::ids::{JmapAccountId, JmapEmailId, JmapMailboxId, MaildirId};
 use crate::jmap::email::{self as jmap_email, EmailSetOp};
 use crate::jmap::limits;
 use crate::jmap::retry::is_transient_error;
-use crate::jmap::types::{MailboxFolderBinding, MaybeReference};
 use crate::maildir_ops::{flags::keywords_to_flags, namespace, store};
 use crate::state::queries::{self, MessageRecord};
 use crate::sync::engine::SyncOutcome;
@@ -2386,8 +2386,8 @@ async fn upload_one(client: &Client, job: UploadJob) -> Result<UploadOutcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::MaybeReference;
     use crate::ids::{JmapEmailId, MaildirId};
-    use crate::jmap::types::MaybeReference;
     use crate::state::db;
     use std::collections::HashMap;
 

@@ -5,8 +5,9 @@ use std::sync::Arc;
 use tracing::{debug, error, warn};
 
 use crate::config::{AllowDestructiveFolderSync, ConflictStrategy, FolderLayout, SyncConfig};
+use crate::domain::{MailboxFolderBinding, MaybeReference};
 use crate::ids::{JmapBlobId, JmapEmailId, JmapMailboxId, JmapThreadId, MaildirId, MessageId};
-use crate::jmap::types::{EmailObject, MailboxFolderBinding, MaybeReference};
+use crate::jmap::types::EmailObject;
 use crate::maildir_ops::flags::{flags_to_keyword_patch, flags_to_keywords, keywords_to_flags};
 use crate::maildir_ops::layout::decompose_folder_string;
 use crate::maildir_ops::scan::LocalChange;
@@ -2154,8 +2155,8 @@ fn emit_local_flag_update(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{MailboxFolderBinding, MaybeReference};
     use crate::ids::JmapMailboxId;
-    use crate::jmap::types::{MailboxFolderBinding, MaybeReference};
     use crate::sync::dedupe::{LocalEntry, LocalIndex};
     use std::path::PathBuf;
 

@@ -120,10 +120,11 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
 
+use crate::domain::MailboxObject;
 use crate::ids::{JmapEmailId, JmapMailboxId, MessageId};
 use crate::jmap::limits;
 use crate::jmap::retry::with_retry;
-use crate::jmap::types::{EmailObject, MailboxObject};
+use crate::jmap::types::EmailObject;
 use crate::jmap::{email as jmap_email, mailbox as jmap_mailbox};
 use crate::maildir_ops::headers::parse_message_id_from_file;
 use crate::maildir_ops::namespace::is_jma_private;
