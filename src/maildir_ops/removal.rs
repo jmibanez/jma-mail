@@ -39,17 +39,22 @@ pub(crate) enum RemovalOutcome {
 
 /// Delete an entire maildir folder tree and cascade the state-DB rows
 /// that reference it (`message_map`, `local_state`,
-/// `folder_checkpoint`). `maildir_root_canon` is the caller's
-/// already-canonicalized `maildir_root`. `mailbox_id` is the folder's
-/// bound mailbox, or `None` for a row-less folder (an untracked
-/// stray): with `None` every file is treated as unmapped (so all are
-/// rescued) and the `message_map` cascade is skipped. The
-/// `mailbox_map` row itself is not touched here -- the caller owns
-/// that.
+/// `folder_checkpoint`). `maildir_root` must be canonical -- absolute,
+/// with `~`, `.`/`..`, and symlinks already resolved (obtain it from
+/// `std::fs::canonicalize` or `Config::canonical_maildir_root`). The
+/// path-escape guard leans on that: a canonical root means `folder` is
+/// the only input that can introduce an escape, so the guard has just
+/// one untrusted value to vet. `mailbox_id` is the folder's bound
+/// mailbox, or `None` for a row-less folder (an untracked stray): with
+/// `None` every file is treated as unmapped (so all are rescued) and
+/// the `message_map` cascade is skipped. The `mailbox_map` row itself
+/// is not touched here -- the caller owns that.
 ///
 /// Caller-visible guarantees:
-/// - Refuses (`Skipped`) if `folder` resolves outside `maildir_root`,
-///   so a bad path can't escape the tree.
+/// - Refuses (`Skipped`) if `folder` would resolve outside
+///   `maildir_root` -- a `..` component, an absolute path, or a
+///   symlink pointing out of the tree -- so a bad row can't reach
+///   outside it.
 /// - Never silently drops a file the DB doesn't know about: unmapped
 ///   files are moved to the rescue maildir first, and a rescue
 ///   failure leaves the folder intact for a later retry.
@@ -62,23 +67,23 @@ pub(crate) enum RemovalOutcome {
 pub(crate) fn remove_maildir_tree(
     conn: &Connection,
     maildir_root: &Path,
-    maildir_root_canon: &Path,
     folder: &str,
     mailbox_id: Option<&JmapMailboxId>,
 ) -> Result<RemovalOutcome> {
     let target = maildir_root.join(folder);
-    // Path-safety guard. `canonicalize` follows symlinks so a
-    // sibling-rooted symlink can't smuggle the remove outside the
-    // root. On the NotFound branch the target doesn't exist on disk;
-    // fall back to a lexical check, but explicitly refuse any
-    // `ParentDir` component first -- `PathBuf::starts_with` is
-    // component-wise lexical, so `../X` would otherwise pass the
-    // prefix check (the root is still the prefix; the `..` is just an
-    // extra component).
+    // Path-safety guard. `maildir_root` is canonical by contract, so
+    // `folder` is the only input that can escape the tree. When the
+    // target exists, `canonicalize` resolves any symlinks and we check
+    // the resolved path stays under the root (catches a symlinked
+    // folder pointing outside). When it doesn't exist (canonicalize ->
+    // NotFound), fall back to a lexical check on `folder`: refuse a
+    // `..` component (a rule-renamed folder can carry one) and refuse
+    // an absolute `folder`, which `join` would let replace the root
+    // entirely.
     let escaped = match std::fs::canonicalize(&target) {
-        Ok(canon) => !canon.starts_with(maildir_root_canon),
+        Ok(canon) => !canon.starts_with(maildir_root),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            target
+            Path::new(folder)
                 .components()
                 .any(|c| matches!(c, std::path::Component::ParentDir))
                 || !target.starts_with(maildir_root)
@@ -97,7 +102,7 @@ pub(crate) fn remove_maildir_tree(
             "remove_maildir_tree: refusing to remove {} -- resolves outside \
              maildir_root {}",
             target.display(),
-            maildir_root_canon.display()
+            maildir_root.display()
         );
         return Ok(RemovalOutcome::Skipped);
     }
@@ -239,7 +244,6 @@ mod tests {
         let root_canon = std::fs::canonicalize(maildir_root).unwrap();
         remove_maildir_tree(
             conn,
-            maildir_root,
             &root_canon,
             folder,
             Some(&JmapMailboxId::from(mailbox_id)),
@@ -265,7 +269,7 @@ mod tests {
         .unwrap();
 
         let root_canon = std::fs::canonicalize(maildir_root).unwrap();
-        let outcome = remove_maildir_tree(&conn, maildir_root, &root_canon, folder, None).unwrap();
+        let outcome = remove_maildir_tree(&conn, &root_canon, folder, None).unwrap();
 
         assert_eq!(outcome, RemovalOutcome::Removed);
         assert!(!folder_path.exists(), "stray maildir must be removed");

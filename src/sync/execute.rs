@@ -1726,7 +1726,6 @@ fn delete_local_folders(
         );
         crate::maildir_ops::removal::remove_maildir_tree(
             conn,
-            maildir_root,
             &maildir_root_canon,
             &binding.maildir_folder,
             Some(mailbox_id),
