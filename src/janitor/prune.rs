@@ -242,13 +242,7 @@ pub fn apply(
             continue;
         }
         let mailbox_id = id_by_folder.get(entry.folder.as_str()).copied();
-        let removal = remove_maildir_tree(
-            conn,
-            maildir_root,
-            &maildir_root_canon,
-            &entry.folder,
-            mailbox_id,
-        )?;
+        let removal = remove_maildir_tree(conn, &maildir_root_canon, &entry.folder, mailbox_id)?;
         match removal {
             RemovalOutcome::Removed => {
                 // The tree is gone and its message_map/local_state/
