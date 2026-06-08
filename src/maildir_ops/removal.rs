@@ -108,6 +108,25 @@ pub(crate) fn remove_maildir_tree(
     }
     // A row-less folder (a stray) has no id to show in the logs.
     let id_label = mailbox_id.map_or_else(|| "-".to_string(), |id| id.to_string());
+    // A folder with mail in new/ but no cur/ is a maildir that lost
+    // its cur/ -- e.g. an empty-dir cleanup tool removed the (empty)
+    // cur/ while new/ still held messages. It isn't maildir-shaped, so
+    // the rescue pass below would skip it and remove_dir_all would drop
+    // those messages. Recreate the missing cur/ so the rescue sees and
+    // protects them, the same heal an MUA performs on open. A folder
+    // with neither cur/ nor new/ is left alone here: it isn't a maildir
+    // and has no messages to rescue, so the removal below handles it.
+    if store::try_open_maildir(&target).is_none()
+        && target.join("new").is_dir()
+        && let Err(e) = store::ensure_maildir(&target)
+    {
+        warn!(
+            "remove_maildir_tree {}/ (id {}): folder has new/ but no cur/ and \
+             healing it failed: {}; skipping so a later retry can rescue its mail",
+            folder, id_label, e
+        );
+        return Ok(RemovalOutcome::Skipped);
+    }
     match rescue_unmapped_files(conn, maildir_root, &target, mailbox_id) {
         Ok(0) => {}
         Ok(n) => {
@@ -593,6 +612,56 @@ mod tests {
         assert!(
             !rescued[0].contains(mapped_id.as_ref()),
             "the mapped file must NOT appear in rescue dir; got {}",
+            rescued[0]
+        );
+    }
+
+    /// A maildir whose (empty) `cur/` was removed -- e.g. by an
+    /// empty-dir cleanup tool -- while `new/` still holds mail is not
+    /// maildir-shaped, so without healing the rescue pass would skip it
+    /// and `remove_dir_all` would silently drop the `new/` messages.
+    /// `remove_maildir_tree` recreates the missing `cur/` so the
+    /// unmapped message is rescued before the folder is removed.
+    #[test]
+    fn heals_and_rescues_maildir_missing_cur() {
+        let dir = tempdir().unwrap();
+        let conn = db::open_in_memory().unwrap();
+        let maildir_root = dir.path();
+
+        let folder = "Archive";
+        let folder_path = maildir_root.join(folder);
+        let maildir = ensure_maildir(&folder_path).unwrap();
+        // Empty flags route to new/; no message_map row -> unmapped.
+        let unmapped_id = store_message(
+            &maildir,
+            b"Message-ID: <local@example.com>\r\nSubject: x\r\n\r\nbody\r\n",
+            "",
+        )
+        .unwrap();
+        // Simulate the cleanup: drop the empty cur/, leaving new/ + its
+        // message behind.
+        std::fs::remove_dir(folder_path.join("cur")).unwrap();
+        assert!(!folder_path.join("cur").exists());
+        assert!(folder_path.join("new").is_dir());
+
+        let outcome = remove_one(&conn, maildir_root, folder, "MB-ARCH");
+
+        assert_eq!(outcome, RemovalOutcome::Removed);
+        assert!(!folder_path.exists(), "folder removed after rescue");
+        let rescue_cur = maildir_root.join(namespace::RESCUE_FOLDER_NAME).join("cur");
+        let rescued: Vec<String> = std::fs::read_dir(&rescue_cur)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            rescued.len(),
+            1,
+            "the unmapped new/ message must be rescued, not destroyed; got {rescued:?}"
+        );
+        assert!(
+            rescued[0].contains(unmapped_id.as_ref()),
+            "rescued file should carry the unmapped id {unmapped_id}; got {}",
             rescued[0]
         );
     }
