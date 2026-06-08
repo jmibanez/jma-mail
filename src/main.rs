@@ -625,7 +625,7 @@ async fn cmd_janitor_dedupe(cli: &Cli, apply: bool) -> Result<()> {
         return Ok(());
     }
 
-    let maildir_root = config.maildir_path();
+    let maildir_root = config.canonical_maildir_root()?;
     let plan = jma_mail::janitor::dedupe::run(&maildir_root, &folders, !apply)?;
 
     if plan.deletions.is_empty() {
@@ -758,7 +758,7 @@ async fn cmd_janitor_rebindfolders(
     let conn = state::db::open_or_recreate(&config.db_path())?;
 
     let client = session::connect(&config.account, &conn).await?;
-    let maildir_root = config.maildir_path();
+    let maildir_root = config.canonical_maildir_root()?;
     let samples_per_group = sample_size
         .map(|n| n as usize)
         .unwrap_or(jma_mail::janitor::rebindfolders::DEFAULT_SAMPLE_SIZE);
@@ -855,7 +855,7 @@ fn cmd_janitor_prune(
     let config = load_config(cli)?;
     acquire_mutator_locks(&config)?;
     let conn = state::db::open_or_recreate(&config.db_path())?;
-    let maildir_root = config.maildir_path();
+    let maildir_root = config.canonical_maildir_root()?;
 
     let mut plan = prune::plan(
         &conn,

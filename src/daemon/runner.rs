@@ -176,7 +176,7 @@ impl<'a> WatchDaemon<'a> {
         // FS watcher is independent of JMAP and survives reconnects --
         // spawn it once for the daemon's lifetime.
         let fs_tx = tx.clone();
-        let fs_root = config.maildir_path();
+        let fs_root = config.canonical_maildir_root()?;
         let debounce = config.watch.debounce_secs;
         let fs_self_writes = self_writes.clone();
         let fs_handle = tokio::spawn(async move {

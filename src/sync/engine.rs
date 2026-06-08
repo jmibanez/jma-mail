@@ -209,7 +209,7 @@ impl<'a> SyncEngine<'a> {
         scan_scope: ScanScope,
     ) -> Result<SyncOutcome> {
         let mut mailboxes = self.resolve_mailboxes().await?;
-        let maildir_root = self.config.maildir_path();
+        let maildir_root = self.config.canonical_maildir_root()?;
 
         // Push-only on a fresh config has nothing local to upload:
         // CreateLocalMailbox actions would be dropped by the
@@ -691,7 +691,7 @@ impl<'a> SyncEngine<'a> {
             self.conn,
             self.config,
             self.self_writes.clone(),
-        );
+        )?;
         let mut outcome = executor
             .execute(filtered)
             .instrument(tracing::info_span!(
@@ -803,7 +803,7 @@ impl<'a> SyncEngine<'a> {
         // lives at a different path than the cache (and the
         // server) is the "user `mv`-ed the maildir" case. Empty
         // for first-cycle syncs (no sentinels exist yet).
-        let maildir_root = self.config.maildir_path();
+        let maildir_root = self.config.canonical_maildir_root()?;
         let disk_sentinels = walk_sentinels(&maildir_root);
 
         let name_cap = limits::max_size_mailbox_name(&self.client);
