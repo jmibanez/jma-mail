@@ -2152,7 +2152,7 @@ async fn create_remote_mailbox_issues_mailbox_set_per_action() {
     let client = jma_mail::jmap::session::connect(&config.account, &conn)
         .await
         .expect("session connects");
-    let executor = Executor::new(Arc::new(client), &conn, &config, None);
+    let executor = Executor::new(Arc::new(client), &conn, &config, None).expect("Executor::new");
 
     let plan = SyncPlan {
         actions: vec![
@@ -2227,7 +2227,7 @@ async fn create_remote_mailbox_warns_and_continues_on_rejection() {
     let client = jma_mail::jmap::session::connect(&config.account, &conn)
         .await
         .expect("session connects");
-    let executor = Executor::new(Arc::new(client), &conn, &config, None);
+    let executor = Executor::new(Arc::new(client), &conn, &config, None).expect("Executor::new");
 
     let plan = SyncPlan {
         actions: vec![
@@ -2300,7 +2300,7 @@ async fn create_remote_mailbox_chained_create_resolves_parent_reference() {
     let client = jma_mail::jmap::session::connect(&config.account, &conn)
         .await
         .expect("session connects");
-    let executor = Executor::new(Arc::new(client), &conn, &config, None);
+    let executor = Executor::new(Arc::new(client), &conn, &config, None).expect("Executor::new");
 
     let plan = SyncPlan {
         actions: vec![
@@ -2419,7 +2419,7 @@ async fn create_remote_mailbox_skips_child_when_parent_reference_unresolved() {
     let client = jma_mail::jmap::session::connect(&config.account, &conn)
         .await
         .expect("session connects");
-    let executor = Executor::new(Arc::new(client), &conn, &config, None);
+    let executor = Executor::new(Arc::new(client), &conn, &config, None).expect("Executor::new");
 
     let plan = SyncPlan {
         actions: vec![SyncAction::CreateRemoteMailbox {
@@ -2504,7 +2504,7 @@ async fn destroy_remote_mailbox_issues_mailbox_set_per_action_and_drops_cache_ro
     let client = jma_mail::jmap::session::connect(&config.account, &conn)
         .await
         .expect("session connects");
-    let executor = Executor::new(Arc::new(client), &conn, &config, None);
+    let executor = Executor::new(Arc::new(client), &conn, &config, None).expect("Executor::new");
 
     let plan = SyncPlan {
         actions: vec![SyncAction::DestroyRemoteMailbox {
@@ -2607,7 +2607,7 @@ async fn destroy_remote_mailbox_keeps_cache_row_on_rejection_and_continues() {
     let client = jma_mail::jmap::session::connect(&config.account, &conn)
         .await
         .expect("session connects");
-    let executor = Executor::new(Arc::new(client), &conn, &config, None);
+    let executor = Executor::new(Arc::new(client), &conn, &config, None).expect("Executor::new");
 
     let plan = SyncPlan {
         actions: vec![
@@ -3541,8 +3541,12 @@ async fn resolve_mailboxes_orphan_catalogs_bound_and_local_only_messages() {
     // never delivered by the server. Filename uses the
     // maildir spec's `<unique>:2,<flags>` shape so the
     // walker's `split_once(":2,")` recognises it.
-    let local_only_path = temp
-        .path()
+    // Build the expected path from the canonical root the engine
+    // catalogs against, not the raw temp path -- on macOS the tempdir
+    // resolves through the /var -> /private/var symlink.
+    let local_only_path = config
+        .canonical_maildir_root()
+        .expect("maildir root exists")
         .join("Archive")
         .join("cur")
         .join("LOCAL-FILE-1.host:2,S");

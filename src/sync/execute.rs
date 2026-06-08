@@ -79,17 +79,17 @@ impl<'a> Executor<'a> {
         conn: &'a Connection,
         config: &'a Config,
         self_writes: Option<Arc<SelfWriteCache>>,
-    ) -> Self {
+    ) -> Result<Self> {
         let account_id: JmapAccountId = client.default_account_id().into();
-        let maildir_root = config.maildir_path();
-        Self {
+        let maildir_root = config.canonical_maildir_root()?;
+        Ok(Self {
             client,
             conn,
             config,
             maildir_root,
             account_id,
             self_writes,
-        }
+        })
     }
 
     /// Walk a SyncPlan in dependency order:
@@ -655,7 +655,7 @@ impl<'a> Executor<'a> {
         actions: Vec<SyncAction>,
     ) -> Result<HashMap<String, JmapMailboxId>> {
         let mut creation_refs: HashMap<String, JmapMailboxId> = HashMap::new();
-        let maildir_root = self.config.maildir_path();
+        let maildir_root = &self.maildir_root;
         for action in actions {
             let SyncAction::CreateRemoteMailbox {
                 name,
@@ -779,7 +779,7 @@ impl<'a> Executor<'a> {
     /// collision, `invalidProperties` from an over-long name,
     /// ...) doesn't cascade into the rest of the cycle.
     async fn rename_remote_mailboxes(&self, actions: Vec<SyncAction>) -> Result<()> {
-        let maildir_root = self.config.maildir_path();
+        let maildir_root = &self.maildir_root;
         for action in actions {
             let SyncAction::RenameRemoteMailbox {
                 from_folder,

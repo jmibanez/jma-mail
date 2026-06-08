@@ -504,6 +504,18 @@ impl Config {
         expand_tilde(Path::new(&self.sync.maildir_path))
     }
 
+    /// The maildir root resolved to an absolute, normalized path: `~`
+    /// expanded (via `maildir_path`) and `.`/`..`/symlinks resolved by
+    /// the OS. Errors if the root does not exist, so callers reach for
+    /// this only after the maildir lock has confirmed existence -- a
+    /// failure here is a genuine mid-run disappearance (e.g. an
+    /// unmounted volume), not a missing-config case.
+    pub fn canonical_maildir_root(&self) -> Result<PathBuf> {
+        let raw = self.maildir_path();
+        std::fs::canonicalize(&raw)
+            .with_context(|| format!("canonicalize maildir root {}", raw.display()))
+    }
+
     /// Resolved state DB path. Returns the explicit `[state].db_path`
     /// override (with `~` expanded) if set, otherwise the default
     /// `<maildir_path>/.jma.db` next to the maildir it describes.
@@ -936,6 +948,43 @@ mod tests {
     fn write_with_mode(path: &Path, mode: u32) {
         std::fs::write(path, b"x").unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    fn config_with_maildir(maildir_path: &Path) -> Config {
+        Config {
+            sync: SyncConfig {
+                maildir_path: maildir_path.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn canonical_maildir_root_collapses_dotdot() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("Mail");
+        std::fs::create_dir_all(&root).unwrap();
+        // A configured path that lexically carries a `..` but resolves
+        // to the real root -- expand_tilde never normalizes it away.
+        let config = config_with_maildir(&root.join("..").join("Mail"));
+
+        let canonical = config.canonical_maildir_root().expect("root exists");
+        assert!(
+            !canonical
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir)),
+            "canonical root must not contain `..`: {}",
+            canonical.display()
+        );
+        assert_eq!(canonical, std::fs::canonicalize(&root).unwrap());
+    }
+
+    #[test]
+    fn canonical_maildir_root_errors_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_maildir(&dir.path().join("does-not-exist"));
+        assert!(config.canonical_maildir_root().is_err());
     }
 
     #[test]
