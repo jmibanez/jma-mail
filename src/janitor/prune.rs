@@ -163,6 +163,38 @@ pub fn plan(
     })
 }
 
+/// Narrow a plan to a requested scope. `mailbox`, when given, keeps
+/// only the entry / rename naming that maildir folder; `only_disk`
+/// (`Some(true)` = disk-removing entries, `Some(false)` = DB-only
+/// entries, `None` = no class filter) keeps only the matching class.
+///
+/// A `mailbox` that names nothing in the plan is an error, not a silent
+/// empty scope, so a typo surfaces rather than masquerading as "no
+/// drift." Pending renames are informational and never pruned, so the
+/// class filter leaves them in place -- only `mailbox` scopes them out.
+pub fn narrow(plan: &mut PrunePlan, mailbox: Option<&str>, only_disk: Option<bool>) -> Result<()> {
+    if let Some(folder) = mailbox {
+        let matched = plan.entries.iter().any(|e| e.folder == folder)
+            || plan
+                .skipped_renames
+                .iter()
+                .any(|r| r.db_folder == folder || r.disk_folder == folder);
+        if !matched {
+            anyhow::bail!(
+                "No drift entry for maildir folder {folder:?}; run `jma status` \
+                 to see the current drift."
+            );
+        }
+        plan.entries.retain(|e| e.folder == folder);
+        plan.skipped_renames
+            .retain(|r| r.db_folder == folder || r.disk_folder == folder);
+    }
+    if let Some(want_disk) = only_disk {
+        plan.entries.retain(|e| e.removes_disk == want_disk);
+    }
+    Ok(())
+}
+
 fn non_empty_safety(file_count: usize) -> PruneSafety {
     if file_count == 0 {
         PruneSafety::Safe
@@ -340,6 +372,83 @@ mod tests {
             .iter()
             .find(|e| e.folder == folder)
             .unwrap_or_else(|| panic!("no entry for {folder}; got {:?}", plan.entries))
+    }
+
+    fn entry_for(folder: &str, removes_disk: bool) -> PruneEntry {
+        PruneEntry {
+            folder: folder.to_string(),
+            class: if removes_disk {
+                PruneClass::DiskOnlyStray
+            } else {
+                PruneClass::DbOnlyOrphan
+            },
+            file_count: 0,
+            removes_disk,
+            safety: PruneSafety::Safe,
+        }
+    }
+
+    fn rename(db: &str, disk: &str) -> RenameInFlight {
+        RenameInFlight {
+            db_folder: db.to_string(),
+            disk_folder: disk.to_string(),
+        }
+    }
+
+    /// A `--mailbox` that names nothing in the plan is an error, not a
+    /// silent empty scope masquerading as "no drift."
+    #[test]
+    fn narrow_mailbox_no_match_errors() {
+        let mut plan = PrunePlan {
+            entries: vec![entry_for("Archive", true)],
+            skipped_renames: vec![],
+        };
+        assert!(narrow(&mut plan, Some("Nope"), None).is_err());
+    }
+
+    /// `--mailbox` scopes both entries and pending renames to the named
+    /// folder.
+    #[test]
+    fn narrow_mailbox_scopes_entries_and_renames() {
+        let mut plan = PrunePlan {
+            entries: vec![entry_for("Archive", true), entry_for("Sent", true)],
+            skipped_renames: vec![rename("Old", "Archive"), rename("X", "Y")],
+        };
+        narrow(&mut plan, Some("Archive"), None).unwrap();
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(plan.entries[0].folder, "Archive");
+        assert_eq!(plan.skipped_renames.len(), 1);
+        assert_eq!(plan.skipped_renames[0].disk_folder, "Archive");
+    }
+
+    /// `--only disk` keeps disk-removing entries and drops DB-only ones.
+    #[test]
+    fn narrow_only_disk_keeps_disk_drops_db() {
+        let mut plan = PrunePlan {
+            entries: vec![entry_for("Stray", true), entry_for("Orphan", false)],
+            skipped_renames: vec![],
+        };
+        narrow(&mut plan, None, Some(true)).unwrap();
+        assert_eq!(plan.entries.len(), 1);
+        assert!(plan.entries[0].removes_disk);
+    }
+
+    /// `--only db` keeps DB-only entries AND preserves pending renames:
+    /// renames are informational and must not be silently dropped.
+    #[test]
+    fn narrow_only_db_keeps_db_entries_and_renames() {
+        let mut plan = PrunePlan {
+            entries: vec![entry_for("Stray", true), entry_for("Orphan", false)],
+            skipped_renames: vec![rename("Old", "New")],
+        };
+        narrow(&mut plan, None, Some(false)).unwrap();
+        assert_eq!(plan.entries.len(), 1);
+        assert!(!plan.entries[0].removes_disk);
+        assert_eq!(
+            plan.skipped_renames.len(),
+            1,
+            "pending renames must survive --only db"
+        );
     }
 
     #[test]

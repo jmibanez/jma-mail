@@ -864,20 +864,11 @@ fn cmd_janitor_prune(
         config.sync.case_insensitive_match,
     )?;
 
-    if let Some(folder) = mailbox.as_deref() {
-        plan.entries.retain(|e| e.folder == folder);
-        plan.skipped_renames
-            .retain(|r| r.db_folder == folder || r.disk_folder == folder);
-    }
-    if let Some(only) = only {
-        let want_disk = matches!(only, PruneOnly::Disk);
-        plan.entries.retain(|e| e.removes_disk == want_disk);
-        // Pending renames are a disk-side concern; drop them under
-        // `--only db`.
-        if !want_disk {
-            plan.skipped_renames.clear();
-        }
-    }
+    prune::narrow(
+        &mut plan,
+        mailbox.as_deref(),
+        only.map(|o| matches!(o, PruneOnly::Disk)),
+    )?;
 
     if plan.entries.is_empty() && plan.skipped_renames.is_empty() {
         jma_mail::notify!("Prune: no drift to clean up.");
