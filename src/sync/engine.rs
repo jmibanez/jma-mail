@@ -2230,7 +2230,11 @@ fn walk_sentinels_inner(
             continue;
         }
         let path = entry.path();
-        if path.join("cur").is_dir() {
+        // Recognize a folder via store::is_maildir (cur/ or new/), the
+        // shared "present on disk" predicate, so a maildir whose empty
+        // cur/ was removed but still holds mail (and a sentinel) in
+        // new/ is still read for rename detection rather than skipped.
+        if store::is_maildir(&path) {
             match crate::maildir_ops::sentinel::read(&path) {
                 Ok(Some(mapping)) => {
                     let rel = match path.strip_prefix(root) {
@@ -2341,6 +2345,35 @@ mod tests {
     use crate::ids::{JmapEmailId, MaildirId, MessageId};
     use crate::state::db;
     use crate::state::queries::MessageRecord;
+
+    /// `walk_sentinels` recognizes a maildir via `store::is_maildir`, so
+    /// a folder whose empty `cur/` was removed but still carries its
+    /// sentinel (and mail) in a `new/`-only shape is read for rename
+    /// detection rather than skipped.
+    #[test]
+    fn walk_sentinels_reads_new_only_folder() {
+        use crate::maildir_ops::sentinel::{self, MailboxMapping};
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("Archive");
+        // new/ only -- no cur/.
+        std::fs::create_dir_all(folder.join("new")).unwrap();
+        sentinel::write(
+            &folder,
+            &MailboxMapping {
+                jmap_mailbox_id: "MB-ARCH".into(),
+                parent_jmap_mailbox_id: None,
+                server_name: "Archive".to_string(),
+            },
+        )
+        .unwrap();
+
+        let out = walk_sentinels(dir.path());
+        assert_eq!(
+            out.get(&JmapMailboxId::from("MB-ARCH")).map(String::as_str),
+            Some("Archive"),
+            "a new/-only folder's sentinel must be discovered for rename detection"
+        );
+    }
 
     fn record(
         jmap_id: &str,
