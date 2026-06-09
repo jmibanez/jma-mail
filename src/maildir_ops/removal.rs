@@ -73,15 +73,17 @@ pub(crate) fn remove_maildir_tree(
     let target = maildir_root.join(folder);
     // Path-safety guard. `maildir_root` is canonical by contract, so
     // `folder` is the only input that can escape the tree. When the
-    // target exists, `canonicalize` resolves any symlinks and we check
-    // the resolved path stays under the root (catches a symlinked
-    // folder pointing outside). When it doesn't exist (canonicalize ->
-    // NotFound), fall back to a lexical check on `folder`: refuse a
-    // `..` component (a rule-renamed folder can carry one) and refuse
-    // an absolute `folder`, which `join` would let replace the root
-    // entirely.
+    // target exists, `canonicalize` resolves any symlinks and we refuse
+    // a resolved path that escapes outside the root (a symlinked folder
+    // pointing out) OR that IS the root itself -- an empty or
+    // `.`/`..`-only `folder` resolves back to `maildir_root`, and
+    // removing it would `remove_dir_all` the whole maildir. When the
+    // target doesn't exist (canonicalize -> NotFound), fall back to a
+    // lexical check on `folder`: refuse a `..` component (a rule-renamed
+    // folder can carry one) and refuse an absolute `folder`, which
+    // `join` would let replace the root entirely.
     let escaped = match std::fs::canonicalize(&target) {
-        Ok(canon) => !canon.starts_with(maildir_root),
+        Ok(canon) => canon == maildir_root || !canon.starts_with(maildir_root),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             Path::new(folder)
                 .components()
@@ -99,8 +101,8 @@ pub(crate) fn remove_maildir_tree(
     };
     if escaped {
         warn!(
-            "remove_maildir_tree: refusing to remove {} -- resolves outside \
-             maildir_root {}",
+            "remove_maildir_tree: refusing to remove {} -- it is, or resolves \
+             outside, maildir_root {}",
             target.display(),
             maildir_root.display()
         );
@@ -494,6 +496,33 @@ mod tests {
                 .is_some(),
             "guard must refuse on `../X` even when the target is absent; \
              the DB cascade must not run for a refused action"
+        );
+    }
+
+    /// Path-safety: a folder that resolves to the maildir root itself
+    /// (`""` or `"."`) must be refused -- otherwise `remove_dir_all`
+    /// would wipe the entire maildir. The root has no nested maildir
+    /// here, so only the root-equivalence guard (not the nested-maildir
+    /// guard) can catch it.
+    #[test]
+    fn refuses_root_equivalent_folder() {
+        let dir = tempdir().unwrap();
+        let conn = db::open_in_memory().unwrap();
+        let maildir_root = dir.path();
+        // A non-maildir marker at the root, to prove it survives.
+        std::fs::write(maildir_root.join(".jma.db"), b"state").unwrap();
+
+        for folder in ["", "."] {
+            assert_eq!(
+                remove_one(&conn, maildir_root, folder, "MB-ROOT"),
+                RemovalOutcome::Skipped,
+                "folder {folder:?} resolves to the root and must be refused"
+            );
+        }
+        assert!(maildir_root.exists(), "the maildir root must survive");
+        assert!(
+            maildir_root.join(".jma.db").exists(),
+            "root contents must survive"
         );
     }
 

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tracing::{Instrument, debug, error, info, warn};
+use tracing::{Instrument, debug, info, warn};
 
 use crate::config::Config;
 use crate::domain::{MailboxFolderBinding, MaybeReference};
@@ -1705,18 +1705,11 @@ fn delete_local_folders(
     if actions.is_empty() {
         return Ok(());
     }
-    let maildir_root_canon = match std::fs::canonicalize(maildir_root) {
-        Ok(p) => p,
-        Err(e) => {
-            error!(
-                "DeleteLocalFolder: cannot canonicalize maildir_root {}: {}; \
-                 refusing every destroy this cycle",
-                maildir_root.display(),
-                e
-            );
-            return Ok(());
-        }
-    };
+    // `maildir_root` is already canonical (Executor::new resolves it via
+    // Config::canonical_maildir_root), which is exactly what
+    // remove_maildir_tree's contract requires -- pass it straight
+    // through. A target that can't be resolved at removal time is
+    // guarded per-folder inside remove_maildir_tree.
     for action in actions {
         let SyncAction::DeleteLocalFolder { binding } = action else {
             continue;
@@ -1726,7 +1719,7 @@ fn delete_local_folders(
         );
         crate::maildir_ops::removal::remove_maildir_tree(
             conn,
-            &maildir_root_canon,
+            maildir_root,
             &binding.maildir_folder,
             Some(mailbox_id),
         )?;
