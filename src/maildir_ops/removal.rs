@@ -108,6 +108,22 @@ pub(crate) fn remove_maildir_tree(
     }
     // A row-less folder (a stray) has no id to show in the logs.
     let id_label = mailbox_id.map_or_else(|| "-".to_string(), |id| id.to_string());
+    // Refuse to remove a folder that still contains a nested maildir:
+    // remove_dir_all would take that child's whole tree (and its mail)
+    // too, while only this folder's own cur/+new/ get a rescue pass.
+    // Callers that prune a parent and child together process them
+    // deepest-first, so a child still present here is one that is NOT
+    // being removed -- destroying it would lose mail outside this
+    // entry's scope and skip its cascade. Leave it for the caller to
+    // handle the child first (or explicitly).
+    if contains_nested_maildir(&target) {
+        warn!(
+            "remove_maildir_tree {}/ (id {}): contains a nested maildir not being \
+             removed; skipping so its mail isn't destroyed with the parent",
+            folder, id_label
+        );
+        return Ok(RemovalOutcome::Skipped);
+    }
     // A folder that is a maildir on disk (store::is_maildir) but not
     // ready to enumerate (no cur/) is one that lost its cur/ -- e.g. an
     // empty-dir cleanup tool removed the empty cur/ while new/ still
@@ -180,6 +196,36 @@ pub(crate) fn remove_maildir_tree(
         folder, id_label, messages_removed, state_removed
     );
     Ok(RemovalOutcome::Removed)
+}
+
+/// Whether `dir` contains a nested maildir at any depth below itself --
+/// a descendant directory that is itself a maildir (`store::is_maildir`).
+/// `dir`'s own `cur/`/`new/`/`tmp/` leaves and jma's private namespace
+/// are skipped, so only genuine sub-mailboxes count. Used to refuse a
+/// `remove_dir_all` that would swallow a child maildir the caller
+/// didn't ask to remove.
+fn contains_nested_maildir(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str == "cur" || name_str == "new" || name_str == "tmp" {
+            continue;
+        }
+        if namespace::is_jma_private(&name_str) {
+            continue;
+        }
+        let path = entry.path();
+        if store::is_maildir(&path) || contains_nested_maildir(&path) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Move any file in `folder_path` that the state DB doesn't know
@@ -663,6 +709,39 @@ mod tests {
             rescued[0].contains(unmapped_id.as_ref()),
             "rescued file should carry the unmapped id {unmapped_id}; got {}",
             rescued[0]
+        );
+    }
+
+    /// A folder containing a nested maildir is refused: `remove_dir_all`
+    /// would swallow the child's tree (and its mail) too, but only the
+    /// parent's own files get a rescue pass. The destroy is skipped so
+    /// the caller removes the child first (or explicitly). Protects both
+    /// the prune and sync destroy paths.
+    #[test]
+    fn refuses_folder_with_nested_maildir() {
+        let dir = tempdir().unwrap();
+        let conn = db::open_in_memory().unwrap();
+        let maildir_root = dir.path();
+        let parent = "Parent";
+        ensure_maildir(&maildir_root.join(parent)).unwrap();
+        let child = ensure_maildir(&maildir_root.join(parent).join("Child")).unwrap();
+        store_message(
+            &child,
+            b"Message-ID: <c@example.com>\r\nSubject: x\r\n\r\nbody\r\n",
+            "",
+        )
+        .unwrap();
+
+        let outcome = remove_one(&conn, maildir_root, parent, "MB-PARENT");
+
+        assert_eq!(
+            outcome,
+            RemovalOutcome::Skipped,
+            "a folder containing a nested maildir must be refused"
+        );
+        assert!(
+            maildir_root.join(parent).join("Child").join("new").is_dir(),
+            "the nested child maildir must be left untouched"
         );
     }
 
