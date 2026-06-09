@@ -16,6 +16,7 @@ use crate::ids::JmapMailboxId;
 use crate::jmap::mailbox::{MailboxSelectionInput, get_selected_mailboxes};
 use crate::maildir_ops::namespace::is_jma_private;
 use crate::maildir_ops::sentinel;
+use crate::maildir_ops::store;
 use crate::state::queries::{self, MailboxRecord};
 
 /// Outcome of comparing the cached `mailbox_map` rows against the
@@ -87,11 +88,14 @@ pub fn compute_drift(
     let on_disk = find_maildir_folders(maildir_root);
     let known: BTreeSet<String> = rows.iter().map(|r| r.maildir_folder.clone()).collect();
 
-    // A row's maildir is present when its `<folder>/cur` exists. This
+    // A row's maildir is present when its `<folder>` has a `cur/` or a
+    // `new/` (see `store::is_maildir`): a folder whose empty `cur/` was
+    // removed but still holds mail in `new/` is present, not gone --
+    // matching how `remove_maildir_tree` heals and rescues it. This
     // per-folder check is layout-independent (the stored
     // `maildir_folder` joins onto the root with the FS separator) and
     // isn't fooled by a recursive walk that missed something.
-    let present = |folder: &str| maildir_root.join(folder).join("cur").is_dir();
+    let present = |folder: &str| store::is_maildir(&maildir_root.join(folder));
 
     // Raw discrepancies, before pulling out rename pairs.
     let disk_orphans: Vec<String> = on_disk.difference(&known).cloned().collect();
@@ -192,9 +196,11 @@ pub fn compute_drift(
 }
 
 /// Return the relative path of every maildir-shaped folder under
-/// `root` -- a directory containing a `cur/` subdirectory, the marker
-/// `ensure_maildir` creates, recognized under any folder layout.
-/// jma's own private namespace (see
+/// `root` -- a directory with a `cur/` or `new/` subdirectory (see
+/// `store::is_maildir`), recognized under any folder layout. A
+/// `new/`-only folder (a maildir whose empty `cur/` was removed) still
+/// counts, so a stray that lost its `cur/` is reported rather than
+/// silently dropped. jma's own private namespace (see
 /// `maildir_ops::namespace::is_jma_private`) is excluded. Best
 /// effort: unreadable directories are silently skipped, since a
 /// partial drift report is more useful than none.
@@ -228,7 +234,7 @@ fn walk_for_maildirs(root: &Path, dir: &Path, found: &mut BTreeSet<String>) {
             continue;
         }
         let path = entry.path();
-        if path.join("cur").is_dir()
+        if store::is_maildir(&path)
             && let Ok(rel) = path.strip_prefix(root)
         {
             found.insert(rel.to_string_lossy().into_owned());
@@ -338,6 +344,45 @@ mod tests {
         assert_eq!(c.db_only, vec!["Archive".to_string()]);
         assert!(c.disk_only.is_empty());
         assert!(c.rename_in_flight.is_empty());
+    }
+
+    /// A tracked folder whose empty cur/ was removed but still holds
+    /// mail in new/ is present on disk (store::is_maildir), so it
+    /// classifies by config membership -- here config_dropped -- not as
+    /// a db_only orphan prune would treat as already gone.
+    #[test]
+    fn new_only_folder_is_present_not_db_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open_in_memory().unwrap();
+        touch_maildir(dir.path(), "INBOX");
+        upsert_mailbox(&conn, "M1", "INBOX", "INBOX", Some("inbox"));
+        // Archive: tracked, dropped from config, only new/ on disk.
+        upsert_mailbox(&conn, "M2", "Archive", "Archive", None);
+        std::fs::create_dir_all(dir.path().join("Archive").join("new")).unwrap();
+
+        let c = classes(compute_drift(&conn, dir.path(), &["INBOX".to_string()], false).unwrap());
+        assert_eq!(c.config_dropped, vec!["Archive".to_string()]);
+        assert!(
+            c.db_only.is_empty(),
+            "a new/-only folder is present on disk, not db-only"
+        );
+        assert!(c.disk_only.is_empty());
+    }
+
+    /// An untracked folder with only new/ (its cur/ removed) is still a
+    /// maildir on disk, so the walk reports it as a stray rather than
+    /// silently dropping it.
+    #[test]
+    fn untracked_new_only_folder_is_a_stray() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open_in_memory().unwrap();
+        upsert_mailbox(&conn, "M1", "INBOX", "INBOX", Some("inbox"));
+        touch_maildir(dir.path(), "INBOX");
+        std::fs::create_dir_all(dir.path().join("Stray").join("new")).unwrap();
+
+        let c = classes(compute_drift(&conn, dir.path(), &[], false).unwrap());
+        assert_eq!(c.disk_only, vec!["Stray".to_string()]);
+        assert!(c.db_only.is_empty());
     }
 
     #[test]
@@ -500,10 +545,10 @@ mod tests {
         assert_eq!(found, expected);
     }
 
-    /// A directory without `cur/` is just a regular directory, not a
-    /// maildir. Don't claim it.
+    /// A directory with neither `cur/` nor `new/` is just a regular
+    /// directory, not a maildir. Don't claim it.
     #[test]
-    fn ignores_directories_without_cur() {
+    fn ignores_directories_with_neither_cur_nor_new() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("notes")).unwrap();
         std::fs::create_dir_all(dir.path().join("staging")).unwrap();

@@ -171,14 +171,29 @@ fn non_empty_safety(file_count: usize) -> PruneSafety {
     }
 }
 
-/// Count the mail files in a folder's `cur/` + `new/`. A folder that
-/// can't be opened as a maildir (already gone, never created) counts
-/// as 0.
+/// Count the mail files in a folder's `cur/` + `new/`. When the folder
+/// has no `cur/` (so it can't be opened as a maildir) but still has a
+/// `new/` -- a maildir whose empty `cur/` was removed -- fall back to
+/// counting `new/` directly, so its mail still trips the non-empty
+/// gate. A folder that is gone or was never created counts as 0.
 fn count_folder_files(maildir_root: &Path, folder: &str) -> usize {
-    match store::try_open_maildir(&maildir_root.join(folder)) {
+    let base = maildir_root.join(folder);
+    match store::try_open_maildir(&base) {
         Some(maildir) => maildir.list_cur().chain(maildir.list_new()).count(),
-        None => 0,
+        None => count_dir_files(&base.join("new")),
     }
+}
+
+/// Best-effort count of regular files directly under `dir`. A missing
+/// or unreadable directory counts as 0.
+fn count_dir_files(dir: &Path) -> usize {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(Result::ok)
+                .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+                .count()
+        })
+        .unwrap_or(0)
 }
 
 /// Which force gates the caller has opted into.
@@ -366,6 +381,31 @@ mod tests {
 
         let archive = entry(&p, "Archive");
         assert_eq!(archive.class, PruneClass::ConfigDropped);
+        assert_eq!(archive.safety, PruneSafety::NeedsForceNonEmpty);
+        assert!(archive.removes_disk);
+    }
+
+    /// A config-dropped folder whose empty cur/ was removed but still
+    /// holds mail in new/ must trip the non-empty gate: count_folder_files
+    /// counts new/ even though the folder can't be opened as a maildir.
+    #[test]
+    fn config_dropped_new_only_with_mail_needs_force_non_empty() {
+        let dir = tempdir().unwrap();
+        let conn = db::open_in_memory().unwrap();
+        touch_maildir(dir.path(), "INBOX");
+        upsert_mailbox(&conn, "M1", "INBOX", "INBOX", Some("inbox"));
+        // Archive: tracked + dropped from config, only new/ on disk
+        // (no cur/), with a message still in it.
+        upsert_mailbox(&conn, "M2", "Archive", "Archive", None);
+        let new_dir = dir.path().join("Archive").join("new");
+        std::fs::create_dir_all(&new_dir).unwrap();
+        std::fs::write(new_dir.join("1.host"), b"x").unwrap();
+
+        let p = plan(&conn, dir.path(), &["INBOX".to_string()], false).unwrap();
+
+        let archive = entry(&p, "Archive");
+        assert_eq!(archive.class, PruneClass::ConfigDropped);
+        assert_eq!(archive.file_count, 1);
         assert_eq!(archive.safety, PruneSafety::NeedsForceNonEmpty);
         assert!(archive.removes_disk);
     }

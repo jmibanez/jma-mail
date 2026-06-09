@@ -108,16 +108,16 @@ pub(crate) fn remove_maildir_tree(
     }
     // A row-less folder (a stray) has no id to show in the logs.
     let id_label = mailbox_id.map_or_else(|| "-".to_string(), |id| id.to_string());
-    // A folder with mail in new/ but no cur/ is a maildir that lost
-    // its cur/ -- e.g. an empty-dir cleanup tool removed the (empty)
-    // cur/ while new/ still held messages. It isn't maildir-shaped, so
-    // the rescue pass below would skip it and remove_dir_all would drop
-    // those messages. Recreate the missing cur/ so the rescue sees and
-    // protects them, the same heal an MUA performs on open. A folder
-    // with neither cur/ nor new/ is left alone here: it isn't a maildir
-    // and has no messages to rescue, so the removal below handles it.
-    if store::try_open_maildir(&target).is_none()
-        && target.join("new").is_dir()
+    // A folder that is a maildir on disk (store::is_maildir) but not
+    // ready to enumerate (no cur/) is one that lost its cur/ -- e.g. an
+    // empty-dir cleanup tool removed the empty cur/ while new/ still
+    // held messages. Without healing, the rescue pass below would skip
+    // it and remove_dir_all would drop those messages. Recreate the
+    // missing cur/ so the rescue sees and protects them, the same heal
+    // an MUA performs on open. A folder that isn't a maildir at all has
+    // no messages to rescue, so the removal below handles it directly.
+    if store::is_maildir(&target)
+        && store::try_open_maildir(&target).is_none()
         && let Err(e) = store::ensure_maildir(&target)
     {
         warn!(

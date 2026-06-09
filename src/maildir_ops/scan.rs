@@ -11,6 +11,7 @@ use crate::ids::{JmapMailboxId, MaildirId, MessageId};
 use crate::maildir_ops::headers::parse_message_id_from_file;
 use crate::maildir_ops::namespace::is_jma_private;
 use crate::maildir_ops::sentinel::MailboxMapping;
+use crate::maildir_ops::store;
 
 /// One live `cur/` entry passed into `classify_changes`. Both
 /// `scan_folder` (full enumeration via the maildir crate) and
@@ -558,8 +559,12 @@ pub fn scan_paths(
 /// consumer can fork between "cache lost a binding the sentinel still
 /// pins" and "genuinely new local folder").
 ///
-/// "Maildir-shaped" means `<dir>/cur/` exists -- the same predicate
-/// `store::try_open_maildir` uses elsewhere.
+/// "Maildir-shaped" means `<dir>/cur/` or `<dir>/new/` exists -- the
+/// shared `store::is_maildir` predicate, so a folder whose empty `cur/`
+/// was removed but still holds mail in `new/` is discovered rather than
+/// silently skipped. (Distinct from `store::try_open_maildir`, the
+/// stricter "ready to enumerate" check, which the message-scan path
+/// uses.)
 ///
 /// Walk strategy is `layout`-dependent so we don't pay for traversal
 /// that the layout's naming convention rules out:
@@ -639,7 +644,7 @@ fn collect_flat(dir: &Path, found: &mut Vec<PathBuf>) {
             continue;
         }
         let path = entry.path();
-        if path.join("cur").is_dir() {
+        if store::is_maildir(&path) {
             found.push(path);
         }
     }
@@ -663,7 +668,7 @@ fn collect_maildir_pp(dir: &Path, found: &mut Vec<PathBuf>) {
             continue;
         }
         let path = entry.path();
-        if path.join("cur").is_dir() {
+        if store::is_maildir(&path) {
             found.push(path);
         }
     }
@@ -717,7 +722,7 @@ fn walk_for_maildir_dirs_recursive(dir: &Path, found: &mut Vec<PathBuf>) {
             continue;
         }
         let path = entry.path();
-        if path.join("cur").is_dir() {
+        if store::is_maildir(&path) {
             found.push(path.clone());
         }
         walk_for_maildir_dirs_recursive(&path, found);
@@ -2036,6 +2041,28 @@ mod tests {
         }
     }
 
+    /// A folder whose empty `cur/` was removed but still holds mail in
+    /// `new/` is maildir-shaped under `store::is_maildir`, so discovery
+    /// surfaces it (for rebind or create) rather than skipping it --
+    /// matching the drift report and the rename-detection walk.
+    #[test]
+    fn discover_unbound_folders_flat_emits_for_new_only_folder() {
+        let tmp = TempDir::new().unwrap();
+        let folder = tmp.path().join("Archive");
+        // new/ only -- no cur/.
+        std::fs::create_dir_all(folder.join("new")).unwrap();
+        let bindings = MailboxIndex::default();
+        let changes = discover_unbound_folders(tmp.path(), FolderLayout::Flat, &bindings);
+        assert_eq!(changes.len(), 1);
+        match &changes[0] {
+            LocalChange::LocalFolderCreated { path, sentinel } => {
+                assert_eq!(path, &folder);
+                assert!(sentinel.is_none());
+            }
+            other => panic!("expected LocalFolderCreated, got {:?}", other),
+        }
+    }
+
     /// Carrying a sentinel: emit LocalFolderCreated whose `sentinel`
     /// is `Some(_)` (so a consumer can fork "cache lost a binding
     /// the disk pins" from "genuinely new local folder").
@@ -2157,9 +2184,10 @@ mod tests {
         }
     }
 
-    /// Non-maildir-shaped directories (no `cur/` subdir) are
-    /// ignored across all layouts. A plain `mkdir Projects`
-    /// without the maildir triplet doesn't produce a candidate.
+    /// Directories with neither `cur/` nor `new/` are not
+    /// maildir-shaped under `store::is_maildir` and are ignored across
+    /// all layouts. A plain `mkdir Projects` without the maildir
+    /// triplet doesn't produce a candidate.
     #[test]
     fn discover_unbound_folders_ignores_non_maildir_dirs() {
         let tmp = TempDir::new().unwrap();

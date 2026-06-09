@@ -34,6 +34,21 @@ pub fn try_open_maildir(path: &Path) -> Option<Maildir> {
     }
 }
 
+/// Whether `path` is a maildir folder present on disk: it has a `cur/`
+/// or a `new/` subdirectory. A folder with only `new/` is a maildir
+/// whose (empty) `cur/` was removed -- it is still present and may hold
+/// mail, so it counts. This is the single source of truth for "is this
+/// a maildir on disk," shared by the drift walk and the `present`
+/// predicate so they can't drift apart.
+///
+/// Distinct from `try_open_maildir`, which is the stricter
+/// "ready to enumerate" check: walking a maildir reads `cur/`, so a
+/// `new/`-only folder must be healed (its `cur/` recreated) before it
+/// can be opened.
+pub fn is_maildir(path: &Path) -> bool {
+    path.join("cur").is_dir() || path.join("new").is_dir()
+}
+
 /// Store a raw email message into a maildir, routing unseen messages
 /// (no `S` in `flags`) to `new/` and seen messages to `cur/`. The
 /// `:2,<flags>` info suffix is appended in both subfolders so that

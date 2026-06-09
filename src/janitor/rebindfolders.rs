@@ -129,6 +129,7 @@ use crate::jmap::{email as jmap_email, mailbox as jmap_mailbox};
 use crate::maildir_ops::headers::parse_message_id_from_file;
 use crate::maildir_ops::namespace::is_jma_private;
 use crate::maildir_ops::sentinel::{self, MailboxMapping};
+use crate::maildir_ops::store;
 use crate::state::queries;
 
 /// Default Message-ID sample size *per consensus group* per orphan
@@ -1057,10 +1058,14 @@ fn walk_for_orphans(
 }
 
 /// Recursive maildir-tree walk. Mirrors the helper used by the
-/// `status` drift report (`maildir_ops::drift::find_maildir_folders`);
-/// kept local because the two callers want subtly different return
-/// shapes (drift wants relative strings for set differencing;
-/// rebindfolders wants absolute paths for `sentinel::read`).
+/// `status` drift report (`maildir_ops::drift::find_maildir_folders`)
+/// -- both recognize a folder via the shared `store::is_maildir`
+/// predicate (a `cur/` or `new/` subdir), so a maildir whose empty
+/// `cur/` was removed but still holds mail in `new/` is discovered here
+/// and can be rebound rather than silently skipped. Kept local because
+/// the two callers want subtly different return shapes (drift wants
+/// relative strings for set differencing; rebindfolders wants absolute
+/// paths for `sentinel::read`).
 fn walk_for_maildirs(dir: &Path, found: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -1078,7 +1083,7 @@ fn walk_for_maildirs(dir: &Path, found: &mut Vec<PathBuf>) {
             continue;
         }
         let path = entry.path();
-        if path.join("cur").is_dir() {
+        if store::is_maildir(&path) {
             found.push(path.clone());
         }
         walk_for_maildirs(&path, found);
@@ -1370,6 +1375,27 @@ mod tests {
             [JmapMailboxId::from("MB-ARCH")].into(),
             "Archive's sentinel pins MB-ARCH; that id is what the --bind guard \
              reads to refuse rebinding it under a different folder name"
+        );
+    }
+
+    /// A folder whose empty `cur/` was removed (e.g. by an empty-dir
+    /// cleanup tool) but still holds mail in `new/` is a malformed
+    /// maildir, not cruft: `walk_for_orphans` must discover it via the
+    /// shared `store::is_maildir` predicate so its Message-IDs can
+    /// rebind it, matching what the drift report now reports.
+    #[test]
+    fn walk_discovers_new_only_orphan() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Lost: new/ with mail, but no cur/ (removed externally).
+        std::fs::create_dir_all(root.join("Lost").join("new")).unwrap();
+
+        let by_id: HashMap<JmapMailboxId, &MailboxObject> = HashMap::new();
+        let (orphans, _) = walk_for_orphans(root, &by_id, &HashSet::new());
+        assert_eq!(
+            orphans,
+            vec![root.join("Lost")],
+            "a new/-only maildir must be discovered as an orphan, not skipped"
         );
     }
 
