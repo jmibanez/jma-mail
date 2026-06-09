@@ -251,7 +251,16 @@ pub fn apply(
         .map(|r| (r.maildir_folder.as_str(), &r.jmap_mailbox_id))
         .collect();
 
-    for entry in &plan.entries {
+    // Process deepest folders first (a child's path sorts after its
+    // parent, so reverse order puts children before parents). With a
+    // co-pruned parent and child, the child is removed first and the
+    // parent's remove_maildir_tree then sees an empty parent; a child
+    // that is NOT being pruned is still present when the parent is
+    // reached, where remove_maildir_tree refuses rather than swallow it.
+    let mut entries: Vec<&PruneEntry> = plan.entries.iter().collect();
+    entries.sort_by(|a, b| b.folder.cmp(&a.folder));
+
+    for entry in entries {
         if !permitted(entry.safety, &opts) {
             outcome.skipped.push((entry.folder.clone(), entry.safety));
             continue;
@@ -448,6 +457,96 @@ mod tests {
         let archive = entry(&p, "Archive");
         assert_eq!(archive.class, PruneClass::DbOnlyOrphan);
         assert_eq!(archive.safety, PruneSafety::NeedsForceInConfig);
+    }
+
+    /// A nested maildir must not be destroyed by removing its parent.
+    /// Under on-disk nesting, drift reports both `Foo` and `Foo/Bar` as
+    /// strays; a naive parent-first `remove_dir_all` would take the
+    /// child (and its mail) with it. apply removes deepest-first, and
+    /// remove_maildir_tree refuses a folder that still contains a nested
+    /// maildir -- so the child (gated here by --force-non-empty) and its
+    /// mail survive, and the empty parent is deferred.
+    #[test]
+    fn apply_does_not_destroy_nested_maildir_via_parent() {
+        let dir = tempdir().unwrap();
+        let conn = db::open_in_memory().unwrap();
+        upsert_mailbox(&conn, "M1", "INBOX", "INBOX", Some("inbox"));
+        touch_maildir(dir.path(), "INBOX");
+        // Untracked nested strays: empty parent Foo, child Foo/Bar with
+        // a message in it.
+        touch_maildir(dir.path(), "Foo");
+        touch_maildir(dir.path(), "Foo/Bar");
+        seed_file(dir.path(), "Foo/Bar", "1");
+
+        // Default opts: Foo is empty (Safe); Foo/Bar has mail
+        // (NeedsForceNonEmpty), so it is not removed this run.
+        let p = plan(&conn, dir.path(), &[], false).unwrap();
+        let out = apply(&conn, dir.path(), &p, PruneApplyOptions::default()).unwrap();
+
+        assert!(
+            dir.path()
+                .join("Foo")
+                .join("Bar")
+                .join("cur")
+                .join("1.host:2,")
+                .exists(),
+            "child maildir's mail must not be destroyed by pruning the parent"
+        );
+        assert!(
+            dir.path().join("Foo").exists(),
+            "parent must be deferred while it still contains the un-pruned child"
+        );
+        assert!(
+            out.removed.is_empty(),
+            "nothing is safely removable this run; got removed={:?}",
+            out.removed
+        );
+    }
+
+    /// With --force-non-empty the deepest-first order removes the child
+    /// (rescuing its unmapped mail) before the now-empty parent, so both
+    /// are pruned in one run and the child's mail is preserved.
+    #[test]
+    fn apply_force_removes_nested_child_then_parent() {
+        let dir = tempdir().unwrap();
+        let conn = db::open_in_memory().unwrap();
+        upsert_mailbox(&conn, "M1", "INBOX", "INBOX", Some("inbox"));
+        touch_maildir(dir.path(), "INBOX");
+        touch_maildir(dir.path(), "Foo");
+        touch_maildir(dir.path(), "Foo/Bar");
+        seed_file(dir.path(), "Foo/Bar", "1");
+
+        let p = plan(&conn, dir.path(), &[], false).unwrap();
+        let out = apply(
+            &conn,
+            dir.path(),
+            &p,
+            PruneApplyOptions {
+                force_non_empty: true,
+                force_in_config: false,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            !dir.path().join("Foo").exists(),
+            "both child and parent must be removed"
+        );
+        // The child's unmapped message was rescued, not destroyed.
+        let rescue_cur = dir
+            .path()
+            .join(crate::maildir_ops::namespace::RESCUE_FOLDER_NAME)
+            .join("cur");
+        let rescued = std::fs::read_dir(&rescue_cur)
+            .map(|rd| rd.count())
+            .unwrap_or(0);
+        assert_eq!(rescued, 1, "the child's unmapped mail must be rescued");
+        assert_eq!(
+            out.removed.len(),
+            2,
+            "both folders pruned in one run; got {:?}",
+            out.removed
+        );
     }
 
     #[test]
