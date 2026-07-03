@@ -130,7 +130,7 @@ async fn create_remote_mailbox_round_trips_through_server() {
         let client = session::connect(&config.account, &conn)
             .await
             .expect("connect to fixture JMAP");
-        let server_mailboxes = jmap_mailbox::get_all(&client)
+        let (server_mailboxes, _state) = jmap_mailbox::get_all(&client)
             .await
             .expect("Mailbox/get against fixture");
 

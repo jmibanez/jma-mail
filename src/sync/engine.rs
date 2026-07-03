@@ -784,7 +784,7 @@ impl<'a> SyncEngine<'a> {
         // pure decision core in between. All reads happen before
         // any writes so a single upsert mid-cycle can't shift
         // what the decision loop observes.
-        let remote_mailboxes = jmap_mailbox::get_all(&self.client).await?;
+        let (remote_mailboxes, _mailbox_state) = jmap_mailbox::get_all(&self.client).await?;
         let cached_records: HashMap<JmapMailboxId, queries::MailboxRecord> =
             queries::get_all_mailboxes(self.conn)?
                 .into_iter()

@@ -253,7 +253,7 @@ pub async fn plan(
     let _phase =
         tracing::info_span!(target: crate::profile::TARGET_PHASE, "rebindfolders").entered();
 
-    let server_mailboxes = jmap_mailbox::get_all(client).await?;
+    let (server_mailboxes, _mailbox_state) = jmap_mailbox::get_all(client).await?;
     let by_id: HashMap<JmapMailboxId, &MailboxObject> = server_mailboxes
         .iter()
         .map(|mb| (mb.id.clone(), mb))

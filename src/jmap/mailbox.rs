@@ -243,7 +243,7 @@ pub fn get_selected_mailboxes(
 /// server's `maxObjectsInGet` is well into the hundreds. If we ever
 /// hit `requestTooLarge` here, the right fix is the query+chunked-
 /// get refactor, not raising a hardcoded constant.
-pub async fn get_all(client: &Client) -> Result<Vec<MailboxObject>> {
+pub async fn get_all(client: &Client) -> Result<(Vec<MailboxObject>, String)> {
     let name_cap = limits::max_size_mailbox_name(client);
     let (mailboxes, state) = with_retry("Mailbox/get", || async {
         let mut request = client.build();
@@ -347,7 +347,7 @@ pub async fn get_all(client: &Client) -> Result<Vec<MailboxObject>> {
 
     info!("Fetched {} mailboxes (state: {})", mailboxes.len(), state);
 
-    Ok(mailboxes)
+    Ok((mailboxes, state))
 }
 
 /// Issue one `Mailbox/set { create }` against the server.

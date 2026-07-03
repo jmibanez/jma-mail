@@ -294,7 +294,7 @@ async fn rebindfolders_cross_mapping_resolves_ambiguous_archive() {
     // names for role mailboxes are not guaranteed to match those
     // labels exactly across image tags, so going through Mailbox/get
     // sources the names the server actually advertises.
-    let preexisting = jma_mail::jmap::mailbox::get_all(&admin)
+    let (preexisting, _state) = jma_mail::jmap::mailbox::get_all(&admin)
         .await
         .expect("Mailbox/get for role-folder discovery");
     for mb in &preexisting {

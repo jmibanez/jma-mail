@@ -154,10 +154,11 @@ async fn mailbox_get_retries_transient_5xx() {
 
     let client = build_client(&server).await;
 
-    let mailboxes = tokio::time::timeout(std::time::Duration::from_secs(15), get_all(&client))
-        .await
-        .expect("get_all should not exceed timeout")
-        .expect("get_all should succeed after retries");
+    let (mailboxes, _state) =
+        tokio::time::timeout(std::time::Duration::from_secs(15), get_all(&client))
+            .await
+            .expect("get_all should not exceed timeout")
+            .expect("get_all should succeed after retries");
 
     assert_eq!(mailboxes.len(), 1);
     assert_eq!(mailboxes[0].name, "Inbox");

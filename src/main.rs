@@ -279,7 +279,7 @@ async fn cmd_mailboxes(cli: &Cli) -> Result<()> {
     let conn = state::db::open(&db_path)?;
     let client = session::connect(&config.account, &conn).await?;
 
-    let mailboxes = jma_mail::jmap::mailbox::get_all(&client).await?;
+    let (mailboxes, _mailbox_state) = jma_mail::jmap::mailbox::get_all(&client).await?;
 
     // Index by id so `resolve_folder_path` can compute the on-disk
     // name and `build_remote_paths` can resolve each server path.

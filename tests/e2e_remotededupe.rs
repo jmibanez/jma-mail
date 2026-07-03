@@ -381,7 +381,7 @@ async fn remotededupe_skips_groups_when_bytes_disagree_despite_same_size() {
 }
 
 async fn resolve_inbox_id(client: &jmap_client::client::Client) -> JmapMailboxId {
-    let mailboxes = jmap_mailbox::get_all(client)
+    let (mailboxes, _state) = jmap_mailbox::get_all(client)
         .await
         .expect("Mailbox/get on test fixture");
     mailboxes
