@@ -122,6 +122,7 @@ use tracing::{debug, info};
 
 use crate::domain::MailboxObject;
 use crate::ids::{JmapEmailId, JmapMailboxId, MessageId};
+use crate::jmap::build_request;
 use crate::jmap::limits;
 use crate::jmap::retry::with_retry;
 use crate::jmap::types::EmailObject;
@@ -968,7 +969,7 @@ async fn query_by_message_ids(client: &Client, samples: &[MessageId]) -> Result<
     let filter: CoreFilter<EmailFilter> = CoreFilter::or(conditions);
 
     let ids = with_retry("Email/query (rebindfolders)", || async {
-        let mut request = client.build();
+        let mut request = build_request(client);
         let q = request
             .query_email()
             .account_id(client.default_account_id());

@@ -7,6 +7,7 @@ use tracing::{debug, info};
 
 use crate::domain::MailboxObject;
 use crate::ids::JmapMailboxId;
+use crate::jmap::build_request;
 use crate::jmap::limits;
 use crate::jmap::retry::with_retry;
 
@@ -246,7 +247,7 @@ pub fn get_selected_mailboxes(
 pub async fn get_all(client: &Client) -> Result<(Vec<MailboxObject>, String)> {
     let name_cap = limits::max_size_mailbox_name(client);
     let (mailboxes, state) = with_retry("Mailbox/get", || async {
-        let mut request = client.build();
+        let mut request = build_request(client);
         let get_request = request
             .get_mailbox()
             .account_id(client.default_account_id());
@@ -400,8 +401,13 @@ fn only_counts_changed(updated_properties: Option<&[mailbox::Property]>) -> bool
 /// full `Mailbox/get`.
 pub async fn get_changes(client: &Client, since_state: &str) -> Result<MailboxChanges> {
     let changes = with_retry("Mailbox/changes", || async {
-        client
-            .mailbox_changes(since_state, 500)
+        // Manual build (not the `mailbox_changes` convenience helper)
+        // so the request goes through `build_request` and declares only
+        // the capabilities we use; see `crate::jmap::build_request`.
+        let mut request = build_request(client);
+        request.changes_mailbox(since_state).max_changes(500);
+        request
+            .send_changes_mailbox()
             .await
             .context("Failed to fetch mailbox changes")
     })
@@ -520,7 +526,7 @@ pub async fn update_name_and_parent(
         .with_context(|| format!("rejecting Mailbox/set update for {} -> {:?}", id, new_name))?;
 
     with_retry("Mailbox/set update", || async {
-        let mut request = client.build();
+        let mut request = build_request(client);
         request
             .set_mailbox()
             .update(id.as_ref())

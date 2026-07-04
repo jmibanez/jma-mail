@@ -14,6 +14,7 @@ use tracing::field::Empty;
 use tracing::{Instrument, debug, info, instrument, warn};
 
 use crate::ids::{JmapBlobId, JmapEmailId, JmapMailboxId, JmapThreadId, MessageId};
+use crate::jmap::build_request;
 use crate::jmap::limits;
 use crate::jmap::retry::with_retry;
 use crate::jmap::types::{ChangesResponse, EmailObject};
@@ -70,7 +71,7 @@ pub async fn get_by_ids(client: &Client, ids: &[JmapEmailId]) -> Result<Vec<Emai
     );
     async move {
         with_retry("Email/get", || async {
-            let mut request = client.build();
+            let mut request = build_request(client);
             let get_request = request.get_email().account_id(client.default_account_id());
             get_request.ids(ids.iter().map(String::from));
             get_request.properties(email_properties());
@@ -105,7 +106,7 @@ pub async fn get_by_ids(client: &Client, ids: &[JmapEmailId]) -> Result<Vec<Emai
 /// themselves.
 pub async fn count_emails_in_mailbox(client: &Client, mailbox_id: &JmapMailboxId) -> Result<u64> {
     let total = with_retry("Email/query (count)", || async {
-        let mut request = client.build();
+        let mut request = build_request(client);
         let query = request
             .query_email()
             .account_id(client.default_account_id());
@@ -160,7 +161,7 @@ async fn query_page(
     );
     async move {
         let (ids, total) = with_retry("Email/query", || async {
-            let mut request = client.build();
+            let mut request = build_request(client);
             let query = request
                 .query_email()
                 .account_id(client.default_account_id());
@@ -300,7 +301,7 @@ pub async fn query_mailbox(
 /// Use this to bootstrap the state for delta sync after a full initial pull.
 pub async fn get_current_state(client: &Client) -> Result<String> {
     with_retry("Email/get (state bootstrap)", || async {
-        let mut request = client.build();
+        let mut request = build_request(client);
         let get_request = request.get_email().account_id(client.default_account_id());
         get_request.ids(Vec::<String>::new());
         get_request.properties(vec![email::Property::Id]);
@@ -324,11 +325,16 @@ pub async fn get_current_state(client: &Client) -> Result<String> {
     .await
 }
 
-/// Fetch email changes since a given state using convenience helper.
+/// Fetch email changes since a given state.
 pub async fn get_changes(client: &Client, since_state: &str) -> Result<ChangesResponse> {
     let changes = with_retry("Email/changes", || async {
-        client
-            .email_changes(since_state, Some(500))
+        // Manual build (not the `email_changes` convenience helper) so
+        // the request goes through `build_request` and declares only
+        // the capabilities we use; see `crate::jmap::build_request`.
+        let mut request = build_request(client);
+        request.changes_email(since_state).max_changes(500);
+        request
+            .send_changes_email()
             .await
             .context("Failed to fetch email changes")
     })
@@ -474,7 +480,7 @@ pub async fn set_email_batch(client: &Client, ops: &[EmailSetOp]) -> Result<Emai
 
     for chunk in ops.chunks(chunk_size) {
         let chunk_outcome = with_retry("Email/set (batch)", || async {
-            let mut request = client.build();
+            let mut request = build_request(client);
             {
                 let set = request.set_email().account_id(client.default_account_id());
                 for op in chunk {
@@ -627,7 +633,7 @@ pub async fn import_email(
             .await?
             .take_blob_id();
 
-        let mut request = client.build();
+        let mut request = build_request(client);
         let import_request = request
             .import_email()
             .account_id(&account_id)
