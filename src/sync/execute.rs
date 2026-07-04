@@ -173,7 +173,9 @@ impl<'a> Executor<'a> {
         self.rename_local_mailboxes(local_renames)?;
         adopt_messages(self.conn, unconditional_adopts)?;
         let downloaded = self.download_messages(downloads).await?;
+        let local_flags_attempted = local_flags.len();
         let local_flag_updates = self.update_local_flags(local_flags)?;
+        let local_moves_attempted = local_moves.len();
         let local_moves_count = self.move_local_messages(local_moves)?;
         let local_deletes_count = self.delete_local_messages(local_deletes)?;
         // DeleteLocalFolder runs after every per-message
@@ -243,16 +245,23 @@ impl<'a> Executor<'a> {
             (None, None) | (Some(_), Some(_))
         );
         let combined_intact = upload_results.chain_intact && set_intact;
-        let new_email_state = if combined_intact {
-            let mut edges: HashMap<String, String> =
-                upload_results.chain_pairs.into_iter().collect();
-            if let (Some(o), Some(n)) = (outcome.chain_old, outcome.chain_new) {
-                edges.insert(o, n);
-            }
-            walk_chain(new_email_state, &edges)
-        } else {
-            new_email_state
-        };
+        let mut edges: HashMap<String, String> = upload_results.chain_pairs.into_iter().collect();
+        if let (Some(o), Some(n)) = (outcome.chain_old, outcome.chain_new) {
+            edges.insert(o, n);
+        }
+        // A pull-side FS op that warn-and-skipped this cycle (a
+        // MoveLocal or UpdateLocalFlags whose on-disk rename failed)
+        // left its paired DB write unwritten. Advancing the cursor
+        // past the delta that produced it would strand the change
+        // silently -- see `resolve_email_cursor`.
+        let pull_apply_incomplete =
+            local_flag_updates < local_flags_attempted || local_moves_count < local_moves_attempted;
+        let new_email_state = resolve_email_cursor(
+            new_email_state,
+            pull_apply_incomplete,
+            combined_intact,
+            &edges,
+        );
 
         // Intentionally outside the per-phase transactions: if the process
         // dies between the last phase commit and this write, the cursor
@@ -1693,6 +1702,39 @@ fn walk_chain(cursor: Option<String>, edges: &HashMap<String, String>) -> Option
     }
 }
 
+/// Decide the Email-state cursor to persist at the tail of a cycle.
+///
+/// Returns `None` -- hold the cursor at its prior on-disk value --
+/// when `pull_apply_incomplete` is set. That flag means a pull-side
+/// filesystem op warn-and-skipped this cycle: a `MoveLocal` or
+/// `UpdateLocalFlags` whose on-disk rename failed, so the handler
+/// logged and continued without its paired DB write. Advancing the
+/// cursor past the `Email/changes` delta that produced the skipped
+/// action would strand it: next cycle's delta runs from the advanced
+/// cursor and never re-reports the email, and the local scan can't
+/// re-derive it either (the file and its `local_state` row are both
+/// unchanged), so the change is lost silently. Holding the cursor
+/// lets the next cycle re-apply the action idempotently.
+///
+/// Otherwise ratchets as usual: walks the chain from `reconcile_state`
+/// when `combined_intact`, or leaves the cursor at `reconcile_state`
+/// when a server call returned a missing chain half.
+fn resolve_email_cursor(
+    reconcile_state: Option<String>,
+    pull_apply_incomplete: bool,
+    combined_intact: bool,
+    edges: &HashMap<String, String>,
+) -> Option<String> {
+    if pull_apply_incomplete {
+        return None;
+    }
+    if combined_intact {
+        walk_chain(reconcile_state, edges)
+    } else {
+        reconcile_state
+    }
+}
+
 /// Execute `DeleteLocalFolder` actions, removing each named local
 /// maildir folder and the state-DB rows that reference it. Best
 /// effort per folder: one that can't be removed is logged and
@@ -2599,6 +2641,47 @@ mod tests {
     fn walk_chain_three_cycle_does_not_wedge() {
         let edges = edges_from(&[("S0", "S1"), ("S1", "S2"), ("S2", "S0")]);
         assert_eq!(walk_chain(Some("S0".into()), &edges).as_deref(), Some("S0"));
+    }
+
+    /// Regression pin: a pull-side FS op warn-skipped this cycle (a
+    /// MoveLocal or UpdateLocalFlags whose on-disk rename failed, so
+    /// its paired DB write never ran). The Email cursor must be HELD
+    /// (`None`) even though the chain is intact and reconcile handed
+    /// us a fresh state -- advancing would move past the
+    /// `Email/changes` delta that produced the skipped action, and
+    /// the next cycle could neither re-report it (cursor moved on)
+    /// nor re-derive it from the local scan (file + local_state
+    /// unchanged), silently stranding the change.
+    #[test]
+    fn cursor_held_when_pull_apply_incomplete() {
+        let edges = edges_from(&[("S0", "S1")]);
+        assert_eq!(
+            resolve_email_cursor(Some("S1".into()), true, true, &edges),
+            None
+        );
+    }
+
+    /// Baseline: no pull-side skip + intact chain ratchets to the
+    /// chain's end, exactly as the bare `walk_chain` would.
+    #[test]
+    fn cursor_advances_when_pull_side_complete() {
+        let edges = edges_from(&[("S0", "S1")]);
+        assert_eq!(
+            resolve_email_cursor(Some("S0".into()), false, true, &edges).as_deref(),
+            Some("S1")
+        );
+    }
+
+    /// No pull-side skip but a server call returned a missing chain
+    /// half (`combined_intact` false): the cursor stays at the
+    /// reconcile state without walking, preserving prior behavior.
+    #[test]
+    fn cursor_preserved_when_chain_not_intact() {
+        let edges = edges_from(&[("S0", "S1")]);
+        assert_eq!(
+            resolve_email_cursor(Some("S0".into()), false, false, &edges).as_deref(),
+            Some("S0")
+        );
     }
 
     /// A message downloaded as unread lands in `new/` with no
