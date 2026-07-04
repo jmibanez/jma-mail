@@ -721,7 +721,32 @@ impl<'a> SyncEngine<'a> {
         // partial-failure rows stay un-applied so the next
         // cycle sees the same `FirstCycle` (or rename) state
         // and retries cleanly.
-        apply_pending_mailbox_writes(self.conn, &maildir_root, mailboxes.pending_mailbox_writes())?;
+        let all_applied = apply_pending_mailbox_writes(
+            self.conn,
+            &maildir_root,
+            mailboxes.pending_mailbox_writes(),
+        )?;
+
+        // Advance the `Mailbox` cursor only once `mailbox_map`
+        // faithfully mirrors the server structure this cycle's
+        // `Mailbox/get` observed. A skipped pending write means the
+        // cache is still missing a row the fetched state includes;
+        // stamping the cursor anyway would seed the SSE dedup cache
+        // with a state whose first event we would then suppress --
+        // the very sync that would reconcile the lagging cache.
+        // Parking the cursor instead makes the next cycle re-fetch
+        // and retry. Sits past the `--dry-run` early return, so
+        // plan-only runs never stamp it -- mirroring the Email cursor.
+        if all_applied {
+            if let Some(state) = mailboxes.mailbox_state() {
+                queries::set_jmap_state(self.conn, self.account_id.as_ref(), "Mailbox", state)?;
+            }
+        } else {
+            debug!(
+                "Parking Mailbox cursor: not every pending mailbox write landed this cycle; \
+                 next cycle re-fetches to reconcile the cache"
+            );
+        }
 
         // Phase 6: record per-folder checkpoints. Snapshot every
         // synced folder after the executor has landed its writes,
@@ -784,7 +809,7 @@ impl<'a> SyncEngine<'a> {
         // pure decision core in between. All reads happen before
         // any writes so a single upsert mid-cycle can't shift
         // what the decision loop observes.
-        let (remote_mailboxes, _mailbox_state) = jmap_mailbox::get_all(&self.client).await?;
+        let (remote_mailboxes, mailbox_state) = jmap_mailbox::get_all(&self.client).await?;
         let cached_records: HashMap<JmapMailboxId, queries::MailboxRecord> =
             queries::get_all_mailboxes(self.conn)?
                 .into_iter()
@@ -908,6 +933,7 @@ impl<'a> SyncEngine<'a> {
         // candidate, already handled by `decide_mailbox_action`
         // above).
         synced.set_disk_sentinels(disk_sentinels);
+        synced.set_mailbox_state(mailbox_state);
 
         let synced = synced.build();
 

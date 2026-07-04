@@ -33,7 +33,7 @@ enum ConnectOutcome {
 /// to wake the daemon. Under the destructive-arm policy the
 /// resulting drift between cache, server, and disk views can
 /// land silently, so the cursor-plumbing cost is worth paying.
-const TRACKED_TYPES: &[&str] = &["Email", "Mailbox"];
+pub(super) const TRACKED_TYPES: &[&str] = &["Email", "Mailbox"];
 
 /// Spec-mandated upper bound on a server's allowed maximum ping
 /// interval (RFC 8620 §7.3: "servers MUST NOT have ... a maximum

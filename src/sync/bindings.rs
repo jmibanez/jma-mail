@@ -117,6 +117,13 @@ pub struct MailboxBindings {
     /// "user renamed maildir", since a sentinel surviving at a
     /// different path means rename territory, not deletion).
     disk_sentinels: HashMap<JmapMailboxId, String>,
+    /// The `Mailbox/get` state token these bindings reflect, set
+    /// by `resolve_mailboxes` from the fetch that produced them.
+    /// `None` on the default/empty bindings used in tests and on
+    /// early-return cycles that never fetched. The engine stamps
+    /// it as the `Mailbox` cursor at the cycle tail, gated on the
+    /// cache having fully caught up (see `apply_pending_mailbox_writes`).
+    mailbox_state: Option<String>,
 }
 
 /// A mailbox whose on-disk state `resolve_mailboxes` found
@@ -419,6 +426,14 @@ impl MailboxBindings {
         &self.cache_route_orphan_deletes
     }
 
+    /// The `Mailbox/get` state token these bindings reflect, or
+    /// `None` if they were built without a fetch. The engine
+    /// stamps this as the `Mailbox` cursor once the cache has
+    /// caught up with the server structure it names.
+    pub fn mailbox_state(&self) -> Option<&str> {
+        self.mailbox_state.as_deref()
+    }
+
     pub fn len(&self) -> usize {
         self.index.len()
     }
@@ -556,6 +571,14 @@ impl MailboxBindingsBuilder {
     /// Called once by `resolve_mailboxes` after its own walk.
     pub(crate) fn set_disk_sentinels(&mut self, walk: HashMap<JmapMailboxId, String>) {
         self.0.disk_sentinels = walk;
+    }
+
+    /// Record the `Mailbox/get` state token this cycle's fetch
+    /// returned. Called once by `resolve_mailboxes`; the engine
+    /// reads it back at the cycle tail to stamp the `Mailbox`
+    /// cursor.
+    pub(crate) fn set_mailbox_state(&mut self, state: String) {
+        self.0.mailbox_state = Some(state);
     }
 
     /// Stage a `mailbox_map` row to be upserted after the

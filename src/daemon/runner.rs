@@ -308,11 +308,17 @@ impl<'a> WatchDaemon<'a> {
 
         // Seed the SSE dedup cache from current DB state so the first
         // event after (re)connect isn't a guaranteed redundant trigger.
-        // Only Email is tracked today; see TRACKED_TYPES in
-        // eventsource.rs for why.
+        // Seed every TRACKED_TYPE the listener acts on: without the
+        // Mailbox seed, the first StateChange after connect reports a
+        // `<none> -> <state>` Mailbox transition and fires a no-op
+        // structural sync.
         let mut initial_states: HashMap<String, String> = HashMap::new();
-        if let Some(state) = queries::get_jmap_state(self.conn, account_id.as_ref(), "Email")? {
-            initial_states.insert("Email".to_string(), state);
+        for &entity_type in super::eventsource::TRACKED_TYPES {
+            if let Some(state) =
+                queries::get_jmap_state(self.conn, account_id.as_ref(), entity_type)?
+            {
+                initial_states.insert(entity_type.to_string(), state);
+            }
         }
 
         let sse_tx = self.tx.clone();
