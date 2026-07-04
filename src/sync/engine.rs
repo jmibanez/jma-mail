@@ -728,15 +728,16 @@ impl<'a> SyncEngine<'a> {
         )?;
 
         // Advance the `Mailbox` cursor only once `mailbox_map`
-        // faithfully mirrors the server structure this cycle's
-        // `Mailbox/get` observed. A skipped pending write means the
-        // cache is still missing a row the fetched state includes;
-        // stamping the cursor anyway would seed the SSE dedup cache
-        // with a state whose first event we would then suppress --
-        // the very sync that would reconcile the lagging cache.
-        // Parking the cursor instead makes the next cycle re-fetch
-        // and retry. Sits past the `--dry-run` early return, so
-        // plan-only runs never stamp it -- mirroring the Email cursor.
+        // faithfully mirrors the server structure this cycle resolved
+        // (from `Mailbox/get`, or the `Mailbox/changes` new_state on
+        // the cache-reuse path). A skipped pending write means the
+        // cache is still missing a row that state includes; stamping
+        // the cursor anyway would seed the SSE dedup cache with a
+        // state whose first event we would then suppress -- the very
+        // sync that would reconcile the lagging cache. Parking the
+        // cursor instead makes the next cycle re-fetch and retry.
+        // Sits past the `--dry-run` early return, so plan-only runs
+        // never stamp it -- mirroring the Email cursor.
         if all_applied {
             if let Some(state) = mailboxes.mailbox_state() {
                 queries::set_jmap_state(self.conn, self.account_id.as_ref(), "Mailbox", state)?;
@@ -797,6 +798,55 @@ impl<'a> SyncEngine<'a> {
         Ok(outcome)
     }
 
+    /// Resolve this cycle's mailbox set and the `Mailbox` state token
+    /// to stamp. With a `Mailbox` cursor whose `Mailbox/changes` delta
+    /// touched no structural property, rebuild the set from `cached`
+    /// (every structural field the resolution core reads is on the
+    /// cached row) and skip the full `Mailbox/get`; otherwise fetch.
+    /// A cursor the server cannot compute changes from, or no cursor
+    /// at all, routes to the full fetch that (re)bootstraps it.
+    ///
+    /// The reuse path is sound because the `Mailbox` state token
+    /// guarantees the cache mirrors the server structure as of the
+    /// cursor: an unchanged (or count-only) delta means no structural
+    /// property moved, so the cached rows are the current server view.
+    async fn fetch_or_reuse_mailboxes(
+        &self,
+        cached: &HashMap<JmapMailboxId, queries::MailboxRecord>,
+    ) -> Result<(Vec<MailboxObject>, String)> {
+        let Some(mut since) =
+            queries::get_jmap_state(self.conn, self.account_id.as_ref(), "Mailbox")?
+        else {
+            return jmap_mailbox::get_all(&self.client).await;
+        };
+
+        // Walk the changes chain. Any structural page -- or an
+        // inability to compute changes -- routes to a full
+        // `Mailbox/get`; a chain that touches only email/thread counts
+        // lets us reuse the cache and skip the fetch.
+        loop {
+            let changes = match jmap_mailbox::get_changes(&self.client, &since).await {
+                Ok(c) => c,
+                Err(e) if crate::jmap::email::is_cannot_calculate_changes(&e) => {
+                    info!("Server cannot calculate mailbox changes; doing a full Mailbox/get");
+                    return jmap_mailbox::get_all(&self.client).await;
+                }
+                Err(e) => return Err(e),
+            };
+            if changes.is_structural() {
+                return jmap_mailbox::get_all(&self.client).await;
+            }
+            if !changes.has_more_changes {
+                debug!(
+                    "Mailbox structure unchanged since cursor; reusing {} cached row(s)",
+                    cached.len()
+                );
+                return Ok((synthesize_mailbox_objects(cached), changes.new_state));
+            }
+            since = changes.new_state;
+        }
+    }
+
     /// Resolve the set of mailboxes to sync, returning a
     /// [`MailboxBindings`] indexed for O(1) lookup by either id or
     /// on-disk folder. Every downstream consumer (scan, reconcile,
@@ -809,7 +859,6 @@ impl<'a> SyncEngine<'a> {
         // pure decision core in between. All reads happen before
         // any writes so a single upsert mid-cycle can't shift
         // what the decision loop observes.
-        let (remote_mailboxes, mailbox_state) = jmap_mailbox::get_all(&self.client).await?;
         let cached_records: HashMap<JmapMailboxId, queries::MailboxRecord> =
             queries::get_all_mailboxes(self.conn)?
                 .into_iter()
@@ -821,6 +870,13 @@ impl<'a> SyncEngine<'a> {
         // iteration, so iterating it directly would shuffle the
         // order `local_orphans` entries land in.
         let known_mailbox_ids = queries::list_known_mailbox_ids(self.conn)?;
+
+        // Source the mailbox set: reuse the cache when the `Mailbox`
+        // cursor's `Mailbox/changes` delta shows no structural change,
+        // otherwise a full `Mailbox/get`. Cache reads happen first so
+        // the reuse path has them in hand.
+        let (remote_mailboxes, mailbox_state) =
+            self.fetch_or_reuse_mailboxes(&cached_records).await?;
 
         // Walk the maildir tree once, building an id -> on-disk
         // path map from `.jma.mapping` sentinels. Used for
@@ -1784,6 +1840,30 @@ fn record_sentinel_route_orphans(
 /// messages, stashes the sentinel walk, and finalizes with
 /// `.build()`; no `mailbox_map` writes happen in the shell.
 ///
+/// Rebuild the `MailboxObject` set from cached `mailbox_map` rows for
+/// a cycle that reuses the cache instead of a full `Mailbox/get`.
+/// Every structural field the resolution core reads (`id`, `name`,
+/// `parent_id`, `role`, `sort_order`) comes straight from the cached
+/// row; the count fields the core never reads are zero-filled. Sound
+/// only when the `Mailbox` cursor guarantees the cache mirrors the
+/// server structure -- see `fetch_or_reuse_mailboxes`.
+fn synthesize_mailbox_objects(
+    cached: &HashMap<JmapMailboxId, queries::MailboxRecord>,
+) -> Vec<MailboxObject> {
+    cached
+        .values()
+        .map(|r| MailboxObject {
+            id: r.jmap_mailbox_id.clone(),
+            name: r.name.clone(),
+            parent_id: r.parent_id.clone(),
+            role: r.role.clone(),
+            sort_order: r.sort_order as u32,
+            total_emails: 0,
+            unread_emails: 0,
+        })
+        .collect()
+}
+
 /// `maildir_root` is passed through so the sentinel-driven orphan
 /// info! log carries the same absolute path it did before the
 /// pre-pass split; the core does no actual I/O against it.

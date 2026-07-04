@@ -314,6 +314,22 @@ pub fn apply(
             RemovalOutcome::Skipped => outcome.deferred.push(entry.folder.clone()),
         }
     }
+
+    // A removed folder that had a `mailbox_map` row means this offline
+    // pass dropped a cache row out of band. The `Mailbox` sync cursor
+    // tracks server state and cannot see that local mutation, so reset
+    // it: the next sync re-fetches the mailbox set rather than trusting
+    // a cache that no longer mirrors the server. `id_by_folder` is the
+    // pre-deletion snapshot, so it still names every folder we dropped
+    // a row for.
+    let dropped_mailbox_rows = outcome
+        .removed
+        .iter()
+        .any(|folder| id_by_folder.contains_key(folder.as_str()));
+    if dropped_mailbox_rows {
+        queries::clear_jmap_state(conn, "Mailbox")?;
+    }
+
     Ok(outcome)
 }
 
@@ -806,6 +822,71 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "message_map row must be cascaded"
+        );
+    }
+
+    /// Dropping a mapped `mailbox_map` row mutates the cache the sync
+    /// cursor tracks out of band, so the `Mailbox` cursor is reset;
+    /// the `Email` cursor (a different entity) is left alone.
+    #[test]
+    fn apply_resets_mailbox_cursor_when_a_mapped_row_drops() {
+        let dir = tempdir().unwrap();
+        let conn = db::open_in_memory().unwrap();
+        touch_maildir(dir.path(), "INBOX");
+        upsert_mailbox(&conn, "M1", "INBOX", "INBOX", Some("inbox"));
+        // Archive: row, no maildir, in config -> NeedsForceInConfig.
+        upsert_mailbox(&conn, "M2", "Archive", "Archive", None);
+        queries::set_jmap_state(&conn, "acct", "Mailbox", "J1").unwrap();
+        queries::set_jmap_state(&conn, "acct", "Email", "J1").unwrap();
+        let cfg = vec!["INBOX".to_string(), "Archive".to_string()];
+
+        let p = plan(&conn, dir.path(), &cfg, false).unwrap();
+        let out = apply(
+            &conn,
+            dir.path(),
+            &p,
+            PruneApplyOptions {
+                force_non_empty: false,
+                force_in_config: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(out.removed, vec!["Archive".to_string()]);
+        assert!(
+            queries::get_jmap_state(&conn, "acct", "Mailbox")
+                .unwrap()
+                .is_none(),
+            "dropping a mapped row must reset the Mailbox cursor"
+        );
+        assert!(
+            queries::get_jmap_state(&conn, "acct", "Email")
+                .unwrap()
+                .is_some(),
+            "the Email cursor is a different entity and stays"
+        );
+    }
+
+    /// Removing an unmapped stray drops no `mailbox_map` row, so the
+    /// cache still mirrors the server and the `Mailbox` cursor stands.
+    #[test]
+    fn apply_keeps_mailbox_cursor_when_only_unmapped_folders_drop() {
+        let dir = tempdir().unwrap();
+        let conn = db::open_in_memory().unwrap();
+        upsert_mailbox(&conn, "M1", "INBOX", "INBOX", Some("inbox"));
+        touch_maildir(dir.path(), "INBOX");
+        touch_maildir(dir.path(), "EmptyStray");
+        queries::set_jmap_state(&conn, "acct", "Mailbox", "J1").unwrap();
+
+        let p = plan(&conn, dir.path(), &[], false).unwrap();
+        let out = apply(&conn, dir.path(), &p, PruneApplyOptions::default()).unwrap();
+
+        assert_eq!(out.removed, vec!["EmptyStray".to_string()]);
+        assert!(
+            queries::get_jmap_state(&conn, "acct", "Mailbox")
+                .unwrap()
+                .is_some(),
+            "an unmapped stray drops no mailbox_map row, so the cursor stays"
         );
     }
 

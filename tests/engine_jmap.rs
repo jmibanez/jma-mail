@@ -234,6 +234,7 @@ fn handle_method(name: &str, args: &Value, call_id: &str, state: &mut MockState)
     match name {
         "Mailbox/get" => mailbox_get(args, call_id, state),
         "Mailbox/set" => mailbox_set(args, call_id, state),
+        "Mailbox/changes" => mailbox_changes(call_id),
         "Email/query" => email_query(args, call_id, state),
         "Email/get" => email_get(args, call_id, state),
         "Email/changes" => email_changes(args, call_id, state),
@@ -521,6 +522,19 @@ fn email_changes(args: &Value, call_id: &str, state: &mut MockState) -> Value {
             "updated": changes.updated,
             "destroyed": changes.destroyed,
         },
+        call_id
+    ])
+}
+
+/// jma's cache-reuse path calls `Mailbox/changes` once a `Mailbox`
+/// cursor exists. Return `cannotCalculateChanges` so the engine falls
+/// back to the full `Mailbox/get` this mock serves -- every test keeps
+/// exercising the same server-structure path it did before the cursor
+/// existed, rather than needing the mock to track mailbox-state deltas.
+fn mailbox_changes(call_id: &str) -> Value {
+    json!([
+        "error",
+        { "type": "cannotCalculateChanges", "description": "mock: full refetch" },
         call_id
     ])
 }

@@ -216,6 +216,7 @@ async fn mount_blob_downloads(server: &MockServer, state: Arc<Mutex<MockState>>)
 fn handle_method(name: &str, args: &Value, call_id: &str, state: &MockState) -> Value {
     match name {
         "Mailbox/get" => mailbox_get(call_id, state),
+        "Mailbox/changes" => mailbox_changes(call_id),
         "Email/query" => email_query(args, call_id, state),
         "Email/get" => email_get(args, call_id, state),
         "Email/changes" => email_changes(args, call_id, state),
@@ -225,6 +226,17 @@ fn handle_method(name: &str, args: &Value, call_id: &str, state: &MockState) -> 
             call_id
         ]),
     }
+}
+
+/// jma's cache-reuse path calls `Mailbox/changes` once a `Mailbox`
+/// cursor exists. Return `cannotCalculateChanges` so the engine falls
+/// back to the full `Mailbox/get` this mock serves.
+fn mailbox_changes(call_id: &str) -> Value {
+    json!([
+        "error",
+        { "type": "cannotCalculateChanges", "description": "mock: full refetch" },
+        call_id
+    ])
 }
 
 fn mailbox_get(call_id: &str, state: &MockState) -> Value {

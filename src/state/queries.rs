@@ -39,6 +39,20 @@ pub fn set_jmap_state(
     Ok(())
 }
 
+/// Drop every `jmap_state` cursor of `entity_type`, across all
+/// accounts. Used by offline maintenance (`janitor prune`) that
+/// mutates `mailbox_map` out of band: the next sync then re-fetches
+/// that entity from scratch rather than trusting a cursor whose
+/// cache was changed underneath it. Returns the number of rows
+/// removed.
+pub fn clear_jmap_state(conn: &Connection, entity_type: &str) -> Result<usize> {
+    let removed = conn.execute(
+        "DELETE FROM jmap_state WHERE entity_type = ?1",
+        params![entity_type],
+    )?;
+    Ok(removed)
+}
+
 /// One row of the `jmap_state` table, returned verbatim for inspection
 /// callers (e.g. `cmd_status`). Unlike `get_jmap_state`, this preserves
 /// the empty-string forced-resync sentinel so callers can distinguish
