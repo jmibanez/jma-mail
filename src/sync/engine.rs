@@ -1270,11 +1270,18 @@ fn apply_unconditional_mailbox_writes(
 /// rename retry) so the executor's next pass can retry from
 /// scratch, instead of leaving a phantom row that the
 /// remote-orphan check would misread.
+///
+/// Returns `true` when every staged row was applied. `false`
+/// means at least one row was skipped because its maildir or
+/// sentinel had not caught up, so `mailbox_map` does not yet
+/// fully reflect the server structure the fetch observed and a
+/// caller must not treat the cache as a faithful mirror of it.
 fn apply_pending_mailbox_writes(
     conn: &Connection,
     maildir_root: &std::path::Path,
     writes: &[queries::MailboxRecord],
-) -> Result<()> {
+) -> Result<bool> {
+    let mut all_applied = true;
     for record in writes {
         let folder_path = maildir_root.join(&record.maildir_folder);
         let maildir_ok = store::try_open_maildir(&folder_path).is_some();
@@ -1289,6 +1296,7 @@ fn apply_pending_mailbox_writes(
         if maildir_ok && sentinel_ok {
             queries::upsert_mailbox(conn, record)?;
         } else {
+            all_applied = false;
             debug!(
                 "Pending mailbox write for id {} ({} at {}) skipped: \
                  disk state not yet consistent (maildir_ok={}, sentinel_ok={}); \
@@ -1297,7 +1305,7 @@ fn apply_pending_mailbox_writes(
             );
         }
     }
-    Ok(())
+    Ok(all_applied)
 }
 
 /// Snapshot every synced folder after a successful cycle and upsert
@@ -2594,8 +2602,10 @@ mod tests {
             )
             .unwrap();
 
-            apply_pending_mailbox_writes(&conn, dir.path(), &[record("MB-ARCH", "Archive")])
-                .unwrap();
+            let all_applied =
+                apply_pending_mailbox_writes(&conn, dir.path(), &[record("MB-ARCH", "Archive")])
+                    .unwrap();
+            assert!(all_applied, "consistent disk state applies every row");
 
             let rows = queries::list_known_mailbox_ids(&conn).unwrap();
             assert!(
@@ -2616,8 +2626,10 @@ mod tests {
             // No maildir, no sentinel: executor didn't run, or
             // failed before creating the folder.
 
-            apply_pending_mailbox_writes(&conn, dir.path(), &[record("MB-ARCH", "Archive")])
-                .unwrap();
+            let all_applied =
+                apply_pending_mailbox_writes(&conn, dir.path(), &[record("MB-ARCH", "Archive")])
+                    .unwrap();
+            assert!(!all_applied, "absent maildir leaves the write pending");
 
             let rows = queries::list_known_mailbox_ids(&conn).unwrap();
             assert!(
@@ -2636,8 +2648,10 @@ mod tests {
             make_maildir(dir.path(), "Archive");
             // Skip sentinel::write.
 
-            apply_pending_mailbox_writes(&conn, dir.path(), &[record("MB-ARCH", "Archive")])
-                .unwrap();
+            let all_applied =
+                apply_pending_mailbox_writes(&conn, dir.path(), &[record("MB-ARCH", "Archive")])
+                    .unwrap();
+            assert!(!all_applied, "missing sentinel leaves the write pending");
 
             let rows = queries::list_known_mailbox_ids(&conn).unwrap();
             assert!(
@@ -2665,8 +2679,13 @@ mod tests {
             )
             .unwrap();
 
-            apply_pending_mailbox_writes(&conn, dir.path(), &[record("MB-ARCH", "Archive")])
-                .unwrap();
+            let all_applied =
+                apply_pending_mailbox_writes(&conn, dir.path(), &[record("MB-ARCH", "Archive")])
+                    .unwrap();
+            assert!(
+                !all_applied,
+                "disagreeing sentinel leaves the write pending"
+            );
 
             let rows = queries::list_known_mailbox_ids(&conn).unwrap();
             assert!(
