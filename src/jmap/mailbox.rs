@@ -350,6 +350,100 @@ pub async fn get_all(client: &Client) -> Result<(Vec<MailboxObject>, String)> {
     Ok((mailboxes, state))
 }
 
+/// One page of `Mailbox/changes`. Callers loop while
+/// `has_more_changes` is set, ratcheting `since_state` to
+/// `new_state`.
+pub struct MailboxChanges {
+    pub created: Vec<JmapMailboxId>,
+    pub updated: Vec<JmapMailboxId>,
+    pub destroyed: Vec<JmapMailboxId>,
+    /// `true` iff the server reported (via RFC 8621 section 2.2
+    /// `updatedProperties`) that only email/thread count properties
+    /// changed for the updated set. `false` when the server returned
+    /// null -- it could not tell -- or listed any structural property.
+    pub updated_only_counts: bool,
+    pub new_state: String,
+    pub has_more_changes: bool,
+}
+
+impl MailboxChanges {
+    /// Whether this delta reflects a structural change -- a created or
+    /// destroyed mailbox, or an update touching more than the
+    /// email/thread counts -- and so needs a full `Mailbox/get`. An
+    /// email arriving bumps a mailbox's `totalEmails`, which is a
+    /// count-only update and not structural.
+    pub fn is_structural(&self) -> bool {
+        !self.created.is_empty()
+            || !self.destroyed.is_empty()
+            || (!self.updated.is_empty() && !self.updated_only_counts)
+    }
+}
+
+/// Whether a `Mailbox/changes` `updatedProperties` list means only
+/// email/thread counts changed. Count-only requires a non-null list
+/// whose every entry is a count property; a null list (the server
+/// could not tell) or an empty one falls to `false` -- the safe
+/// direction, since the caller then does a full `Mailbox/get` rather
+/// than risk treating a structural change as count churn.
+fn only_counts_changed(updated_properties: Option<&[mailbox::Property]>) -> bool {
+    matches!(
+        updated_properties,
+        Some(props) if !props.is_empty() && props.iter().all(mailbox::Property::is_count)
+    )
+}
+
+/// Fetch one page of `Mailbox/changes` since `since_state`.
+///
+/// A `cannotCalculateChanges` method error propagates as `Err`
+/// (`with_retry` classifies it as non-transient); the caller detects
+/// it via `email::is_cannot_calculate_changes` and falls back to a
+/// full `Mailbox/get`.
+pub async fn get_changes(client: &Client, since_state: &str) -> Result<MailboxChanges> {
+    let changes = with_retry("Mailbox/changes", || async {
+        client
+            .mailbox_changes(since_state, 500)
+            .await
+            .context("Failed to fetch mailbox changes")
+    })
+    .await?;
+
+    let updated_only_counts = only_counts_changed(changes.arguments().updated_properties());
+
+    let result = MailboxChanges {
+        created: changes
+            .created()
+            .iter()
+            .map(|id| JmapMailboxId::from(id.as_str()))
+            .collect(),
+        updated: changes
+            .updated()
+            .iter()
+            .map(|id| JmapMailboxId::from(id.as_str()))
+            .collect(),
+        destroyed: changes
+            .destroyed()
+            .iter()
+            .map(|id| JmapMailboxId::from(id.as_str()))
+            .collect(),
+        updated_only_counts,
+        new_state: changes.new_state().to_string(),
+        has_more_changes: changes.has_more_changes(),
+    };
+
+    info!(
+        "Mailbox changes: {} created, {} updated, {} destroyed \
+         (state {} -> {}, counts_only={})",
+        result.created.len(),
+        result.updated.len(),
+        result.destroyed.len(),
+        changes.old_state(),
+        result.new_state,
+        result.updated_only_counts,
+    );
+
+    Ok(result)
+}
+
 /// Issue one `Mailbox/set { create }` against the server.
 /// Returns the server-assigned `JmapMailboxId` on success.
 ///
@@ -501,6 +595,78 @@ fn parse_role(role: &str) -> mailbox::Role {
 mod tests {
     use super::*;
     use crate::jmap::limits::MAX_MAILBOX_NAME_LEN;
+
+    fn changes(
+        created: usize,
+        updated: usize,
+        destroyed: usize,
+        updated_only_counts: bool,
+    ) -> MailboxChanges {
+        let ids = |n: usize| -> Vec<JmapMailboxId> {
+            (0..n)
+                .map(|i| JmapMailboxId::from(format!("MB-{i}").as_str()))
+                .collect()
+        };
+        MailboxChanges {
+            created: ids(created),
+            updated: ids(updated),
+            destroyed: ids(destroyed),
+            updated_only_counts,
+            new_state: "s".to_string(),
+            has_more_changes: false,
+        }
+    }
+
+    #[test]
+    fn empty_delta_is_not_structural() {
+        assert!(!changes(0, 0, 0, false).is_structural());
+    }
+
+    #[test]
+    fn created_mailbox_is_structural() {
+        assert!(changes(1, 0, 0, false).is_structural());
+    }
+
+    #[test]
+    fn destroyed_mailbox_is_structural() {
+        assert!(changes(0, 0, 1, false).is_structural());
+    }
+
+    #[test]
+    fn count_only_update_is_not_structural() {
+        assert!(!changes(0, 2, 0, true).is_structural());
+    }
+
+    #[test]
+    fn non_count_update_is_structural() {
+        assert!(changes(0, 1, 0, false).is_structural());
+    }
+
+    #[test]
+    fn only_counts_changed_true_when_all_counts() {
+        assert!(only_counts_changed(Some(&[
+            mailbox::Property::TotalEmails,
+            mailbox::Property::UnreadEmails,
+        ])));
+    }
+
+    #[test]
+    fn only_counts_changed_false_when_null() {
+        assert!(!only_counts_changed(None));
+    }
+
+    #[test]
+    fn only_counts_changed_false_when_empty() {
+        assert!(!only_counts_changed(Some(&[])));
+    }
+
+    #[test]
+    fn only_counts_changed_false_when_structural_prop_present() {
+        assert!(!only_counts_changed(Some(&[
+            mailbox::Property::TotalEmails,
+            mailbox::Property::Name,
+        ])));
+    }
 
     fn mb_child(id: &str, name: &str, parent: &str, role: Option<&str>) -> MailboxObject {
         MailboxObject {
