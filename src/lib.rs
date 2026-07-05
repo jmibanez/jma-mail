@@ -10,6 +10,7 @@ pub mod maildir_ops;
 pub mod profile;
 pub mod state;
 pub mod sync;
+pub mod tui;
 pub mod ui;
 pub mod wizard;
 
@@ -27,8 +28,18 @@ pub mod wizard;
 #[macro_export]
 macro_rules! notify {
     ($($arg:tt)*) => {{
+        // -q wins outright (errors-only floor). Otherwise: when the
+        // TUI is active, the milestone becomes the new status line
+        // (single-slot, latest wins). When the TUI is off, the
+        // milestone prints to stdout as before. Either way it surfaces
+        // -- the TUI doesn't drop them, it just routes them somewhere
+        // that doesn't corrupt the alternate screen.
         if !$crate::ui::is_quiet() {
-            println!($($arg)*);
+            if $crate::tui::is_active() {
+                $crate::tui::push_status(format!($($arg)*));
+            } else {
+                println!($($arg)*);
+            }
         }
     }};
 }

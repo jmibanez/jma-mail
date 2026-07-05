@@ -76,7 +76,11 @@ pub enum Command {
         dry_run: bool,
     },
     /// Daemon mode: continuous sync on server + local changes
-    Watch,
+    Watch {
+        /// Disable the watch-mode TUI (auto-disabled when stdout is not a tty)
+        #[arg(long)]
+        no_tui: bool,
+    },
     /// Initialize config file. Runs the interactive setup wizard by
     /// default; pass --no-interactive to write a fully-commented
     /// template config instead. Maildirs are created on the first

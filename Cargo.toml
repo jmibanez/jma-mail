@@ -124,6 +124,14 @@ regex = "1.12"
 # routing through a re-export.
 libc = "0.2"
 
+# TUI for `jma watch`. ratatui owns the layout/render primitives;
+# crossterm is its backend (raw mode, alt screen, key events). Only
+# the watch command activates the TUI -- one-shot sync still prints
+# plain text -- so these are unconditional deps but the runtime cost
+# is paid only when `jma watch` is interactive.
+ratatui = "0.29"
+crossterm = "0.28"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { version = "1", features = ["keychain"] }
 

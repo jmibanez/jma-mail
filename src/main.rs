@@ -1,7 +1,10 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use jma_mail::maildir_ops::layout::FolderLayoutDefinition;
+use std::io::IsTerminal;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Notify;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 
@@ -14,11 +17,27 @@ use jma_mail::maildir_ops;
 use jma_mail::profile::{self, ProfileSink};
 use jma_mail::state;
 use jma_mail::sync::engine::SyncEngine;
+use jma_mail::tui::writer::gated_stderr;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     jma_mail::ui::init_quiet(cli.quiet);
+
+    let command = cli.command.clone().unwrap_or(Command::Sync {
+        args: cli.sync.clone(),
+    });
+    // Capture the discriminant up front: the Auth match arm
+    // partial-moves `account` out of `command`, so any later check
+    // against `command` would otherwise fail to compile.
+    let is_watch = matches!(command, Command::Watch { .. });
+
+    // TUI activation. Watch-only, gated by watch's --no-tui flag and
+    // tty detection. The result feeds into the verbosity dial below
+    // (TUI bumps the default to -v so the log pane has real content
+    // to show) before the layer is constructed.
+    let want_tui =
+        matches!(command, Command::Watch { no_tui: false }) && std::io::stdout().is_terminal();
 
     // Verbosity dial. At the default level the tracing filter sits
     // at warn -- info-level logs are suppressed, and milestone status
@@ -27,22 +46,51 @@ async fn main() -> Result<()> {
     // for our crates, -vv opens debug for our crates, -vvv widens
     // debug to every crate (notably hyper/tokio internals), -vvvv
     // lifts to trace. -q clamps every channel to error.
-    let filter = match (cli.quiet, cli.verbose) {
-        (true, _) => "error",
-        (_, 0) => "jma_mail=warn,jma=warn",
-        (_, 1) => "jma_mail=info,jma=info",
-        (_, 2) => "jma_mail=debug,jma=debug",
-        (_, 3) => "debug",
-        (_, _) => "trace",
+    //
+    // Special case: when the TUI is active and the user hasn't
+    // dialed verbosity at all, treat it as if they had passed -v.
+    // The TUI's log pane is half the screen; at warn-default it sits
+    // near-empty during normal sync activity, which defeats the
+    // purpose of having a pane in the first place. The user can
+    // still take it lower with -q.
+    let filter = match (cli.quiet, cli.verbose, want_tui) {
+        (true, _, _) => "error",
+        (_, 0, true) => "jma_mail=info,jma=info",
+        (_, 0, false) => "jma_mail=warn,jma=warn",
+        (_, 1, _) => "jma_mail=info,jma=info",
+        (_, 2, _) => "jma_mail=debug,jma=debug",
+        (_, 3, _) => "debug",
+        (_, _, _) => "trace",
     };
     // Tracing logs go to stderr so `notify!`'s status text (stdout)
     // stays parseable when the user redirects one and not the other.
     // tracing_subscriber's default writer is stdout, hence the
     // explicit override.
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter));
+    // The fmt layer writes to a gated stderr so it goes silent while
+    // the TUI's alternate screen is up. Outside of `jma watch` (and
+    // inside it when --no-tui or no tty), the gate is permanently
+    // open and behavior matches the prior `std::io::stderr` writer
+    // exactly.
     let fmt_layer = tracing_subscriber::fmt::layer()
-        .with_writer(std::io::stderr)
+        .with_writer(gated_stderr)
         .with_filter(env_filter);
+
+    // Install the TUI layer alongside fmt_layer. The level filter
+    // pins the registry's global interest at INFO from this layer's
+    // perspective; without it, a filterless layer would bump
+    // `LevelFilter::current()` to TRACE and every trace!() / debug!()
+    // call site in the crate would fire just to be discarded by
+    // on_event's internal floor. The internal floor stays for defense
+    // in depth, but the filter is what keeps cold call sites cold.
+    // Capturing starts from the first event the registry handles, so
+    // by the time the render thread comes up there's already a small
+    // backlog to show.
+    let tui_layer = if want_tui {
+        Some(jma_mail::tui::install().with_filter(tracing::level_filters::LevelFilter::INFO))
+    } else {
+        None
+    };
 
     // Build the optional profile layer + sink up front. The layer
     // installs alongside fmt_layer; the sink rides through the
@@ -62,6 +110,7 @@ async fn main() -> Result<()> {
             .with_target(profile::TARGET_FILE_OP, tracing::Level::TRACE);
         tracing_subscriber::registry()
             .with(fmt_layer)
+            .with(tui_layer)
             .with(layer.with_filter(target_filter))
             .init();
         Some(ProfileSink {
@@ -70,17 +119,12 @@ async fn main() -> Result<()> {
             json_path: cli.profile_json.clone(),
         })
     } else {
-        tracing_subscriber::registry().with(fmt_layer).init();
+        tracing_subscriber::registry()
+            .with(fmt_layer)
+            .with(tui_layer)
+            .init();
         None
     };
-
-    let command = cli.command.clone().unwrap_or(Command::Sync {
-        args: cli.sync.clone(),
-    });
-    // Capture the discriminant up front: the Auth match arm
-    // partial-moves `account` out of `command`, so any later check
-    // against `command` would otherwise fail to compile.
-    let is_watch = matches!(command, Command::Watch);
 
     jma_mail::notify!("Running jma version {}", env!("JMA_VERSION"));
 
@@ -91,7 +135,7 @@ async fn main() -> Result<()> {
         Command::Sync { args } => cmd_sync(&cli, args.dry_run).await,
         Command::Pull { dry_run } => cmd_pull(&cli, dry_run).await,
         Command::Push { dry_run } => cmd_push(&cli, dry_run).await,
-        Command::Watch => cmd_watch(&cli, profile_sink.clone()).await,
+        Command::Watch { .. } => cmd_watch(&cli, profile_sink.clone()).await,
         Command::Auth { action, account } => cmd_auth(&cli, action, account).await,
         Command::Janitor { action } => cmd_janitor(&cli, action).await,
     };
@@ -577,9 +621,44 @@ async fn cmd_watch(cli: &Cli, profile_sink: Option<ProfileSink>) -> Result<()> {
     acquire_mutator_locks(&config)?;
     let conn = state::db::open_or_recreate(&config.db_path())?;
 
-    daemon::runner::run(&conn, &config, profile_sink).await?;
+    // The TUI is wired up in main(), which means `tui::state()` is
+    // Some(...) exactly when we decided to run with one. No TUI ->
+    // run the daemon directly, plain stderr/stdout as before.
+    let Some(tui_state) = jma_mail::tui::state() else {
+        daemon::runner::run(&conn, &config, profile_sink).await?;
+        return Ok(());
+    };
 
-    Ok(())
+    // Pair the daemon with the render thread on a shared shutdown
+    // signal. 'q' / Esc / Ctrl-C in the render thread notifies us;
+    // we then drop the daemon future, which propagates cancellation
+    // through every awaited subtask (SSE listener, FS watcher,
+    // running sync). The drop path doesn't run `fs_handle.abort()`
+    // explicitly the way a clean exit would, but the process is on
+    // its way out anyway -- detached tasks ride the runtime drop
+    // when main returns.
+    let shutdown = Arc::new(Notify::new());
+    let render_state = tui_state.clone();
+    let render_shutdown = shutdown.clone();
+    let render_handle = tokio::task::spawn_blocking(move || {
+        jma_mail::tui::render::run(render_state, render_shutdown)
+    });
+
+    let daemon_fut = daemon::runner::run(&conn, &config, profile_sink);
+    tokio::pin!(daemon_fut);
+
+    let daemon_result = tokio::select! {
+        res = &mut daemon_fut => res,
+        _ = shutdown.notified() => Ok(()),
+    };
+
+    // Make sure the render thread is torn down (terminal restored)
+    // before we return. If the daemon exited first, the render
+    // thread is still polling for input -- nudge it to quit.
+    shutdown.notify_waiters();
+    let _ = render_handle.await;
+
+    daemon_result
 }
 
 async fn cmd_janitor(cli: &Cli, action: Option<JanitorAction>) -> Result<()> {
