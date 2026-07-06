@@ -51,11 +51,14 @@ pub struct TuiState {
 
 struct Inner {
     log: VecDeque<LogLine>,
-    /// Lines above the live tail. 0 means "follow the bottom" --
-    /// new entries auto-appear. >0 means the user has scrolled
-    /// back; `push_log` increments the offset in lockstep so the
-    /// pinned content doesn't drift as new lines arrive.
-    log_scroll: usize,
+    /// Monotonic count of every line ever pushed -- never decremented,
+    /// even when the ring evicts from the front. It gives each entry a
+    /// stable identity (its push ordinal): the render pins a
+    /// scrolled-back viewport to one entry by ordinal so the same
+    /// content stays put across resizes and new arrivals, however the
+    /// wrapping shifts. Wraparound is not a concern at any realistic
+    /// log rate.
+    pushed_total: u64,
     /// Most recent `notify!` line. Single-slot rather than a ring
     /// because the status bar shows one milestone at a time -- the
     /// log pane already holds history, so older milestones aren't
@@ -228,7 +231,7 @@ impl TuiState {
         Self {
             inner: Mutex::new(Inner {
                 log: VecDeque::with_capacity(LOG_CAPACITY),
-                log_scroll: 0,
+                pushed_total: 0,
                 status: None,
                 bytes_in_total: 0,
                 bytes_out_total: 0,
@@ -248,84 +251,46 @@ impl TuiState {
     /// already at LOG_CAPACITY. Cheap enough to call from every
     /// tracing event the layer captures.
     ///
-    /// When the user has scrolled back (log_scroll > 0), bumping the
-    /// offset by 1 keeps the pinned content visually stable: the
-    /// "distance from newest" framing means a new line at the bottom
-    /// would shift the visible window otherwise. The bump is clamped
-    /// to `log.len() - 1` so the user can't accidentally scroll past
-    /// the oldest available line via incoming-traffic drift.
+    /// `pushed_total` bumps on every call so each entry gets a stable
+    /// push ordinal; the render uses it to keep a scrolled-back
+    /// viewport pinned to the same entry as new lines arrive.
     pub fn push_log(&self, line: LogLine) {
         let mut i = self.inner.lock().expect("tui state mutex");
         if i.log.len() == LOG_CAPACITY {
             i.log.pop_front();
         }
         i.log.push_back(line);
-        if i.log_scroll > 0 {
-            let max = i.log.len().saturating_sub(1);
-            i.log_scroll = (i.log_scroll + 1).min(max);
-        }
+        i.pushed_total += 1;
     }
 
-    /// Snapshot a height-tall window of the log buffer.
+    /// Snapshot the whole log buffer for rendering, along with the
+    /// monotonic push counter.
     ///
-    /// Returns the lines to render plus the scroll offset (0 means
-    /// live-following) -- the render path uses the offset to surface
-    /// a "[scrolled +N]" indicator in the title.
-    pub fn log_view(&self, height: usize) -> LogView {
+    /// The render wraps the lines itself -- only it knows the pane
+    /// width -- so it needs the raw entries, not a pre-sliced window,
+    /// and it owns the scroll position (which entry is pinned). The
+    /// counter lets it map that pinned entry's push ordinal to a
+    /// current buffer index; the oldest buffered entry's ordinal is
+    /// `pushed_total - lines.len()`. The buffer is bounded by
+    /// LOG_CAPACITY, so the clone is a fixed ceiling regardless of
+    /// uptime.
+    pub fn log_snapshot(&self) -> LogSnapshot {
         let i = self.inner.lock().expect("tui state mutex");
-        let total = i.log.len();
-        let end = total.saturating_sub(i.log_scroll);
-        let start = end.saturating_sub(height);
-        let lines: Vec<LogLine> = i
-            .log
-            .iter()
-            .skip(start)
-            .take(end - start)
-            .cloned()
-            .collect();
-        LogView {
-            lines,
-            scroll: i.log_scroll,
+        LogSnapshot {
+            lines: i.log.iter().cloned().collect(),
+            pushed_total: i.pushed_total,
         }
-    }
-
-    /// Scroll the log view by `delta` lines toward the past. Clamped
-    /// so we never pin past the oldest available line. `height` is
-    /// the visible row count, used to compute the clamp.
-    pub fn scroll_log_back(&self, delta: usize, height: usize) {
-        let mut i = self.inner.lock().expect("tui state mutex");
-        let max = i.log.len().saturating_sub(height);
-        i.log_scroll = (i.log_scroll + delta).min(max);
-    }
-
-    /// Scroll the log view by `delta` lines toward the present. A
-    /// move past the live tail collapses to 0 (back on the bottom,
-    /// auto-follow re-enabled).
-    pub fn scroll_log_forward(&self, delta: usize) {
-        let mut i = self.inner.lock().expect("tui state mutex");
-        i.log_scroll = i.log_scroll.saturating_sub(delta);
-    }
-
-    /// Jump to the top of the buffer (or as close to it as the ring
-    /// still holds). `height` is the visible row count.
-    pub fn scroll_log_to_top(&self, height: usize) {
-        let mut i = self.inner.lock().expect("tui state mutex");
-        i.log_scroll = i.log.len().saturating_sub(height);
-    }
-
-    /// Jump back to the live tail.
-    pub fn scroll_log_to_bottom(&self) {
-        let mut i = self.inner.lock().expect("tui state mutex");
-        i.log_scroll = 0;
     }
 }
 
-/// Snapshot returned by `log_view`. `lines` is the formatted-ready
-/// window; `scroll` is the current offset from the tail (0 means
-/// live-following) so the render path can decorate the title.
-pub struct LogView {
+/// Snapshot returned by `log_snapshot`: the full log buffer plus the
+/// push counter the render needs to place the scroll viewport.
+pub struct LogSnapshot {
+    /// Every buffered entry, oldest first.
     pub lines: Vec<LogLine>,
-    pub scroll: usize,
+    /// Monotonic count of lines ever pushed. The oldest buffered
+    /// entry's push ordinal is `pushed_total - lines.len()`.
+    pub pushed_total: u64,
 }
 
 impl TuiState {
@@ -566,7 +531,7 @@ mod tests {
         for i in 0..(LOG_CAPACITY + 3) {
             state.push_log(line(&format!("line {}", i)));
         }
-        let logs = state.log_view(LOG_CAPACITY + 3).lines;
+        let logs = state.log_snapshot().lines;
         assert_eq!(logs.len(), LOG_CAPACITY);
         assert_eq!(logs.first().unwrap().message, "line 3");
         assert_eq!(
@@ -742,60 +707,27 @@ mod tests {
         }
     }
 
-    /// Default view is the live tail: scroll == 0, last `height`
-    /// lines, and a height taller than the buffer returns everything
-    /// without panicking. Pins the "no scroll, no surprises" baseline
-    /// so a future refactor that defaults to a non-zero offset is
-    /// caught.
+    /// A fresh snapshot hands back the whole buffer in order and counts
+    /// every push -- the render, not the state, decides how many rows
+    /// fit and which entry is pinned. `pushed_total` is what lets the
+    /// render turn a pinned entry's ordinal into a buffer index, so pin
+    /// down that it tracks every push and survives eviction.
     #[test]
-    fn log_view_at_tail_shows_newest() {
+    fn log_snapshot_returns_all_lines_and_counts_pushes() {
         let state = TuiState::new();
         push_n(&state, 10);
-        let view = state.log_view(3);
-        assert_eq!(view.scroll, 0);
-        let msgs: Vec<_> = view.lines.iter().map(|l| l.message.clone()).collect();
-        assert_eq!(msgs, vec!["line 7", "line 8", "line 9"]);
-        assert_eq!(state.log_view(50).lines.len(), 10);
-    }
+        let snap = state.log_snapshot();
+        assert_eq!(snap.pushed_total, 10);
+        assert_eq!(snap.lines.len(), 10);
+        assert_eq!(snap.lines.first().unwrap().message, "line 0");
+        assert_eq!(snap.lines.last().unwrap().message, "line 9");
 
-    /// When the user is scrolled back, a new push must bump the
-    /// offset by 1 so the pinned content stays where the eye left
-    /// it. Without this, a steady incoming-log stream would drag
-    /// the visible window forward and the user would lose their
-    /// reading position. Critical UX invariant -- regress this and
-    /// scrollback is useless during active sync.
-    #[test]
-    fn push_log_keeps_pinned_content_stable() {
-        let state = TuiState::new();
-        push_n(&state, 10);
-        state.scroll_log_back(3, 3); // pin showing lines 4..7
-        let before = state.log_view(3);
-        assert_eq!(
-            before.lines.iter().map(|l| &l.message).collect::<Vec<_>>(),
-            vec!["line 4", "line 5", "line 6"]
-        );
-
-        push_n(&state, 5); // 15 lines total now, scroll auto-bumped
-
-        let after = state.log_view(3);
-        // Same window content as before -- not the new lines.
-        assert_eq!(
-            after.lines.iter().map(|l| &l.message).collect::<Vec<_>>(),
-            vec!["line 4", "line 5", "line 6"]
-        );
-    }
-
-    /// End / scroll_log_to_bottom snaps back to the live tail and
-    /// re-enables auto-follow (scroll == 0). Important enough to
-    /// pin because it's the user's escape hatch when they're done
-    /// reading scrollback.
-    #[test]
-    fn scroll_to_bottom_re_enables_follow() {
-        let state = TuiState::new();
-        push_n(&state, 10);
-        state.scroll_log_back(5, 3);
-        assert!(state.log_view(3).scroll > 0);
-        state.scroll_log_to_bottom();
-        assert_eq!(state.log_view(3).scroll, 0);
+        // Past capacity the counter keeps climbing while the buffer
+        // stays capped, so `pushed_total - len` names the oldest
+        // surviving entry's ordinal.
+        push_n(&state, LOG_CAPACITY);
+        let snap = state.log_snapshot();
+        assert_eq!(snap.pushed_total as usize, 10 + LOG_CAPACITY);
+        assert_eq!(snap.lines.len(), LOG_CAPACITY);
     }
 }

@@ -129,7 +129,12 @@ libc = "0.2"
 # the watch command activates the TUI -- one-shot sync still prints
 # plain text -- so these are unconditional deps but the runtime cost
 # is paid only when `jma watch` is interactive.
-ratatui = "0.29"
+#
+# `unstable-rendered-line-info` unlocks `Paragraph::line_count`, which
+# the log pane uses to measure how many visual rows its wrapped lines
+# occupy so it can bottom-anchor the newest line (draw_log). The
+# version is pinned, so the "unstable" API can't shift under us.
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 crossterm = "0.28"
 
 [target.'cfg(target_os = "macos")'.dependencies]

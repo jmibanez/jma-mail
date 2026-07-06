@@ -131,17 +131,17 @@ fn run_loop(
     shutdown: &Arc<Notify>,
     manual_sync: &Arc<Notify>,
 ) -> Result<()> {
-    // `last_log_height` is written by draw_log on each render and
-    // read by the scroll-key handler so PgUp/PgDn jumps match the
-    // visible-row count. A 1-row default keeps any initial key
-    // press before the first draw from dividing by zero -- the
-    // first frame overwrites it immediately.
-    let mut last_log_height: u16 = 1;
+    // The log pane's scroll position lives here, not in `TuiState`:
+    // only the render touches it, and resolving it needs the pane width
+    // the shared state never sees. Key presses record their intent on
+    // it; the next `draw_log` resolves that intent against the current
+    // wrapping.
+    let mut log_scroll = LogScroll::default();
     let mut show_help = false;
     loop {
         terminal
             .draw(|frame| {
-                last_log_height = draw(frame, &state, show_help);
+                draw(frame, &state, show_help, &mut log_scroll);
             })
             .context("draw frame")?;
 
@@ -168,8 +168,51 @@ fn run_loop(
                 shutdown.notify_waiters();
                 return Ok(());
             } else {
-                handle_scroll_key(key, &state, last_log_height);
+                handle_scroll_key(key, &mut log_scroll);
             }
+        }
+    }
+}
+
+/// Which log entry the scroll viewport is anchored to. `Follow` tracks
+/// the live tail (newest at the bottom). `Pinned` fixes a specific
+/// entry -- identified by its monotonic push ordinal (`seq`) -- at a
+/// given sub-row of the viewport's top, so the same content stays put
+/// across resizes and new arrivals however the wrapping shifts. The
+/// render re-derives the pixel offset from this every frame; the offset
+/// itself is never stored.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Anchor {
+    Follow,
+    Pinned { seq: u64, row: usize },
+}
+
+/// One deferred scroll action. The run loop reads at most one key event
+/// between draws, so at most one lands here per frame; `draw_log`
+/// applies it once it knows the pane width the motion depends on.
+#[derive(Clone, Copy)]
+enum ScrollCmd {
+    LineUp,
+    LineDown,
+    PageUp,
+    PageDown,
+    Home,
+    End,
+}
+
+/// Render-owned scroll state for the log pane: where the viewport is
+/// anchored plus a pending key action awaiting the next frame's
+/// width-aware resolution.
+struct LogScroll {
+    anchor: Anchor,
+    pending: Option<ScrollCmd>,
+}
+
+impl Default for LogScroll {
+    fn default() -> Self {
+        Self {
+            anchor: Anchor::Follow,
+            pending: None,
         }
     }
 }
@@ -202,24 +245,24 @@ fn is_sync_key(key: KeyEvent) -> bool {
     key.kind == KeyEventKind::Press && key.code == KeyCode::Char('s')
 }
 
-/// Map cursor / paging keys to log-pane scroll actions. No-ops on
-/// any other key. `pane_height` is the most recently observed log-
-/// pane height -- PgUp/PgDn use it for one-screen jumps so the
-/// motion matches what the user can see.
-fn handle_scroll_key(key: KeyEvent, state: &TuiState, pane_height: u16) {
+/// Record a cursor / paging key as a pending scroll action. No-ops on
+/// any other key. The motion is resolved in *visible rows* by the next
+/// `draw_log` (arrows move one row, PgUp/PgDn a full pane), which is the
+/// only place the pane width -- and thus the wrapping -- is known.
+fn handle_scroll_key(key: KeyEvent, scroll: &mut LogScroll) {
     if key.kind != KeyEventKind::Press {
         return;
     }
-    let h = pane_height.max(1) as usize;
-    match key.code {
-        KeyCode::Up => state.scroll_log_back(1, h),
-        KeyCode::Down => state.scroll_log_forward(1),
-        KeyCode::PageUp => state.scroll_log_back(h, h),
-        KeyCode::PageDown => state.scroll_log_forward(h),
-        KeyCode::Home => state.scroll_log_to_top(h),
-        KeyCode::End => state.scroll_log_to_bottom(),
-        _ => {}
-    }
+    let cmd = match key.code {
+        KeyCode::Up => ScrollCmd::LineUp,
+        KeyCode::Down => ScrollCmd::LineDown,
+        KeyCode::PageUp => ScrollCmd::PageUp,
+        KeyCode::PageDown => ScrollCmd::PageDown,
+        KeyCode::Home => ScrollCmd::Home,
+        KeyCode::End => ScrollCmd::End,
+        _ => return,
+    };
+    scroll.pending = Some(cmd);
 }
 
 fn is_quit_key(key: KeyEvent) -> bool {
@@ -233,9 +276,7 @@ fn is_quit_key(key: KeyEvent) -> bool {
     }
 }
 
-/// Returns the log pane's inner height so the loop can use it for
-/// PgUp/PgDn jump sizing on the next key event.
-fn draw(frame: &mut ratatui::Frame<'_>, state: &TuiState, show_help: bool) -> u16 {
+fn draw(frame: &mut ratatui::Frame<'_>, state: &TuiState, show_help: bool, scroll: &mut LogScroll) {
     let area = frame.area();
     // Three rows: metrics (top half), log (most of bottom half), and
     // a single-row status bar at the very bottom that absorbs
@@ -252,12 +293,11 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &TuiState, show_help: bool) -> u1
         .split(area);
 
     draw_metrics(frame, chunks[0], state);
-    let log_height = draw_log(frame, chunks[1], state);
+    draw_log(frame, chunks[1], state, scroll);
     draw_status_bar(frame, chunks[2], state);
     if show_help {
         draw_help_overlay(frame);
     }
-    log_height
 }
 
 /// Centered overlay listing every key binding. The idle status hint
@@ -519,27 +559,150 @@ fn format_rate(bps: f64) -> String {
 }
 
 /// Bottom half: log pane. Renders the lines visible at the current
-/// scroll position; level gets a color hint, target is dimmed,
-/// message takes the rest of the line. Title shows "[scrolled +N]"
-/// when the user has paged back from the live tail so the deviation
-/// is obvious at a glance. Returns the inner pane height so the
-/// run loop can size PgUp/PgDn jumps against what's actually on
-/// screen.
-fn draw_log(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) -> u16 {
-    let inner_height = area.height.saturating_sub(2);
-    let view = state.log_view(inner_height as usize);
-    let title = if view.scroll > 0 {
-        format!(" Log [scrolled +{}] ", view.scroll)
+/// scroll position; level gets a color hint, target is dimmed, message
+/// takes the rest of the line. Title shows "[scrolled +N]" (visual rows
+/// back from the live tail) when the user has scrolled away from the
+/// bottom.
+///
+/// Scrolling is anchored to a log *entry*, not a pixel offset (see
+/// [`Anchor`]). Each frame this resolves the anchor against the current
+/// wrapping, applies at most one pending key action in visible-row
+/// units, then re-derives the anchor from the resulting position. That
+/// single "re-resolve" is what keeps a scrolled-back view pinned to the
+/// same content across a terminal resize (which re-wraps every line) or
+/// new arrivals at the tail (which shift entry indices) -- the pinned
+/// entry's ordinal is stable even as its pixel row moves.
+fn draw_log(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState, scroll: &mut LogScroll) {
+    let inner_width = area.width.saturating_sub(2);
+    let pane_rows = area.height.saturating_sub(2) as usize;
+    let snapshot = state.log_snapshot();
+    let len = snapshot.lines.len();
+
+    // Build the display lines once. A following view needs only the
+    // total wrapped height; only a scrolled-back (pinned) view needs
+    // each entry's row span, so the per-entry prefix sums are computed
+    // lazily below and a following frame skips them entirely.
+    let rendered: Vec<Line> = snapshot
+        .lines
+        .iter()
+        .cloned()
+        .map(format_log_line)
+        .collect();
+    let paragraph = Paragraph::new(rendered).wrap(Wrap { trim: false });
+
+    // Total wrapped height in one whole-buffer pass: same WordWrapper
+    // and width as the render path, with no block yet so there are no
+    // border rows to subtract.
+    let total_rows = paragraph.line_count(inner_width);
+    let max_top = total_rows.saturating_sub(pane_rows);
+    // Push ordinal of the oldest still-buffered entry: entry i carries
+    // ordinal `oldest_seq + i`.
+    let oldest_seq = snapshot.pushed_total.saturating_sub(len as u64);
+
+    // `starts[i]` is the first visual row of entry i and `starts[len]`
+    // the total. Placing a pinned entry is the only thing that needs
+    // it, so build it at most once, and only when the scroll position
+    // actually touches an entry.
+    let mut starts: Option<Vec<usize>> = None;
+
+    // Resolve the anchor to a top visual-row index.
+    let mut top = match scroll.anchor {
+        Anchor::Follow => max_top,
+        Anchor::Pinned { seq, row } => {
+            if len == 0 || seq < oldest_seq {
+                // The pinned entry has aged out of the ring; fall back
+                // to the oldest surviving row.
+                0
+            } else {
+                let s = starts.get_or_insert_with(|| entry_starts(&snapshot.lines, inner_width));
+                let idx = ((seq - oldest_seq) as usize).min(len - 1);
+                // A narrower pane may have shrunk this entry; clamp the
+                // sub-row into its current height.
+                let height = s[idx + 1] - s[idx];
+                s[idx] + row.min(height.saturating_sub(1))
+            }
+        }
+    };
+
+    // Apply the one pending key action (the run loop reads a single
+    // event between draws). Everything is in visible rows.
+    let mut follow = matches!(scroll.anchor, Anchor::Follow);
+    match scroll.pending.take() {
+        Some(ScrollCmd::LineUp) => {
+            top = top.saturating_sub(1);
+            follow = false;
+        }
+        Some(ScrollCmd::PageUp) => {
+            top = top.saturating_sub(pane_rows);
+            follow = false;
+        }
+        Some(ScrollCmd::LineDown) => {
+            top += 1;
+            follow = top >= max_top;
+        }
+        Some(ScrollCmd::PageDown) => {
+            top += pane_rows;
+            follow = top >= max_top;
+        }
+        Some(ScrollCmd::Home) => {
+            top = 0;
+            follow = false;
+        }
+        Some(ScrollCmd::End) => follow = true,
+        None => {}
+    }
+    top = top.min(max_top);
+
+    // Persist the anchor for the next frame. Reaching the tail (or End)
+    // re-enables follow; otherwise pin to the entry now at the viewport
+    // top so resize and new arrivals hold it in place.
+    scroll.anchor = if follow || total_rows == 0 {
+        Anchor::Follow
+    } else {
+        let s = starts.get_or_insert_with(|| entry_starts(&snapshot.lines, inner_width));
+        let idx = line_at_row(s, top).min(len.saturating_sub(1));
+        Anchor::Pinned {
+            seq: oldest_seq + idx as u64,
+            row: top - s[idx],
+        }
+    };
+
+    let scrolled = max_top - top;
+    let title = if scrolled > 0 {
+        format!(" Log [scrolled +{}] ", scrolled)
     } else {
         " Log ".to_string()
     };
-    let block = Block::default().borders(Borders::ALL).title(title);
-    let lines: Vec<Line> = view.lines.into_iter().map(format_log_line).collect();
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: false });
+    let paragraph = paragraph
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .scroll((u16::try_from(top).unwrap_or(u16::MAX), 0));
     frame.render_widget(paragraph, area);
-    inner_height
+}
+
+/// Per-entry visual-row prefix sums at `width`: `starts[i]` is the
+/// first row of entry i and `starts[len]` the total wrapped height.
+/// Only a scrolled-back view needs these, so this stays off the common
+/// path. Formats and wraps each entry with the same WordWrapper the
+/// render uses; WordWrapper never merges two logical lines, so entry
+/// spans are independent and this matches what ratatui draws.
+fn entry_starts(lines: &[LogLine], width: u16) -> Vec<usize> {
+    let mut starts = Vec::with_capacity(lines.len() + 1);
+    let mut acc = 0usize;
+    for line in lines {
+        starts.push(acc);
+        acc += Paragraph::new(format_log_line(line.clone()))
+            .wrap(Wrap { trim: false })
+            .line_count(width);
+    }
+    starts.push(acc);
+    starts
+}
+
+/// Index of the entry whose visual-row span contains `row`. `starts` is
+/// ascending with a trailing total-rows sentinel, so the containing
+/// entry is one before the first start that exceeds `row`.
+fn line_at_row(starts: &[usize], row: usize) -> usize {
+    starts.partition_point(|&s| s <= row).saturating_sub(1)
 }
 
 /// Single-row status bar at the very bottom. Left half carries the
@@ -822,5 +985,266 @@ mod tests {
     fn truncate_degenerate_widths() {
         assert_eq!(truncate_with_ellipsis("hello", 0), "");
         assert_eq!(truncate_with_ellipsis("hello", 1), "h");
+    }
+
+    /// Push `n` lines whose messages are long enough to wrap at any
+    /// realistic pane width -- helper for the scroll tests. Entry `i`
+    /// carries the marker `L{i:02}`.
+    fn push_wrapping(state: &TuiState, n: usize) {
+        for i in 0..n {
+            state.push_log(LogLine {
+                ts: chrono::Utc::now(),
+                level: tracing::Level::INFO,
+                target: "t".into(),
+                message: format!("L{:02}-{}", i, "x".repeat(40)),
+            });
+        }
+    }
+
+    /// The inner rows of a bordered pane (borders stripped), as strings.
+    fn inner_rows(
+        terminal: &Terminal<ratatui::backend::TestBackend>,
+        w: u16,
+        h: u16,
+    ) -> Vec<String> {
+        let buf = terminal.backend().buffer();
+        (1..h - 1)
+            .map(|y| (1..w - 1).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect()
+    }
+
+    /// Render the log pane into a fresh `w`x`h` terminal, applying any
+    /// pending scroll action, and return its inner rows.
+    fn render_scroll(state: &TuiState, scroll: &mut LogScroll, w: u16, h: u16) -> Vec<String> {
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_log(frame, area, state, scroll);
+            })
+            .unwrap();
+        inner_rows(&terminal, w, h)
+    }
+
+    /// A following view keeps the newest line on screen even when lines
+    /// wrap past the pane height: the entries wrap top-down and would
+    /// otherwise clip the tail, hiding exactly the lines the user most
+    /// wants to see. Six lines wider than the pane overflow it, so a
+    /// naive top-anchored render would show the oldest and drop the
+    /// newest; the anchor pins the tail instead.
+    #[test]
+    fn following_view_keeps_newest_line_visible_when_lines_wrap() {
+        let state = TuiState::new();
+        push_wrapping(&state, 6);
+
+        // Inner area is 28 wide x 6 tall; six wrapping lines overflow it.
+        let mut scroll = LogScroll::default();
+        let rendered = render_scroll(&state, &mut scroll, 30, 8).join("\n");
+
+        assert!(
+            rendered.contains("L05"),
+            "newest line was clipped off the bottom: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("L00"),
+            "oldest line should have scrolled off the top: {rendered:?}"
+        );
+    }
+
+    /// Scrolling back one row moves the viewport by a single *visual*
+    /// row, not a whole logical entry: the new view is the old one
+    /// shifted down by exactly one row, with one older row revealed at
+    /// the top. A logical-line scroll would jump a full wrapped entry
+    /// (several rows) and this equality would not hold.
+    #[test]
+    fn scrolling_back_one_row_shifts_a_single_visual_row() {
+        let (w, h) = (24, 10); // inner 22 x 8; L-lines wrap to ~3 rows
+        let state = TuiState::new();
+        push_wrapping(&state, 12);
+
+        let mut scroll = LogScroll::default();
+        let at_tail = render_scroll(&state, &mut scroll, w, h);
+        scroll.pending = Some(ScrollCmd::LineUp);
+        let scrolled = render_scroll(&state, &mut scroll, w, h);
+
+        // One row of older content appeared at the top, and everything
+        // else slid down by one row.
+        let pane_rows = (h - 2) as usize;
+        assert_eq!(
+            scrolled[1..pane_rows],
+            at_tail[0..pane_rows - 1],
+            "a one-row scroll should shift the view by exactly one visual row"
+        );
+        assert_ne!(
+            scrolled[0], at_tail[0],
+            "a new older row should be revealed at the top"
+        );
+    }
+
+    /// A page press moves exactly one screenful of visible rows: one
+    /// PageUp lands on the same content as `pane_rows` single-row steps.
+    /// This is the property the original logical-line paging broke.
+    #[test]
+    fn page_scroll_equals_a_screenful_of_line_scrolls() {
+        let (w, h) = (24, 12);
+        let pane_rows = (h - 2) as usize;
+        let state = TuiState::new();
+        push_wrapping(&state, 20);
+
+        let mut paged = LogScroll::default();
+        let _ = render_scroll(&state, &mut paged, w, h);
+        paged.pending = Some(ScrollCmd::PageUp);
+        let paged_rows = render_scroll(&state, &mut paged, w, h);
+
+        let mut stepped = LogScroll::default();
+        let mut stepped_rows = render_scroll(&state, &mut stepped, w, h);
+        for _ in 0..pane_rows {
+            stepped.pending = Some(ScrollCmd::LineUp);
+            stepped_rows = render_scroll(&state, &mut stepped, w, h);
+        }
+
+        assert_eq!(
+            paged_rows, stepped_rows,
+            "PageUp should move exactly one pane of visible rows"
+        );
+    }
+
+    /// While scrolled back, lines arriving at the tail must not drag the
+    /// pinned content off its spot. The anchor names a specific entry,
+    /// so re-resolving it after new pushes leaves the same rows on
+    /// screen -- no width-dependent bookkeeping at push time.
+    #[test]
+    fn scrolled_back_view_is_stable_across_appends() {
+        let (w, h) = (24, 10);
+        let state = TuiState::new();
+        push_wrapping(&state, 12);
+
+        let mut scroll = LogScroll::default();
+        let _ = render_scroll(&state, &mut scroll, w, h);
+        scroll.pending = Some(ScrollCmd::PageUp);
+        let before = render_scroll(&state, &mut scroll, w, h);
+
+        // New lines land at the tail; the pinned view must not move.
+        push_wrapping(&state, 3);
+        let after = render_scroll(&state, &mut scroll, w, h);
+
+        assert_eq!(
+            before, after,
+            "appends at the tail dragged a scrolled-back view off its spot"
+        );
+    }
+
+    /// The heart of the resize fix: a pinned entry stays put when the
+    /// terminal is resized, whether the new width wraps its lines more
+    /// or less. Home pins the oldest entry; widening (fewer wraps) and
+    /// narrowing (more wraps) both keep that same entry -- identified by
+    /// its stable push ordinal -- at the top of the pane.
+    #[test]
+    fn resize_keeps_the_pinned_entry_in_place() {
+        let state = TuiState::new();
+        push_wrapping(&state, 20);
+
+        let mut scroll = LogScroll::default();
+        let _ = render_scroll(&state, &mut scroll, 30, 12);
+        scroll.pending = Some(ScrollCmd::Home);
+
+        // Pin the oldest entry (ordinal 0) at the top.
+        for (w, note) in [(30u16, "initial"), (60, "wider"), (20, "narrower")] {
+            let pane = render_scroll(&state, &mut scroll, w, 12).join("\n");
+            assert_eq!(
+                scroll.anchor,
+                Anchor::Pinned { seq: 0, row: 0 },
+                "resize to {note} lost the pinned entry"
+            );
+            assert!(
+                pane.contains("L00"),
+                "pinned oldest entry vanished after resize to {note}: {pane:?}"
+            );
+            assert!(
+                !pane.contains("L19"),
+                "newest entry should stay off-screen after resize to {note}: {pane:?}"
+            );
+        }
+    }
+
+    /// Widening can shrink the pinned entry to fewer rows than the
+    /// sub-row the viewport was resting on. The sub-row must clamp into
+    /// the entry's new height so the anchor stays on that entry rather
+    /// than sliding onto the next one.
+    #[test]
+    fn resize_wider_keeps_a_mid_entry_pin_from_sliding() {
+        let state = TuiState::new();
+        push_wrapping(&state, 20);
+
+        let mut scroll = LogScroll::default();
+        let _ = render_scroll(&state, &mut scroll, 24, 12);
+        // Pin the oldest entry, then step one row into it: at width 24
+        // it wraps to several rows, so the sub-row is non-zero.
+        scroll.pending = Some(ScrollCmd::Home);
+        let _ = render_scroll(&state, &mut scroll, 24, 12);
+        scroll.pending = Some(ScrollCmd::LineDown);
+        let _ = render_scroll(&state, &mut scroll, 24, 12);
+        let pinned_seq = match scroll.anchor {
+            Anchor::Pinned { seq, row } => {
+                assert!(row > 0, "expected a non-zero sub-row to exercise the clamp");
+                seq
+            }
+            Anchor::Follow => panic!("expected a pinned anchor"),
+        };
+
+        // Widen so the pinned entry collapses to a single row (< the
+        // sub-row). The anchor must stay on the same entry.
+        let wide = render_scroll(&state, &mut scroll, 70, 12).join("\n");
+        assert!(
+            matches!(scroll.anchor, Anchor::Pinned { seq, .. } if seq == pinned_seq),
+            "widening slid the anchor off its entry: {:?}",
+            scroll.anchor
+        );
+        assert!(wide.contains(&format!("L{pinned_seq:02}")));
+    }
+
+    /// A following view stays glued to the tail across a resize: the
+    /// newest line is on screen at every width, no matter how the
+    /// wrapping changes.
+    #[test]
+    fn following_view_tracks_tail_across_resize() {
+        let state = TuiState::new();
+        push_wrapping(&state, 20);
+
+        let mut scroll = LogScroll::default();
+        for w in [30u16, 60, 20] {
+            let pane = render_scroll(&state, &mut scroll, w, 12).join("\n");
+            assert_eq!(scroll.anchor, Anchor::Follow);
+            assert!(
+                pane.contains("L19"),
+                "following view lost the tail at width {w}: {pane:?}"
+            );
+        }
+    }
+
+    /// Each cursor / paging key records the matching pending action;
+    /// unrelated keys leave the scroll state alone.
+    #[test]
+    fn scroll_keys_map_to_pending_commands() {
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut scroll = LogScroll::default();
+
+        handle_scroll_key(press(KeyCode::Up), &mut scroll);
+        assert!(matches!(scroll.pending, Some(ScrollCmd::LineUp)));
+        handle_scroll_key(press(KeyCode::Down), &mut scroll);
+        assert!(matches!(scroll.pending, Some(ScrollCmd::LineDown)));
+        handle_scroll_key(press(KeyCode::PageUp), &mut scroll);
+        assert!(matches!(scroll.pending, Some(ScrollCmd::PageUp)));
+        handle_scroll_key(press(KeyCode::PageDown), &mut scroll);
+        assert!(matches!(scroll.pending, Some(ScrollCmd::PageDown)));
+        handle_scroll_key(press(KeyCode::Home), &mut scroll);
+        assert!(matches!(scroll.pending, Some(ScrollCmd::Home)));
+        handle_scroll_key(press(KeyCode::End), &mut scroll);
+        assert!(matches!(scroll.pending, Some(ScrollCmd::End)));
+
+        // An unrelated key doesn't disturb the pending action.
+        handle_scroll_key(press(KeyCode::Char('x')), &mut scroll);
+        assert!(matches!(scroll.pending, Some(ScrollCmd::End)));
     }
 }
