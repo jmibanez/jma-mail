@@ -85,6 +85,17 @@ pub async fn listen(
             }
         }
 
+        // Surface the degraded push channel to the TUI's health
+        // segment: remote changes stop arriving as triggers until
+        // the stream comes back, and that staleness is otherwise
+        // invisible outside the log.
+        tracing::event!(
+            target: crate::tui::layer::TARGET_TUI_CONN,
+            tracing::Level::TRACE,
+            channel = "sse",
+            state = "reconnecting",
+            backoff_ms = backoff.as_millis() as u64,
+        );
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(RECONNECT_MAX_BACKOFF);
     }
@@ -144,6 +155,7 @@ async fn connect_and_listen(
     let mut watchdog = Duration::from_secs(SPEC_MAX_PING_INTERVAL_SECS) + PING_WATCHDOG_SLACK;
     let mut watchdog_negotiated = false;
     let mut parse_failure_logged = false;
+    let mut healthy_reported = false;
 
     loop {
         let next = match tokio::time::timeout(watchdog, es.next()).await {
@@ -161,6 +173,19 @@ async fn connect_and_listen(
             }
             Ok(Event::Message(msg)) => {
                 *backoff = RECONNECT_INITIAL_BACKOFF;
+                if !healthy_reported {
+                    // First data on this connection: report the push
+                    // channel healthy to the TUI. Same evidence bar
+                    // as the backoff reset above -- Event::Open alone
+                    // doesn't prove the server will deliver events.
+                    tracing::event!(
+                        target: crate::tui::layer::TARGET_TUI_CONN,
+                        tracing::Level::TRACE,
+                        channel = "sse",
+                        state = "connected",
+                    );
+                    healthy_reported = true;
+                }
 
                 debug!("SSE event: type={}, data={}", msg.event, msg.data);
 

@@ -30,7 +30,7 @@ use tracing_subscriber::layer::{Context, Layer};
 use tracing_subscriber::registry::LookupSpan;
 
 use crate::profile::{TARGET_BLOB, TARGET_PHASE};
-use crate::tui::state::{Direction, LogLine, TuiState};
+use crate::tui::state::{ConnState, Direction, LogLine, TuiState};
 
 /// Target the executor emits a per-message download-progress event
 /// under. Captured by TuiLayer's on_event into TuiState's live
@@ -42,6 +42,13 @@ pub const TARGET_TUI_PROGRESS: &str = "jma::tui::progress";
 /// (Subject + folder). Captured by TuiLayer into the Recent pane's
 /// ring buffer.
 pub const TARGET_TUI_MESSAGE: &str = "jma::tui::message";
+
+/// Target the daemon emits connection-health transitions under.
+/// Events carry `channel` ("engine" for the JMAP session, "sse" for
+/// the push listener), `state` ("connected" / "reconnecting"), and
+/// `backoff_ms` while reconnecting. Captured by TuiLayer into the
+/// status bar's health segment.
+pub const TARGET_TUI_CONN: &str = "jma::tui::conn";
 
 pub struct TuiLayer {
     state: Arc<TuiState>,
@@ -161,6 +168,23 @@ where
             event.record(&mut visitor);
             if let (Some(folder), Some(subject)) = (visitor.folder, visitor.subject) {
                 self.state.push_recent(folder, subject);
+            }
+            return;
+        }
+        // Connection-health transitions feed the status bar's health
+        // segment. Same TRACE routing rationale as above.
+        if meta.target() == TARGET_TUI_CONN {
+            let mut visitor = ConnVisitor::default();
+            event.record(&mut visitor);
+            if let (Some(channel), Some(state)) =
+                (visitor.channel.as_deref(), visitor.state.as_deref())
+                && let Some(conn) = conn_state_from_event(state, visitor.backoff_ms)
+            {
+                match channel {
+                    "engine" => self.state.set_engine_conn(conn),
+                    "sse" => self.state.set_sse_conn(conn),
+                    _ => {}
+                }
             }
             return;
         }
@@ -289,5 +313,87 @@ impl Visit for MessageVisitor {
         if field.name() == "message" {
             self.message = Some(format!("{:?}", value));
         }
+    }
+}
+
+/// Reads `channel`, `state`, and `backoff_ms` from a
+/// `TARGET_TUI_CONN` event. Channel and state must both be present
+/// for the report to register; a missing backoff on a reconnecting
+/// report renders as zero rather than dropping the transition.
+#[derive(Default)]
+struct ConnVisitor {
+    channel: Option<String>,
+    state: Option<String>,
+    backoff_ms: Option<u64>,
+}
+
+impl Visit for ConnVisitor {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        match field.name() {
+            "channel" => self.channel = Some(value.to_string()),
+            "state" => self.state = Some(value.to_string()),
+            _ => {}
+        }
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        if field.name() == "backoff_ms" {
+            self.backoff_ms = Some(value);
+        }
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        // Same quote-stripping fallback as MessageInfoVisitor, for
+        // call sites that don't pass a `&str` literal.
+        match field.name() {
+            "channel" => self.channel = Some(format!("{:?}", value).trim_matches('"').to_string()),
+            "state" => self.state = Some(format!("{:?}", value).trim_matches('"').to_string()),
+            _ => {}
+        }
+    }
+}
+
+/// Map a `TARGET_TUI_CONN` event's `state` string onto `ConnState`.
+/// Unknown states drop the report on the floor rather than guessing;
+/// the previous displayed state stays until a recognized transition
+/// arrives.
+fn conn_state_from_event(state: &str, backoff_ms: Option<u64>) -> Option<ConnState> {
+    match state {
+        "connected" => Some(ConnState::Connected),
+        "reconnecting" => Some(ConnState::Reconnecting {
+            backoff: std::time::Duration::from_millis(backoff_ms.unwrap_or(0)),
+        }),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// The event-to-state mapping is the layer's contract with the
+    /// daemon's emit sites: recognized states convert (reconnecting
+    /// carries its backoff, defaulting to zero when absent), unknown
+    /// states are dropped so a typo'd emit can't corrupt the display.
+    #[test]
+    fn conn_state_mapping_covers_known_states_and_drops_unknown() {
+        assert_eq!(
+            conn_state_from_event("connected", None),
+            Some(ConnState::Connected)
+        );
+        assert_eq!(
+            conn_state_from_event("reconnecting", Some(8_000)),
+            Some(ConnState::Reconnecting {
+                backoff: Duration::from_secs(8)
+            })
+        );
+        assert_eq!(
+            conn_state_from_event("reconnecting", None),
+            Some(ConnState::Reconnecting {
+                backoff: Duration::ZERO
+            })
+        );
+        assert_eq!(conn_state_from_event("degraded", None), None);
     }
 }

@@ -39,7 +39,8 @@ use std::time::Duration;
 use tokio::sync::Notify;
 
 use crate::tui::state::{
-    ActivePhase, Bandwidth, CompletedPhase, LogLine, Progress, Status, TuiState,
+    ActivePhase, Bandwidth, CompletedPhase, ConnHealth, ConnState, LogLine, Progress, Status,
+    TuiState,
 };
 
 /// Frame cadence. Crossterm's `poll` returns early on key events, so
@@ -429,15 +430,22 @@ fn draw_status_bar(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState)
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(area);
 
-    let left = match state.status() {
-        Some(Status { at, message }) => Line::from(vec![
-            Span::raw(format!(" [{}] ", at.format("%H:%M:%S"))),
-            Span::raw(message),
-        ]),
-        None => Line::from(" jma watch -- arrows/PgUp/PgDn scroll log, q quits "),
-    };
+    let mut left_spans = vec![conn_span(state.conn_health())];
+    match state.status() {
+        Some(Status { at, message }) => {
+            left_spans.push(Span::raw(format!(" [{}] ", at.format("%H:%M:%S"))));
+            left_spans.push(Span::raw(message));
+        }
+        None => {
+            left_spans.push(Span::raw(
+                " jma watch -- arrows/PgUp/PgDn scroll log, q quits ",
+            ));
+        }
+    }
     frame.render_widget(
-        Paragraph::new(left).style(style).alignment(Alignment::Left),
+        Paragraph::new(Line::from(left_spans))
+            .style(style)
+            .alignment(Alignment::Left),
         halves[0],
     );
 
@@ -488,6 +496,38 @@ fn phase_status_line(
     Line::from("")
 }
 
+/// Compact health segment for the status bar's left edge, colored by
+/// severity so degraded states read without consulting the log.
+/// Worst state wins: an engine (JMAP session) outage means sync
+/// itself is down and shows red; a degraded push channel still syncs
+/// on local triggers, so it shows yellow; both healthy is a quiet
+/// green "jmap ok". Before the first report from the daemon the
+/// segment shows a dim "starting".
+fn conn_span(health: ConnHealth) -> Span<'static> {
+    if let Some(ConnState::Reconnecting { backoff }) = health.engine {
+        return Span::styled(
+            format!(" reconnecting {}s ", backoff.as_secs()),
+            Style::default().bg(Color::Red).fg(Color::White),
+        );
+    }
+    if let Some(ConnState::Reconnecting { backoff }) = health.sse {
+        return Span::styled(
+            format!(" push retry {}s ", backoff.as_secs()),
+            Style::default().bg(Color::Yellow).fg(Color::Black),
+        );
+    }
+    if health.engine.is_none() && health.sse.is_none() {
+        return Span::styled(
+            " starting ".to_string(),
+            Style::default().bg(Color::DarkGray).fg(Color::White),
+        );
+    }
+    Span::styled(
+        " jmap ok ".to_string(),
+        Style::default().bg(Color::Green).fg(Color::Black),
+    )
+}
+
 fn format_log_line(line: LogLine) -> Line<'static> {
     let level_style = match line.level {
         tracing::Level::ERROR => Style::default().fg(Color::Red),
@@ -522,6 +562,43 @@ mod tests {
         crate::tui::mark_active(true);
         drop(TerminalGuard);
         assert!(!crate::tui::is_active());
+    }
+
+    /// Worst state wins in the health segment: an engine outage
+    /// outranks a degraded push channel, which outranks healthy; no
+    /// reports at all reads as startup rather than health.
+    #[test]
+    fn conn_span_picks_worst_state_first() {
+        use std::time::Duration;
+        let both_down = ConnHealth {
+            engine: Some(ConnState::Reconnecting {
+                backoff: Duration::from_secs(4),
+            }),
+            sse: Some(ConnState::Reconnecting {
+                backoff: Duration::from_secs(2),
+            }),
+        };
+        assert_eq!(conn_span(both_down).content, " reconnecting 4s ");
+
+        let push_only = ConnHealth {
+            engine: Some(ConnState::Connected),
+            sse: Some(ConnState::Reconnecting {
+                backoff: Duration::from_secs(2),
+            }),
+        };
+        assert_eq!(conn_span(push_only).content, " push retry 2s ");
+
+        let healthy = ConnHealth {
+            engine: Some(ConnState::Connected),
+            sse: Some(ConnState::Connected),
+        };
+        assert_eq!(conn_span(healthy).content, " jmap ok ");
+
+        let unreported = ConnHealth {
+            engine: None,
+            sse: None,
+        };
+        assert_eq!(conn_span(unreported).content, " starting ");
     }
 
     /// Strings within budget pass through untouched -- no gratuitous

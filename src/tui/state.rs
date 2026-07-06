@@ -93,6 +93,33 @@ struct Inner {
     /// uploads are messages the user already saw). Newest at the
     /// back; oldest drops off the front when capacity is reached.
     recent: VecDeque<RecentMessage>,
+    /// Health of the JMAP session as last reported by the daemon
+    /// runner: None until the first report, then Connected or
+    /// Reconnecting. Engine reconnecting means sync itself is down,
+    /// not just the push channel.
+    engine_conn: Option<ConnState>,
+    /// Health of the SSE push channel as reported by the listener's
+    /// internal reconnect loop. Degraded push means remote changes
+    /// stop arriving as triggers until the stream comes back; local
+    /// FS triggers keep working and the listener retries forever.
+    sse_conn: Option<ConnState>,
+}
+
+/// One connection channel's state. Every degraded state is actively
+/// retrying (both the engine and the SSE listener reconnect forever
+/// with backoff), so there is no terminal "down" variant -- the
+/// backoff carries the "how bad is it" signal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnState {
+    Connected,
+    Reconnecting { backoff: Duration },
+}
+
+/// Snapshot of both connection channels for the status bar.
+#[derive(Clone, Copy, Debug)]
+pub struct ConnHealth {
+    pub engine: Option<ConnState>,
+    pub sse: Option<ConnState>,
 }
 
 /// One row in the Recent pane. Subject is decoded -- mailparse's
@@ -194,6 +221,8 @@ impl TuiState {
                 last_phase: None,
                 download_progress: None,
                 recent: VecDeque::with_capacity(RECENT_CAPACITY),
+                engine_conn: None,
+                sse_conn: None,
             }),
         }
     }
@@ -407,6 +436,30 @@ impl TuiState {
         i.recent.iter().skip(start).cloned().collect()
     }
 
+    /// Record the JMAP session channel's state. Latest report wins;
+    /// repeated Reconnecting reports overwrite so the displayed
+    /// backoff tracks the runner's actual retry cadence.
+    pub fn set_engine_conn(&self, state: ConnState) {
+        let mut i = self.inner.lock().expect("tui state mutex");
+        i.engine_conn = Some(state);
+    }
+
+    /// Record the SSE push channel's state. Same latest-wins rule as
+    /// the engine channel.
+    pub fn set_sse_conn(&self, state: ConnState) {
+        let mut i = self.inner.lock().expect("tui state mutex");
+        i.sse_conn = Some(state);
+    }
+
+    /// Snapshot both connection channels for the status bar.
+    pub fn conn_health(&self) -> ConnHealth {
+        let i = self.inner.lock().expect("tui state mutex");
+        ConnHealth {
+            engine: i.engine_conn,
+            sse: i.sse_conn,
+        }
+    }
+
     /// Snapshot the bandwidth panel. Rates are bytes/sec averaged
     /// over `BW_WINDOW`; totals are cumulative since process start.
     /// When the newest sample is older than `BW_IDLE_THRESHOLD`,
@@ -602,6 +655,35 @@ mod tests {
                 format!("subject {}", RECENT_CAPACITY + 1),
             ]
         );
+    }
+
+    /// Latest report wins on both connection channels: a repeated
+    /// Reconnecting overwrites so the displayed backoff tracks the
+    /// runner's doubling, and Connected clears the degraded state.
+    #[test]
+    fn conn_channels_track_latest_report() {
+        let state = TuiState::new();
+        let health = state.conn_health();
+        assert!(health.engine.is_none() && health.sse.is_none());
+
+        state.set_engine_conn(ConnState::Reconnecting {
+            backoff: Duration::from_secs(2),
+        });
+        state.set_engine_conn(ConnState::Reconnecting {
+            backoff: Duration::from_secs(4),
+        });
+        state.set_sse_conn(ConnState::Connected);
+        let health = state.conn_health();
+        assert_eq!(
+            health.engine,
+            Some(ConnState::Reconnecting {
+                backoff: Duration::from_secs(4)
+            })
+        );
+        assert_eq!(health.sse, Some(ConnState::Connected));
+
+        state.set_engine_conn(ConnState::Connected);
+        assert_eq!(state.conn_health().engine, Some(ConnState::Connected));
     }
 
     /// Push `n` sequentially numbered lines -- helper for the

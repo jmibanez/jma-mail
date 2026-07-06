@@ -263,6 +263,17 @@ impl<'a> WatchDaemon<'a> {
                         "Reconnecting after transport error ({:#}); backoff {:?}",
                         e, self.backoff
                     );
+                    // Surface the outage to the TUI's health segment
+                    // before sleeping the backoff away -- the user
+                    // should see "reconnecting" for the whole gap,
+                    // not just the connect attempts.
+                    tracing::event!(
+                        target: crate::tui::layer::TARGET_TUI_CONN,
+                        tracing::Level::TRACE,
+                        channel = "engine",
+                        state = "reconnecting",
+                        backoff_ms = self.backoff.as_millis() as u64,
+                    );
                     tokio::time::sleep(self.backoff).await;
                     self.engine =
                         connect_with_backoff(self.conn, self.config, self.self_writes.clone())
@@ -462,10 +473,23 @@ async fn connect_with_backoff<'a>(
         match SyncEngine::connect(conn, config).await {
             Ok(mut engine) => {
                 engine.set_self_writes(self_writes);
+                tracing::event!(
+                    target: crate::tui::layer::TARGET_TUI_CONN,
+                    tracing::Level::TRACE,
+                    channel = "engine",
+                    state = "connected",
+                );
                 return Ok(engine);
             }
             Err(e) if is_transient_error(&e) => {
                 warn!("Connect failed ({:#}); retrying in {:?}", e, backoff);
+                tracing::event!(
+                    target: crate::tui::layer::TARGET_TUI_CONN,
+                    tracing::Level::TRACE,
+                    channel = "engine",
+                    state = "reconnecting",
+                    backoff_ms = backoff.as_millis() as u64,
+                );
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(RECONNECT_MAX_BACKOFF);
             }
