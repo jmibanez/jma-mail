@@ -54,7 +54,11 @@ const TICK: Duration = Duration::from_millis(100);
 /// the external `shutdown` was triggered). Returns `Err` only if
 /// terminal setup or rendering hits an irrecoverable I/O error; the
 /// caller in `cmd_watch` logs that and tears down regardless.
-pub fn run(state: Arc<TuiState>, shutdown: Arc<Notify>) -> Result<()> {
+///
+/// `manual_sync` is notified when the user presses 's'; the caller
+/// wires it to the daemon as a sync trigger. The TUI knows nothing
+/// about triggers -- it just raises the signal.
+pub fn run(state: Arc<TuiState>, shutdown: Arc<Notify>, manual_sync: Arc<Notify>) -> Result<()> {
     enable_raw_mode().context("enable raw mode")?;
     // Armed before any further fallible step: from here, every exit
     // from this function -- normal return, a setup error below, or
@@ -66,7 +70,7 @@ pub fn run(state: Arc<TuiState>, shutdown: Arc<Notify>) -> Result<()> {
     let mut terminal = setup_terminal().context("Failed to initialize TUI terminal")?;
     crate::tui::mark_active(true);
 
-    let result = run_loop(&mut terminal, state, &shutdown);
+    let result = run_loop(&mut terminal, state, &shutdown, &manual_sync);
 
     crate::tui::mark_active(false);
     if let Err(e) = restore_terminal(&mut terminal) {
@@ -121,7 +125,12 @@ fn restore_terminal(terminal: &mut Tui) -> Result<()> {
     Ok(())
 }
 
-fn run_loop(terminal: &mut Tui, state: Arc<TuiState>, shutdown: &Arc<Notify>) -> Result<()> {
+fn run_loop(
+    terminal: &mut Tui,
+    state: Arc<TuiState>,
+    shutdown: &Arc<Notify>,
+    manual_sync: &Arc<Notify>,
+) -> Result<()> {
     // `last_log_height` is written by draw_log on each render and
     // read by the scroll-key handler so PgUp/PgDn jumps match the
     // visible-row count. A 1-row default keeps any initial key
@@ -150,6 +159,11 @@ fn run_loop(terminal: &mut Tui, state: Arc<TuiState>, shutdown: &Arc<Notify>) ->
                 }
             } else if is_help_key(key) {
                 show_help = true;
+            } else if is_sync_key(key) {
+                // notify_one stores at most one permit, so holding
+                // the key down can't queue a burst of cycles; the
+                // daemon's coalescing window absorbs the rest.
+                manual_sync.notify_one();
             } else if is_quit_key(key) {
                 shutdown.notify_waiters();
                 return Ok(());
@@ -182,6 +196,10 @@ fn help_overlay_key(key: KeyEvent) -> HelpKey {
 
 fn is_help_key(key: KeyEvent) -> bool {
     key.kind == KeyEventKind::Press && key.code == KeyCode::Char('?')
+}
+
+fn is_sync_key(key: KeyEvent) -> bool {
+    key.kind == KeyEventKind::Press && key.code == KeyCode::Char('s')
 }
 
 /// Map cursor / paging keys to log-pane scroll actions. No-ops on
@@ -254,6 +272,7 @@ fn draw_help_overlay(frame: &mut ratatui::Frame<'_>) {
         Line::from("  PgUp / PgDn  scroll log by screen"),
         Line::from("  Home         oldest buffered line"),
         Line::from("  End          back to live tail"),
+        Line::from("  s            sync now"),
         Line::from("  ?            toggle this help"),
     ];
     // Size the box to its content plus borders; center it. Clear
@@ -684,6 +703,10 @@ mod tests {
     fn help_overlay_key_routes_quit_close_ignore() {
         assert!(is_help_key(KeyEvent::new(
             KeyCode::Char('?'),
+            KeyModifiers::NONE
+        )));
+        assert!(is_sync_key(KeyEvent::new(
+            KeyCode::Char('s'),
             KeyModifiers::NONE
         )));
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);

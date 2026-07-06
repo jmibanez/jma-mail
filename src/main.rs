@@ -639,9 +639,10 @@ async fn cmd_watch(cli: &Cli, profile_sink: Option<ProfileSink>) -> Result<()> {
 
     // The TUI is wired up in main(), which means `tui::state()` is
     // Some(...) exactly when we decided to run with one. No TUI ->
-    // run the daemon directly, plain stderr/stdout as before.
+    // run the daemon directly, plain stderr/stdout as before; no
+    // manual-sync signal either, since nothing reads keys.
     let Some(tui_state) = jma_mail::tui::state() else {
-        daemon::runner::run(&conn, &config, profile_sink).await?;
+        daemon::runner::run(&conn, &config, profile_sink, None).await?;
         return Ok(());
     };
 
@@ -654,13 +655,17 @@ async fn cmd_watch(cli: &Cli, profile_sink: Option<ProfileSink>) -> Result<()> {
     // its way out anyway -- detached tasks ride the runtime drop
     // when main returns.
     let shutdown = Arc::new(Notify::new());
+    // Manual-sync signal: the render thread raises it on 's'; the
+    // daemon turns each permit into a sync trigger.
+    let manual_sync = Arc::new(Notify::new());
     let render_state = tui_state.clone();
     let render_shutdown = shutdown.clone();
+    let render_manual = manual_sync.clone();
     let render_handle = tokio::task::spawn_blocking(move || {
-        jma_mail::tui::render::run(render_state, render_shutdown)
+        jma_mail::tui::render::run(render_state, render_shutdown, render_manual)
     });
 
-    let daemon_fut = daemon::runner::run(&conn, &config, profile_sink);
+    let daemon_fut = daemon::runner::run(&conn, &config, profile_sink, Some(manual_sync));
     tokio::pin!(daemon_fut);
 
     let daemon_result = tokio::select! {

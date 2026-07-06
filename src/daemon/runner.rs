@@ -5,7 +5,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
@@ -32,6 +32,9 @@ pub enum SyncTrigger {
     LocalChange(Vec<PathBuf>),
     LocalStructuralChange,
     Initial,
+    /// The user asked for a cycle now (the TUI's 's' key). Carries
+    /// no hint about what changed, so it implies a full scan.
+    Manual,
 }
 
 impl fmt::Display for SyncTrigger {
@@ -41,6 +44,7 @@ impl fmt::Display for SyncTrigger {
             Self::LocalChange(paths) => write!(f, "LocalChange ({} FS event(s))", paths.len()),
             Self::LocalStructuralChange => f.write_str("LocalStructuralChange"),
             Self::Initial => f.write_str("Initial"),
+            Self::Manual => f.write_str("Manual"),
         }
     }
 }
@@ -52,12 +56,13 @@ impl fmt::Display for SyncTrigger {
 /// initial trigger, which the trigger loop just received.
 ///
 /// Dominance order, broadest first: `Initial` wins if present (it's
-/// a full bootstrap, not a per-trigger delta), then `RemoteChange`
-/// (we're looking at server-side state too), then
-/// `LocalStructuralChange` (folder-level drift forces a full local
-/// scan), otherwise `LocalChange` carrying every path from every
-/// absorbed `LocalChange` trigger. The order matches "broader scan
-/// wins" -- once we've decided we need a non-LocalChange shape, the
+/// a full bootstrap, not a per-trigger delta), then `Manual` (the
+/// user asked for a full look), then `RemoteChange` (we're looking
+/// at server-side state too), then `LocalStructuralChange`
+/// (folder-level drift forces a full local scan), otherwise
+/// `LocalChange` carrying every path from every absorbed
+/// `LocalChange` trigger. The order matches "broader scan wins" --
+/// once we've decided we need a non-LocalChange shape, the
 /// LocalChange path set is irrelevant.
 ///
 /// The path-drop on RemoteChange/LocalStructuralChange/Initial
@@ -67,11 +72,13 @@ impl fmt::Display for SyncTrigger {
 fn coalesce_triggers(first: SyncTrigger, rest: Vec<SyncTrigger>) -> SyncTrigger {
     let mut paths: Vec<PathBuf> = Vec::new();
     let mut has_initial = false;
+    let mut has_manual = false;
     let mut has_remote = false;
     let mut has_structural = false;
     for t in std::iter::once(first).chain(rest) {
         match t {
             SyncTrigger::Initial => has_initial = true,
+            SyncTrigger::Manual => has_manual = true,
             SyncTrigger::RemoteChange => has_remote = true,
             SyncTrigger::LocalStructuralChange => has_structural = true,
             SyncTrigger::LocalChange(p) => paths.extend(p),
@@ -79,6 +86,8 @@ fn coalesce_triggers(first: SyncTrigger, rest: Vec<SyncTrigger>) -> SyncTrigger 
     }
     if has_initial {
         SyncTrigger::Initial
+    } else if has_manual {
+        SyncTrigger::Manual
     } else if has_remote {
         SyncTrigger::RemoteChange
     } else if has_structural {
@@ -107,12 +116,18 @@ enum SessionExit {
 /// cycle (initial bootstrap plus each post-trigger run) so the daemon
 /// emits one profile report per cycle instead of accumulating across
 /// the daemon's whole lifetime.
+///
+/// `manual_trigger`, if provided, is a signal the caller can notify
+/// to request a sync cycle now (the TUI's 's' key); each permit
+/// becomes a `SyncTrigger::Manual`. Plain watch runs pass None --
+/// nothing reads keys there.
 pub async fn run(
     conn: &Connection,
     config: &Config,
     profile_sink: Option<ProfileSink>,
+    manual_trigger: Option<Arc<Notify>>,
 ) -> Result<()> {
-    WatchDaemon::new(conn, config, profile_sink)
+    WatchDaemon::new(conn, config, profile_sink, manual_trigger)
         .await?
         .run()
         .await
@@ -134,6 +149,9 @@ struct WatchDaemon<'a> {
     rx: mpsc::Receiver<SyncTrigger>,
     self_writes: Arc<SelfWriteCache>,
     fs_handle: JoinHandle<()>,
+    /// Forwards manual-sync permits into the trigger channel; None
+    /// when the caller provided no manual-trigger signal.
+    manual_handle: Option<JoinHandle<()>>,
     profile_sink: Option<ProfileSink>,
     backoff: Duration,
 }
@@ -148,6 +166,7 @@ impl<'a> WatchDaemon<'a> {
         conn: &'a Connection,
         config: &'a Config,
         profile_sink: Option<ProfileSink>,
+        manual_trigger: Option<Arc<Notify>>,
     ) -> Result<Self> {
         let (tx, rx) = mpsc::channel::<SyncTrigger>(32);
 
@@ -187,6 +206,14 @@ impl<'a> WatchDaemon<'a> {
             }
         });
 
+        // Manual triggers ride the same channel as SSE and FS
+        // triggers, so they coalesce and scope like any other
+        // trigger; the forwarder just converts Notify permits.
+        let manual_handle = manual_trigger.map(|notify| {
+            let manual_tx = tx.clone();
+            tokio::spawn(forward_manual_triggers(notify, manual_tx))
+        });
+
         let engine = connect_with_backoff(conn, config, self_writes.clone()).await?;
 
         Ok(Self {
@@ -198,6 +225,7 @@ impl<'a> WatchDaemon<'a> {
             rx,
             self_writes,
             fs_handle,
+            manual_handle,
             profile_sink,
             backoff: RECONNECT_INITIAL_BACKOFF,
         })
@@ -226,6 +254,9 @@ impl<'a> WatchDaemon<'a> {
         let result = self.watch_loop().await;
         crate::notify!("Watch mode shutting down");
         self.fs_handle.abort();
+        if let Some(handle) = &self.manual_handle {
+            handle.abort();
+        }
         result
     }
 
@@ -412,7 +443,8 @@ impl<'a> WatchDaemon<'a> {
                 SyncTrigger::LocalChange(paths) => ScanScope::Paths(paths.clone()),
                 SyncTrigger::RemoteChange
                 | SyncTrigger::LocalStructuralChange
-                | SyncTrigger::Initial => ScanScope::Full,
+                | SyncTrigger::Initial
+                | SyncTrigger::Manual => ScanScope::Full,
             };
             match self.engine.run(false, SyncDirection::Both, scope).await {
                 Ok(outcome) => {
@@ -446,6 +478,20 @@ impl<'a> WatchDaemon<'a> {
 
         sse_handle.abort();
         Ok(exit)
+    }
+}
+
+/// Forward each manual-sync permit (the TUI's 's' key notifying the
+/// shared signal) into the trigger channel as `SyncTrigger::Manual`.
+/// Ends when the trigger channel closes on daemon shutdown; rapid
+/// presses collapse naturally -- Notify stores at most one permit,
+/// and the trigger loop's coalescing window absorbs the rest.
+async fn forward_manual_triggers(notify: Arc<Notify>, tx: mpsc::Sender<SyncTrigger>) {
+    loop {
+        notify.notified().await;
+        if tx.send(SyncTrigger::Manual).await.is_err() {
+            break;
+        }
     }
 }
 
@@ -613,5 +659,36 @@ mod tests {
             vec![SyncTrigger::RemoteChange],
         );
         assert!(matches!(merged, SyncTrigger::RemoteChange));
+    }
+
+    /// Manual dominates everything except Initial: the user asked
+    /// for a full look, and only the bootstrap shape is broader.
+    #[test]
+    fn coalesce_manual_dominates_all_but_initial() {
+        let p = PathBuf::from("/Mail/INBOX/cur/file:2,S");
+        let merged = coalesce_triggers(
+            SyncTrigger::LocalChange(vec![p]),
+            vec![SyncTrigger::RemoteChange, SyncTrigger::Manual],
+        );
+        assert!(matches!(merged, SyncTrigger::Manual));
+        let merged = coalesce_triggers(SyncTrigger::Manual, vec![SyncTrigger::Initial]);
+        assert!(matches!(merged, SyncTrigger::Initial));
+    }
+
+    /// Each manual-sync permit becomes exactly one Manual trigger,
+    /// and the forwarder ends when the trigger channel closes --
+    /// otherwise daemon shutdown would leave the loop waiting on a
+    /// Notify nobody signals.
+    #[tokio::test]
+    async fn forward_manual_triggers_converts_permits_and_ends_on_close() {
+        let notify = Arc::new(Notify::new());
+        let (tx, mut rx) = mpsc::channel::<SyncTrigger>(4);
+        let handle = tokio::spawn(forward_manual_triggers(notify.clone(), tx));
+        notify.notify_one();
+        let got = rx.recv().await.expect("trigger");
+        assert!(matches!(got, SyncTrigger::Manual));
+        drop(rx);
+        notify.notify_one();
+        handle.await.expect("forwarder task");
     }
 }
