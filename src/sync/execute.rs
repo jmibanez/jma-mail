@@ -1489,6 +1489,18 @@ impl<'a> Executor<'a> {
         queries::upsert_local_state(&txn, &mid, &binding.maildir_folder, &flags, None)?;
         txn.commit()?;
         progress.downloaded += 1;
+        // Per-message progress signal for the TUI panel. Fires at
+        // TRACE so the fmt_layer's default-filter drops it; only
+        // TuiLayer's targets filter opens TARGET_TUI_PROGRESS to
+        // TRACE explicitly. The full `kind = "download"` field is
+        // future-proofing for when an upload counter shows up.
+        tracing::event!(
+            target: crate::tui::layer::TARGET_TUI_PROGRESS,
+            tracing::Level::TRACE,
+            kind = "download",
+            done = progress.downloaded as u64,
+            total = progress.total as u64,
+        );
         if progress.verbose_per_message {
             info!(
                 "Downloaded new email {} -> {}/{}",

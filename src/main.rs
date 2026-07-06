@@ -76,18 +76,25 @@ async fn main() -> Result<()> {
         .with_writer(gated_stderr)
         .with_filter(env_filter);
 
-    // Install the TUI layer alongside fmt_layer. The level filter
-    // pins the registry's global interest at INFO from this layer's
-    // perspective; without it, a filterless layer would bump
-    // `LevelFilter::current()` to TRACE and every trace!() / debug!()
-    // call site in the crate would fire just to be discarded by
-    // on_event's internal floor. The internal floor stays for defense
-    // in depth, but the filter is what keeps cold call sites cold.
-    // Capturing starts from the first event the registry handles, so
-    // by the time the render thread comes up there's already a small
-    // backlog to show.
+    // Install the TUI layer alongside fmt_layer. The targets filter
+    // is what keeps cold call sites cold -- without it, a filterless
+    // layer would bump `LevelFilter::current()` to TRACE and every
+    // trace!() / debug!() call site in the crate would fire just to
+    // be discarded by on_event's internal floor. The shape: INFO as
+    // the default (drives the log pane) plus TRACE on the metric
+    // targets (phase spans for "current phase", blob spans for
+    // bandwidth, and the TUI's own progress events). The internal
+    // floor on log events stays for defense in depth.
     let tui_layer = if want_tui {
-        Some(jma_mail::tui::install().with_filter(tracing::level_filters::LevelFilter::INFO))
+        let target_filter = tracing_subscriber::filter::Targets::new()
+            .with_default(tracing::Level::INFO)
+            .with_target(profile::TARGET_PHASE, tracing::Level::TRACE)
+            .with_target(profile::TARGET_BLOB, tracing::Level::TRACE)
+            .with_target(
+                jma_mail::tui::layer::TARGET_TUI_PROGRESS,
+                tracing::Level::TRACE,
+            );
+        Some(jma_mail::tui::install().with_filter(target_filter))
     } else {
         None
     };

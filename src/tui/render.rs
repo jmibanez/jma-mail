@@ -29,7 +29,7 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
@@ -38,7 +38,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
 
-use crate::tui::state::{Bandwidth, LogLine, Status, TuiState};
+use crate::tui::state::{
+    ActivePhase, Bandwidth, CompletedPhase, LogLine, Progress, Status, TuiState,
+};
 
 /// Frame cadence. Crossterm's `poll` returns early on key events, so
 /// this is the upper bound on time-to-redraw, not the only redraw
@@ -169,22 +171,37 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
 /// Top half: metrics. Today that is the bandwidth panel (network
 /// in / out) on the full row.
 fn draw_metrics(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
-    draw_bandwidth(frame, area, state.bandwidth());
+    draw_bandwidth(frame, area, state.bandwidth(), state.download_progress());
 }
 
-/// Network bandwidth: in (blob downloads) and out (Email/import
-/// uploads). Each direction gets one line: a rolling-window rate
+/// Network bandwidth: in (blob downloads), out (Email/import
+/// uploads), and live download progress while `download_blobs` is
+/// active. Each direction gets one line: a rolling-window rate
 /// followed by the cumulative total in parens. The window is
 /// `BW_WINDOW` -- short enough that the number tracks live
 /// activity, long enough that a single multi-megabyte blob doesn't
 /// produce a spike that reads as nonsense.
 ///
+/// The download-progress row is conditional: it only renders while
+/// the executor is emitting progress events (TuiState clears the
+/// slot when the `download_blobs` phase closes). "  dl  12345/67890
+/// (89%)" reads naturally alongside the in/out rates -- it's the
+/// same "what's on the wire" signal set. The status-bar phase
+/// widget remains the source of truth for "what is sync doing";
+/// this row adds the live counter that matters while the wire is
+/// busy.
+///
 /// Maildir-write bytes intentionally don't appear here. They're
 /// disk-write throughput, not network bandwidth, and conflating them
 /// into a single panel makes the in/out labels lie.
-fn draw_bandwidth(frame: &mut ratatui::Frame<'_>, area: Rect, bw: Bandwidth) {
+fn draw_bandwidth(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    bw: Bandwidth,
+    progress: Option<Progress>,
+) {
     let block = Block::default().borders(Borders::ALL).title(" Network ");
-    let lines = vec![
+    let mut lines = vec![
         Line::from(vec![
             Span::raw("  in  "),
             Span::styled(
@@ -208,6 +225,22 @@ fn draw_bandwidth(frame: &mut ratatui::Frame<'_>, area: Rect, bw: Bandwidth) {
             ),
         ]),
     ];
+    if let Some(Progress { done, total }) = progress
+        && total > 0
+    {
+        let pct = (done * 100 / total) as u32;
+        lines.push(Line::from(vec![
+            Span::raw("  dl  "),
+            Span::styled(
+                format!("{:>10}", format!("{}/{}", done, total)),
+                Style::default().fg(Color::Green),
+            ),
+            Span::styled(
+                format!("  ({}%)", pct),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ]));
+    }
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
@@ -257,23 +290,84 @@ fn draw_log(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
     frame.render_widget(paragraph, area);
 }
 
-/// Single-row status bar at the very bottom. Shows the most recent
-/// `notify!` milestone, prefixed with its arrival time. When nothing
-/// has been emitted yet, shows the quit hint instead so the row
-/// always carries useful information.
+/// Single-row status bar at the very bottom. Left half carries the
+/// most recent `notify!` milestone (or the quit hint when none has
+/// been emitted); right half carries the current sync phase, with
+/// progress and elapsed appended when applicable. The two halves
+/// share the same blue/white styling so the bar reads as one strip.
+///
+/// One line is all the phase needs -- name, optional download
+/// counter, elapsed-so-far -- so it shares the bar instead of
+/// spending a metrics tile. Idle cycles show a dimmed "last: X
+/// (1.2s)" so the corner is never empty.
 fn draw_status_bar(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
     let style = Style::default()
         .bg(Color::Blue)
         .fg(Color::White)
         .add_modifier(Modifier::BOLD);
-    let line = match state.status() {
+
+    let halves = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(area);
+
+    let left = match state.status() {
         Some(Status { at, message }) => Line::from(vec![
             Span::raw(format!(" [{}] ", at.format("%H:%M:%S"))),
             Span::raw(message),
         ]),
         None => Line::from(" jma watch -- press q, Esc, or Ctrl-C to quit "),
     };
-    frame.render_widget(Paragraph::new(line).style(style), area);
+    frame.render_widget(
+        Paragraph::new(left).style(style).alignment(Alignment::Left),
+        halves[0],
+    );
+
+    let right = phase_status_line(
+        state.current_phase(),
+        state.last_phase(),
+        state.download_progress(),
+    );
+    frame.render_widget(
+        Paragraph::new(right)
+            .style(style)
+            .alignment(Alignment::Right),
+        halves[1],
+    );
+}
+
+/// Build the right-side phase string for the status bar. Active
+/// phase wins: shows name, progress (when download_blobs is the
+/// active phase and a total is known), and elapsed-so-far. Idle
+/// falls back to a dimmed "last: X (1.2s)" so the corner is never
+/// just blue padding. If no phase has ever run, returns an empty
+/// line and the bar's blue background carries the space.
+fn phase_status_line(
+    current: Option<ActivePhase>,
+    last: Option<CompletedPhase>,
+    progress: Option<Progress>,
+) -> Line<'static> {
+    if let Some(p) = current {
+        let mut spans: Vec<Span<'static>> = vec![Span::raw(p.name.clone())];
+        if p.name == "download_blobs"
+            && let Some(Progress { done, total }) = progress
+            && total > 0
+        {
+            spans.push(Span::raw(format!(" {}/{}", done, total)));
+        }
+        spans.push(Span::raw(format!(
+            " ({:.1}s) ",
+            p.started.elapsed().as_secs_f32()
+        )));
+        return Line::from(spans);
+    }
+    if let Some(p) = last {
+        return Line::from(Span::styled(
+            format!("last: {} ({:.1}s) ", p.name, p.elapsed.as_secs_f32()),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
+    Line::from("")
 }
 
 fn format_log_line(line: LogLine) -> Line<'static> {

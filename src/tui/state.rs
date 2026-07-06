@@ -63,6 +63,46 @@ struct Inner {
     /// `Instant` rather than wall-clock so the rate calc is immune
     /// to clock adjustments.
     bw_samples: VecDeque<BwSample>,
+    /// Stack of currently-entered phase spans, most recent on top.
+    /// The render picks the top of the stack as "what is sync
+    /// doing now"; everything below is an enclosing phase (e.g.
+    /// `execute` wraps `download_blobs`). Empty between sync cycles.
+    phase_stack: Vec<ActivePhase>,
+    /// Last completed phase, if any. Shown after the stack empties
+    /// so the status bar's phase slot doesn't go blank between
+    /// cycles -- "last: execute (1.2 s)" is more useful than empty
+    /// space.
+    last_phase: Option<CompletedPhase>,
+    /// Live download progress when `download_blobs` is active.
+    /// Cleared when the phase ends so a stale 50/50 doesn't sit on
+    /// screen forever. Upload progress isn't tracked here -- the
+    /// upload stream doesn't expose a per-message counter, only an
+    /// at-the-end success count, so there's nothing to plot.
+    download_progress: Option<Progress>,
+}
+
+/// One entry in the phase stack. Tracks the span's name and the
+/// instant it became active so the render can show elapsed-so-far.
+#[derive(Clone)]
+pub struct ActivePhase {
+    pub name: String,
+    pub started: Instant,
+    /// Opaque id used to match the span on close. The Layer assigns
+    /// these from the `tracing::span::Id` it gets; the TUI never
+    /// interprets the value, just compares for equality during pop.
+    pub id: u64,
+}
+
+#[derive(Clone)]
+pub struct CompletedPhase {
+    pub name: String,
+    pub elapsed: Duration,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Progress {
+    pub done: u64,
+    pub total: u64,
 }
 
 /// One blob's contribution to the bandwidth window. Stamped at the
@@ -125,6 +165,9 @@ impl TuiState {
                 bytes_in_total: 0,
                 bytes_out_total: 0,
                 bw_samples: VecDeque::new(),
+                phase_stack: Vec::new(),
+                last_phase: None,
+                download_progress: None,
             }),
         }
     }
@@ -190,6 +233,61 @@ impl TuiState {
                 break;
             }
         }
+    }
+
+    /// Push a phase onto the active stack. `id` comes from the
+    /// tracing span; the matching pop in `complete_phase` uses it
+    /// to leave the stack consistent even if phases nest in an
+    /// order we didn't anticipate.
+    pub fn enter_phase(&self, id: u64, name: String) {
+        let mut i = self.inner.lock().expect("tui state mutex");
+        i.phase_stack.push(ActivePhase {
+            name,
+            started: Instant::now(),
+            id,
+        });
+    }
+
+    /// Pop the matching phase. If the id doesn't match anything on
+    /// the stack we drop the close on the floor rather than mutating
+    /// state we don't understand -- the stack would resync once the
+    /// outermost phase ends and the next cycle starts fresh.
+    pub fn complete_phase(&self, id: u64) {
+        let mut i = self.inner.lock().expect("tui state mutex");
+        let Some(idx) = i.phase_stack.iter().rposition(|p| p.id == id) else {
+            return;
+        };
+        let phase = i.phase_stack.remove(idx);
+        let elapsed = phase.started.elapsed();
+        let name = phase.name;
+        // Clearing download progress when its phase ends keeps a
+        // stale 50/50 from sitting on screen across cycles. The
+        // name-check is so an unrelated phase pop doesn't blank a
+        // still-live readout.
+        if name == "download_blobs" {
+            i.download_progress = None;
+        }
+        i.last_phase = Some(CompletedPhase { name, elapsed });
+    }
+
+    pub fn current_phase(&self) -> Option<ActivePhase> {
+        let i = self.inner.lock().expect("tui state mutex");
+        i.phase_stack.last().cloned()
+    }
+
+    pub fn last_phase(&self) -> Option<CompletedPhase> {
+        let i = self.inner.lock().expect("tui state mutex");
+        i.last_phase.clone()
+    }
+
+    pub fn set_download_progress(&self, done: u64, total: u64) {
+        let mut i = self.inner.lock().expect("tui state mutex");
+        i.download_progress = Some(Progress { done, total });
+    }
+
+    pub fn download_progress(&self) -> Option<Progress> {
+        let i = self.inner.lock().expect("tui state mutex");
+        i.download_progress
     }
 
     /// Snapshot the bandwidth panel. Rates are bytes/sec averaged
@@ -349,5 +447,37 @@ mod tests {
         let bw = state.bandwidth();
         assert_eq!(bw.rate_in, 0.0);
         assert_eq!(bw.rate_out, 0.0);
+    }
+
+    /// The download counter is cleared exactly when its owning phase
+    /// pops. An unrelated pop must not blank a still-live readout,
+    /// and the `download_blobs` pop must not leave a stale count
+    /// behind for the next cycle.
+    #[test]
+    fn download_progress_clears_on_its_phase_pop_only() {
+        let state = TuiState::new();
+        state.enter_phase(1, "execute".into());
+        state.enter_phase(2, "download_blobs".into());
+        state.set_download_progress(5, 10);
+        state.complete_phase(1);
+        assert!(state.download_progress().is_some());
+        state.complete_phase(2);
+        assert!(state.download_progress().is_none());
+    }
+
+    /// The deepest active phase is what the status bar shows, and
+    /// pop-by-id tolerates out-of-order closes without corrupting
+    /// the stack.
+    #[test]
+    fn phase_stack_tracks_deepest_and_pops_by_id() {
+        let state = TuiState::new();
+        state.enter_phase(1, "execute".into());
+        state.enter_phase(2, "download_blobs".into());
+        assert_eq!(state.current_phase().unwrap().name, "download_blobs");
+        state.complete_phase(1);
+        assert_eq!(state.current_phase().unwrap().name, "download_blobs");
+        state.complete_phase(2);
+        assert!(state.current_phase().is_none());
+        assert_eq!(state.last_phase().unwrap().name, "download_blobs");
     }
 }
