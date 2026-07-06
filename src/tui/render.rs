@@ -38,7 +38,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
 
-use crate::tui::state::{LogLine, Status, TuiState};
+use crate::tui::state::{Bandwidth, LogLine, Status, TuiState};
 
 /// Frame cadence. Crossterm's `poll` returns early on key events, so
 /// this is the upper bound on time-to-redraw, not the only redraw
@@ -161,24 +161,81 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
         ])
         .split(area);
 
-    draw_metrics_placeholder(frame, chunks[0]);
+    draw_metrics(frame, chunks[0], state);
     draw_log(frame, chunks[1], state);
     draw_status_bar(frame, chunks[2], state);
 }
 
-/// Top half: reserved for metrics. Bandwidth, download progress,
-/// and recent subjects land in follow-up commits; this is the
-/// layout stub so the split exists from the start.
-fn draw_metrics_placeholder(frame: &mut ratatui::Frame<'_>, area: Rect) {
-    let block = Block::default().borders(Borders::ALL).title(" jma watch ");
-    let body = Paragraph::new(vec![
-        Line::from("Metrics will land here:"),
-        Line::from("  - bandwidth (in / out, rolling rate)"),
-        Line::from("  - download progress"),
-        Line::from("  - recently synced subjects"),
-    ])
-    .block(block);
-    frame.render_widget(body, area);
+/// Top half: metrics. Today that is the bandwidth panel (network
+/// in / out) on the full row.
+fn draw_metrics(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
+    draw_bandwidth(frame, area, state.bandwidth());
+}
+
+/// Network bandwidth: in (blob downloads) and out (Email/import
+/// uploads). Each direction gets one line: a rolling-window rate
+/// followed by the cumulative total in parens. The window is
+/// `BW_WINDOW` -- short enough that the number tracks live
+/// activity, long enough that a single multi-megabyte blob doesn't
+/// produce a spike that reads as nonsense.
+///
+/// Maildir-write bytes intentionally don't appear here. They're
+/// disk-write throughput, not network bandwidth, and conflating them
+/// into a single panel makes the in/out labels lie.
+fn draw_bandwidth(frame: &mut ratatui::Frame<'_>, area: Rect, bw: Bandwidth) {
+    let block = Block::default().borders(Borders::ALL).title(" Network ");
+    let lines = vec![
+        Line::from(vec![
+            Span::raw("  in  "),
+            Span::styled(
+                format!("{:>10}/s", format_rate(bw.rate_in)),
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::styled(
+                format!("  ({} total)", format_bytes(bw.total_in)),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw("  out "),
+            Span::styled(
+                format!("{:>10}/s", format_rate(bw.rate_out)),
+                Style::default().fg(Color::Magenta),
+            ),
+            Span::styled(
+                format!("  ({} total)", format_bytes(bw.total_out)),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn format_bytes(n: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    if n >= GB {
+        format!("{:.1} GB", n as f64 / GB as f64)
+    } else if n >= MB {
+        format!("{:.1} MB", n as f64 / MB as f64)
+    } else if n >= KB {
+        format!("{:.1} KB", n as f64 / KB as f64)
+    } else {
+        format!("{} B", n)
+    }
+}
+
+fn format_rate(bps: f64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    if bps >= MB {
+        format!("{:.1} MB", bps / MB)
+    } else if bps >= KB {
+        format!("{:.1} KB", bps / KB)
+    } else {
+        format!("{:.0} B", bps)
+    }
 }
 
 /// Bottom half: log pane. Renders the most recent N lines that fit
