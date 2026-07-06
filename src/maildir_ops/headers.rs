@@ -111,6 +111,41 @@ pub fn parse_message_id(raw: &[u8]) -> Option<MessageId> {
     extract_msgid_value(&value)
 }
 
+/// Read a message file and extract its decoded Subject, using the
+/// same soft/hard-capped, end-of-headers-aware read as
+/// `parse_message_id_from_file`. Without a complete header section
+/// the parse can't be trusted -- a Subject sheared mid-value reads
+/// as garbage -- so the guard yields `None` and the caller skips
+/// the row; the stakes are display-only.
+pub fn parse_subject_from_file(path: &Path) -> Result<Option<String>> {
+    let raw = read_headers_section(path, HEADER_SOFT_CAP, HEADER_HARD_CAP)?;
+    if !contains_end_of_headers(&raw) {
+        return Ok(None);
+    }
+    Ok(parse_subject(&raw))
+}
+
+/// Pull the Subject header out of a raw header section. `mailparse::
+/// get_first_value` already decodes RFC 2047 encoded-words (`=?utf-8?B?
+/// ...?=`), so the returned string is human-readable. Long subjects
+/// are returned as-is -- the caller decides whether to truncate for
+/// display.
+///
+/// Returns `None` if the headers don't parse cleanly or if no
+/// Subject header is present. A subject of literal empty string is
+/// folded into `None`: a blank subject in the TUI is indistinguishable
+/// from no subject at all and just looks like the panel is broken.
+pub fn parse_subject(raw: &[u8]) -> Option<String> {
+    let (headers, _) = parse_headers(raw).ok()?;
+    let value = headers.get_first_value("Subject")?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 fn extract_msgid_value(value: &str) -> Option<MessageId> {
     let s = value.trim();
     if let (Some(lt), Some(gt)) = (s.find('<'), s.rfind('>'))
@@ -304,5 +339,51 @@ mod tests {
 
         let raw = read_headers_section(&path, 64, 256).unwrap();
         assert!(contains_end_of_headers(&raw));
+    }
+
+    #[test]
+    fn parse_subject_returns_trimmed_value() {
+        let raw = b"Subject:  Hello world \r\nFrom: a@b\r\n\r\nbody";
+        assert_eq!(parse_subject(raw).as_deref(), Some("Hello world"));
+    }
+
+    /// mailparse decodes RFC 2047 encoded-words, so the returned
+    /// string is human-readable rather than the raw =?utf-8?...?=
+    /// transport form.
+    #[test]
+    fn parse_subject_decodes_rfc2047_encoded_words() {
+        let raw = b"Subject: =?utf-8?B?SMOpbGxvIHdvcmxk?=\r\n\r\nbody";
+        assert_eq!(parse_subject(raw).as_deref(), Some("H\u{e9}llo world"));
+    }
+
+    /// Blank and missing Subjects both collapse to None -- the
+    /// recent pane treats them identically, so the parser folds
+    /// them at the source.
+    #[test]
+    fn parse_subject_folds_blank_and_missing_to_none() {
+        assert_eq!(parse_subject(b"Subject:   \r\n\r\nbody"), None);
+        assert_eq!(parse_subject(b"From: a@b\r\n\r\nbody"), None);
+    }
+
+    #[test]
+    fn parse_subject_from_file_reads_complete_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("subject.eml");
+        write_file(&path, b"Subject: On disk\r\n\r\nbody");
+        assert_eq!(
+            parse_subject_from_file(&path).unwrap().as_deref(),
+            Some("On disk")
+        );
+    }
+
+    /// Same trust guard as the Message-ID path: no end-of-headers
+    /// marker means the section may be truncated, and a possibly
+    /// partial Subject is worse than none.
+    #[test]
+    fn parse_subject_from_file_returns_none_when_eoh_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no-eoh.eml");
+        write_file(&path, b"Subject: cut off mid-hea");
+        assert_eq!(parse_subject_from_file(&path).unwrap(), None);
     }
 }

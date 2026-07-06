@@ -38,6 +38,11 @@ use crate::tui::state::{Direction, LogLine, TuiState};
 /// profile layer's target-filtered Layer doesn't pick it up.
 pub const TARGET_TUI_PROGRESS: &str = "jma::tui::progress";
 
+/// Target the executor emits a "message just synced" event under
+/// (Subject + folder). Captured by TuiLayer into the Recent pane's
+/// ring buffer.
+pub const TARGET_TUI_MESSAGE: &str = "jma::tui::message";
+
 pub struct TuiLayer {
     state: Arc<TuiState>,
 }
@@ -149,6 +154,16 @@ where
             }
             return;
         }
+        // Recent-messages events feed the Recent pane. Same TRACE
+        // routing rationale as the progress events above.
+        if meta.target() == TARGET_TUI_MESSAGE {
+            let mut visitor = MessageInfoVisitor::default();
+            event.record(&mut visitor);
+            if let (Some(folder), Some(subject)) = (visitor.folder, visitor.subject) {
+                self.state.push_recent(folder, subject);
+            }
+            return;
+        }
         // Floor at INFO. Trace/debug events are too high-volume to
         // share a half-screen pane with the metrics the user wants
         // to read.
@@ -222,6 +237,36 @@ impl Visit for ProgressVisitor {
     }
 
     fn record_debug(&mut self, _: &Field, _: &dyn std::fmt::Debug) {}
+}
+
+/// Reads `folder` and `subject` from a `TARGET_TUI_MESSAGE` event.
+/// Both must be present for the entry to land in the recent pane;
+/// missing either drops the push without disturbing prior entries.
+#[derive(Default)]
+struct MessageInfoVisitor {
+    folder: Option<String>,
+    subject: Option<String>,
+}
+
+impl Visit for MessageInfoVisitor {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        match field.name() {
+            "folder" => self.folder = Some(value.to_string()),
+            "subject" => self.subject = Some(value.to_string()),
+            _ => {}
+        }
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        // `event!(subject = some_string)` where the value isn't a
+        // `&str` literal can land here. Strip the surrounding quotes
+        // so the panel doesn't show "\"Subject text\"" literally.
+        match field.name() {
+            "folder" => self.folder = Some(format!("{:?}", value).trim_matches('"').to_string()),
+            "subject" => self.subject = Some(format!("{:?}", value).trim_matches('"').to_string()),
+            _ => {}
+        }
+    }
 }
 
 /// Pulls the `message` field out of a tracing event. Other fields

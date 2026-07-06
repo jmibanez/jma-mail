@@ -40,6 +40,12 @@ const BW_WINDOW: Duration = Duration::from_secs(5);
 /// the samples have aged out.
 const BW_IDLE_THRESHOLD: Duration = Duration::from_secs(1);
 
+/// Cap on the "recent messages" ring. The render shows however many
+/// rows fit the pane, so this cap only bounds memory; it is sized
+/// comfortably above any realistic pane height (half the terminal,
+/// minus borders) so the pane can always be filled from the ring.
+const RECENT_CAPACITY: usize = 128;
+
 pub struct TuiState {
     inner: Mutex<Inner>,
 }
@@ -79,6 +85,20 @@ struct Inner {
     /// upload stream doesn't expose a per-message counter, only an
     /// at-the-end success count, so there's nothing to plot.
     download_progress: Option<Progress>,
+    /// Most recently stored messages (downloads only, today --
+    /// uploads are messages the user already saw). Newest at the
+    /// back; oldest drops off the front when capacity is reached.
+    recent: VecDeque<RecentMessage>,
+}
+
+/// One row in the Recent pane. Subject is decoded -- mailparse's
+/// `get_first_value` already unwraps RFC 2047 encoded-words -- so
+/// the render path is just a styled push.
+#[derive(Clone)]
+pub struct RecentMessage {
+    pub at: DateTime<Utc>,
+    pub folder: String,
+    pub subject: String,
 }
 
 /// One entry in the phase stack. Tracks the span's name and the
@@ -168,6 +188,7 @@ impl TuiState {
                 phase_stack: Vec::new(),
                 last_phase: None,
                 download_progress: None,
+                recent: VecDeque::with_capacity(RECENT_CAPACITY),
             }),
         }
     }
@@ -288,6 +309,32 @@ impl TuiState {
     pub fn download_progress(&self) -> Option<Progress> {
         let i = self.inner.lock().expect("tui state mutex");
         i.download_progress
+    }
+
+    /// Push one freshly-synced message into the recent ring.
+    /// Trimmed inline to `RECENT_CAPACITY`. The timestamp is wall-
+    /// clock (UTC), matching the log pane's convention so the two
+    /// panels read the same way.
+    pub fn push_recent(&self, folder: String, subject: String) {
+        let mut i = self.inner.lock().expect("tui state mutex");
+        if i.recent.len() == RECENT_CAPACITY {
+            i.recent.pop_front();
+        }
+        i.recent.push_back(RecentMessage {
+            at: chrono::Utc::now(),
+            folder,
+            subject,
+        });
+    }
+
+    /// Snapshot the newest `n` recent messages, oldest first (the
+    /// render reverses for newest-on-top). `n` is typically the
+    /// pane's inner row count; asking for more than the ring holds
+    /// returns everything.
+    pub fn recent(&self, n: usize) -> Vec<RecentMessage> {
+        let i = self.inner.lock().expect("tui state mutex");
+        let start = i.recent.len().saturating_sub(n);
+        i.recent.iter().skip(start).cloned().collect()
     }
 
     /// Snapshot the bandwidth panel. Rates are bytes/sec averaged
@@ -479,5 +526,29 @@ mod tests {
         state.complete_phase(2);
         assert!(state.current_phase().is_none());
         assert_eq!(state.last_phase().unwrap().name, "download_blobs");
+    }
+
+    /// The recent ring bounds memory at RECENT_CAPACITY (oldest
+    /// drops off the front), and `recent(n)` hands the render the
+    /// newest `n` rows, oldest first, so the pane can be filled to
+    /// exactly its own height.
+    #[test]
+    fn recent_ring_is_bounded_and_returns_newest_tail() {
+        let state = TuiState::new();
+        for i in 0..(RECENT_CAPACITY + 2) {
+            state.push_recent("INBOX".into(), format!("subject {}", i));
+        }
+        let all = state.recent(RECENT_CAPACITY + 2);
+        assert_eq!(all.len(), RECENT_CAPACITY);
+        assert_eq!(all.first().unwrap().subject, "subject 2");
+        let tail: Vec<String> = state.recent(3).into_iter().map(|m| m.subject).collect();
+        assert_eq!(
+            tail,
+            vec![
+                format!("subject {}", RECENT_CAPACITY - 1),
+                format!("subject {}", RECENT_CAPACITY),
+                format!("subject {}", RECENT_CAPACITY + 1),
+            ]
+        );
     }
 }

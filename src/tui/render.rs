@@ -168,10 +168,25 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
     draw_status_bar(frame, chunks[2], state);
 }
 
-/// Top half: metrics. Today that is the bandwidth panel (network
-/// in / out) on the full row.
+/// Width reserved for the Network pane. Sized to comfortably hold
+/// the widest realistic line -- "  in     1.0 MB/s  (1.2 GB total)"
+/// or the "  dl   12345/67890  (99%)" row -- with two cells of
+/// border. Fixed rather than percentage so the Recent pane's width
+/// doesn't jitter just because a rate string got a digit wider.
+const NETWORK_PANE_WIDTH: u16 = 40;
+
+/// Top half: metrics. Network on the left at a fixed width, Recent
+/// on the right with everything else. Recent benefits the most from
+/// extra horizontal room (Subject strings are the only variable-
+/// width content) and the Network pane has a tight, bounded layout
+/// that doesn't grow with the window.
 fn draw_metrics(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
-    draw_bandwidth(frame, area, state.bandwidth(), state.download_progress());
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(NETWORK_PANE_WIDTH), Constraint::Min(0)])
+        .split(area);
+    draw_bandwidth(frame, cols[0], state.bandwidth(), state.download_progress());
+    draw_recent(frame, cols[1], state);
 }
 
 /// Network bandwidth: in (blob downloads), out (Email/import
@@ -242,6 +257,71 @@ fn draw_bandwidth(
         ]));
     }
     frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// Right column: the most recent messages that landed on disk,
+/// as many as fit the pane. Newest at the top -- that's the row
+/// the user's eye naturally goes to when a new message arrives,
+/// and it matches the "latest first" feel of most mail UIs.
+/// Subject is truncated to the inner width so a pathologically
+/// long header doesn't push the timestamp off-screen.
+fn draw_recent(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
+    let block = Block::default().borders(Borders::ALL).title(" Recent ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let recent = state.recent(inner.height as usize);
+    if recent.is_empty() {
+        let hint = Paragraph::new(Line::from(Span::styled(
+            "  (no messages synced yet)",
+            Style::default().add_modifier(Modifier::DIM),
+        )));
+        frame.render_widget(hint, inner);
+        return;
+    }
+    // Reserve a few characters for the timestamp and a separator
+    // before truncating the subject. `subject_budget` could go
+    // negative on absurdly narrow terminals -- clamp at 1 so we
+    // always show at least the first char rather than nothing.
+    let lines: Vec<Line> = recent
+        .into_iter()
+        .rev()
+        .map(|m| {
+            let ts = m.at.format("%H:%M:%S").to_string();
+            let prefix_width = ts.len() + m.folder.len() + 4;
+            let subject_budget = (inner.width as usize).saturating_sub(prefix_width).max(1);
+            let subject = truncate_with_ellipsis(&m.subject, subject_budget);
+            Line::from(vec![
+                Span::styled(ts, Style::default().add_modifier(Modifier::DIM)),
+                Span::raw(" "),
+                Span::styled(m.folder, Style::default().fg(Color::Cyan)),
+                Span::raw(" "),
+                Span::raw(subject),
+            ])
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Cap `s` at `max` display columns, appending an ellipsis if any
+/// content had to be dropped. Counts unicode chars rather than
+/// bytes -- close enough to a column estimate for ASCII-heavy
+/// subjects, and avoids splitting a multi-byte char mid-sequence.
+fn truncate_with_ellipsis(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return s.to_string();
+    }
+    // Reserve one column for the ellipsis. If max < 2 we just emit
+    // the leading char-or-two without a trailing marker.
+    let keep = max.saturating_sub(1).max(1);
+    let mut out: String = chars.into_iter().take(keep).collect();
+    if max >= 2 {
+        out.push('\u{2026}');
+    }
+    out
 }
 
 fn format_bytes(n: u64) -> String {
@@ -404,5 +484,33 @@ mod tests {
         crate::tui::mark_active(true);
         drop(TerminalGuard);
         assert!(!crate::tui::is_active());
+    }
+
+    /// Strings within budget pass through untouched -- no gratuitous
+    /// ellipsis on content that already fits.
+    #[test]
+    fn truncate_keeps_fitting_strings_intact() {
+        assert_eq!(truncate_with_ellipsis("hello", 5), "hello");
+        assert_eq!(truncate_with_ellipsis("hello", 10), "hello");
+    }
+
+    /// Over-budget strings keep max-1 chars plus the ellipsis, and
+    /// the count is chars, not bytes -- a multi-byte subject must
+    /// never be split mid-codepoint.
+    #[test]
+    fn truncate_counts_chars_not_bytes() {
+        assert_eq!(truncate_with_ellipsis("hello world", 6), "hello\u{2026}");
+        assert_eq!(
+            truncate_with_ellipsis("\u{e9}\u{e9}\u{e9}\u{e9}", 3),
+            "\u{e9}\u{e9}\u{2026}"
+        );
+    }
+
+    /// Degenerate widths: 0 renders nothing, 1 renders the first
+    /// char without a marker (an ellipsis alone carries no signal).
+    #[test]
+    fn truncate_degenerate_widths() {
+        assert_eq!(truncate_with_ellipsis("hello", 0), "");
+        assert_eq!(truncate_with_ellipsis("hello", 1), "h");
     }
 }

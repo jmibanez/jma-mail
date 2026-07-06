@@ -1440,6 +1440,21 @@ impl<'a> Executor<'a> {
         // before opening the tmp file; constructing a fresh `Maildir`
         // handle here is just a `PathBuf` wrap.
         let maildir = maildir::Maildir::from(maildir_path.clone());
+        // Snapshot the Subject for the TUI's recent pane while the
+        // tmp handle still points at the streamed bytes -- finalize
+        // consumes it. The read shares the Message-ID scan's capped,
+        // end-of-headers-aware path and runs only when a TUI is
+        // installed, so plain sync/pull never pays the extra
+        // open+read. I/O errors collapse to None -- display-only.
+        // Reading the file back beats threading a subject field
+        // through SyncAction for a display-only pane.
+        let subject = if crate::tui::state().is_some() {
+            crate::maildir_ops::headers::parse_subject_from_file(tmp.path())
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
         let mid = store::finalize_message(&maildir, tmp, &flags)?;
         if let Some(cache) = &self.self_writes {
             // Suppress the fsevents echo of this delivery and -- for
@@ -1501,6 +1516,17 @@ impl<'a> Executor<'a> {
             done = progress.downloaded as u64,
             total = progress.total as u64,
         );
+        // Surface the freshly stored message to the TUI's recent
+        // pane. A missing/blank Subject skips the push, so the pane
+        // only carries usable rows.
+        if let Some(subject) = subject {
+            tracing::event!(
+                target: crate::tui::layer::TARGET_TUI_MESSAGE,
+                tracing::Level::TRACE,
+                folder = binding.maildir_folder.as_str(),
+                subject = subject.as_str(),
+            );
+        }
         if progress.verbose_per_message {
             info!(
                 "Downloaded new email {} -> {}/{}",

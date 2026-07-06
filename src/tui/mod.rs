@@ -2,8 +2,10 @@
 //!
 //! Layout: bottom half is a streaming log pane (driven by a tracing
 //! Layer that captures `info!+` events into a ring buffer); top half
-//! is reserved for metrics (bandwidth, download progress, recently
-//! synced subjects -- each lands in a follow-up commit).
+//! is the metrics row -- network bandwidth with live download
+//! progress on the left, recently synced messages on the right. A
+//! single-row status bar at the very bottom carries `notify!`
+//! milestones and the active sync phase.
 //!
 //! Activation rules: `jma watch` only, stdout must be a TTY, and the
 //! user must not have passed `--no-tui`. One-shot commands (`sync`,
