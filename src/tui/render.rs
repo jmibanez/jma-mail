@@ -32,7 +32,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use std::io::{Stdout, stdout};
 use std::sync::Arc;
 use std::time::Duration;
@@ -128,23 +128,60 @@ fn run_loop(terminal: &mut Tui, state: Arc<TuiState>, shutdown: &Arc<Notify>) ->
     // press before the first draw from dividing by zero -- the
     // first frame overwrites it immediately.
     let mut last_log_height: u16 = 1;
+    let mut show_help = false;
     loop {
         terminal
             .draw(|frame| {
-                last_log_height = draw(frame, &state);
+                last_log_height = draw(frame, &state, show_help);
             })
             .context("draw frame")?;
 
         if event::poll(TICK).context("poll for terminal event")?
             && let CrosstermEvent::Key(key) = event::read().context("read terminal event")?
         {
-            if is_quit_key(key) {
+            if show_help {
+                match help_overlay_key(key) {
+                    HelpKey::Quit => {
+                        shutdown.notify_waiters();
+                        return Ok(());
+                    }
+                    HelpKey::Close => show_help = false,
+                    HelpKey::Ignore => {}
+                }
+            } else if is_help_key(key) {
+                show_help = true;
+            } else if is_quit_key(key) {
                 shutdown.notify_waiters();
                 return Ok(());
+            } else {
+                handle_scroll_key(key, &state, last_log_height);
             }
-            handle_scroll_key(key, &state, last_log_height);
         }
     }
+}
+
+/// What a key press means while the help overlay is open. Ctrl-C
+/// stays a hard quit -- it must work no matter what is on screen --
+/// and every other press closes the overlay, so there is no way to
+/// get stuck in it.
+enum HelpKey {
+    Quit,
+    Close,
+    Ignore,
+}
+
+fn help_overlay_key(key: KeyEvent) -> HelpKey {
+    if key.kind != KeyEventKind::Press {
+        return HelpKey::Ignore;
+    }
+    match key.code {
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => HelpKey::Quit,
+        _ => HelpKey::Close,
+    }
+}
+
+fn is_help_key(key: KeyEvent) -> bool {
+    key.kind == KeyEventKind::Press && key.code == KeyCode::Char('?')
 }
 
 /// Map cursor / paging keys to log-pane scroll actions. No-ops on
@@ -180,7 +217,7 @@ fn is_quit_key(key: KeyEvent) -> bool {
 
 /// Returns the log pane's inner height so the loop can use it for
 /// PgUp/PgDn jump sizing on the next key event.
-fn draw(frame: &mut ratatui::Frame<'_>, state: &TuiState) -> u16 {
+fn draw(frame: &mut ratatui::Frame<'_>, state: &TuiState, show_help: bool) -> u16 {
     let area = frame.area();
     // Three rows: metrics (top half), log (most of bottom half), and
     // a single-row status bar at the very bottom that absorbs
@@ -199,7 +236,47 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &TuiState) -> u16 {
     draw_metrics(frame, chunks[0], state);
     let log_height = draw_log(frame, chunks[1], state);
     draw_status_bar(frame, chunks[2], state);
+    if show_help {
+        draw_help_overlay(frame);
+    }
     log_height
+}
+
+/// Centered overlay listing every key binding. The idle status hint
+/// only fits a pointer here, and the first notify! milestone
+/// displaces even that -- this overlay is the always-available
+/// reference.
+fn draw_help_overlay(frame: &mut ratatui::Frame<'_>) {
+    let lines = vec![
+        Line::from("  q / Esc      quit"),
+        Line::from("  Ctrl-C       quit"),
+        Line::from("  Up / Down    scroll log by line"),
+        Line::from("  PgUp / PgDn  scroll log by screen"),
+        Line::from("  Home         oldest buffered line"),
+        Line::from("  End          back to live tail"),
+        Line::from("  ?            toggle this help"),
+    ];
+    // Size the box to its content plus borders; center it. Clear
+    // erases whatever the frame drew underneath so the overlay
+    // doesn't blend into the log pane.
+    let area = centered_rect(frame.area(), 40, lines.len() as u16 + 2);
+    frame.render_widget(Clear, area);
+    let block = Block::default().borders(Borders::ALL).title(" Keys ");
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// Center a width x height box inside `area`, clamped to fit --
+/// tiny terminals get whatever space exists rather than an
+/// off-screen rect.
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let w = width.min(area.width);
+    let h = height.min(area.height);
+    Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.y + (area.height - h) / 2,
+        width: w,
+        height: h,
+    }
 }
 
 /// Width reserved for the Network pane. Sized to comfortably hold
@@ -474,9 +551,7 @@ fn draw_status_bar(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState)
             left_spans.push(Span::raw(message));
         }
         None => {
-            left_spans.push(Span::raw(
-                " jma watch -- arrows/PgUp/PgDn scroll log, q quits ",
-            ));
+            left_spans.push(Span::raw(" jma watch -- ? for keys, q quits "));
         }
     }
     frame.render_widget(
@@ -599,6 +674,35 @@ mod tests {
         crate::tui::mark_active(true);
         drop(TerminalGuard);
         assert!(!crate::tui::is_active());
+    }
+
+    /// While the overlay is open, Ctrl-C still hard-quits and any
+    /// other press closes it -- there is no way to get stuck in the
+    /// overlay. Non-press events are ignored so key release can't
+    /// close it the instant it opens.
+    #[test]
+    fn help_overlay_key_routes_quit_close_ignore() {
+        assert!(is_help_key(KeyEvent::new(
+            KeyCode::Char('?'),
+            KeyModifiers::NONE
+        )));
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(matches!(help_overlay_key(ctrl_c), HelpKey::Quit));
+        let q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(matches!(help_overlay_key(q), HelpKey::Close));
+        let mut release = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+        release.kind = KeyEventKind::Release;
+        assert!(matches!(help_overlay_key(release), HelpKey::Ignore));
+    }
+
+    /// The overlay box centers inside large areas and clamps to tiny
+    /// ones instead of landing off-screen.
+    #[test]
+    fn centered_rect_centers_and_clamps() {
+        let big = centered_rect(Rect::new(0, 0, 100, 40), 40, 9);
+        assert_eq!((big.x, big.y, big.width, big.height), (30, 15, 40, 9));
+        let tiny = centered_rect(Rect::new(0, 0, 10, 4), 40, 9);
+        assert_eq!((tiny.x, tiny.y, tiny.width, tiny.height), (0, 0, 10, 4));
     }
 
     /// The "last" row reads "in sync" for no-op cycles -- zero

@@ -215,7 +215,14 @@ impl<'a> WatchDaemon<'a> {
         // Email/changes.
         self.initial_sync().await;
 
-        crate::notify!("Watch mode active. Press Ctrl+C to stop.");
+        // The quit affordance differs by display: the TUI takes q
+        // (with the full bindings behind ?), while a plain watch run
+        // only stops on SIGINT.
+        if crate::tui::is_active() {
+            crate::notify!("Watch mode active. Press q to quit, ? for keys.");
+        } else {
+            crate::notify!("Watch mode active. Press Ctrl+C to stop.");
+        }
         let result = self.watch_loop().await;
         crate::notify!("Watch mode shutting down");
         self.fs_handle.abort();
