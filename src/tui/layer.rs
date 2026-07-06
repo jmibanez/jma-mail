@@ -50,6 +50,11 @@ pub const TARGET_TUI_MESSAGE: &str = "jma::tui::message";
 /// status bar's health segment.
 pub const TARGET_TUI_CONN: &str = "jma::tui::conn";
 
+/// Target the daemon emits one event per completed sync cycle
+/// under, carrying `downloaded`, `uploaded`, and `in_sync`. Feeds
+/// the Network pane's "last" row.
+pub const TARGET_TUI_CYCLE: &str = "jma::tui::cycle";
+
 pub struct TuiLayer {
     state: Arc<TuiState>,
 }
@@ -168,6 +173,18 @@ where
             event.record(&mut visitor);
             if let (Some(folder), Some(subject)) = (visitor.folder, visitor.subject) {
                 self.state.push_recent(folder, subject);
+            }
+            return;
+        }
+        // Cycle outcomes feed the Network pane's "last" row. Same
+        // TRACE routing rationale as above.
+        if meta.target() == TARGET_TUI_CYCLE {
+            let mut visitor = CycleVisitor::default();
+            event.record(&mut visitor);
+            if let (Some(downloaded), Some(uploaded), Some(in_sync)) =
+                (visitor.downloaded, visitor.uploaded, visitor.in_sync)
+            {
+                self.state.set_last_cycle(downloaded, uploaded, in_sync);
             }
             return;
         }
@@ -351,6 +368,35 @@ impl Visit for ConnVisitor {
             _ => {}
         }
     }
+}
+
+/// Reads `downloaded`, `uploaded`, and `in_sync` from a
+/// `TARGET_TUI_CYCLE` event. All three must be present for the
+/// outcome to register; a partial event leaves the previous cycle
+/// on display.
+#[derive(Default)]
+struct CycleVisitor {
+    downloaded: Option<u64>,
+    uploaded: Option<u64>,
+    in_sync: Option<bool>,
+}
+
+impl Visit for CycleVisitor {
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        match field.name() {
+            "downloaded" => self.downloaded = Some(value),
+            "uploaded" => self.uploaded = Some(value),
+            _ => {}
+        }
+    }
+
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        if field.name() == "in_sync" {
+            self.in_sync = Some(value);
+        }
+    }
+
+    fn record_debug(&mut self, _: &Field, _: &dyn std::fmt::Debug) {}
 }
 
 /// Map a `TARGET_TUI_CONN` event's `state` string onto `ConnState`.

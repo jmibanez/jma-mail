@@ -14,7 +14,7 @@ use crate::config::Config;
 use crate::jmap::retry::is_transient_error;
 use crate::profile::ProfileSink;
 use crate::state::queries;
-use crate::sync::engine::{ScanScope, SyncEngine};
+use crate::sync::engine::{ScanScope, SyncEngine, SyncOutcome};
 use crate::sync::plan::SyncDirection;
 use crate::sync::self_writes::SelfWriteCache;
 
@@ -230,6 +230,7 @@ impl<'a> WatchDaemon<'a> {
             .await
         {
             Ok(outcome) => {
+                report_cycle(&outcome);
                 if outcome.downloaded > 0 {
                     self.hook.trigger().await;
                 }
@@ -412,6 +413,7 @@ impl<'a> WatchDaemon<'a> {
                     // reset the outer backoff so the next disconnect
                     // starts fresh rather than at whatever cap we hit.
                     self.backoff = RECONNECT_INITIAL_BACKOFF;
+                    report_cycle(&outcome);
                     if outcome.downloaded > 0 {
                         self.hook.trigger().await;
                     }
@@ -438,6 +440,20 @@ impl<'a> WatchDaemon<'a> {
         sse_handle.abort();
         Ok(exit)
     }
+}
+
+/// Report a completed cycle's outcome to the TUI's "last" row. One
+/// event per successful `engine.run`, initial bootstrap included;
+/// failed cycles report nothing (the error surfaces through the log
+/// pane and the health segment).
+fn report_cycle(outcome: &SyncOutcome) {
+    tracing::event!(
+        target: crate::tui::layer::TARGET_TUI_CYCLE,
+        tracing::Level::TRACE,
+        downloaded = outcome.downloaded as u64,
+        uploaded = outcome.uploaded as u64,
+        in_sync = outcome.already_in_sync,
+    );
 }
 
 /// Flush the per-cycle profile snapshot (table + JSON, depending on

@@ -103,6 +103,22 @@ struct Inner {
     /// stop arriving as triggers until the stream comes back; local
     /// FS triggers keep working and the listener retries forever.
     sse_conn: Option<ConnState>,
+    /// Outcome of the most recent completed sync cycle. Kept in its
+    /// own slot because cycle results otherwise flow through the
+    /// single-slot `notify!` status, where any later milestone
+    /// overwrites them.
+    last_cycle: Option<CycleSummary>,
+}
+
+/// One completed sync cycle's outcome for the Network pane's "last"
+/// row. `in_sync` means the cycle found nothing to do; the counts
+/// are only meaningful when it is false.
+#[derive(Clone, Copy, Debug)]
+pub struct CycleSummary {
+    pub at: DateTime<Utc>,
+    pub downloaded: u64,
+    pub uploaded: u64,
+    pub in_sync: bool,
 }
 
 /// One connection channel's state. Every degraded state is actively
@@ -223,6 +239,7 @@ impl TuiState {
                 recent: VecDeque::with_capacity(RECENT_CAPACITY),
                 engine_conn: None,
                 sse_conn: None,
+                last_cycle: None,
             }),
         }
     }
@@ -460,6 +477,23 @@ impl TuiState {
         }
     }
 
+    /// Record a completed sync cycle's outcome, stamped now. Latest
+    /// cycle wins; history lives in the log pane.
+    pub fn set_last_cycle(&self, downloaded: u64, uploaded: u64, in_sync: bool) {
+        let mut i = self.inner.lock().expect("tui state mutex");
+        i.last_cycle = Some(CycleSummary {
+            at: chrono::Utc::now(),
+            downloaded,
+            uploaded,
+            in_sync,
+        });
+    }
+
+    pub fn last_cycle(&self) -> Option<CycleSummary> {
+        let i = self.inner.lock().expect("tui state mutex");
+        i.last_cycle
+    }
+
     /// Snapshot the bandwidth panel. Rates are bytes/sec averaged
     /// over `BW_WINDOW`; totals are cumulative since process start.
     /// When the newest sample is older than `BW_IDLE_THRESHOLD`,
@@ -684,6 +718,20 @@ mod tests {
 
         state.set_engine_conn(ConnState::Connected);
         assert_eq!(state.conn_health().engine, Some(ConnState::Connected));
+    }
+
+    /// The last-cycle slot is latest-wins: a fresh outcome replaces
+    /// the prior one outright, and the recorded counts survive as
+    /// given.
+    #[test]
+    fn last_cycle_keeps_latest_outcome() {
+        let state = TuiState::new();
+        assert!(state.last_cycle().is_none());
+        state.set_last_cycle(12, 3, false);
+        state.set_last_cycle(0, 0, true);
+        let cycle = state.last_cycle().unwrap();
+        assert!(cycle.in_sync);
+        assert_eq!((cycle.downloaded, cycle.uploaded), (0, 0));
     }
 
     /// Push `n` sequentially numbered lines -- helper for the

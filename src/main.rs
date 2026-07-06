@@ -98,7 +98,11 @@ async fn main() -> Result<()> {
                 jma_mail::tui::layer::TARGET_TUI_MESSAGE,
                 tracing::Level::TRACE,
             )
-            .with_target(jma_mail::tui::layer::TARGET_TUI_CONN, tracing::Level::TRACE);
+            .with_target(jma_mail::tui::layer::TARGET_TUI_CONN, tracing::Level::TRACE)
+            .with_target(
+                jma_mail::tui::layer::TARGET_TUI_CYCLE,
+                tracing::Level::TRACE,
+            );
         Some(jma_mail::tui::install().with_filter(target_filter))
     } else {
         None

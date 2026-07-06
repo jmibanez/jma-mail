@@ -39,8 +39,8 @@ use std::time::Duration;
 use tokio::sync::Notify;
 
 use crate::tui::state::{
-    ActivePhase, Bandwidth, CompletedPhase, ConnHealth, ConnState, LogLine, Progress, Status,
-    TuiState,
+    ActivePhase, Bandwidth, CompletedPhase, ConnHealth, ConnState, CycleSummary, LogLine, Progress,
+    Status, TuiState,
 };
 
 /// Frame cadence. Crossterm's `poll` returns early on key events, so
@@ -219,7 +219,13 @@ fn draw_metrics(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(NETWORK_PANE_WIDTH), Constraint::Min(0)])
         .split(area);
-    draw_bandwidth(frame, cols[0], state.bandwidth(), state.download_progress());
+    draw_bandwidth(
+        frame,
+        cols[0],
+        state.bandwidth(),
+        state.download_progress(),
+        state.last_cycle(),
+    );
     draw_recent(frame, cols[1], state);
 }
 
@@ -240,6 +246,10 @@ fn draw_metrics(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
 /// this row adds the live counter that matters while the wire is
 /// busy.
 ///
+/// The dimmed "last" row shows the most recent completed cycle's
+/// outcome with its wall-clock time -- the single-slot notify!
+/// status would otherwise overwrite it with the next milestone.
+///
 /// Maildir-write bytes intentionally don't appear here. They're
 /// disk-write throughput, not network bandwidth, and conflating them
 /// into a single panel makes the in/out labels lie.
@@ -248,6 +258,7 @@ fn draw_bandwidth(
     area: Rect,
     bw: Bandwidth,
     progress: Option<Progress>,
+    last_cycle: Option<CycleSummary>,
 ) {
     let block = Block::default().borders(Borders::ALL).title(" Network ");
     let mut lines = vec![
@@ -290,7 +301,33 @@ fn draw_bandwidth(
             ),
         ]));
     }
+    if let Some(cycle) = last_cycle {
+        lines.push(cycle_line(cycle));
+    }
     frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// The Network pane's "last" row: the most recent completed cycle's
+/// outcome, dimmed -- it's context, not live activity. In-sync
+/// cycles read "in sync" rather than "0 dn / 0 up", which would
+/// look like a stall.
+fn cycle_line(cycle: CycleSummary) -> Line<'static> {
+    let text = if cycle.in_sync {
+        "in sync".to_string()
+    } else {
+        format!("{} dn / {} up", cycle.downloaded, cycle.uploaded)
+    };
+    Line::from(vec![
+        Span::raw("  last"),
+        Span::styled(
+            format!("{:>12}", text),
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+        Span::styled(
+            format!("  {}", cycle.at.format("%H:%M:%S")),
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+    ])
 }
 
 /// Right column: the most recent messages that landed on disk,
@@ -562,6 +599,37 @@ mod tests {
         crate::tui::mark_active(true);
         drop(TerminalGuard);
         assert!(!crate::tui::is_active());
+    }
+
+    /// The "last" row reads "in sync" for no-op cycles -- zero
+    /// counts would look like a stall -- and the real counts
+    /// otherwise.
+    #[test]
+    fn cycle_line_formats_in_sync_and_counts() {
+        let at = chrono::Utc::now();
+        let text: String = cycle_line(CycleSummary {
+            at,
+            downloaded: 0,
+            uploaded: 0,
+            in_sync: true,
+        })
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+        assert!(text.contains("in sync"));
+
+        let text: String = cycle_line(CycleSummary {
+            at,
+            downloaded: 12,
+            uploaded: 3,
+            in_sync: false,
+        })
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+        assert!(text.contains("12 dn / 3 up"));
     }
 
     /// Worst state wins in the health segment: an engine outage
