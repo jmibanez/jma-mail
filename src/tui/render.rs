@@ -121,18 +121,48 @@ fn restore_terminal(terminal: &mut Tui) -> Result<()> {
 }
 
 fn run_loop(terminal: &mut Tui, state: Arc<TuiState>, shutdown: &Arc<Notify>) -> Result<()> {
+    // `last_log_height` is written by draw_log on each render and
+    // read by the scroll-key handler so PgUp/PgDn jumps match the
+    // visible-row count. A 1-row default keeps any initial key
+    // press before the first draw from dividing by zero -- the
+    // first frame overwrites it immediately.
+    let mut last_log_height: u16 = 1;
     loop {
         terminal
-            .draw(|frame| draw(frame, &state))
+            .draw(|frame| {
+                last_log_height = draw(frame, &state);
+            })
             .context("draw frame")?;
 
         if event::poll(TICK).context("poll for terminal event")?
             && let CrosstermEvent::Key(key) = event::read().context("read terminal event")?
-            && is_quit_key(key)
         {
-            shutdown.notify_waiters();
-            return Ok(());
+            if is_quit_key(key) {
+                shutdown.notify_waiters();
+                return Ok(());
+            }
+            handle_scroll_key(key, &state, last_log_height);
         }
+    }
+}
+
+/// Map cursor / paging keys to log-pane scroll actions. No-ops on
+/// any other key. `pane_height` is the most recently observed log-
+/// pane height -- PgUp/PgDn use it for one-screen jumps so the
+/// motion matches what the user can see.
+fn handle_scroll_key(key: KeyEvent, state: &TuiState, pane_height: u16) {
+    if key.kind != KeyEventKind::Press {
+        return;
+    }
+    let h = pane_height.max(1) as usize;
+    match key.code {
+        KeyCode::Up => state.scroll_log_back(1, h),
+        KeyCode::Down => state.scroll_log_forward(1),
+        KeyCode::PageUp => state.scroll_log_back(h, h),
+        KeyCode::PageDown => state.scroll_log_forward(h),
+        KeyCode::Home => state.scroll_log_to_top(h),
+        KeyCode::End => state.scroll_log_to_bottom(),
+        _ => {}
     }
 }
 
@@ -147,7 +177,9 @@ fn is_quit_key(key: KeyEvent) -> bool {
     }
 }
 
-fn draw(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
+/// Returns the log pane's inner height so the loop can use it for
+/// PgUp/PgDn jump sizing on the next key event.
+fn draw(frame: &mut ratatui::Frame<'_>, state: &TuiState) -> u16 {
     let area = frame.area();
     // Three rows: metrics (top half), log (most of bottom half), and
     // a single-row status bar at the very bottom that absorbs
@@ -164,8 +196,9 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &TuiState) {
         .split(area);
 
     draw_metrics(frame, chunks[0], state);
-    draw_log(frame, chunks[1], state);
+    let log_height = draw_log(frame, chunks[1], state);
     draw_status_bar(frame, chunks[2], state);
+    log_height
 }
 
 /// Width reserved for the Network pane. Sized to comfortably hold
@@ -351,23 +384,28 @@ fn format_rate(bps: f64) -> String {
     }
 }
 
-/// Bottom half: log pane. Renders the most recent N lines that fit
-/// the pane's inner height, oldest at top, newest at bottom. Level
-/// gets a color hint, target is dimmed, message takes the rest of
-/// the line.
-fn draw_log(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
-    let block = Block::default().borders(Borders::ALL).title(" Log ");
-    let inner = block.inner(area);
-    let capacity = inner.height as usize;
-    let lines: Vec<Line> = state
-        .recent_logs(capacity)
-        .into_iter()
-        .map(format_log_line)
-        .collect();
+/// Bottom half: log pane. Renders the lines visible at the current
+/// scroll position; level gets a color hint, target is dimmed,
+/// message takes the rest of the line. Title shows "[scrolled +N]"
+/// when the user has paged back from the live tail so the deviation
+/// is obvious at a glance. Returns the inner pane height so the
+/// run loop can size PgUp/PgDn jumps against what's actually on
+/// screen.
+fn draw_log(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) -> u16 {
+    let inner_height = area.height.saturating_sub(2);
+    let view = state.log_view(inner_height as usize);
+    let title = if view.scroll > 0 {
+        format!(" Log [scrolled +{}] ", view.scroll)
+    } else {
+        " Log ".to_string()
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let lines: Vec<Line> = view.lines.into_iter().map(format_log_line).collect();
     let paragraph = Paragraph::new(lines)
         .block(block)
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
+    inner_height
 }
 
 /// Single-row status bar at the very bottom. Left half carries the
@@ -396,7 +434,7 @@ fn draw_status_bar(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState)
             Span::raw(format!(" [{}] ", at.format("%H:%M:%S"))),
             Span::raw(message),
         ]),
-        None => Line::from(" jma watch -- press q, Esc, or Ctrl-C to quit "),
+        None => Line::from(" jma watch -- arrows/PgUp/PgDn scroll log, q quits "),
     };
     frame.render_widget(
         Paragraph::new(left).style(style).alignment(Alignment::Left),
