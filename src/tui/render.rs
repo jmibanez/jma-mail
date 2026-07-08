@@ -147,7 +147,13 @@ fn run_loop(
         if event::poll(TICK).context("poll for terminal event")?
             && let CrosstermEvent::Key(key) = event::read().context("read terminal event")?
         {
-            if show_help {
+            if is_redraw_key(key) {
+                // Clear resets ratatui's diff baseline, so the next
+                // draw rewrites every cell rather than diffing against
+                // a possibly-corrupted screen. Handled ahead of the
+                // overlay branch so a redraw never doubles as a close.
+                terminal.clear().context("clear on redraw")?;
+            } else if show_help {
                 match help_overlay_key(key) {
                     HelpKey::Quit => {
                         shutdown.notify_waiters();
@@ -275,6 +281,15 @@ fn is_quit_key(key: KeyEvent) -> bool {
     }
 }
 
+/// Ctrl-L, the conventional "redraw the screen" key. Forces a full
+/// repaint on the next frame, recovering a display left corrupted by
+/// stray output that reached the alternate screen.
+fn is_redraw_key(key: KeyEvent) -> bool {
+    key.kind == KeyEventKind::Press
+        && key.code == KeyCode::Char('l')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
 fn draw(frame: &mut ratatui::Frame<'_>, state: &TuiState, show_help: bool, scroll: &mut LogScroll) {
     let area = frame.area();
     // Three rows: metrics (top half), log (most of bottom half), and
@@ -307,6 +322,7 @@ fn draw_help_overlay(frame: &mut ratatui::Frame<'_>) {
     let lines = vec![
         Line::from("  q / Esc      quit"),
         Line::from("  Ctrl-C       quit"),
+        Line::from("  Ctrl-L       redraw the screen"),
         Line::from("  Up / Down    scroll log by line"),
         Line::from("  PgUp / PgDn  scroll log by screen"),
         Line::from("  Home         oldest buffered line"),
@@ -878,6 +894,21 @@ mod tests {
         let mut release = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
         release.kind = KeyEventKind::Release;
         assert!(matches!(help_overlay_key(release), HelpKey::Ignore));
+    }
+
+    /// Ctrl-L is the redraw key: only the Ctrl-modified press counts,
+    /// so a bare `l` or a key release never forces a repaint.
+    #[test]
+    fn redraw_key_is_ctrl_l_on_press() {
+        let ctrl_l = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
+        assert!(is_redraw_key(ctrl_l));
+        assert!(!is_redraw_key(KeyEvent::new(
+            KeyCode::Char('l'),
+            KeyModifiers::NONE
+        )));
+        let mut release = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
+        release.kind = KeyEventKind::Release;
+        assert!(!is_redraw_key(release));
     }
 
     /// The overlay box centers inside large areas and clamps to tiny
