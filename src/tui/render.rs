@@ -292,26 +292,45 @@ fn is_redraw_key(key: KeyEvent) -> bool {
 
 fn draw(frame: &mut ratatui::Frame<'_>, state: &TuiState, show_help: bool, scroll: &mut LogScroll) {
     let area = frame.area();
-    // Three rows: metrics (top half), log (most of bottom half), and
-    // a single-row status bar at the very bottom that absorbs
-    // `notify!` milestones. The status bar uses Min(1) so it stays
-    // anchored even when the terminal shrinks; metrics and log split
-    // the remaining space 50/50.
+    // Four rows, top to bottom: a one-row version-banner header, the
+    // metrics pane (half the remaining height), the log pane (Min(1),
+    // so it absorbs the rest and never collapses), and a single-row
+    // status bar that carries `notify!` milestones.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(1),
             Constraint::Percentage(50),
             Constraint::Min(1),
             Constraint::Length(1),
         ])
         .split(area);
 
-    draw_metrics(frame, chunks[0], state);
-    draw_log(frame, chunks[1], state, scroll);
-    draw_status_bar(frame, chunks[2], state);
+    draw_header(frame, chunks[0]);
+    draw_metrics(frame, chunks[1], state);
+    draw_log(frame, chunks[2], state, scroll);
+    draw_status_bar(frame, chunks[3], state);
     if show_help {
         draw_help_overlay(frame);
     }
+}
+
+/// Full-width header strip carrying the app name and the git-appended
+/// JMA_VERSION, so the running build is identifiable at a glance when
+/// troubleshooting -- most usefully on a local compile, where the
+/// version carries the commit it was built from.
+fn draw_header(frame: &mut ratatui::Frame<'_>, area: Rect) {
+    let style = Style::default()
+        .bg(Color::Blue)
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+    let banner = Line::from(format!(" jma {} ", env!("JMA_VERSION")));
+    frame.render_widget(
+        Paragraph::new(banner)
+            .style(style)
+            .alignment(Alignment::Center),
+        area,
+    );
 }
 
 /// Centered overlay listing every key binding. The idle status hint
