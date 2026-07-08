@@ -494,7 +494,7 @@ fn cycle_line(cycle: CycleSummary) -> Line<'static> {
             Style::default().add_modifier(Modifier::DIM),
         ),
         Span::styled(
-            format!("  {}", cycle.at.format("%H:%M:%S")),
+            format!("  {}", format_ts(cycle.at, &chrono::Local)),
             Style::default().add_modifier(Modifier::DIM),
         ),
     ])
@@ -527,7 +527,7 @@ fn draw_recent(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
         .into_iter()
         .rev()
         .map(|m| {
-            let ts = m.at.format("%H:%M:%S").to_string();
+            let ts = format_ts(m.at, &chrono::Local);
             let prefix_width = ts.len() + m.folder.len() + 4;
             let subject_budget = (inner.width as usize).saturating_sub(prefix_width).max(1);
             let subject = truncate_with_ellipsis(&m.subject, subject_budget);
@@ -763,7 +763,7 @@ fn draw_status_bar(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState)
     let mut left_spans = vec![conn_span(state.conn_health())];
     match state.status() {
         Some(Status { at, message }) => {
-            left_spans.push(Span::raw(format!(" [{}] ", at.format("%H:%M:%S"))));
+            left_spans.push(Span::raw(format!(" [{}] ", format_ts(at, &chrono::Local))));
             left_spans.push(Span::raw(message));
         }
         None => {
@@ -856,6 +856,20 @@ fn conn_span(health: ConnHealth) -> Span<'static> {
     )
 }
 
+/// Formats a captured-UTC timestamp as a time-of-day string in `tz`.
+/// The watch TUI stores timestamps in UTC (see `TuiLayer::on_event`
+/// for the log pane, `TuiState` for the metric panels) but renders
+/// them in the machine's local zone so the times match the wall clock
+/// of whoever is watching. Non-interactive stderr output stays UTC.
+fn format_ts<Tz: chrono::TimeZone>(ts: chrono::DateTime<chrono::Utc>, tz: &Tz) -> String
+where
+    // chrono's DelayedFormat requires the offset be Display even though
+    // "%H:%M:%S" never prints it -- the bound is chrono's, not ours.
+    Tz::Offset: std::fmt::Display,
+{
+    ts.with_timezone(tz).format("%H:%M:%S").to_string()
+}
+
 fn format_log_line(line: LogLine) -> Line<'static> {
     let level_style = match line.level {
         tracing::Level::ERROR => Style::default().fg(Color::Red),
@@ -863,7 +877,7 @@ fn format_log_line(line: LogLine) -> Line<'static> {
         tracing::Level::INFO => Style::default().fg(Color::Green),
         _ => Style::default().fg(Color::DarkGray),
     };
-    let ts = line.ts.format("%H:%M:%S").to_string();
+    let ts = format_ts(line.ts, &chrono::Local);
     Line::from(vec![
         Span::styled(ts, Style::default().add_modifier(Modifier::DIM)),
         Span::raw(" "),
@@ -878,6 +892,30 @@ fn format_log_line(line: LogLine) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TUI timestamps are captured in UTC but rendered in a wall-clock
+    /// zone; the conversion must land on the right time-of-day even when
+    /// the offset rolls the date across midnight. Fixed offsets keep the
+    /// assertion independent of the test host's own zone -- the render
+    /// path itself passes `chrono::Local`.
+    #[test]
+    fn format_ts_renders_time_of_day_in_the_given_zone() {
+        use chrono::{FixedOffset, TimeZone, Utc};
+        let ts = Utc.with_ymd_and_hms(2026, 7, 9, 23, 30, 0).unwrap();
+        // +08:00 rolls past midnight into the next day; the panes show
+        // time-of-day only, so the date roll is invisible.
+        assert_eq!(
+            format_ts(ts, &FixedOffset::east_opt(8 * 3600).unwrap()),
+            "07:30:00"
+        );
+        // -05:00 stays on the same day.
+        assert_eq!(
+            format_ts(ts, &FixedOffset::west_opt(5 * 3600).unwrap()),
+            "18:30:00"
+        );
+        // UTC is unchanged -- the non-interactive default.
+        assert_eq!(format_ts(ts, &Utc), "23:30:00");
+    }
 
     /// Dropping the guard lowers the active flag no matter how `run`
     /// exits, so the stderr/stdout gating window cannot outlive the
