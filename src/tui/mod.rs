@@ -15,12 +15,17 @@
 //!
 //! The layer is installed at `tracing` init time so events flow into
 //! the shared `TuiState` from the moment the registry comes online.
-//! `mark_active(true)` is only flipped once the alternate screen is
-//! up and rendering starts -- before that, fmt_layer is still writing
-//! to stderr and `notify!` is still writing to stdout. The
-//! mark_active flag is what those two output channels consult to
-//! suppress themselves, so flipping it any earlier would silence
-//! pre-render stderr/stdout for no reason.
+//! `mark_active(true)` is set as soon as the watch command finds it
+//! is running with a TUI, before the alternate screen is up and
+//! before any startup work logs. Config load, lock acquisition, and
+//! DB open all emit INFO lines, and the daemon (which starts
+//! concurrently with the render thread) adds its own connect and
+//! initial-sync logs -- all in the window before the first frame.
+//! Left un-gated those lines dribble onto the real terminal and
+//! survive as orphaned scrollback above the restored screen. The
+//! layer captures the same events into the ring buffer, so the log
+//! pane replays them once rendering starts; gating stderr/stdout off
+//! from that point keeps the terminal clean without dropping anything.
 
 pub mod layer;
 pub mod render;
@@ -33,9 +38,12 @@ use std::sync::{Arc, OnceLock};
 pub use layer::TuiLayer;
 pub use state::TuiState;
 
-/// Set to true once the TUI's alternate screen is up. Read by the
-/// fmt_layer writer gate (`writer::GatedStderr`) and the `notify!`
-/// macro so neither corrupts the rendered display.
+/// True while the TUI owns the terminal. While it is set, tracing's
+/// stderr output and `notify!`'s stdout are withheld from the raw
+/// terminal and captured by the log ring buffer / status line
+/// instead, so neither dribbles onto the screen before the first
+/// frame nor corrupts the rendered display after it. Set before the
+/// first frame is drawn, cleared on teardown.
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Process-wide handle on the shared TUI state. Held both by the
@@ -64,16 +72,17 @@ pub fn state() -> Option<Arc<TuiState>> {
     STATE.get().cloned()
 }
 
-/// True when the alternate screen is up and rendering. Consulted by
-/// fmt_layer's writer and the `notify!` macro to gate themselves off.
+/// Whether the TUI currently owns the terminal -- i.e. whether raw
+/// stderr/stdout output is being withheld to protect the display.
 pub fn is_active() -> bool {
     ACTIVE.load(Ordering::Relaxed)
 }
 
-/// Flip the active flag. The render loop sets it to true right after
-/// entering the alternate screen and back to false right before
-/// leaving, so the un-suppressed stderr/stdout window matches the
-/// terminal-is-clean window exactly.
+/// Set whether the TUI owns the terminal. Pass `true` once a TUI run
+/// is committed, before anything draws or logs; pass `false` on
+/// teardown. While `true`, raw stderr/stdout output is withheld to
+/// protect the display, so it must be cleared before any final
+/// message -- an error on the way out -- is expected to reach the user.
 pub fn mark_active(v: bool) {
     ACTIVE.store(v, Ordering::Relaxed);
 }

@@ -68,10 +68,11 @@ async fn main() -> Result<()> {
     // explicit override.
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter));
     // The fmt layer writes to a gated stderr so it goes silent while
-    // the TUI's alternate screen is up. Outside of `jma watch` (and
-    // inside it when --no-tui or no tty), the gate is permanently
-    // open and behavior matches the prior `std::io::stderr` writer
-    // exactly.
+    // the TUI owns the terminal -- from the point `cmd_watch` commits
+    // to a TUI, before the alternate screen is up, through teardown.
+    // Outside of `jma watch` (and inside it when --no-tui or no tty),
+    // the gate is permanently open and behavior matches the prior
+    // `std::io::stderr` writer exactly.
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_writer(gated_stderr)
         .with_filter(env_filter);
@@ -633,15 +634,28 @@ async fn cmd_push(cli: &Cli, dry_run: bool) -> Result<()> {
 }
 
 async fn cmd_watch(cli: &Cli, profile_sink: Option<ProfileSink>) -> Result<()> {
+    // The TUI is wired up in main(), so `tui::state()` is Some(...)
+    // exactly when we decided to run with one. Grab it up front: when
+    // it is set, take ownership of the terminal now, before any of the
+    // startup work below logs. Config load, lock acquisition, and DB
+    // open each emit INFO lines that would otherwise land on the
+    // terminal as scrollback above the screen the TUI restores on
+    // exit; TuiLayer still captures them for the log pane. A fatal
+    // error in that setup still surfaces -- it propagates as Err and
+    // prints via the process's Termination path, which ignores the
+    // gate.
+    let tui_state = jma_mail::tui::state();
+    if tui_state.is_some() {
+        jma_mail::tui::mark_active(true);
+    }
+
     let config = load_config(cli)?;
     acquire_mutator_locks(&config)?;
     let conn = state::db::open_or_recreate(&config.db_path())?;
 
-    // The TUI is wired up in main(), which means `tui::state()` is
-    // Some(...) exactly when we decided to run with one. No TUI ->
-    // run the daemon directly, plain stderr/stdout as before; no
-    // manual-sync signal either, since nothing reads keys.
-    let Some(tui_state) = jma_mail::tui::state() else {
+    // No TUI -> run the daemon directly, plain stderr/stdout as
+    // before; no manual-sync signal either, since nothing reads keys.
+    let Some(tui_state) = tui_state else {
         daemon::runner::run(&conn, &config, profile_sink, None).await?;
         return Ok(());
     };
@@ -678,6 +692,12 @@ async fn cmd_watch(cli: &Cli, profile_sink: Option<ProfileSink>) -> Result<()> {
     // thread is still polling for input -- nudge it to quit.
     shutdown.notify_waiters();
     let _ = render_handle.await;
+
+    // Safety net: the render guard lowers the flag on every path it
+    // controls, but a failure before the guard was armed (raw mode
+    // refused, say) would leave it raised and swallow the daemon's
+    // remaining output. Lower it unconditionally now render is done.
+    jma_mail::tui::mark_active(false);
 
     daemon_result
 }

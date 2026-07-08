@@ -68,7 +68,6 @@ pub fn run(state: Arc<TuiState>, shutdown: Arc<Notify>, manual_sync: Arc<Notify>
     let _guard = TerminalGuard;
 
     let mut terminal = setup_terminal().context("Failed to initialize TUI terminal")?;
-    crate::tui::mark_active(true);
 
     let result = run_loop(&mut terminal, state, &shutdown, &manual_sync);
 
