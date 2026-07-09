@@ -45,9 +45,10 @@ pub const TARGET_TUI_MESSAGE: &str = "jma::tui::message";
 
 /// Target the daemon emits connection-health transitions under.
 /// Events carry `channel` ("engine" for the JMAP session, "sse" for
-/// the push listener), `state` ("connected" / "reconnecting"), and
-/// `backoff_ms` while reconnecting. Captured by TuiLayer into the
-/// status bar's health segment.
+/// the push listener, "watcher" for the filesystem watcher), `state`
+/// ("connected" / "reconnecting" / "down"), and `backoff_ms` while
+/// reconnecting. Captured by TuiLayer into the status bar's health
+/// badges.
 pub const TARGET_TUI_CONN: &str = "jma::tui::conn";
 
 /// Target the daemon emits one event per completed sync cycle
@@ -200,6 +201,7 @@ where
                 match channel {
                     "engine" => self.state.set_engine_conn(conn),
                     "sse" => self.state.set_sse_conn(conn),
+                    "watcher" => self.state.set_watcher_conn(conn),
                     _ => {}
                 }
             }
@@ -409,6 +411,7 @@ fn conn_state_from_event(state: &str, backoff_ms: Option<u64>) -> Option<ConnSta
         "reconnecting" => Some(ConnState::Reconnecting {
             backoff: std::time::Duration::from_millis(backoff_ms.unwrap_or(0)),
         }),
+        "down" => Some(ConnState::Down),
         _ => None,
     }
 }
@@ -440,6 +443,7 @@ mod tests {
                 backoff: Duration::ZERO
             })
         );
+        assert_eq!(conn_state_from_event("down", None), Some(ConnState::Down));
         assert_eq!(conn_state_from_event("degraded", None), None);
     }
 }

@@ -106,6 +106,12 @@ struct Inner {
     /// stop arriving as triggers until the stream comes back; local
     /// FS triggers keep working and the listener retries forever.
     sse_conn: Option<ConnState>,
+    /// Health of the filesystem watcher as reported by the daemon
+    /// runner. The watcher task is one-shot -- any exit, clean or
+    /// not, means local changes stop syncing until the daemon is
+    /// restarted -- so this channel is the only place that failure
+    /// is visible at all.
+    watcher_conn: Option<ConnState>,
     /// Outcome of the most recent completed sync cycle. Kept in its
     /// own slot because cycle results otherwise flow through the
     /// single-slot `notify!` status, where any later milestone
@@ -124,21 +130,25 @@ pub struct CycleSummary {
     pub in_sync: bool,
 }
 
-/// One connection channel's state. Every degraded state is actively
-/// retrying (both the engine and the SSE listener reconnect forever
-/// with backoff), so there is no terminal "down" variant -- the
-/// backoff carries the "how bad is it" signal.
+/// One connection channel's state. The engine and SSE channels only
+/// use `Connected` / `Reconnecting` -- both retry forever with
+/// backoff, so for them every degraded state is actively healing.
+/// `Down` is terminal: the filesystem watcher is a one-shot task
+/// that is never restarted, so once it reports down it stays down
+/// for the life of the process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConnState {
     Connected,
     Reconnecting { backoff: Duration },
+    Down,
 }
 
-/// Snapshot of both connection channels for the status bar.
+/// Snapshot of every health channel for the status bar.
 #[derive(Clone, Copy, Debug)]
 pub struct ConnHealth {
     pub engine: Option<ConnState>,
     pub sse: Option<ConnState>,
+    pub watcher: Option<ConnState>,
 }
 
 /// One row in the Recent pane. Subject is decoded -- mailparse's
@@ -242,6 +252,7 @@ impl TuiState {
                 recent: VecDeque::with_capacity(RECENT_CAPACITY),
                 engine_conn: None,
                 sse_conn: None,
+                watcher_conn: None,
                 last_cycle: None,
             }),
         }
@@ -433,12 +444,21 @@ impl TuiState {
         i.sse_conn = Some(state);
     }
 
-    /// Snapshot both connection channels for the status bar.
+    /// Record the filesystem watcher's state. Same latest-wins rule
+    /// as the other channels; in practice the watcher reports
+    /// connected once at startup and down at most once, on exit.
+    pub fn set_watcher_conn(&self, state: ConnState) {
+        let mut i = self.inner.lock().expect("tui state mutex");
+        i.watcher_conn = Some(state);
+    }
+
+    /// Snapshot every health channel for the status bar.
     pub fn conn_health(&self) -> ConnHealth {
         let i = self.inner.lock().expect("tui state mutex");
         ConnHealth {
             engine: i.engine_conn,
             sse: i.sse_conn,
+            watcher: i.watcher_conn,
         }
     }
 
@@ -656,14 +676,15 @@ mod tests {
         );
     }
 
-    /// Latest report wins on both connection channels: a repeated
+    /// Latest report wins on every health channel: a repeated
     /// Reconnecting overwrites so the displayed backoff tracks the
-    /// runner's doubling, and Connected clears the degraded state.
+    /// runner's doubling, Connected clears the degraded state, and
+    /// the watcher's one-shot Down lands like any other report.
     #[test]
     fn conn_channels_track_latest_report() {
         let state = TuiState::new();
         let health = state.conn_health();
-        assert!(health.engine.is_none() && health.sse.is_none());
+        assert!(health.engine.is_none() && health.sse.is_none() && health.watcher.is_none());
 
         state.set_engine_conn(ConnState::Reconnecting {
             backoff: Duration::from_secs(2),
@@ -672,6 +693,7 @@ mod tests {
             backoff: Duration::from_secs(4),
         });
         state.set_sse_conn(ConnState::Connected);
+        state.set_watcher_conn(ConnState::Connected);
         let health = state.conn_health();
         assert_eq!(
             health.engine,
@@ -680,9 +702,13 @@ mod tests {
             })
         );
         assert_eq!(health.sse, Some(ConnState::Connected));
+        assert_eq!(health.watcher, Some(ConnState::Connected));
 
         state.set_engine_conn(ConnState::Connected);
         assert_eq!(state.conn_health().engine, Some(ConnState::Connected));
+
+        state.set_watcher_conn(ConnState::Down);
+        assert_eq!(state.conn_health().watcher, Some(ConnState::Down));
     }
 
     /// The last-cycle slot is latest-wins: a fresh outcome replaces

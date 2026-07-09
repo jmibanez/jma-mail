@@ -760,7 +760,11 @@ fn draw_status_bar(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState)
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(area);
 
-    let mut left_spans = vec![conn_span(state.conn_health())];
+    // A one-cell gap in the bar's own background separates the two
+    // badges -- their background colors are what delimit them, so
+    // no bracketing glyphs are needed.
+    let health = state.conn_health();
+    let mut left_spans = vec![jmap_badge(health), Span::raw(" "), fs_badge(health)];
     match state.status() {
         Some(Status { at, message }) => {
             left_spans.push(Span::raw(format!(" [{}] ", format_ts(at, &chrono::Local))));
@@ -824,36 +828,67 @@ fn phase_status_line(
     Line::from("")
 }
 
-/// Compact health segment for the status bar's left edge, colored by
-/// severity so degraded states read without consulting the log.
-/// Worst state wins: an engine (JMAP session) outage means sync
-/// itself is down and shows red; a degraded push channel still syncs
-/// on local triggers, so it shows yellow; both healthy is a quiet
-/// green "jmap ok". Before the first report from the daemon the
-/// segment shows a dim "starting".
-fn conn_span(health: ConnHealth) -> Span<'static> {
-    if let Some(ConnState::Reconnecting { backoff }) = health.engine {
-        return Span::styled(
-            format!(" reconnecting {}s ", backoff.as_secs()),
-            Style::default().bg(Color::Red).fg(Color::White),
-        );
-    }
-    if let Some(ConnState::Reconnecting { backoff }) = health.sse {
-        return Span::styled(
-            format!(" push retry {}s ", backoff.as_secs()),
-            Style::default().bg(Color::Yellow).fg(Color::Black),
-        );
-    }
-    if health.engine.is_none() && health.sse.is_none() {
-        return Span::styled(
-            " starting ".to_string(),
+/// Label text of the two health badges, padded to one shared width:
+/// uneven badges read as clutter, and every text the jmap badge can
+/// show -- label or reconnect timer -- renders at this same width,
+/// so the status bar's left edge never reflows on a state
+/// transition.
+const JMAP_BADGE: &str = " jmap ";
+const FS_BADGE: &str = "  fs  ";
+
+/// Health badge for the JMAP side, folding the engine (session) and
+/// SSE (push) channels into one color: red when the engine is
+/// reconnecting (sync itself is down), yellow when only the push
+/// channel is retrying (remote triggers stall but sync still works),
+/// green when connected, dim gray before the first report. While a
+/// channel is reconnecting, its backoff replaces the label -- a
+/// yellow "4s" reads as "push retries in 4s" -- centered into the
+/// same width so the badge doesn't resize.
+fn jmap_badge(health: ConnHealth) -> Span<'static> {
+    let red = Style::default().bg(Color::Red).fg(Color::White);
+    let yellow = Style::default().bg(Color::Yellow).fg(Color::Black);
+    let (text, style) = match (health.engine, health.sse) {
+        (Some(ConnState::Reconnecting { backoff }), _) => (backoff_text(backoff), red),
+        (Some(ConnState::Down), _) => (JMAP_BADGE.to_string(), red),
+        (_, Some(ConnState::Reconnecting { backoff })) => (backoff_text(backoff), yellow),
+        (_, Some(ConnState::Down)) => (JMAP_BADGE.to_string(), yellow),
+        (None, None) => (
+            JMAP_BADGE.to_string(),
             Style::default().bg(Color::DarkGray).fg(Color::White),
-        );
-    }
-    Span::styled(
-        " jmap ok ".to_string(),
-        Style::default().bg(Color::Green).fg(Color::Black),
+        ),
+        _ => (
+            JMAP_BADGE.to_string(),
+            Style::default().bg(Color::Green).fg(Color::Black),
+        ),
+    };
+    Span::styled(text, style)
+}
+
+/// A reconnect backoff centered into the badge width, e.g.
+/// "  4s  ". The daemon caps backoff at 60s (RECONNECT_MAX_BACKOFF),
+/// so the text always fits and the badge never resizes.
+fn backoff_text(backoff: std::time::Duration) -> String {
+    format!(
+        "{:^width$}",
+        format!("{}s", backoff.as_secs()),
+        width = JMAP_BADGE.len()
     )
+}
+
+/// Health badge for the filesystem watcher: green while it runs,
+/// red once it has exited (the task is one-shot -- local changes
+/// stop syncing until the daemon restarts, so the red never
+/// clears), dim gray before the first report. Always shows its
+/// label; there is no retry state to time.
+fn fs_badge(health: ConnHealth) -> Span<'static> {
+    let style = match health.watcher {
+        None => Style::default().bg(Color::DarkGray).fg(Color::White),
+        Some(ConnState::Connected) => Style::default().bg(Color::Green).fg(Color::Black),
+        Some(ConnState::Reconnecting { .. }) | Some(ConnState::Down) => {
+            Style::default().bg(Color::Red).fg(Color::White)
+        }
+    };
+    Span::styled(FS_BADGE, style)
 }
 
 /// Formats a captured-UTC timestamp as a time-of-day string in `tz`.
@@ -1009,41 +1044,111 @@ mod tests {
         assert!(text.contains("12 dn / 3 up"));
     }
 
-    /// Worst state wins in the health segment: an engine outage
-    /// outranks a degraded push channel, which outranks healthy; no
-    /// reports at all reads as startup rather than health.
+    /// Build a ConnHealth snapshot from per-channel states -- helper
+    /// for the badge tests.
+    fn health(
+        engine: Option<ConnState>,
+        sse: Option<ConnState>,
+        watcher: Option<ConnState>,
+    ) -> ConnHealth {
+        ConnHealth {
+            engine,
+            sse,
+            watcher,
+        }
+    }
+
+    /// The jmap badge folds engine + SSE into one color: engine
+    /// degradation (sync down) outranks push degradation (sync still
+    /// works), connected is green, and no reports read as startup
+    /// gray. While a channel reconnects, the winning channel's
+    /// backoff replaces the label; every text renders at the label's
+    /// width so the bar never reflows on a transition.
     #[test]
-    fn conn_span_picks_worst_state_first() {
+    fn jmap_badge_colors_by_channel_state() {
         use std::time::Duration;
-        let both_down = ConnHealth {
-            engine: Some(ConnState::Reconnecting {
-                backoff: Duration::from_secs(4),
-            }),
-            sse: Some(ConnState::Reconnecting {
-                backoff: Duration::from_secs(2),
-            }),
+        let retry_4s = ConnState::Reconnecting {
+            backoff: Duration::from_secs(4),
         };
-        assert_eq!(conn_span(both_down).content, " reconnecting 4s ");
+        let retry_2s = ConnState::Reconnecting {
+            backoff: Duration::from_secs(2),
+        };
 
-        let push_only = ConnHealth {
-            engine: Some(ConnState::Connected),
-            sse: Some(ConnState::Reconnecting {
-                backoff: Duration::from_secs(2),
+        let engine_down = jmap_badge(health(Some(retry_4s), Some(ConnState::Connected), None));
+        assert_eq!(engine_down.content, "  4s  ");
+        assert_eq!(engine_down.style.bg, Some(Color::Red));
+
+        // Engine degradation wins over push degradation when both
+        // report at once -- the displayed timer is the engine's.
+        let both = jmap_badge(health(Some(retry_4s), Some(retry_2s), None));
+        assert_eq!(both.content, "  4s  ");
+        assert_eq!(both.style.bg, Some(Color::Red));
+
+        let push_only = jmap_badge(health(Some(ConnState::Connected), Some(retry_2s), None));
+        assert_eq!(push_only.content, "  2s  ");
+        assert_eq!(push_only.style.bg, Some(Color::Yellow));
+
+        let healthy = jmap_badge(health(
+            Some(ConnState::Connected),
+            Some(ConnState::Connected),
+            None,
+        ));
+        assert_eq!(healthy.content, JMAP_BADGE);
+        assert_eq!(healthy.style.bg, Some(Color::Green));
+
+        let unreported = jmap_badge(health(None, None, None));
+        assert_eq!(unreported.content, JMAP_BADGE);
+        assert_eq!(unreported.style.bg, Some(Color::DarkGray));
+
+        // Width stability is the badge's layout contract: label and
+        // timer render at exactly the same width, including the
+        // longest possible timer (the 60s backoff cap).
+        let capped = jmap_badge(health(
+            Some(ConnState::Reconnecting {
+                backoff: Duration::from_secs(60),
             }),
-        };
-        assert_eq!(conn_span(push_only).content, " push retry 2s ");
+            None,
+            None,
+        ));
+        assert_eq!(capped.content.len(), JMAP_BADGE.len());
+        assert_eq!(engine_down.content.len(), JMAP_BADGE.len());
+    }
 
-        let healthy = ConnHealth {
-            engine: Some(ConnState::Connected),
-            sse: Some(ConnState::Connected),
-        };
-        assert_eq!(conn_span(healthy).content, " jmap ok ");
+    /// The fs badge tracks the watcher channel alone: green while
+    /// running, red once down (terminal -- the watcher task is
+    /// one-shot), gray before the first report. The watcher's state
+    /// must not bleed into the jmap badge or vice versa: each badge
+    /// reads exactly one failure domain.
+    #[test]
+    fn fs_badge_colors_by_watcher_state() {
+        // The two badges share one width -- uneven badges read as
+        // clutter, and the labels are consts, so pin it here.
+        assert_eq!(JMAP_BADGE.len(), FS_BADGE.len());
 
-        let unreported = ConnHealth {
-            engine: None,
-            sse: None,
-        };
-        assert_eq!(conn_span(unreported).content, " starting ");
+        let unreported = fs_badge(health(None, None, None));
+        assert_eq!(unreported.content, FS_BADGE);
+        assert_eq!(unreported.style.bg, Some(Color::DarkGray));
+
+        let running = fs_badge(health(None, None, Some(ConnState::Connected)));
+        assert_eq!(running.style.bg, Some(Color::Green));
+
+        let dead = fs_badge(health(None, None, Some(ConnState::Down)));
+        assert_eq!(dead.style.bg, Some(Color::Red));
+
+        // A dead watcher leaves the jmap badge alone, and a degraded
+        // engine leaves the fs badge alone.
+        let jmap = jmap_badge(health(
+            Some(ConnState::Connected),
+            Some(ConnState::Connected),
+            Some(ConnState::Down),
+        ));
+        assert_eq!(jmap.style.bg, Some(Color::Green));
+        let fs = fs_badge(health(
+            Some(ConnState::Down),
+            None,
+            Some(ConnState::Connected),
+        ));
+        assert_eq!(fs.style.bg, Some(Color::Green));
     }
 
     /// Strings within budget pass through untouched -- no gratuitous

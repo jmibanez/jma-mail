@@ -214,6 +214,15 @@ pub async fn watch(
         .watch(maildir_root, notify::RecursiveMode::Recursive)?;
 
     info!("Filesystem watcher started");
+    // Reported only once the debouncer is actually watching -- a
+    // setup failure above returns Err before this, and the runner's
+    // spawn wrapper turns that exit into a "down" report.
+    tracing::event!(
+        target: crate::tui::layer::TARGET_TUI_CONN,
+        tracing::Level::TRACE,
+        channel = "watcher",
+        state = "connected",
+    );
 
     while let Some(trigger) = notify_rx.recv().await {
         debug!("Local filesystem change detected ({})", trigger);

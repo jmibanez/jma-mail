@@ -204,6 +204,22 @@ impl<'a> WatchDaemon<'a> {
             {
                 error!("Filesystem watcher error: {}", e);
             }
+            // Any exit -- error or clean channel close -- means local
+            // changes stop syncing for the rest of this process, so
+            // report the watcher down either way. Daemon teardown
+            // doesn't normally reach this emit: clean loop exit
+            // aborts the task at an await point, and the TUI-quit
+            // path detaches it (see cmd_watch) so the future is
+            // dropped at its recv().await before the emit runs. An
+            // FS event racing into that drop-to-teardown window can
+            // still fire it, but the terminal is already being
+            // restored by then.
+            tracing::event!(
+                target: crate::tui::layer::TARGET_TUI_CONN,
+                tracing::Level::TRACE,
+                channel = "watcher",
+                state = "down",
+            );
         });
 
         // Manual triggers ride the same channel as SSE and FS
