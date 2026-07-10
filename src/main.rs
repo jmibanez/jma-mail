@@ -81,30 +81,12 @@ async fn main() -> Result<()> {
     // is what keeps cold call sites cold -- without it, a filterless
     // layer would bump `LevelFilter::current()` to TRACE and every
     // trace!() / debug!() call site in the crate would fire just to
-    // be discarded by on_event's internal floor. The shape: INFO as
-    // the default (drives the log pane) plus TRACE on the metric
-    // targets (phase spans for "current phase", blob spans for
-    // bandwidth, and the TUI's own progress events). The internal
-    // floor on log events stays for defense in depth.
+    // be discarded by on_event's internal floor. The filter itself
+    // is derived inside the layer module from its own routing table
+    // (see `tui::layer::target_filter`), so a new TUI metric never
+    // needs an edit here.
     let tui_layer = if want_tui {
-        let target_filter = tracing_subscriber::filter::Targets::new()
-            .with_default(tracing::Level::INFO)
-            .with_target(profile::TARGET_PHASE, tracing::Level::TRACE)
-            .with_target(profile::TARGET_BLOB, tracing::Level::TRACE)
-            .with_target(
-                jma_mail::tui::layer::TARGET_TUI_PROGRESS,
-                tracing::Level::TRACE,
-            )
-            .with_target(
-                jma_mail::tui::layer::TARGET_TUI_MESSAGE,
-                tracing::Level::TRACE,
-            )
-            .with_target(jma_mail::tui::layer::TARGET_TUI_CONN, tracing::Level::TRACE)
-            .with_target(
-                jma_mail::tui::layer::TARGET_TUI_CYCLE,
-                tracing::Level::TRACE,
-            );
-        Some(jma_mail::tui::install().with_filter(target_filter))
+        Some(jma_mail::tui::install().with_filter(jma_mail::tui::layer::target_filter()))
     } else {
         None
     };

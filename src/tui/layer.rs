@@ -56,6 +56,49 @@ pub const TARGET_TUI_CONN: &str = "jma::tui::conn";
 /// cycle's `wall_ms`. Feeds the Network pane's "last" row.
 pub const TARGET_TUI_CYCLE: &str = "jma::tui::cycle";
 
+/// One row per event target the layer consumes: the target string
+/// and the handler that routes a matching event into `TuiState`.
+/// The admission filter is derived from this same table (see
+/// [`target_filter`]), so consuming a new event target is one entry
+/// here -- there is no separate list that can drift out of sync
+/// with the routing.
+const EVENT_ROUTES: &[(&str, EventRoute)] = &[
+    (TARGET_TUI_PROGRESS, route_progress),
+    (TARGET_TUI_MESSAGE, route_message),
+    (TARGET_TUI_CONN, route_conn),
+    (TARGET_TUI_CYCLE, route_cycle),
+];
+
+/// Handler that routes one matched event into `TuiState`.
+type EventRoute = fn(&TuiState, &Event<'_>);
+
+/// Targets whose *spans* the layer consumes -- the phase stack and
+/// the bandwidth samples ride span open/close, not events, so they
+/// dispatch in `on_new_span`/`on_close` rather than through
+/// [`EVENT_ROUTES`]. Listed here so [`target_filter`] admits them.
+const SPAN_TARGETS: &[&str] = &[TARGET_PHASE, TARGET_BLOB];
+
+/// The admission filter for `TuiLayer`, derived from the layer's
+/// own routing tables. Everything the layer consumes fires at
+/// TRACE, below any sane default floor, so each target must be
+/// admitted explicitly -- one left out is dropped before the layer
+/// runs and the panel it feeds silently stays empty. Deriving the
+/// filter from [`EVENT_ROUTES`] and [`SPAN_TARGETS`] makes
+/// routed-but-unadmitted unrepresentable. The INFO default keeps
+/// ordinary log events flowing to the log pane, backstopped by
+/// `on_event`'s own INFO floor for defense in depth.
+pub fn target_filter() -> tracing_subscriber::filter::Targets {
+    tracing_subscriber::filter::Targets::new()
+        .with_default(Level::INFO)
+        .with_targets(
+            EVENT_ROUTES
+                .iter()
+                .map(|(target, _)| *target)
+                .chain(SPAN_TARGETS.iter().copied())
+                .map(|target| (target, Level::TRACE)),
+        )
+}
+
 pub struct TuiLayer {
     state: Arc<TuiState>,
 }
@@ -156,63 +199,14 @@ where
 
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
         let meta = event.metadata();
-        // Progress events feed the metric panel, not the log pane.
-        // Routed before the level floor because they fire at TRACE
-        // (one per stored download).
-        if meta.target() == TARGET_TUI_PROGRESS {
-            let mut visitor = ProgressVisitor::default();
-            event.record(&mut visitor);
-            if let (Some(done), Some(total)) = (visitor.done, visitor.total) {
-                self.state.set_download_progress(done, total);
-            }
-            return;
-        }
-        // Recent-messages events feed the Recent pane. Same TRACE
-        // routing rationale as the progress events above.
-        if meta.target() == TARGET_TUI_MESSAGE {
-            let mut visitor = MessageInfoVisitor::default();
-            event.record(&mut visitor);
-            if let (Some(folder), Some(subject)) = (visitor.folder, visitor.subject) {
-                self.state.push_recent(folder, subject);
-            }
-            return;
-        }
-        // Cycle outcomes feed the Network pane's "last" row. Same
-        // TRACE routing rationale as above.
-        if meta.target() == TARGET_TUI_CYCLE {
-            let mut visitor = CycleVisitor::default();
-            event.record(&mut visitor);
-            if let (Some(downloaded), Some(uploaded), Some(in_sync), Some(wall_ms)) = (
-                visitor.downloaded,
-                visitor.uploaded,
-                visitor.in_sync,
-                visitor.wall_ms,
-            ) {
-                self.state.set_last_cycle(
-                    downloaded,
-                    uploaded,
-                    in_sync,
-                    std::time::Duration::from_millis(wall_ms),
-                );
-            }
-            return;
-        }
-        // Connection-health transitions feed the status bar's health
-        // segment. Same TRACE routing rationale as above.
-        if meta.target() == TARGET_TUI_CONN {
-            let mut visitor = ConnVisitor::default();
-            event.record(&mut visitor);
-            if let (Some(channel), Some(state)) =
-                (visitor.channel.as_deref(), visitor.state.as_deref())
-                && let Some(conn) = conn_state_from_event(state, visitor.backoff_ms)
-            {
-                match channel {
-                    "engine" => self.state.set_engine_conn(conn),
-                    "sse" => self.state.set_sse_conn(conn),
-                    "watcher" => self.state.set_watcher_conn(conn),
-                    _ => {}
-                }
-            }
+        // Metric events feed the panels, not the log pane. Routed
+        // by table lookup before the level floor because they fire
+        // at TRACE (e.g. one progress event per stored download).
+        if let Some((_, route)) = EVENT_ROUTES
+            .iter()
+            .find(|(target, _)| *target == meta.target())
+        {
+            route(&self.state, event);
             return;
         }
         // Floor at INFO. Trace/debug events are too high-volume to
@@ -236,6 +230,61 @@ where
             target: meta.target().to_string(),
             message,
         });
+    }
+}
+
+/// Route one download-progress event into the live progress slot.
+fn route_progress(state: &TuiState, event: &Event<'_>) {
+    let mut visitor = ProgressVisitor::default();
+    event.record(&mut visitor);
+    if let (Some(done), Some(total)) = (visitor.done, visitor.total) {
+        state.set_download_progress(done, total);
+    }
+}
+
+/// Route one just-synced-message event into the Recent pane's ring.
+fn route_message(state: &TuiState, event: &Event<'_>) {
+    let mut visitor = MessageInfoVisitor::default();
+    event.record(&mut visitor);
+    if let (Some(folder), Some(subject)) = (visitor.folder, visitor.subject) {
+        state.push_recent(folder, subject);
+    }
+}
+
+/// Route one cycle-outcome event into the "last" slot.
+fn route_cycle(state: &TuiState, event: &Event<'_>) {
+    let mut visitor = CycleVisitor::default();
+    event.record(&mut visitor);
+    if let (Some(downloaded), Some(uploaded), Some(in_sync), Some(wall_ms)) = (
+        visitor.downloaded,
+        visitor.uploaded,
+        visitor.in_sync,
+        visitor.wall_ms,
+    ) {
+        state.set_last_cycle(
+            downloaded,
+            uploaded,
+            in_sync,
+            std::time::Duration::from_millis(wall_ms),
+        );
+    }
+}
+
+/// Route one connection-health transition into the named channel's
+/// slot in the status bar's health segment.
+fn route_conn(state: &TuiState, event: &Event<'_>) {
+    let mut visitor = ConnVisitor::default();
+    event.record(&mut visitor);
+    if let (Some(channel), Some(conn_state)) =
+        (visitor.channel.as_deref(), visitor.state.as_deref())
+        && let Some(conn) = conn_state_from_event(conn_state, visitor.backoff_ms)
+    {
+        match channel {
+            "engine" => state.set_engine_conn(conn),
+            "sse" => state.set_sse_conn(conn),
+            "watcher" => state.set_watcher_conn(conn),
+            _ => {}
+        }
     }
 }
 
@@ -429,7 +478,60 @@ fn conn_state_from_event(state: &str, backoff_ms: Option<u64>) -> Option<ConnSta
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use std::time::Duration;
+
+    /// Every target the layer consumes -- event and span side alike
+    /// -- must be admitted at TRACE by the derived filter, the INFO
+    /// default must keep ordinary log events flowing to the log
+    /// pane, and unrouted TRACE noise must stay out. Because the
+    /// filter is built from the routing tables themselves, this
+    /// holds for every future table row too.
+    #[test]
+    fn target_filter_admits_exactly_what_the_layer_routes() {
+        let filter = target_filter();
+        for (target, _) in EVENT_ROUTES {
+            assert!(
+                filter.would_enable(target, &Level::TRACE),
+                "{target} routed but not admitted"
+            );
+        }
+        for target in SPAN_TARGETS {
+            assert!(
+                filter.would_enable(target, &Level::TRACE),
+                "{target} consumed as spans but not admitted"
+            );
+        }
+        assert!(filter.would_enable("jma::sync::engine", &Level::INFO));
+        assert!(!filter.would_enable("jma::sync::engine", &Level::TRACE));
+    }
+
+    /// End-to-end through a real subscriber: a metric event emitted
+    /// the way the daemon emits it -- TRACE level, through the
+    /// derived filter -- must land in the state slot. Layer-only
+    /// tests cannot see admission: a target the filter drops never
+    /// reaches on_event, and the panel it feeds silently stays
+    /// empty.
+    #[test]
+    fn routed_event_passes_the_derived_filter_into_state() {
+        use tracing_subscriber::prelude::*;
+        let state = Arc::new(TuiState::new());
+        let subscriber = tracing_subscriber::registry()
+            .with(TuiLayer::new(state.clone()).with_filter(target_filter()));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::event!(
+                target: TARGET_TUI_CYCLE,
+                tracing::Level::TRACE,
+                downloaded = 12u64,
+                uploaded = 3u64,
+                in_sync = false,
+                wall_ms = 1_200u64,
+            );
+        });
+        let cycle = state.last_cycle().expect("cycle must reach the state slot");
+        assert_eq!((cycle.downloaded, cycle.uploaded), (12, 3));
+        assert_eq!(cycle.wall, Duration::from_millis(1_200));
+    }
 
     /// The event-to-state mapping is the layer's contract with the
     /// daemon's emit sites: recognized states convert (reconnecting
