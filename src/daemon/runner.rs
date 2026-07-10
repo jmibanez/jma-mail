@@ -252,6 +252,11 @@ impl<'a> WatchDaemon<'a> {
     /// escapes. The FS watcher is aborted on the way out regardless
     /// of how the loop exited so the runtime can shut down cleanly.
     async fn run(&mut self) -> Result<()> {
+        // The DB survives restarts, so a mail tally exists before
+        // the first cycle -- report it now rather than leaving the
+        // Stats pane's mail row absent until the bootstrap finishes.
+        report_totals(self.conn);
+
         // Initial bootstrap: the daemon's "catch up since last
         // shutdown" cycle. Not repeated on reconnect because the DB
         // cursor is intact and the next regular trigger will reconcile
@@ -286,6 +291,7 @@ impl<'a> WatchDaemon<'a> {
         {
             Ok(outcome) => {
                 report_cycle(&outcome, started.elapsed());
+                report_totals(self.conn);
                 if outcome.downloaded > 0 {
                     self.hook.trigger().await;
                 }
@@ -471,6 +477,7 @@ impl<'a> WatchDaemon<'a> {
                     // starts fresh rather than at whatever cap we hit.
                     self.backoff = RECONNECT_INITIAL_BACKOFF;
                     report_cycle(&outcome, started.elapsed());
+                    report_totals(self.conn);
                     if outcome.downloaded > 0 {
                         self.hook.trigger().await;
                     }
@@ -528,6 +535,28 @@ fn report_cycle(outcome: &SyncOutcome, wall: Duration) {
         in_sync = outcome.already_in_sync,
         wall_ms = wall.as_millis() as u64,
     );
+}
+
+/// Report the state DB's store-wide mail tally (mapped messages,
+/// distinct maildir folders) to the TUI Stats pane's mail row.
+/// Emitted at daemon startup and after every completed cycle. A
+/// query failure logs at warn and leaves the previous tally on
+/// display -- the tally is context, not worth failing a cycle over.
+fn report_totals(conn: &Connection) {
+    match (
+        queries::count_messages(conn),
+        queries::count_maildir_folders(conn),
+    ) {
+        (Ok(messages), Ok(folders)) => {
+            tracing::event!(
+                target: crate::tui::layer::TARGET_TUI_TOTALS,
+                tracing::Level::TRACE,
+                messages = messages,
+                folders = folders,
+            );
+        }
+        (Err(e), _) | (_, Err(e)) => warn!("Failed to read mail totals: {:#}", e),
+    }
 }
 
 /// Flush the per-cycle profile snapshot (table + JSON, depending on

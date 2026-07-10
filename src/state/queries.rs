@@ -191,6 +191,14 @@ pub fn has_message_map_rows(conn: &Connection) -> Result<bool> {
     Ok(n != 0)
 }
 
+/// Count of `message_map` rows -- the store-wide mapped-mail tally
+/// the watch TUI shows. One number for the whole store; per-mailbox
+/// listings go through `get_messages_by_jmap_mailbox_id`.
+pub fn count_messages(conn: &Connection) -> Result<u64> {
+    let n: i64 = conn.query_row("SELECT COUNT(*) FROM message_map", [], |row| row.get(0))?;
+    Ok(n as u64)
+}
+
 /// Get all messages in a given mailbox.
 pub fn get_messages_by_jmap_mailbox_id(
     conn: &Connection,
@@ -277,6 +285,19 @@ pub fn list_known_maildir_folders(conn: &Connection) -> Result<Vec<String>> {
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+/// Count of distinct maildir folders in `mailbox_map` -- the folder
+/// tally the watch TUI shows next to the message count. DISTINCT
+/// mirrors `list_known_maildir_folders`: several mailboxes bound to
+/// one folder tally as one folder.
+pub fn count_maildir_folders(conn: &Connection) -> Result<u64> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(DISTINCT maildir_folder) FROM mailbox_map",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(n as u64)
 }
 
 /// List every `jmap_mailbox_id` currently recorded in `mailbox_map`,
@@ -596,6 +617,36 @@ mod tests {
             flags: String::new(),
             jmap_keywords: "{}".into(),
         }
+    }
+
+    /// The watch TUI's tally counts: `count_messages` counts every
+    /// `message_map` row, and `count_maildir_folders` counts
+    /// distinct folders -- two mailboxes bound to the same maildir
+    /// folder tally as one, mirroring `list_known_maildir_folders`.
+    #[test]
+    fn tally_counts_messages_and_distinct_folders() {
+        let conn = crate::state::db::open_in_memory().unwrap();
+        assert_eq!(count_messages(&conn).unwrap(), 0);
+        assert_eq!(count_maildir_folders(&conn).unwrap(), 0);
+
+        upsert_message(&conn, &record_with_maildir_id("E1", Some("m1"))).unwrap();
+        upsert_message(&conn, &record_with_maildir_id("E2", Some("m2"))).unwrap();
+        upsert_message(&conn, &record_with_maildir_id("E3", None)).unwrap();
+        assert_eq!(count_messages(&conn).unwrap(), 3);
+
+        let mailbox = |id: &str, folder: &str| MailboxRecord {
+            jmap_mailbox_id: id.into(),
+            name: folder.to_string(),
+            role: None,
+            parent_id: None,
+            maildir_folder: folder.to_string(),
+            sort_order: 0,
+            remote_path: Some(folder.to_string()),
+        };
+        upsert_mailbox(&conn, &mailbox("MB1", "INBOX")).unwrap();
+        upsert_mailbox(&conn, &mailbox("MB2", "Archive")).unwrap();
+        upsert_mailbox(&conn, &mailbox("MB3", "Archive")).unwrap();
+        assert_eq!(count_maildir_folders(&conn).unwrap(), 2);
     }
 
     /// Two distinct `jmap_email_id`s claiming the same non-NULL

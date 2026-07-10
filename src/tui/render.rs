@@ -39,8 +39,8 @@ use std::time::Duration;
 use tokio::sync::Notify;
 
 use crate::tui::state::{
-    ActivePhase, Bandwidth, CompletedPhase, ConnHealth, ConnState, CycleSummary, LogLine, Progress,
-    Status, TuiState,
+    ActivePhase, Bandwidth, CompletedPhase, ConnHealth, ConnState, CycleSummary, LogLine,
+    MailTotals, Progress, Status, TuiState,
 };
 
 /// Frame cadence. Crossterm's `poll` returns early on key events, so
@@ -372,41 +372,43 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
-/// Width reserved for the Network pane. Sized to comfortably hold
+/// Width reserved for the Stats pane. Sized to comfortably hold
 /// the widest realistic line -- "  in     1.0 MB/s  (1.2 GB total)"
 /// or the "  dl   12345/67890  (99%)" row -- with two cells of
 /// border. Fixed rather than percentage so the Recent pane's width
 /// doesn't jitter just because a rate string got a digit wider.
-const NETWORK_PANE_WIDTH: u16 = 40;
+const STATS_PANE_WIDTH: u16 = 40;
 
-/// Top half: metrics. Network on the left at a fixed width, Recent
+/// Top half: metrics. Stats on the left at a fixed width, Recent
 /// on the right with everything else. Recent benefits the most from
 /// extra horizontal room (Subject strings are the only variable-
-/// width content) and the Network pane has a tight, bounded layout
+/// width content) and the Stats pane has a tight, bounded layout
 /// that doesn't grow with the window.
 fn draw_metrics(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(NETWORK_PANE_WIDTH), Constraint::Min(0)])
+        .constraints([Constraint::Length(STATS_PANE_WIDTH), Constraint::Min(0)])
         .split(area);
-    draw_bandwidth(
+    draw_stats(
         frame,
         cols[0],
         state.bandwidth(),
         state.download_progress(),
         state.download_eta(),
         state.last_cycle(),
+        state.totals(),
     );
     draw_recent(frame, cols[1], state);
 }
 
-/// Network bandwidth: in (blob downloads), out (Email/import
-/// uploads), and live download progress while `download_blobs` is
-/// active. Each direction gets one line: a rolling-window rate
-/// followed by the cumulative total in parens. The window is
-/// `BW_WINDOW` -- short enough that the number tracks live
-/// activity, long enough that a single multi-megabyte blob doesn't
-/// produce a spike that reads as nonsense.
+/// The Stats pane: network bandwidth -- in (blob downloads), out
+/// (Email/import uploads) -- live download progress while
+/// `download_blobs` is active, the last cycle's outcome, and the
+/// store-wide mail tally. Each bandwidth direction gets one line: a
+/// rolling-window rate followed by the cumulative total in parens.
+/// The window is `BW_WINDOW` -- short enough that the number tracks
+/// live activity, long enough that a single multi-megabyte blob
+/// doesn't produce a spike that reads as nonsense.
 ///
 /// The download-progress row is conditional: it only renders while
 /// the executor is emitting progress events (TuiState clears the
@@ -425,15 +427,16 @@ fn draw_metrics(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
 /// Maildir-write bytes intentionally don't appear here. They're
 /// disk-write throughput, not network bandwidth, and conflating them
 /// into a single panel makes the in/out labels lie.
-fn draw_bandwidth(
+fn draw_stats(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
     bw: Bandwidth,
     progress: Option<Progress>,
     eta: Option<Duration>,
     last_cycle: Option<CycleSummary>,
+    totals: Option<MailTotals>,
 ) {
-    let block = Block::default().borders(Borders::ALL).title(" Network ");
+    let block = Block::default().borders(Borders::ALL).title(" Stats ");
     let mut lines = vec![
         Line::from(vec![
             Span::raw("  in  "),
@@ -464,10 +467,33 @@ fn draw_bandwidth(
     if let Some(cycle) = last_cycle {
         lines.extend(cycle_lines(cycle));
     }
+    if let Some(line) = totals_line(totals) {
+        lines.push(line);
+    }
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-/// The Network pane's download-progress row, present only while a
+/// The Stats pane's mail row: the store-wide tally as last read
+/// from the state DB -- the same at-a-glance count a file browser
+/// shows for a directory, context rather than a decision input.
+/// Absent until the daemon's first report, so a zero tally only
+/// ever means a truly empty DB, never merely an unreported one.
+fn totals_line(totals: Option<MailTotals>) -> Option<Line<'static>> {
+    let t = totals?;
+    Some(Line::from(vec![
+        Span::raw("  mail"),
+        Span::styled(
+            format!(
+                "  {} msgs in {} folders",
+                group_thousands(t.messages),
+                t.folders
+            ),
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+    ]))
+}
+
+/// The Stats pane's download-progress row, present only while a
 /// download batch is in flight with a known total. The dim parens
 /// carry the completed percentage and, when the download rate is
 /// live, the finish estimate; the ETA is omitted while the
@@ -510,7 +536,7 @@ fn format_eta(eta: Duration) -> String {
     }
 }
 
-/// The Network pane's "last" item: the most recent completed
+/// The Stats pane's "last" item: the most recent completed
 /// cycle's outcome, dimmed -- it's context, not live activity. Two
 /// rows, because the pane is a fixed 38 inner cells with no wrap
 /// and a single row clips the tail on big-count cycles (an initial
@@ -590,6 +616,21 @@ fn draw_recent(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Group a count with comma separators ("87432" -> "87,432") --
+/// six-digit tallies are the norm after a big initial sync, and
+/// ungrouped digit runs don't read at a glance.
+fn group_thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Cap `s` at `max` display columns, appending an ellipsis if any
@@ -1133,7 +1174,7 @@ mod tests {
         assert!(flat(&bottom).contains("(1.2s)"));
     }
 
-    /// Both rows of the "last" item fit the Network pane's fixed
+    /// Both rows of the "last" item fit the Stats pane's fixed
     /// inner width for a big-count cycle -- an initial sync's counts
     /// plus duration plus timestamp is exactly the shape that
     /// overflowed a single row, and the pane's Paragraph does not
@@ -1152,7 +1193,7 @@ mod tests {
         assert!(top.contains("150000 dn / 2000 up"));
         assert!(bottom.contains("(3600.0s)"));
         // All-ASCII rows, so byte length equals display width.
-        let inner = (NETWORK_PANE_WIDTH - 2) as usize;
+        let inner = (STATS_PANE_WIDTH - 2) as usize;
         assert!(
             top.len() <= inner,
             "top row {} > {inner}: {top:?}",
@@ -1270,6 +1311,50 @@ mod tests {
             Some(ConnState::Connected),
         ));
         assert_eq!(fs.style.bg, Some(Color::Green));
+    }
+
+    /// The mail row carries the tally once reported and is absent
+    /// before that -- an empty-looking "0 msgs in 0 folders" only
+    /// appears when the DB really is empty, not merely unreported.
+    /// The row must fit the pane's fixed inner width even at
+    /// seven-digit message counts.
+    #[test]
+    fn totals_line_carries_tally_and_fits_the_pane() {
+        assert!(totals_line(None).is_none());
+        let line = flat(
+            &totals_line(Some(MailTotals {
+                messages: 87_432,
+                folders: 42,
+            }))
+            .unwrap(),
+        );
+        assert_eq!(line, "  mail  87,432 msgs in 42 folders");
+
+        let big = flat(
+            &totals_line(Some(MailTotals {
+                messages: 1_234_567,
+                folders: 999,
+            }))
+            .unwrap(),
+        );
+        // All-ASCII row, so byte length equals display width.
+        let inner = (STATS_PANE_WIDTH - 2) as usize;
+        assert!(
+            big.len() <= inner,
+            "mail row {} > {inner}: {big:?}",
+            big.len()
+        );
+    }
+
+    /// Comma grouping at every third digit, no separator for short
+    /// counts, and no leading comma at exact multiples of three.
+    #[test]
+    fn group_thousands_places_separators() {
+        assert_eq!(group_thousands(0), "0");
+        assert_eq!(group_thousands(999), "999");
+        assert_eq!(group_thousands(1_000), "1,000");
+        assert_eq!(group_thousands(87_432), "87,432");
+        assert_eq!(group_thousands(1_234_567), "1,234,567");
     }
 
     /// Strings within budget pass through untouched -- no gratuitous

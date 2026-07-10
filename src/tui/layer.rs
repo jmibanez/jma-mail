@@ -53,8 +53,14 @@ pub const TARGET_TUI_CONN: &str = "jma::tui::conn";
 
 /// Target the daemon emits one event per completed sync cycle
 /// under, carrying `downloaded`, `uploaded`, `in_sync`, and the
-/// cycle's `wall_ms`. Feeds the Network pane's "last" row.
+/// cycle's `wall_ms`. Feeds the Stats pane's "last" row.
 pub const TARGET_TUI_CYCLE: &str = "jma::tui::cycle";
+
+/// Target the daemon emits the store-wide mail tally under, at
+/// startup and after each sync cycle. Events carry `messages`
+/// (mapped messages) and `folders` (distinct maildir folders).
+/// Feeds the Stats pane's mail row.
+pub const TARGET_TUI_TOTALS: &str = "jma::tui::totals";
 
 /// One row per event target the layer consumes: the target string
 /// and the handler that routes a matching event into `TuiState`.
@@ -67,6 +73,7 @@ const EVENT_ROUTES: &[(&str, EventRoute)] = &[
     (TARGET_TUI_MESSAGE, route_message),
     (TARGET_TUI_CONN, route_conn),
     (TARGET_TUI_CYCLE, route_cycle),
+    (TARGET_TUI_TOTALS, route_totals),
 ];
 
 /// Handler that routes one matched event into `TuiState`.
@@ -270,6 +277,15 @@ fn route_cycle(state: &TuiState, event: &Event<'_>) {
     }
 }
 
+/// Route one mail-tally report into the totals slot.
+fn route_totals(state: &TuiState, event: &Event<'_>) {
+    let mut visitor = TotalsVisitor::default();
+    event.record(&mut visitor);
+    if let (Some(messages), Some(folders)) = (visitor.messages, visitor.folders) {
+        state.set_totals(messages, folders);
+    }
+}
+
 /// Route one connection-health transition into the named channel's
 /// slot in the status bar's health segment.
 fn route_conn(state: &TuiState, event: &Event<'_>) {
@@ -367,6 +383,33 @@ impl Visit for MessageInfoVisitor {
             _ => {}
         }
     }
+}
+
+/// Reads `messages` and `folders` from a `TARGET_TUI_TOTALS` event.
+/// Both must be present for the tally to register; a partial event
+/// leaves the previous tally on display.
+#[derive(Default)]
+struct TotalsVisitor {
+    messages: Option<u64>,
+    folders: Option<u64>,
+}
+
+impl Visit for TotalsVisitor {
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        match field.name() {
+            "messages" => self.messages = Some(value),
+            "folders" => self.folders = Some(value),
+            _ => {}
+        }
+    }
+
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        if value >= 0 {
+            self.record_u64(field, value as u64);
+        }
+    }
+
+    fn record_debug(&mut self, _: &Field, _: &dyn std::fmt::Debug) {}
 }
 
 /// Pulls the `message` field out of a tracing event. Other fields
@@ -531,6 +574,30 @@ mod tests {
         let cycle = state.last_cycle().expect("cycle must reach the state slot");
         assert_eq!((cycle.downloaded, cycle.uploaded), (12, 3));
         assert_eq!(cycle.wall, Duration::from_millis(1_200));
+    }
+
+    /// The tally's own end-to-end proof, same shape as the cycle
+    /// test above: a TRACE totals event through the derived filter
+    /// must land in the totals slot. The admission loop already
+    /// covers the new table row generically; this pins the full
+    /// emit-shape-to-slot path for the feature that shipped without
+    /// it.
+    #[test]
+    fn totals_event_passes_the_derived_filter_into_state() {
+        use tracing_subscriber::prelude::*;
+        let state = Arc::new(TuiState::new());
+        let subscriber = tracing_subscriber::registry()
+            .with(TuiLayer::new(state.clone()).with_filter(target_filter()));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::event!(
+                target: TARGET_TUI_TOTALS,
+                tracing::Level::TRACE,
+                messages = 87_432u64,
+                folders = 42u64,
+            );
+        });
+        let totals = state.totals().expect("tally must reach the state slot");
+        assert_eq!((totals.messages, totals.folders), (87_432, 42));
     }
 
     /// The event-to-state mapping is the layer's contract with the

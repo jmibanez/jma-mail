@@ -117,9 +117,23 @@ struct Inner {
     /// single-slot `notify!` status, where any later milestone
     /// overwrites them.
     last_cycle: Option<CycleSummary>,
+    /// Store-wide mail tally as last read from the state DB by the
+    /// daemon runner: None until the first report, then latest
+    /// wins. The runner re-reads at startup (the DB survives
+    /// restarts, so a tally exists before the first cycle) and
+    /// after every completed cycle.
+    totals: Option<MailTotals>,
 }
 
-/// One completed sync cycle's outcome for the Network pane's "last"
+/// Store-wide mail tally for the Stats pane's mail row: mapped
+/// messages and distinct maildir folders.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MailTotals {
+    pub messages: u64,
+    pub folders: u64,
+}
+
+/// One completed sync cycle's outcome for the Stats pane's "last"
 /// row. `in_sync` means the cycle found nothing to do; the counts
 /// are only meaningful when it is false. `wall` is the whole
 /// cycle's wall-clock as timed by the daemon runner.
@@ -256,6 +270,7 @@ impl TuiState {
                 sse_conn: None,
                 watcher_conn: None,
                 last_cycle: None,
+                totals: None,
             }),
         }
     }
@@ -523,6 +538,18 @@ impl TuiState {
     pub fn last_cycle(&self) -> Option<CycleSummary> {
         let i = self.inner.lock().expect("tui state mutex");
         i.last_cycle
+    }
+
+    /// Record the store-wide mail tally. Latest report wins; the
+    /// runner is the only producer.
+    pub fn set_totals(&self, messages: u64, folders: u64) {
+        let mut i = self.inner.lock().expect("tui state mutex");
+        i.totals = Some(MailTotals { messages, folders });
+    }
+
+    pub fn totals(&self) -> Option<MailTotals> {
+        let i = self.inner.lock().expect("tui state mutex");
+        i.totals
     }
 
     /// Snapshot the bandwidth panel. Rates are bytes/sec averaged
@@ -812,6 +839,24 @@ mod tests {
         assert!(cycle.in_sync);
         assert_eq!((cycle.downloaded, cycle.uploaded), (0, 0));
         assert_eq!(cycle.wall, Duration::from_millis(300));
+    }
+
+    /// The totals slot is latest-wins and starts empty -- the Stats
+    /// pane's mail row stays absent until the runner's first report
+    /// arrives.
+    #[test]
+    fn totals_slot_keeps_latest_report() {
+        let state = TuiState::new();
+        assert!(state.totals().is_none());
+        state.set_totals(10, 2);
+        state.set_totals(87_432, 42);
+        assert_eq!(
+            state.totals(),
+            Some(MailTotals {
+                messages: 87_432,
+                folders: 42
+            })
+        );
     }
 
     /// Push `n` sequentially numbered lines -- helper for the
