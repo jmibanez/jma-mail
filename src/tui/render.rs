@@ -416,9 +416,10 @@ fn draw_metrics(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
 /// this row adds the live counter that matters while the wire is
 /// busy.
 ///
-/// The dimmed "last" row shows the most recent completed cycle's
-/// outcome with its wall-clock time -- the single-slot notify!
-/// status would otherwise overwrite it with the next milestone.
+/// The dimmed "last" rows show the most recent completed cycle's
+/// outcome with its duration and wall-clock time -- the single-slot
+/// notify! status would otherwise overwrite it with the next
+/// milestone.
 ///
 /// Maildir-write bytes intentionally don't appear here. They're
 /// disk-write throughput, not network bandwidth, and conflating them
@@ -472,32 +473,48 @@ fn draw_bandwidth(
         ]));
     }
     if let Some(cycle) = last_cycle {
-        lines.push(cycle_line(cycle));
+        lines.extend(cycle_lines(cycle));
     }
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-/// The Network pane's "last" row: the most recent completed cycle's
-/// outcome, dimmed -- it's context, not live activity. In-sync
-/// cycles read "in sync" rather than "0 dn / 0 up", which would
-/// look like a stall.
-fn cycle_line(cycle: CycleSummary) -> Line<'static> {
+/// The Network pane's "last" item: the most recent completed
+/// cycle's outcome, dimmed -- it's context, not live activity. Two
+/// rows, because the pane is a fixed 38 inner cells with no wrap
+/// and a single row clips the tail on big-count cycles (an initial
+/// sync's "150000 dn / 2000 up" plus duration plus timestamp
+/// overflows it): the outcome rides the labeled row, the duration
+/// and wall-clock time ride a continuation row indented to the
+/// value column. In-sync cycles read "in sync" rather than "0 dn /
+/// 0 up", which would look like a stall. The duration format
+/// matches the status bar's phase widget ("(1.2s)"), so the two
+/// readouts of the same cycle agree at a glance.
+fn cycle_lines(cycle: CycleSummary) -> [Line<'static>; 2] {
     let text = if cycle.in_sync {
         "in sync".to_string()
     } else {
         format!("{} dn / {} up", cycle.downloaded, cycle.uploaded)
     };
-    Line::from(vec![
-        Span::raw("  last"),
-        Span::styled(
-            format!("{:>12}", text),
-            Style::default().add_modifier(Modifier::DIM),
-        ),
-        Span::styled(
-            format!("  {}", format_ts(cycle.at, &chrono::Local)),
-            Style::default().add_modifier(Modifier::DIM),
-        ),
-    ])
+    [
+        Line::from(vec![
+            Span::raw("  last"),
+            Span::styled(
+                format!("{:>12}", text),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw("      "),
+            Span::styled(
+                format!(
+                    "({:.1}s)  {}",
+                    cycle.wall.as_secs_f32(),
+                    format_ts(cycle.at, &chrono::Local)
+                ),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ]),
+    ]
 }
 
 /// Right column: the most recent messages that landed on disk,
@@ -1013,35 +1030,70 @@ mod tests {
         assert_eq!((tiny.x, tiny.y, tiny.width, tiny.height), (0, 0, 10, 4));
     }
 
-    /// The "last" row reads "in sync" for no-op cycles -- zero
+    /// Flatten one rendered line to its text -- helper for the
+    /// cycle-lines tests.
+    fn flat(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// The "last" item reads "in sync" for no-op cycles -- zero
     /// counts would look like a stall -- and the real counts
-    /// otherwise.
+    /// otherwise; the continuation row carries the duration and
+    /// wall-clock time.
     #[test]
-    fn cycle_line_formats_in_sync_and_counts() {
+    fn cycle_lines_format_in_sync_and_counts() {
         let at = chrono::Utc::now();
-        let text: String = cycle_line(CycleSummary {
+        let [top, bottom] = cycle_lines(CycleSummary {
             at,
             downloaded: 0,
             uploaded: 0,
             in_sync: true,
-        })
-        .spans
-        .iter()
-        .map(|s| s.content.as_ref())
-        .collect();
-        assert!(text.contains("in sync"));
+            wall: std::time::Duration::from_millis(300),
+        });
+        assert!(flat(&top).contains("in sync"));
+        assert!(flat(&bottom).contains("(0.3s)"));
 
-        let text: String = cycle_line(CycleSummary {
+        let [top, bottom] = cycle_lines(CycleSummary {
             at,
             downloaded: 12,
             uploaded: 3,
             in_sync: false,
-        })
-        .spans
-        .iter()
-        .map(|s| s.content.as_ref())
-        .collect();
-        assert!(text.contains("12 dn / 3 up"));
+            wall: std::time::Duration::from_millis(1_200),
+        });
+        assert!(flat(&top).contains("12 dn / 3 up"));
+        assert!(flat(&bottom).contains("(1.2s)"));
+    }
+
+    /// Both rows of the "last" item fit the Network pane's fixed
+    /// inner width for a big-count cycle -- an initial sync's counts
+    /// plus duration plus timestamp is exactly the shape that
+    /// overflowed a single row, and the pane's Paragraph does not
+    /// wrap, so an overflow silently clips the tail.
+    #[test]
+    fn cycle_lines_fit_the_pane_for_big_count_cycles() {
+        let at = chrono::Utc::now();
+        let [top, bottom] = cycle_lines(CycleSummary {
+            at,
+            downloaded: 150_000,
+            uploaded: 2_000,
+            in_sync: false,
+            wall: std::time::Duration::from_secs(3_600),
+        });
+        let (top, bottom) = (flat(&top), flat(&bottom));
+        assert!(top.contains("150000 dn / 2000 up"));
+        assert!(bottom.contains("(3600.0s)"));
+        // All-ASCII rows, so byte length equals display width.
+        let inner = (NETWORK_PANE_WIDTH - 2) as usize;
+        assert!(
+            top.len() <= inner,
+            "top row {} > {inner}: {top:?}",
+            top.len()
+        );
+        assert!(
+            bottom.len() <= inner,
+            "bottom row {} > {inner}: {bottom:?}",
+            bottom.len()
+        );
     }
 
     /// Build a ConnHealth snapshot from per-channel states -- helper

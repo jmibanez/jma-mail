@@ -52,8 +52,8 @@ pub const TARGET_TUI_MESSAGE: &str = "jma::tui::message";
 pub const TARGET_TUI_CONN: &str = "jma::tui::conn";
 
 /// Target the daemon emits one event per completed sync cycle
-/// under, carrying `downloaded`, `uploaded`, and `in_sync`. Feeds
-/// the Network pane's "last" row.
+/// under, carrying `downloaded`, `uploaded`, `in_sync`, and the
+/// cycle's `wall_ms`. Feeds the Network pane's "last" row.
 pub const TARGET_TUI_CYCLE: &str = "jma::tui::cycle";
 
 pub struct TuiLayer {
@@ -182,10 +182,18 @@ where
         if meta.target() == TARGET_TUI_CYCLE {
             let mut visitor = CycleVisitor::default();
             event.record(&mut visitor);
-            if let (Some(downloaded), Some(uploaded), Some(in_sync)) =
-                (visitor.downloaded, visitor.uploaded, visitor.in_sync)
-            {
-                self.state.set_last_cycle(downloaded, uploaded, in_sync);
+            if let (Some(downloaded), Some(uploaded), Some(in_sync), Some(wall_ms)) = (
+                visitor.downloaded,
+                visitor.uploaded,
+                visitor.in_sync,
+                visitor.wall_ms,
+            ) {
+                self.state.set_last_cycle(
+                    downloaded,
+                    uploaded,
+                    in_sync,
+                    std::time::Duration::from_millis(wall_ms),
+                );
             }
             return;
         }
@@ -372,8 +380,8 @@ impl Visit for ConnVisitor {
     }
 }
 
-/// Reads `downloaded`, `uploaded`, and `in_sync` from a
-/// `TARGET_TUI_CYCLE` event. All three must be present for the
+/// Reads `downloaded`, `uploaded`, `in_sync`, and `wall_ms` from a
+/// `TARGET_TUI_CYCLE` event. All four must be present for the
 /// outcome to register; a partial event leaves the previous cycle
 /// on display.
 #[derive(Default)]
@@ -381,6 +389,7 @@ struct CycleVisitor {
     downloaded: Option<u64>,
     uploaded: Option<u64>,
     in_sync: Option<bool>,
+    wall_ms: Option<u64>,
 }
 
 impl Visit for CycleVisitor {
@@ -388,6 +397,7 @@ impl Visit for CycleVisitor {
         match field.name() {
             "downloaded" => self.downloaded = Some(value),
             "uploaded" => self.uploaded = Some(value),
+            "wall_ms" => self.wall_ms = Some(value),
             _ => {}
         }
     }

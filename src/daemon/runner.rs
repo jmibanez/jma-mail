@@ -278,13 +278,14 @@ impl<'a> WatchDaemon<'a> {
 
     async fn initial_sync(&mut self) {
         crate::notify!("Running initial sync before entering watch mode");
+        let started = std::time::Instant::now();
         match self
             .engine
             .run(false, SyncDirection::Both, ScanScope::Full)
             .await
         {
             Ok(outcome) => {
-                report_cycle(&outcome);
+                report_cycle(&outcome, started.elapsed());
                 if outcome.downloaded > 0 {
                     self.hook.trigger().await;
                 }
@@ -462,13 +463,14 @@ impl<'a> WatchDaemon<'a> {
                 | SyncTrigger::Initial
                 | SyncTrigger::Manual => ScanScope::Full,
             };
+            let started = std::time::Instant::now();
             match self.engine.run(false, SyncDirection::Both, scope).await {
                 Ok(outcome) => {
                     // A successful cycle means the link is healthy --
                     // reset the outer backoff so the next disconnect
                     // starts fresh rather than at whatever cap we hit.
                     self.backoff = RECONNECT_INITIAL_BACKOFF;
-                    report_cycle(&outcome);
+                    report_cycle(&outcome, started.elapsed());
                     if outcome.downloaded > 0 {
                         self.hook.trigger().await;
                     }
@@ -514,14 +516,17 @@ async fn forward_manual_triggers(notify: Arc<Notify>, tx: mpsc::Sender<SyncTrigg
 /// Report a completed cycle's outcome to the TUI's "last" row. One
 /// event per successful `engine.run`, initial bootstrap included;
 /// failed cycles report nothing (the error surfaces through the log
-/// pane and the health segment).
-fn report_cycle(outcome: &SyncOutcome) {
+/// pane and the health segment). `wall` is the cycle's wall-clock
+/// as the runner saw it -- everything inside `engine.run`, not just
+/// the profile layer's per-phase spans.
+fn report_cycle(outcome: &SyncOutcome, wall: Duration) {
     tracing::event!(
         target: crate::tui::layer::TARGET_TUI_CYCLE,
         tracing::Level::TRACE,
         downloaded = outcome.downloaded as u64,
         uploaded = outcome.uploaded as u64,
         in_sync = outcome.already_in_sync,
+        wall_ms = wall.as_millis() as u64,
     );
 }
 

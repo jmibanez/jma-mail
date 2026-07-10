@@ -121,13 +121,15 @@ struct Inner {
 
 /// One completed sync cycle's outcome for the Network pane's "last"
 /// row. `in_sync` means the cycle found nothing to do; the counts
-/// are only meaningful when it is false.
+/// are only meaningful when it is false. `wall` is the whole
+/// cycle's wall-clock as timed by the daemon runner.
 #[derive(Clone, Copy, Debug)]
 pub struct CycleSummary {
     pub at: DateTime<Utc>,
     pub downloaded: u64,
     pub uploaded: u64,
     pub in_sync: bool,
+    pub wall: Duration,
 }
 
 /// One connection channel's state. The engine and SSE channels only
@@ -464,13 +466,14 @@ impl TuiState {
 
     /// Record a completed sync cycle's outcome, stamped now. Latest
     /// cycle wins; history lives in the log pane.
-    pub fn set_last_cycle(&self, downloaded: u64, uploaded: u64, in_sync: bool) {
+    pub fn set_last_cycle(&self, downloaded: u64, uploaded: u64, in_sync: bool, wall: Duration) {
         let mut i = self.inner.lock().expect("tui state mutex");
         i.last_cycle = Some(CycleSummary {
             at: chrono::Utc::now(),
             downloaded,
             uploaded,
             in_sync,
+            wall,
         });
     }
 
@@ -712,17 +715,18 @@ mod tests {
     }
 
     /// The last-cycle slot is latest-wins: a fresh outcome replaces
-    /// the prior one outright, and the recorded counts survive as
-    /// given.
+    /// the prior one outright, and the recorded counts and duration
+    /// survive as given.
     #[test]
     fn last_cycle_keeps_latest_outcome() {
         let state = TuiState::new();
         assert!(state.last_cycle().is_none());
-        state.set_last_cycle(12, 3, false);
-        state.set_last_cycle(0, 0, true);
+        state.set_last_cycle(12, 3, false, Duration::from_millis(1_200));
+        state.set_last_cycle(0, 0, true, Duration::from_millis(300));
         let cycle = state.last_cycle().unwrap();
         assert!(cycle.in_sync);
         assert_eq!((cycle.downloaded, cycle.uploaded), (0, 0));
+        assert_eq!(cycle.wall, Duration::from_millis(300));
     }
 
     /// Push `n` sequentially numbered lines -- helper for the
