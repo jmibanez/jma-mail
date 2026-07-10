@@ -405,6 +405,49 @@ impl TuiState {
         i.download_progress
     }
 
+    /// Estimated time to finish the current download batch:
+    /// remaining messages over the recent download rate, where the
+    /// rate is In-direction blob closes per second across the
+    /// bandwidth window. None when no download is in flight, nothing
+    /// remains, the window holds no download samples, or the newest
+    /// download sample is older than the idle threshold -- a stalled
+    /// transfer shows no ETA rather than a frozen one.
+    pub fn download_eta(&self) -> Option<Duration> {
+        let i = self.inner.lock().expect("tui state mutex");
+        let Progress { done, total } = i.download_progress?;
+        let remaining = total.saturating_sub(done);
+        if remaining == 0 {
+            return None;
+        }
+        let now = Instant::now();
+        let window_cutoff = now.checked_sub(BW_WINDOW);
+        let mut count: u64 = 0;
+        let mut newest: Option<Instant> = None;
+        for s in &i.bw_samples {
+            let in_window = match window_cutoff {
+                Some(c) => s.at >= c,
+                None => true,
+            };
+            if in_window && s.direction == Direction::In {
+                count += 1;
+                // Unlike bandwidth()'s newest_at, this deliberately
+                // tracks In samples only: the ETA must go stale when
+                // downloads idle even while uploads keep the window
+                // warm.
+                newest = Some(newest.map_or(s.at, |old| old.max(s.at)));
+            }
+        }
+        let stale = match newest {
+            None => true,
+            Some(a) => now.duration_since(a) > BW_IDLE_THRESHOLD,
+        };
+        if stale || count == 0 {
+            return None;
+        }
+        let rate = count as f64 / BW_WINDOW.as_secs_f64();
+        Some(Duration::from_secs_f64(remaining as f64 / rate))
+    }
+
     /// Push one freshly-synced message into the recent ring.
     /// Trimmed inline to `RECENT_CAPACITY`. The timestamp is wall-
     /// clock (UTC), matching the log pane's convention so the two
@@ -621,6 +664,48 @@ mod tests {
         let bw = state.bandwidth();
         assert_eq!(bw.rate_in, 0.0);
         assert_eq!(bw.rate_out, 0.0);
+    }
+
+    /// The download ETA is remaining messages over the recent
+    /// download rate: ten In-direction closes inside the window give
+    /// a rate of 10/BW_WINDOW per second, so 60 remaining messages
+    /// estimate to 60/rate seconds. With no samples at all there is
+    /// no rate and no ETA.
+    #[test]
+    fn download_eta_uses_in_direction_rate() {
+        let state = TuiState::new();
+        assert!(state.download_eta().is_none());
+        state.set_download_progress(40, 100);
+        // Progress alone isn't enough -- no samples means no rate.
+        assert!(state.download_eta().is_none());
+        for _ in 0..10 {
+            state.add_bandwidth(Direction::In, 1_000);
+        }
+        let eta = state.download_eta().expect("eta with a live rate");
+        let expected = 60.0 * BW_WINDOW.as_secs_f64() / 10.0;
+        assert!(
+            (eta.as_secs_f64() - expected).abs() < 0.5,
+            "eta {:?}, expected ~{}s",
+            eta,
+            expected
+        );
+    }
+
+    /// Upload closes must not feed the download rate -- the ETA
+    /// estimates the dl row's counter, not general wire activity --
+    /// and a finished batch has no ETA even with a live rate.
+    #[test]
+    fn download_eta_ignores_uploads_and_finished_batches() {
+        let state = TuiState::new();
+        state.set_download_progress(40, 100);
+        for _ in 0..10 {
+            state.add_bandwidth(Direction::Out, 1_000);
+        }
+        assert!(state.download_eta().is_none());
+
+        state.add_bandwidth(Direction::In, 1_000);
+        state.set_download_progress(100, 100);
+        assert!(state.download_eta().is_none());
     }
 
     /// The download counter is cleared exactly when its owning phase

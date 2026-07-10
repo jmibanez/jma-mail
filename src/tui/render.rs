@@ -394,6 +394,7 @@ fn draw_metrics(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
         cols[0],
         state.bandwidth(),
         state.download_progress(),
+        state.download_eta(),
         state.last_cycle(),
     );
     draw_recent(frame, cols[1], state);
@@ -410,11 +411,11 @@ fn draw_metrics(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState) {
 /// The download-progress row is conditional: it only renders while
 /// the executor is emitting progress events (TuiState clears the
 /// slot when the `download_blobs` phase closes). "  dl  12345/67890
-/// (89%)" reads naturally alongside the in/out rates -- it's the
-/// same "what's on the wire" signal set. The status-bar phase
+/// (89%, ~18m)" reads naturally alongside the in/out rates -- it's
+/// the same "what's on the wire" signal set. The status-bar phase
 /// widget remains the source of truth for "what is sync doing";
-/// this row adds the live counter that matters while the wire is
-/// busy.
+/// this row adds the live counter and finish estimate that matter
+/// while the wire is busy.
 ///
 /// The dimmed "last" rows show the most recent completed cycle's
 /// outcome with its duration and wall-clock time -- the single-slot
@@ -429,6 +430,7 @@ fn draw_bandwidth(
     area: Rect,
     bw: Bandwidth,
     progress: Option<Progress>,
+    eta: Option<Duration>,
     last_cycle: Option<CycleSummary>,
 ) {
     let block = Block::default().borders(Borders::ALL).title(" Network ");
@@ -456,26 +458,56 @@ fn draw_bandwidth(
             ),
         ]),
     ];
-    if let Some(Progress { done, total }) = progress
-        && total > 0
-    {
-        let pct = (done * 100 / total) as u32;
-        lines.push(Line::from(vec![
-            Span::raw("  dl  "),
-            Span::styled(
-                format!("{:>10}", format!("{}/{}", done, total)),
-                Style::default().fg(Color::Green),
-            ),
-            Span::styled(
-                format!("  ({}%)", pct),
-                Style::default().add_modifier(Modifier::DIM),
-            ),
-        ]));
+    if let Some(line) = dl_line(progress, eta) {
+        lines.push(line);
     }
     if let Some(cycle) = last_cycle {
         lines.extend(cycle_lines(cycle));
     }
     frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// The Network pane's download-progress row, present only while a
+/// download batch is in flight with a known total. The dim parens
+/// carry the completed percentage and, when the download rate is
+/// live, the finish estimate; the ETA is omitted while the
+/// bandwidth window is empty or stale so a stalled transfer shows
+/// no estimate rather than a frozen one.
+fn dl_line(progress: Option<Progress>, eta: Option<Duration>) -> Option<Line<'static>> {
+    let Progress { done, total } = progress?;
+    if total == 0 {
+        return None;
+    }
+    let pct = (done * 100 / total) as u32;
+    let paren = match eta {
+        Some(eta) => format!("  ({}%, {})", pct, format_eta(eta)),
+        None => format!("  ({}%)", pct),
+    };
+    Some(Line::from(vec![
+        Span::raw("  dl  "),
+        Span::styled(
+            format!("{:>10}", format!("{}/{}", done, total)),
+            Style::default().fg(Color::Green),
+        ),
+        Span::styled(paren, Style::default().add_modifier(Modifier::DIM)),
+    ]))
+}
+
+/// An ETA as a single coarse unit, always prefixed "~" -- it's an
+/// estimate off a 5-second rate window, and false precision ("17m
+/// 42s") would suggest a fidelity the sample doesn't have. Seconds
+/// up to 89s, then whole minutes (rounded up -- an ETA that
+/// undershoots reads as a stall when it passes), then tenths of an
+/// hour.
+fn format_eta(eta: Duration) -> String {
+    let secs = eta.as_secs();
+    if secs < 90 {
+        format!("~{}s", secs.max(1))
+    } else if secs < 90 * 60 {
+        format!("~{}m", secs.div_ceil(60))
+    } else {
+        format!("~{:.1}h", eta.as_secs_f64() / 3600.0)
+    }
 }
 
 /// The Network pane's "last" item: the most recent completed
@@ -1034,6 +1066,43 @@ mod tests {
     /// cycle-lines tests.
     fn flat(line: &Line<'_>) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// The dl row carries the ETA inside its dim parens only when
+    /// one is available; with no live rate the row falls back to the
+    /// bare percentage, and with no progress at all there is no row.
+    #[test]
+    fn dl_line_includes_eta_only_when_available() {
+        let p = Some(Progress {
+            done: 40,
+            total: 100,
+        });
+        let with = flat(&dl_line(p, Some(Duration::from_secs(30))).unwrap());
+        assert!(with.contains("40/100"));
+        assert!(with.contains("(40%, ~30s)"));
+
+        let without = flat(&dl_line(p, None).unwrap());
+        assert!(without.contains("(40%)"));
+
+        assert!(dl_line(None, None).is_none());
+        assert!(dl_line(Some(Progress { done: 0, total: 0 }), None).is_none());
+    }
+
+    /// The ETA renders as one coarse unit: seconds below 90s (never
+    /// "~0s" -- a sub-second remainder still reads "~1s"), whole
+    /// minutes rounded up below 90 minutes, tenths of an hour past
+    /// that.
+    #[test]
+    fn format_eta_scales_units() {
+        assert_eq!(format_eta(Duration::from_millis(200)), "~1s");
+        assert_eq!(format_eta(Duration::from_secs(45)), "~45s");
+        assert_eq!(format_eta(Duration::from_secs(89)), "~89s");
+        assert_eq!(format_eta(Duration::from_secs(90)), "~2m");
+        assert_eq!(format_eta(Duration::from_secs(121)), "~3m");
+        assert_eq!(format_eta(Duration::from_secs(18 * 60)), "~18m");
+        assert_eq!(format_eta(Duration::from_secs(89 * 60 + 59)), "~90m");
+        assert_eq!(format_eta(Duration::from_secs(90 * 60)), "~1.5h");
+        assert_eq!(format_eta(Duration::from_secs(2 * 3600 + 360)), "~2.1h");
     }
 
     /// The "last" item reads "in sync" for no-op cycles -- zero
