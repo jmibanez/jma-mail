@@ -1,6 +1,8 @@
 use std::future::Future;
 use std::pin::Pin;
+use std::process::Stdio;
 use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
 use tokio::sync::{Mutex, Notify};
 use tracing::{debug, error, info, warn};
@@ -13,6 +15,20 @@ use tracing::{debug, error, info, warn};
 /// reallocating the string per attempt.
 type CommandRunner =
     Arc<dyn Fn(Arc<str>) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
+
+/// Target the hook's own stdout/stderr lines are forwarded under.
+/// Named for the `post_arrival_command` config knob -- the name the
+/// user knows, since it labels *their* command's own words -- and
+/// deliberately not the module path, which stays on this module's
+/// lines about the hook (spawn, exit status). The log renders the
+/// target as the line's label, so a message prefix would stutter
+/// against it.
+///
+/// Because the name carries no crate prefix, any sink whose filter
+/// is crate-qualified must admit it explicitly: the stderr filter
+/// in main.rs derives a directive from this const, and the TUI's
+/// `target_filter` admits unlisted targets at INFO by default.
+pub const TARGET_POST_ARRIVAL_OUTPUT: &str = "post_arrival_command";
 
 /// Hard ceiling on `post_arrival_command_retries`. Values larger than
 /// this are clamped on `Hook` construction (with a warn log) rather
@@ -34,10 +50,12 @@ pub const MAX_POST_ARRIVAL_RETRIES: u32 = 10;
 /// invocation, matching the spec: "delay invocation until the previous
 /// proc finishes" without unbounded queueing.
 ///
-/// The command runs via `sh -c` so users can pipe / chain freely. The
-/// spawned process is detached from this task (the task does
-/// `child.wait().await` to learn when it exits, but a kill of the
-/// daemon won't wait for the child to clean up).
+/// The command runs via `sh -c` so users can pipe / chain freely;
+/// its stdout/stderr are captured into the log rather than
+/// inherited (see `run_shell`). The spawned process is detached
+/// from this task (the task does `child.wait().await` to learn
+/// when it exits, but a kill of the daemon won't wait for the
+/// child to clean up).
 #[derive(Clone)]
 pub struct Hook {
     inner: Arc<Inner>,
@@ -213,15 +231,44 @@ fn clamp_retries(requested: u32) -> u32 {
     }
 }
 
+/// Run the hook via `sh -c`, with stdout/stderr piped into the log
+/// rather than inherited: while the TUI owns the terminal, an
+/// inherited fd writes straight through the alternate screen and
+/// corrupts the display (the gated stderr writer only gates our own
+/// tracing output, not a child's). Each line lands under a target
+/// named for the `post_arrival_command` config knob -- stdout at
+/// info (progress for the log pane), stderr at error (the user's
+/// own command complaining, which is user-actionable). stdin is
+/// nulled for the
+/// input-direction version of the same problem: under the TUI the
+/// terminal is in raw mode, and a child reading it would steal
+/// keystrokes from the display's key handling.
 async fn run_shell(cmd: &str) -> bool {
-    let mut child = match Command::new("sh").arg("-c").arg(cmd).spawn() {
+    let mut child = match Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
         Ok(c) => c,
         Err(e) => {
             error!("Failed to spawn post-arrival hook ({}): {}", cmd, e);
             return false;
         }
     };
-    match child.wait().await {
+    // Drain both pipes concurrently with the wait: draining one at a
+    // time (or waiting first) deadlocks once the child fills the
+    // other pipe's kernel buffer and blocks on write.
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let (status, _, _) = tokio::join!(
+        child.wait(),
+        forward_hook_lines(stdout, false),
+        forward_hook_lines(stderr, true),
+    );
+    match status {
         Ok(status) if status.success() => {
             info!("Post-arrival hook finished cleanly");
             true
@@ -233,6 +280,26 @@ async fn run_shell(cmd: &str) -> bool {
         Err(e) => {
             error!("Failed to await post-arrival hook: {}", e);
             false
+        }
+    }
+}
+
+/// Forward one hook pipe into the log, line by line as the child
+/// produces them -- live output for a long-running hook, one
+/// bounded line in memory at a time for a chatty one. A read error
+/// (I/O failure, non-UTF-8 output) ends forwarding for that pipe
+/// only; the exit status still reports through the wait path.
+async fn forward_hook_lines<R>(pipe: Option<R>, is_stderr: bool)
+where
+    R: AsyncRead + Unpin,
+{
+    let Some(pipe) = pipe else { return };
+    let mut lines = BufReader::new(pipe).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        if is_stderr {
+            error!(target: TARGET_POST_ARRIVAL_OUTPUT, "{}", line);
+        } else {
+            info!(target: TARGET_POST_ARRIVAL_OUTPUT, "{}", line);
         }
     }
 }
@@ -427,6 +494,50 @@ mod tests {
             rx.try_recv().is_err(),
             "retries=0 means exactly one attempt"
         );
+    }
+
+    /// The point of the pipe capture: hook stdout/stderr land in
+    /// the log -- where the TUI's log pane reads them -- instead of
+    /// writing raw to the terminal through the alternate screen.
+    /// Asserted against the real sink (a TuiLayer capturing into
+    /// TuiState) with a real `sh` producing both streams: stdout
+    /// forwards at INFO, stderr at ERROR, both under the target
+    /// named for the config knob, which the log renders as the
+    /// line's label (a message prefix would stutter against it).
+    /// This exercises the layer's internal INFO floor; the composed
+    /// `target_filter` admits unlisted targets at INFO by default,
+    /// which is pinned by the filter tests in tui::layer.
+    #[tokio::test]
+    async fn shell_output_is_captured_into_the_log() {
+        use tracing_subscriber::prelude::*;
+        let state = Arc::new(crate::tui::TuiState::new());
+        let subscriber =
+            tracing_subscriber::registry().with(crate::tui::TuiLayer::new(state.clone()));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        assert!(run_shell("echo out-line; echo err-line 1>&2").await);
+
+        let logs = state.log_snapshot().lines;
+        assert!(
+            logs.iter().any(|l| l.message == "out-line"
+                && l.target == TARGET_POST_ARRIVAL_OUTPUT
+                && l.level == tracing::Level::INFO),
+            "stdout line missing from the log"
+        );
+        assert!(
+            logs.iter().any(|l| l.message == "err-line"
+                && l.target == TARGET_POST_ARRIVAL_OUTPUT
+                && l.level == tracing::Level::ERROR),
+            "stderr line missing from the log"
+        );
+    }
+
+    /// A failing hook still reports through the status path with
+    /// the pipes captured -- the exit code isn't swallowed by the
+    /// concurrent drain.
+    #[tokio::test]
+    async fn shell_failure_still_reports_status() {
+        assert!(!run_shell("exit 3").await);
     }
 
     #[test]

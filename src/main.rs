@@ -53,14 +53,26 @@ async fn main() -> Result<()> {
     // near-empty during normal sync activity, which defeats the
     // purpose of having a pane in the first place. The user can
     // still take it lower with -q.
+    // Directive string opening `level` for everything jma logs
+    // under its own names: the two crate prefixes plus the display
+    // target minted for the post-arrival hook's child output, which
+    // is named for its config knob and so carries no crate prefix
+    // -- the crate-qualified directives alone would silently drop
+    // it from stderr.
+    fn our_targets_filter(level: &str) -> String {
+        format!(
+            "jma_mail={level},jma={level},{target}={level}",
+            target = jma_mail::daemon::hook::TARGET_POST_ARRIVAL_OUTPUT,
+        )
+    }
     let filter = match (cli.quiet, cli.verbose, want_tui) {
-        (true, _, _) => "error",
-        (_, 0, true) => "jma_mail=info,jma=info",
-        (_, 0, false) => "jma_mail=warn,jma=warn",
-        (_, 1, _) => "jma_mail=info,jma=info",
-        (_, 2, _) => "jma_mail=debug,jma=debug",
-        (_, 3, _) => "debug",
-        (_, _, _) => "trace",
+        (true, _, _) => "error".to_string(),
+        (_, 0, true) => our_targets_filter("info"),
+        (_, 0, false) => our_targets_filter("warn"),
+        (_, 1, _) => our_targets_filter("info"),
+        (_, 2, _) => our_targets_filter("debug"),
+        (_, 3, _) => "debug".to_string(),
+        (_, _, _) => "trace".to_string(),
     };
     // Tracing logs go to stderr so `notify!`'s status text (stdout)
     // stays parseable when the user redirects one and not the other.
