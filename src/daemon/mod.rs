@@ -1,3 +1,4 @@
+pub mod classify;
 pub mod eventsource;
 pub mod hook;
 pub mod runner;

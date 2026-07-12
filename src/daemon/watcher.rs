@@ -53,9 +53,9 @@ fn is_maildir_message_path(path: &Path) -> bool {
 
 /// Whether a notify event path is a candidate for structural
 /// classification. This is a selector, not a verdict: it nominates
-/// non-message paths under `maildir_root` that promote the whole
-/// batch to a Full-scope cycle. It does not itself confirm a
-/// structural change occurred.
+/// non-message paths under `maildir_root` for `classify::batch_fires`
+/// to judge. It does not itself confirm a structural change
+/// occurred.
 ///
 /// A path qualifies as a candidate when it sits under
 /// `maildir_root`, is NOT in jma's private namespace (see
@@ -130,8 +130,11 @@ fn batch_might_emit_changes(paths: &[PathBuf]) -> bool {
 /// Classify one coalesced batch of event paths into the trigger it
 /// should produce, applying the two message-path filters
 /// (`batch_might_emit_changes`, self-write matching) regardless of
-/// whether the batch also carries structural candidates. Returns
-/// `None` when the batch collapses to nothing worth sending.
+/// whether the batch also carries structural candidates, and running
+/// the structural candidates through `classify::batch_fires` so a
+/// structural trigger is only emitted for a real folder-level change.
+/// Returns `None` when the batch collapses to nothing worth sending
+/// -- every trigger this produces starts a sync cycle.
 fn classify_batch(
     paths: Vec<PathBuf>,
     maildir_root: &Path,
@@ -167,12 +170,26 @@ fn classify_batch(
         message_paths
     };
 
-    if !structural_candidates.is_empty() {
-        Some(SyncTrigger::LocalStructuralChange {
+    if !structural_candidates.is_empty()
+        && super::classify::batch_fires(&structural_candidates, maildir_root)
+    {
+        return Some(SyncTrigger::LocalStructuralChange {
             candidates: structural_candidates,
             message_paths,
-        })
-    } else if !message_paths.is_empty() {
+        });
+    }
+    if !structural_candidates.is_empty() {
+        let formatted: Vec<String> = structural_candidates
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        debug!(
+            "Dropping {} structural candidate(s) classified as noise: {}",
+            structural_candidates.len(),
+            formatted.join(", ")
+        );
+    }
+    if !message_paths.is_empty() {
         Some(SyncTrigger::LocalChange(message_paths))
     } else {
         None
@@ -520,16 +537,17 @@ mod tests {
         assert!(batch_might_emit_changes(&paths));
     }
 
-    /// A batch mixing a structural candidate (folder create) with
-    /// message paths (a normal delivery elsewhere) must carry both
-    /// sets on the structural trigger rather than dropping the
-    /// message paths -- the whole point of the struct variant is
-    /// that a Full-scope cycle triggered by a folder event still
-    /// gets the FS-event paths as diagnostic context.
+    /// A batch mixing a firing structural candidate (a trio path --
+    /// a folder being created or torn down) with message paths (a
+    /// normal delivery elsewhere) must carry both sets on the
+    /// structural trigger rather than dropping the message paths --
+    /// the whole point of the struct variant is that a Full-scope
+    /// cycle triggered by a folder event still gets the FS-event
+    /// paths as diagnostic context.
     #[test]
     fn classify_batch_carries_both_candidates_and_message_paths() {
         let root = PathBuf::from("/home/u/Mail");
-        let candidate = PathBuf::from("/home/u/Mail/Projects");
+        let candidate = PathBuf::from("/home/u/Mail/Projects/cur");
         let message = PathBuf::from("/home/u/Mail/INBOX/cur/1700000000.M1.host:2,S");
         let trigger = classify_batch(vec![candidate.clone(), message.clone()], &root, None)
             .expect("batch should produce a trigger");
@@ -546,10 +564,10 @@ mod tests {
     }
 
     /// A batch whose message paths are all matched by the self-write
-    /// cache but which also has a structural candidate still sends
-    /// the structural trigger -- the candidate isn't subject to the
-    /// self-write filter -- but with an empty message_paths, since
-    /// the message side was fully suppressed.
+    /// cache but which also has a firing structural candidate still
+    /// sends the structural trigger -- the candidate isn't subject
+    /// to the self-write filter -- but with an empty message_paths,
+    /// since the message side was fully suppressed.
     #[test]
     fn classify_batch_structural_survives_self_write_filtered_messages() {
         let dir = tempfile::tempdir().unwrap();
@@ -558,7 +576,9 @@ mod tests {
         std::fs::create_dir_all(&inbox_cur).unwrap();
         let message = inbox_cur.join("1700000000.M1.host:2,S");
         std::fs::write(&message, b"").unwrap();
+        // A real maildir on disk, so the candidate fires.
         let candidate = root.join("Projects");
+        std::fs::create_dir_all(candidate.join("cur")).unwrap();
 
         let cache = SelfWriteCache::new(Duration::from_secs(60));
         cache.record([message.clone()]);
@@ -574,6 +594,45 @@ mod tests {
                 assert!(message_paths.is_empty());
             }
             other => panic!("expected LocalStructuralChange, got {:?}", other),
+        }
+    }
+
+    /// A batch whose structural candidates all classify as noise and
+    /// which has no message paths sends nothing -- noise never enters
+    /// the trigger channel, so the runner never has to skip.
+    #[test]
+    fn classify_batch_all_noise_sends_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let xapian = root.join(".notmuch/xapian");
+        std::fs::create_dir_all(&xapian).unwrap();
+        let glass = xapian.join("postlist.glass");
+        std::fs::write(&glass, b"x").unwrap();
+        let gone_tmp = xapian.join("postlist.glass.tmp");
+
+        assert!(classify_batch(vec![glass, xapian, gone_tmp], &root, None).is_none());
+    }
+
+    /// A batch whose structural candidates all classify as noise but
+    /// whose message paths survive degrades to a LocalChange trigger
+    /// -- the message-level work still syncs promptly even when the
+    /// folder-level portion of the batch was noise.
+    #[test]
+    fn classify_batch_noise_candidates_degrade_to_local_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let inbox_cur = root.join("INBOX/cur");
+        std::fs::create_dir_all(&inbox_cur).unwrap();
+        let message = inbox_cur.join("1700000000.M1.host:2,S");
+        std::fs::write(&message, b"").unwrap();
+        let sidecar = root.join("INBOX/.uidvalidity");
+        std::fs::write(&sidecar, b"1").unwrap();
+
+        let trigger = classify_batch(vec![sidecar, message.clone()], &root, None)
+            .expect("message paths should still produce a trigger");
+        match trigger {
+            SyncTrigger::LocalChange(paths) => assert_eq!(paths, vec![message]),
+            other => panic!("expected LocalChange, got {:?}", other),
         }
     }
 

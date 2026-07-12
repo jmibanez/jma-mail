@@ -18,17 +18,18 @@ use crate::sync::engine::{ScanScope, SyncEngine, SyncOutcome};
 use crate::sync::plan::SyncDirection;
 use crate::sync::self_writes::SelfWriteCache;
 
-/// What triggered a sync cycle. `LocalChange` carries the FS event
-/// paths that drove the watcher so the runner can surface them when
-/// the cycle ends up doing nothing -- diagnostic for spurious
-/// triggers, where the path list is the only clue to what wrote.
-/// `LocalStructuralChange` fires on a folder-level event (mailbox
-/// directory created, renamed, or removed by the user) and promotes
-/// to a full-scope cycle, since the path-scope scan can't classify
-/// structural drift; it still carries both the `candidates` that
-/// triggered the promotion and any `message_paths` from the same
-/// batch, so a no-op cycle has the same FS-event diagnostic trail
-/// `LocalChange` gets.
+/// What triggered a sync cycle. Every trigger that reaches the
+/// runner starts one -- the watcher classifies batches before
+/// emitting (see `watcher::classify_batch`), so noise never enters
+/// the channel. `LocalChange` carries the FS event paths that drove
+/// the watcher so the runner can surface them when the cycle ends up
+/// doing nothing -- diagnostic for spurious triggers, where the path
+/// list is the only clue to what wrote. `LocalStructuralChange`
+/// means the watcher classified the batch as a real folder-level
+/// change (mailbox directory created, renamed, moved, or torn down)
+/// and implies a full scan; it carries the `candidates` that fired
+/// and any `message_paths` from the same batch, so a no-op cycle has
+/// the same FS-event diagnostic trail `LocalChange` gets.
 #[derive(Debug, Clone)]
 pub enum SyncTrigger {
     RemoteChange,
@@ -72,11 +73,11 @@ impl fmt::Display for SyncTrigger {
 /// Dominance order, broadest first: `Initial` wins if present (it's
 /// a full bootstrap, not a per-trigger delta), then `Manual` (the
 /// user asked for a full look), then `RemoteChange` (we're looking
-/// at server-side state too), then `LocalStructuralChange`
-/// (folder-level drift forces a full local scan), otherwise
-/// `LocalChange` carrying every path from every absorbed
-/// `LocalChange` trigger. The order matches "broader scan wins" --
-/// once we've decided we need a non-LocalChange shape, the
+/// at server-side state too), then `LocalStructuralChange` (a
+/// watcher-classified folder-level change forces a full local
+/// scan), otherwise `LocalChange` carrying every path from every
+/// absorbed `LocalChange` trigger. The order matches "broader scan
+/// wins" -- once we've decided we need a non-LocalChange shape, the
 /// LocalChange path set no longer affects the scope decision.
 ///
 /// A merge that lands on `LocalStructuralChange` unions the
@@ -223,7 +224,10 @@ impl<'a> WatchDaemon<'a> {
         let self_writes = Arc::new(SelfWriteCache::new(config.watch.effective_self_write_ttl()));
 
         // FS watcher is independent of JMAP and survives reconnects --
-        // spawn it once for the daemon's lifetime.
+        // spawn it once for the daemon's lifetime. The watcher both
+        // selects candidate paths under this root and classifies them
+        // (see `watcher::classify_batch`), so the canonical form is
+        // resolved once and used in one place.
         let fs_tx = tx.clone();
         let fs_root = config.canonical_maildir_root()?;
         let debounce = config.watch.debounce_secs;
@@ -483,19 +487,18 @@ impl<'a> WatchDaemon<'a> {
             // LocalChange triggers carry the FS event paths from the
             // coalesced batch; route them through ScanScope::Paths so the
             // engine classifies only the (folder, maildir_id) groups those
-            // paths touched. RemoteChange, LocalStructuralChange, and
-            // Initial fall back to a full per-folder walk --
-            // RemoteChange has no local hint, LocalStructuralChange
-            // requires the engine's discover_unbound_folders +
-            // sentinel walk (Paths-scope can't classify a structural
-            // event), Initial happens once at startup, and a
-            // coalesced batch promoted to any of those by the
-            // dominance order also drops to the safe O(N) shape
-            // (see coalesce_triggers).
+            // paths touched. Everything else takes the full per-folder
+            // walk -- RemoteChange has no local hint, Initial happens
+            // once at startup, Manual is the user asking for a full
+            // look, and LocalStructuralChange means the watcher already
+            // classified the batch as a real folder-level change, which
+            // Paths scope can't handle. Every trigger that reaches this
+            // loop starts a cycle; noise never gets sent (see
+            // `watcher::classify_batch`).
             let scope = match &trigger {
                 SyncTrigger::LocalChange(paths) => ScanScope::Paths(paths.clone()),
-                SyncTrigger::RemoteChange
-                | SyncTrigger::LocalStructuralChange { .. }
+                SyncTrigger::LocalStructuralChange { .. }
+                | SyncTrigger::RemoteChange
                 | SyncTrigger::Initial
                 | SyncTrigger::Manual => ScanScope::Full,
             };
