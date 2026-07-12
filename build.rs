@@ -6,7 +6,7 @@ use std::process::Command;
 fn main() {
     let cargo_version = env::var("CARGO_PKG_VERSION").unwrap();
     rerun_on_git_state();
-    let version = compute_version(&cargo_version).unwrap_or_else(|| cargo_version.clone());
+    let version = compute_version().unwrap_or_else(|| cargo_version.clone());
     println!("cargo:rustc-env=JMA_VERSION={version}");
 }
 
@@ -23,26 +23,17 @@ fn rerun_on_git_state() {
     println!("cargo:rerun-if-changed=.git/packed-refs");
 }
 
-fn compute_version(cargo_version: &str) -> Option<String> {
+fn compute_version() -> Option<String> {
     let tagged = Command::new("git")
-        .args(["describe", "--tags", "--exact-match", "HEAD"])
+        .args(["describe", "--tags", "HEAD"])
         .output()
         .ok()?;
-    if tagged.status.success() {
-        return Some(cargo_version.to_string());
-    }
 
-    let sha = Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
-        .ok()?;
-    if !sha.status.success() {
+    if !tagged.status.success() {
         return None;
     }
-    let sha = String::from_utf8(sha.stdout).ok()?;
-    let sha = sha.trim();
-    if sha.is_empty() {
-        return None;
-    }
-    Some(format!("{cargo_version} ({sha})"))
+    let version_string = String::from_utf8(tagged.stdout).ok()?;
+    let version_string = version_string.trim();
+
+    Some(version_string.to_string())
 }
