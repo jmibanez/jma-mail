@@ -22,15 +22,21 @@ use crate::sync::self_writes::SelfWriteCache;
 /// paths that drove the watcher so the runner can surface them when
 /// the cycle ends up doing nothing -- diagnostic for spurious
 /// triggers, where the path list is the only clue to what wrote.
-/// `LocalStructuralChange` is pathless: a folder-level event
-/// (mailbox directory created, renamed, or removed by the user)
-/// promotes to a full-scope cycle, since the path-scope scan can't
-/// classify structural drift.
+/// `LocalStructuralChange` fires on a folder-level event (mailbox
+/// directory created, renamed, or removed by the user) and promotes
+/// to a full-scope cycle, since the path-scope scan can't classify
+/// structural drift; it still carries both the `candidates` that
+/// triggered the promotion and any `message_paths` from the same
+/// batch, so a no-op cycle has the same FS-event diagnostic trail
+/// `LocalChange` gets.
 #[derive(Debug, Clone)]
 pub enum SyncTrigger {
     RemoteChange,
     LocalChange(Vec<PathBuf>),
-    LocalStructuralChange,
+    LocalStructuralChange {
+        candidates: Vec<PathBuf>,
+        message_paths: Vec<PathBuf>,
+    },
     Initial,
     /// The user asked for a cycle now (the TUI's 's' key). Carries
     /// no hint about what changed, so it implies a full scan.
@@ -42,7 +48,15 @@ impl fmt::Display for SyncTrigger {
         match self {
             Self::RemoteChange => f.write_str("RemoteChange"),
             Self::LocalChange(paths) => write!(f, "LocalChange ({} FS event(s))", paths.len()),
-            Self::LocalStructuralChange => f.write_str("LocalStructuralChange"),
+            Self::LocalStructuralChange {
+                candidates,
+                message_paths,
+            } => write!(
+                f,
+                "LocalStructuralChange ({} candidate(s), {} message path(s))",
+                candidates.len(),
+                message_paths.len()
+            ),
             Self::Initial => f.write_str("Initial"),
             Self::Manual => f.write_str("Manual"),
         }
@@ -63,14 +77,19 @@ impl fmt::Display for SyncTrigger {
 /// `LocalChange` carrying every path from every absorbed
 /// `LocalChange` trigger. The order matches "broader scan wins" --
 /// once we've decided we need a non-LocalChange shape, the
-/// LocalChange path set is irrelevant.
+/// LocalChange path set no longer affects the scope decision.
 ///
-/// The path-drop on RemoteChange/LocalStructuralChange/Initial
-/// assumes those triggers always imply a full local scan. If a
-/// future cycle shape ever pairs one of them with path-narrowed
-/// local work, this merge becomes lossy and needs revisiting.
+/// A merge that lands on `LocalStructuralChange` unions the
+/// `candidates` from every absorbed structural trigger, and folds
+/// every absorbed trigger's message paths -- structural
+/// `message_paths` and plain `LocalChange` paths alike -- into one
+/// `message_paths` list, so the merged trigger keeps the full
+/// FS-event diagnostic trail regardless of which triggers in the
+/// batch carried it.
 fn coalesce_triggers(first: SyncTrigger, rest: Vec<SyncTrigger>) -> SyncTrigger {
-    let mut paths: Vec<PathBuf> = Vec::new();
+    let mut local_change_paths: Vec<PathBuf> = Vec::new();
+    let mut structural_candidates: Vec<PathBuf> = Vec::new();
+    let mut structural_message_paths: Vec<PathBuf> = Vec::new();
     let mut has_initial = false;
     let mut has_manual = false;
     let mut has_remote = false;
@@ -80,8 +99,15 @@ fn coalesce_triggers(first: SyncTrigger, rest: Vec<SyncTrigger>) -> SyncTrigger 
             SyncTrigger::Initial => has_initial = true,
             SyncTrigger::Manual => has_manual = true,
             SyncTrigger::RemoteChange => has_remote = true,
-            SyncTrigger::LocalStructuralChange => has_structural = true,
-            SyncTrigger::LocalChange(p) => paths.extend(p),
+            SyncTrigger::LocalStructuralChange {
+                candidates,
+                message_paths,
+            } => {
+                has_structural = true;
+                structural_candidates.extend(candidates);
+                structural_message_paths.extend(message_paths);
+            }
+            SyncTrigger::LocalChange(p) => local_change_paths.extend(p),
         }
     }
     if has_initial {
@@ -91,9 +117,13 @@ fn coalesce_triggers(first: SyncTrigger, rest: Vec<SyncTrigger>) -> SyncTrigger 
     } else if has_remote {
         SyncTrigger::RemoteChange
     } else if has_structural {
-        SyncTrigger::LocalStructuralChange
+        structural_message_paths.extend(local_change_paths);
+        SyncTrigger::LocalStructuralChange {
+            candidates: structural_candidates,
+            message_paths: structural_message_paths,
+        }
     } else {
-        SyncTrigger::LocalChange(paths)
+        SyncTrigger::LocalChange(local_change_paths)
     }
 }
 
@@ -465,7 +495,7 @@ impl<'a> WatchDaemon<'a> {
             let scope = match &trigger {
                 SyncTrigger::LocalChange(paths) => ScanScope::Paths(paths.clone()),
                 SyncTrigger::RemoteChange
-                | SyncTrigger::LocalStructuralChange
+                | SyncTrigger::LocalStructuralChange { .. }
                 | SyncTrigger::Initial
                 | SyncTrigger::Manual => ScanScope::Full,
             };
@@ -481,15 +511,31 @@ impl<'a> WatchDaemon<'a> {
                     if outcome.downloaded > 0 {
                         self.hook.trigger().await;
                     }
-                    if outcome.already_in_sync
-                        && let SyncTrigger::LocalChange(paths) = &trigger
-                    {
-                        let formatted: Vec<String> =
-                            paths.iter().map(|p| p.display().to_string()).collect();
-                        debug!(
-                            "LocalChange trigger produced no work; FS event path(s): {}",
-                            formatted.join(", ")
-                        );
+                    if outcome.already_in_sync {
+                        match &trigger {
+                            SyncTrigger::LocalChange(paths) => {
+                                let formatted: Vec<String> =
+                                    paths.iter().map(|p| p.display().to_string()).collect();
+                                debug!(
+                                    "LocalChange trigger produced no work; FS event path(s): {}",
+                                    formatted.join(", ")
+                                );
+                            }
+                            SyncTrigger::LocalStructuralChange {
+                                candidates,
+                                message_paths,
+                            } => {
+                                let formatted: Vec<String> =
+                                    candidates.iter().map(|p| p.display().to_string()).collect();
+                                debug!(
+                                    "LocalStructuralChange trigger produced no work; \
+                                     candidate path(s): {} ({} message path(s) alongside)",
+                                    formatted.join(", "),
+                                    message_paths.len()
+                                );
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 Err(e) if is_transient_error(&e) => {
@@ -686,17 +732,31 @@ mod tests {
         assert!(matches!(merged, SyncTrigger::Initial));
     }
 
-    /// LocalStructuralChange dominates LocalChange paths. A
-    /// folder-level event in the batch promotes the cycle to Full
-    /// scope; the path-narrowed local set becomes irrelevant.
+    /// LocalStructuralChange dominates the scope decision for a
+    /// LocalChange in the same batch, but the LocalChange path
+    /// doesn't vanish -- it folds into the merged trigger's
+    /// message_paths, since the resulting Full-scope cycle still
+    /// benefits from the FS-event diagnostic trail.
     #[test]
     fn coalesce_local_structural_dominates_local_change() {
         let p = PathBuf::from("/Mail/INBOX/cur/file:2,S");
         let merged = coalesce_triggers(
-            SyncTrigger::LocalChange(vec![p]),
-            vec![SyncTrigger::LocalStructuralChange],
+            SyncTrigger::LocalChange(vec![p.clone()]),
+            vec![SyncTrigger::LocalStructuralChange {
+                candidates: vec![PathBuf::from("/Mail/Projects")],
+                message_paths: Vec::new(),
+            }],
         );
-        assert!(matches!(merged, SyncTrigger::LocalStructuralChange));
+        match merged {
+            SyncTrigger::LocalStructuralChange {
+                candidates,
+                message_paths,
+            } => {
+                assert_eq!(candidates, vec![PathBuf::from("/Mail/Projects")]);
+                assert_eq!(message_paths, vec![p]);
+            }
+            other => panic!("expected LocalStructuralChange, got {:?}", other),
+        }
     }
 
     /// RemoteChange still wins over LocalStructuralChange: server-
@@ -705,10 +765,66 @@ mod tests {
     #[test]
     fn coalesce_remote_change_dominates_local_structural() {
         let merged = coalesce_triggers(
-            SyncTrigger::LocalStructuralChange,
+            SyncTrigger::LocalStructuralChange {
+                candidates: vec![PathBuf::from("/Mail/Projects")],
+                message_paths: Vec::new(),
+            },
             vec![SyncTrigger::RemoteChange],
         );
         assert!(matches!(merged, SyncTrigger::RemoteChange));
+    }
+
+    /// Two structural triggers in the same coalesced batch (e.g. two
+    /// separate folder events landing in different debouncer
+    /// batches) union their candidate paths rather than the merge
+    /// picking one arbitrarily.
+    #[test]
+    fn coalesce_structural_unions_candidates() {
+        let a = PathBuf::from("/Mail/Projects");
+        let b = PathBuf::from("/Mail/Archive");
+        let merged = coalesce_triggers(
+            SyncTrigger::LocalStructuralChange {
+                candidates: vec![a.clone()],
+                message_paths: Vec::new(),
+            },
+            vec![SyncTrigger::LocalStructuralChange {
+                candidates: vec![b.clone()],
+                message_paths: Vec::new(),
+            }],
+        );
+        match merged {
+            SyncTrigger::LocalStructuralChange { candidates, .. } => {
+                assert_eq!(candidates, vec![a, b]);
+            }
+            other => panic!("expected LocalStructuralChange, got {:?}", other),
+        }
+    }
+
+    /// A structural trigger's own message_paths and a separate
+    /// LocalChange's paths both fold into the merged trigger's
+    /// message_paths, in absorption order.
+    #[test]
+    fn coalesce_structural_folds_own_and_local_change_message_paths() {
+        let structural_msg = PathBuf::from("/Mail/INBOX/cur/a:2,S");
+        let local_change_msg = PathBuf::from("/Mail/Spam/cur/b:2,");
+        let candidate = PathBuf::from("/Mail/Projects");
+        let merged = coalesce_triggers(
+            SyncTrigger::LocalStructuralChange {
+                candidates: vec![candidate.clone()],
+                message_paths: vec![structural_msg.clone()],
+            },
+            vec![SyncTrigger::LocalChange(vec![local_change_msg.clone()])],
+        );
+        match merged {
+            SyncTrigger::LocalStructuralChange {
+                candidates,
+                message_paths,
+            } => {
+                assert_eq!(candidates, vec![candidate]);
+                assert_eq!(message_paths, vec![structural_msg, local_change_msg]);
+            }
+            other => panic!("expected LocalStructuralChange, got {:?}", other),
+        }
     }
 
     /// Manual dominates everything except Initial: the user asked

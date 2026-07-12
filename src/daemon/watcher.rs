@@ -51,20 +51,13 @@ fn is_maildir_message_path(path: &Path) -> bool {
         .is_some_and(|c| c.is_ascii_digit())
 }
 
-/// Whether a notify event path should fire a structural-change
-/// trigger. Structural events are folder-level actions: the user
-/// `mkdir`-ed a new maildir folder, `mv`-ed one to a different
-/// name, or `rm -rf`-ed one. Each of these affects the
-/// (`folder` <-> `jmap_mailbox_id`) binding set and requires a
-/// Full-scope cycle so the engine's `discover_unbound_folders` and
-/// sentinel walk pick them up. The Paths-scope scan can't classify
-/// a structural event (it walks only message-level
-/// `(folder, maildir_id)` groups), so the watcher promotes these
-/// events to a separate `LocalStructuralChange` trigger rather than
-/// burying them under a `LocalChange(paths)` that would
-/// short-circuit.
+/// Whether a notify event path is a candidate for structural
+/// classification. This is a selector, not a verdict: it nominates
+/// non-message paths under `maildir_root` that promote the whole
+/// batch to a Full-scope cycle. It does not itself confirm a
+/// structural change occurred.
 ///
-/// A path qualifies as structural when it sits under
+/// A path qualifies as a candidate when it sits under
 /// `maildir_root`, is NOT in jma's private namespace (see
 /// `crate::maildir_ops::namespace::is_jma_private`, which covers
 /// both the `.jma.*` and `.jma-*` prefixes), and does NOT
@@ -78,7 +71,7 @@ fn is_maildir_message_path(path: &Path) -> bool {
 /// relative path so a maildir root whose own ancestor name
 /// happens to contain those segments doesn't suppress
 /// detection.
-fn is_maildir_structural_path(path: &Path, maildir_root: &Path) -> bool {
+fn is_structural_candidate_path(path: &Path, maildir_root: &Path) -> bool {
     let Ok(rel) = path.strip_prefix(maildir_root) else {
         return false;
     };
@@ -134,6 +127,58 @@ fn batch_might_emit_changes(paths: &[PathBuf]) -> bool {
     })
 }
 
+/// Classify one coalesced batch of event paths into the trigger it
+/// should produce, applying the two message-path filters
+/// (`batch_might_emit_changes`, self-write matching) regardless of
+/// whether the batch also carries structural candidates. Returns
+/// `None` when the batch collapses to nothing worth sending.
+fn classify_batch(
+    paths: Vec<PathBuf>,
+    maildir_root: &Path,
+    self_writes: Option<&SelfWriteCache>,
+) -> Option<SyncTrigger> {
+    let (message_paths, structural_candidates): (Vec<PathBuf>, Vec<PathBuf>) =
+        paths.into_iter().partition(|p| is_maildir_message_path(p));
+    let structural_candidates: Vec<PathBuf> = structural_candidates
+        .into_iter()
+        .filter(|p| is_structural_candidate_path(p, maildir_root))
+        .collect();
+
+    // The two batch-level filters apply to the message-path set
+    // regardless of whether the batch also has structural
+    // candidates: a filtered-out message set contributes nothing,
+    // whether it rides along with a structural trigger or would
+    // have gone out alone.
+    let message_paths = if message_paths.is_empty() {
+        Vec::new()
+    } else if !batch_might_emit_changes(&message_paths) {
+        debug!(
+            "Dropping all-live-new message path(s) ({} path(s)); scan would emit nothing",
+            message_paths.len()
+        );
+        Vec::new()
+    } else if self_writes.is_some_and(|cache| cache.matches_all(&message_paths)) {
+        debug!(
+            "Dropping {} message path(s); all matched recent self-writes",
+            message_paths.len()
+        );
+        Vec::new()
+    } else {
+        message_paths
+    };
+
+    if !structural_candidates.is_empty() {
+        Some(SyncTrigger::LocalStructuralChange {
+            candidates: structural_candidates,
+            message_paths,
+        })
+    } else if !message_paths.is_empty() {
+        Some(SyncTrigger::LocalChange(message_paths))
+    } else {
+        None
+    }
+}
+
 /// Watch local maildir directories for filesystem changes.
 /// `self_writes`, when set, lets the watcher drop fsevents batches
 /// whose every path matches a recent jma write -- the
@@ -156,51 +201,23 @@ pub async fn watch(
         move |result: Result<Vec<notify_debouncer_mini::DebouncedEvent>, notify::Error>| {
             match result {
                 Ok(events) => {
-                    // Classify each event: structural (folder-level)
-                    // dominates because the destructive-arm matrix +
+                    // A batch with any structural candidate needs a
+                    // Full-scope cycle (the destructive-arm matrix +
                     // bidirectional folder lifecycle can't be safely
-                    // run in Paths scope. A batch with any
-                    // structural path collapses to one
-                    // LocalStructuralChange trigger and drops the
-                    // message-path set (Full scope subsumes the
-                    // file-level work). Otherwise we route the
-                    // message paths as today.
-                    let mut message_paths: Vec<PathBuf> = Vec::new();
-                    let mut saw_structural = false;
-                    for e in events {
-                        if !matches!(e.kind, DebouncedEventKind::Any) {
-                            continue;
-                        }
-                        if is_maildir_message_path(&e.path) {
-                            message_paths.push(e.path);
-                        } else if is_maildir_structural_path(&e.path, &maildir_root_owned) {
-                            saw_structural = true;
-                        }
-                    }
-                    if saw_structural {
-                        let _ = notify_tx.blocking_send(SyncTrigger::LocalStructuralChange);
-                        return;
-                    }
-                    if message_paths.is_empty() {
-                        return;
-                    }
-                    if !batch_might_emit_changes(&message_paths) {
-                        debug!(
-                            "Skipping all-live-new fsevents batch ({} path(s)); scan would emit nothing",
-                            message_paths.len()
-                        );
-                        return;
-                    }
-                    if let Some(cache) = &self_writes
-                        && cache.matches_all(&message_paths)
+                    // run in Paths scope), but the message paths in
+                    // the same batch are still useful diagnostic
+                    // context for that cycle, so they ride along
+                    // instead of being dropped.
+                    let paths: Vec<PathBuf> = events
+                        .into_iter()
+                        .filter(|e| matches!(e.kind, DebouncedEventKind::Any))
+                        .map(|e| e.path)
+                        .collect();
+                    if let Some(trigger) =
+                        classify_batch(paths, &maildir_root_owned, self_writes.as_deref())
                     {
-                        debug!(
-                            "Skipping fsevents batch ({} path(s)); all paths matched recent self-writes",
-                            message_paths.len()
-                        );
-                        return;
+                        let _ = notify_tx.blocking_send(trigger);
                     }
-                    let _ = notify_tx.blocking_send(SyncTrigger::LocalChange(message_paths));
                 }
                 Err(e) => {
                     warn!("Filesystem watcher error: {}", e);
@@ -325,7 +342,7 @@ mod tests {
         // A folder being created (e.g. by sync provisioning a new
         // mailbox) shouldn't fire as a message-path trigger --
         // structural detection handles it via the separate
-        // `is_maildir_structural_path` predicate.
+        // `is_structural_candidate_path` predicate.
         let p = PathBuf::from("/home/u/Mail/INBOX/cur");
         assert!(!is_maildir_message_path(&p));
     }
@@ -334,7 +351,7 @@ mod tests {
     fn structural_fires_on_top_level_folder_create() {
         let root = PathBuf::from("/home/u/Mail");
         let p = PathBuf::from("/home/u/Mail/Projects");
-        assert!(is_maildir_structural_path(&p, &root));
+        assert!(is_structural_candidate_path(&p, &root));
     }
 
     #[test]
@@ -348,7 +365,7 @@ mod tests {
         for sub in ["cur", "new", "tmp"] {
             let p = PathBuf::from(format!("/home/u/Mail/Projects/{}", sub));
             assert!(
-                is_maildir_structural_path(&p, &root),
+                is_structural_candidate_path(&p, &root),
                 "{} should classify as structural",
                 p.display()
             );
@@ -362,7 +379,7 @@ mod tests {
         // structural event at the leaf.
         let root = PathBuf::from("/home/u/Mail");
         let p = PathBuf::from("/home/u/Mail/Personal/Notes");
-        assert!(is_maildir_structural_path(&p, &root));
+        assert!(is_structural_candidate_path(&p, &root));
     }
 
     #[test]
@@ -383,7 +400,7 @@ mod tests {
         ] {
             let p = PathBuf::from(format!("/home/u/Mail/{}", name));
             assert!(
-                !is_maildir_structural_path(&p, &root),
+                !is_structural_candidate_path(&p, &root),
                 "{} must not fire structural; it's private jma state",
                 p.display()
             );
@@ -404,7 +421,7 @@ mod tests {
         ] {
             let p = PathBuf::from(path);
             assert!(
-                !is_maildir_structural_path(&p, &root),
+                !is_structural_candidate_path(&p, &root),
                 "{} must not fire structural; it's a message-level path",
                 path
             );
@@ -415,13 +432,13 @@ mod tests {
     fn structural_skips_path_outside_maildir_root() {
         let root = PathBuf::from("/home/u/Mail");
         let p = PathBuf::from("/home/u/Documents/Foo");
-        assert!(!is_maildir_structural_path(&p, &root));
+        assert!(!is_structural_candidate_path(&p, &root));
     }
 
     #[test]
     fn structural_skips_root_event() {
         let root = PathBuf::from("/home/u/Mail");
-        assert!(!is_maildir_structural_path(&root, &root));
+        assert!(!is_structural_candidate_path(&root, &root));
     }
 
     #[test]
@@ -434,7 +451,7 @@ mod tests {
         // anywhere in the full path string.
         let root = PathBuf::from("/home/u/curated/Mail");
         let p = PathBuf::from("/home/u/curated/Mail/Projects");
-        assert!(is_maildir_structural_path(&p, &root));
+        assert!(is_structural_candidate_path(&p, &root));
     }
 
     /// All-live-new batch: every path lives under a `new/` subdir
@@ -501,5 +518,85 @@ mod tests {
             PathBuf::from("/home/u/Mail/INBOX/cur/1700000000.M1.host:2,FS"),
         ];
         assert!(batch_might_emit_changes(&paths));
+    }
+
+    /// A batch mixing a structural candidate (folder create) with
+    /// message paths (a normal delivery elsewhere) must carry both
+    /// sets on the structural trigger rather than dropping the
+    /// message paths -- the whole point of the struct variant is
+    /// that a Full-scope cycle triggered by a folder event still
+    /// gets the FS-event paths as diagnostic context.
+    #[test]
+    fn classify_batch_carries_both_candidates_and_message_paths() {
+        let root = PathBuf::from("/home/u/Mail");
+        let candidate = PathBuf::from("/home/u/Mail/Projects");
+        let message = PathBuf::from("/home/u/Mail/INBOX/cur/1700000000.M1.host:2,S");
+        let trigger = classify_batch(vec![candidate.clone(), message.clone()], &root, None)
+            .expect("batch should produce a trigger");
+        match trigger {
+            SyncTrigger::LocalStructuralChange {
+                candidates,
+                message_paths,
+            } => {
+                assert_eq!(candidates, vec![candidate]);
+                assert_eq!(message_paths, vec![message]);
+            }
+            other => panic!("expected LocalStructuralChange, got {:?}", other),
+        }
+    }
+
+    /// A batch whose message paths are all matched by the self-write
+    /// cache but which also has a structural candidate still sends
+    /// the structural trigger -- the candidate isn't subject to the
+    /// self-write filter -- but with an empty message_paths, since
+    /// the message side was fully suppressed.
+    #[test]
+    fn classify_batch_structural_survives_self_write_filtered_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let inbox_cur = root.join("INBOX/cur");
+        std::fs::create_dir_all(&inbox_cur).unwrap();
+        let message = inbox_cur.join("1700000000.M1.host:2,S");
+        std::fs::write(&message, b"").unwrap();
+        let candidate = root.join("Projects");
+
+        let cache = SelfWriteCache::new(Duration::from_secs(60));
+        cache.record([message.clone()]);
+
+        let trigger = classify_batch(vec![candidate.clone(), message], &root, Some(&cache))
+            .expect("batch should produce a trigger");
+        match trigger {
+            SyncTrigger::LocalStructuralChange {
+                candidates,
+                message_paths,
+            } => {
+                assert_eq!(candidates, vec![candidate]);
+                assert!(message_paths.is_empty());
+            }
+            other => panic!("expected LocalStructuralChange, got {:?}", other),
+        }
+    }
+
+    /// A new/->cur/ MUA promotion pair is entirely message-shaped:
+    /// neither path sits outside cur/new/tmp, so neither qualifies
+    /// as a structural candidate. Pins that ordinary message
+    /// traffic never gets diverted onto the structural route -- it
+    /// must stay on LocalChange so it still gets Paths-scope
+    /// treatment.
+    #[test]
+    fn new_to_cur_promotion_produces_no_structural_candidates() {
+        let root = PathBuf::from("/home/u/Mail");
+        let new_path = PathBuf::from("/home/u/Mail/INBOX/new/1700000000.M1.host:2,F");
+        let cur_path = PathBuf::from("/home/u/Mail/INBOX/cur/1700000000.M1.host:2,FS");
+        for p in [&new_path, &cur_path] {
+            assert!(
+                !is_structural_candidate_path(p, &root),
+                "{} must not be a structural candidate",
+                p.display()
+            );
+        }
+        let trigger = classify_batch(vec![new_path, cur_path], &root, None)
+            .expect("batch should produce a trigger");
+        assert!(matches!(trigger, SyncTrigger::LocalChange(_)));
     }
 }
