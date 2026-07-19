@@ -29,12 +29,7 @@ jobs:
       uses: github/codeql-action/init@v3
       with:
         languages: rust
-        build-mode: manual
-
-    - name: Build
-      env:
-        CC: /usr/bin/cc
-      run: cargo build --workspace --all-targets --locked
+        build-mode: none
 
     - name: Perform CodeQL Analysis
       uses: github/codeql-action/analyze@v3
