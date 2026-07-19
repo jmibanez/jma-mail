@@ -65,14 +65,18 @@ async fn main() -> Result<()> {
             target = jma_mail::daemon::hook::TARGET_POST_ARRIVAL_OUTPUT,
         )
     }
-    let filter = match (cli.quiet, cli.verbose, want_tui) {
-        (true, _, _) => "error".to_string(),
-        (_, 0, true) => our_targets_filter("info"),
-        (_, 0, false) => our_targets_filter("warn"),
-        (_, 1, _) => our_targets_filter("info"),
-        (_, 2, _) => our_targets_filter("debug"),
-        (_, 3, _) => "debug".to_string(),
-        (_, _, _) => "trace".to_string(),
+    // One match yields both log surfaces -- the stderr filter string
+    // and the TUI log pane's admission level -- so the two can't
+    // drift: whatever the user dials applies to whichever surface is
+    // visible.
+    let (filter, tui_log_level) = match (cli.quiet, cli.verbose, want_tui) {
+        (true, _, _) => ("error".to_string(), tracing::Level::ERROR),
+        (_, 0, true) => (our_targets_filter("info"), tracing::Level::INFO),
+        (_, 0, false) => (our_targets_filter("warn"), tracing::Level::WARN),
+        (_, 1, _) => (our_targets_filter("info"), tracing::Level::INFO),
+        (_, 2, _) => (our_targets_filter("debug"), tracing::Level::DEBUG),
+        (_, 3, _) => ("debug".to_string(), tracing::Level::DEBUG),
+        (_, _, _) => ("trace".to_string(), tracing::Level::TRACE),
     };
     // Tracing logs go to stderr so `notify!`'s status text (stdout)
     // stays parseable when the user redirects one and not the other.
@@ -98,7 +102,10 @@ async fn main() -> Result<()> {
     // (see `tui::layer::target_filter`), so a new TUI metric never
     // needs an edit here.
     let tui_layer = if want_tui {
-        Some(jma_mail::tui::install().with_filter(jma_mail::tui::layer::target_filter()))
+        Some(
+            jma_mail::tui::install(tui_log_level)
+                .with_filter(jma_mail::tui::layer::target_filter(tui_log_level)),
+        )
     } else {
         None
     };

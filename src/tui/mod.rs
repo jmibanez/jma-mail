@@ -53,16 +53,18 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// in `cmd_watch`.
 static STATE: OnceLock<Arc<TuiState>> = OnceLock::new();
 
-/// Build the TuiLayer and stash a handle to its shared state. Call
-/// once at tracing init time if the runtime decided we want a TUI;
+/// Build the TuiLayer and stash a handle to its shared state.
+/// `log_level` is the log pane's admission floor -- the user's
+/// verbosity dial, shared with the stderr filter. Call once at
+/// tracing init time if the runtime decided we want a TUI;
 /// idempotent on the OnceLock side (subsequent calls would reuse the
 /// installed state) but the layer itself can only be installed once
 /// on the subscriber, so callers should not call this twice in one
 /// process.
-pub fn install() -> TuiLayer {
+pub fn install(log_level: tracing::Level) -> TuiLayer {
     let state = Arc::new(TuiState::new());
     let _ = STATE.set(state.clone());
-    TuiLayer::new(state)
+    TuiLayer::new(state, log_level)
 }
 
 /// Shared state handle if the TUI was installed this process,

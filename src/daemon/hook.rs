@@ -27,7 +27,8 @@ type CommandRunner =
 /// Because the name carries no crate prefix, any sink whose filter
 /// is crate-qualified must admit it explicitly: the stderr filter
 /// in main.rs derives a directive from this const, and the TUI's
-/// `target_filter` admits unlisted targets at INFO by default.
+/// `target_filter` admits unlisted targets at the user's dialed
+/// level (INFO by default under the TUI).
 pub const TARGET_POST_ARRIVAL_OUTPUT: &str = "post_arrival_command";
 
 /// Hard ceiling on `post_arrival_command_retries`. Values larger than
@@ -504,15 +505,18 @@ mod tests {
     /// forwards at INFO, stderr at ERROR, both under the target
     /// named for the config knob, which the log renders as the
     /// line's label (a message prefix would stutter against it).
-    /// This exercises the layer's internal INFO floor; the composed
-    /// `target_filter` admits unlisted targets at INFO by default,
-    /// which is pinned by the filter tests in tui::layer.
+    /// This exercises the layer's internal level floor at its INFO
+    /// default; the composed `target_filter` admits unlisted targets
+    /// at the same dialed level, which is pinned by the filter tests
+    /// in tui::layer.
     #[tokio::test]
     async fn shell_output_is_captured_into_the_log() {
         use tracing_subscriber::prelude::*;
         let state = Arc::new(crate::tui::TuiState::new());
-        let subscriber =
-            tracing_subscriber::registry().with(crate::tui::TuiLayer::new(state.clone()));
+        let subscriber = tracing_subscriber::registry().with(crate::tui::TuiLayer::new(
+            state.clone(),
+            tracing::Level::INFO,
+        ));
         let _guard = tracing::subscriber::set_default(subscriber);
 
         assert!(run_shell("echo out-line; echo err-line 1>&2").await);

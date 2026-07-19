@@ -2,13 +2,12 @@
 //!
 //! Two data paths:
 //!
-//!   - Events at INFO and above land in the log pane ring buffer.
-//!     The fmt_layer's env-filter already drops everything below
-//!     `warn` at default verbosity; the TUI layer raises that floor
-//!     back to `info` independently so users running with `-v` don't
-//!     drown the log pane in debug spam from `jma::profile::*` and
-//!     friends. The render pane is ~half a screen tall; surfacing
-//!     debug noise there steals room from real progress signals.
+//!   - Events at the user's verbosity dial and above land in the log
+//!     pane ring buffer (INFO at the TUI's default; -vv/-vvv lower
+//!     the floor to debug/trace, -q raises it to error). The floor
+//!     matters because the render pane is ~half a screen tall --
+//!     surfacing debug noise there uninvited steals room from real
+//!     progress signals.
 //!
 //!   - `jma::profile::blob` spans -- one per blob.download or
 //!     blob.upload -- carry a `bytes` field that gets recorded
@@ -91,12 +90,14 @@ const SPAN_TARGETS: &[&str] = &[TARGET_PHASE, TARGET_BLOB];
 /// admitted explicitly -- one left out is dropped before the layer
 /// runs and the panel it feeds silently stays empty. Deriving the
 /// filter from [`EVENT_ROUTES`] and [`SPAN_TARGETS`] makes
-/// routed-but-unadmitted unrepresentable. The INFO default keeps
-/// ordinary log events flowing to the log pane, backstopped by
-/// `on_event`'s own INFO floor for defense in depth.
-pub fn target_filter() -> tracing_subscriber::filter::Targets {
+/// routed-but-unadmitted unrepresentable. The default admits
+/// ordinary log events to the log pane at `log_level` -- the user's
+/// verbosity dial, the same one that drives the stderr filter --
+/// backstopped by `on_event`'s own floor at that level for defense
+/// in depth.
+pub fn target_filter(log_level: Level) -> tracing_subscriber::filter::Targets {
     tracing_subscriber::filter::Targets::new()
-        .with_default(Level::INFO)
+        .with_default(log_level)
         .with_targets(
             EVENT_ROUTES
                 .iter()
@@ -108,11 +109,14 @@ pub fn target_filter() -> tracing_subscriber::filter::Targets {
 
 pub struct TuiLayer {
     state: Arc<TuiState>,
+    /// Level floor for ordinary log events entering the log pane.
+    /// Metric events (the routed TRACE targets) bypass it.
+    log_level: Level,
 }
 
 impl TuiLayer {
-    pub fn new(state: Arc<TuiState>) -> Self {
-        Self { state }
+    pub fn new(state: Arc<TuiState>, log_level: Level) -> Self {
+        Self { state, log_level }
     }
 }
 
@@ -216,10 +220,11 @@ where
             route(&self.state, event);
             return;
         }
-        // Floor at INFO. Trace/debug events are too high-volume to
-        // share a half-screen pane with the metrics the user wants
-        // to read.
-        if *meta.level() > Level::INFO {
+        // Floor at the user's verbosity dial (INFO by default under
+        // the TUI). Trace/debug events are too high-volume to share
+        // a half-screen pane with the metrics the user wants to read
+        // unless explicitly requested with -vv/-vvv.
+        if *meta.level() > self.log_level {
             return;
         }
         let mut visitor = MessageVisitor::default();
@@ -525,14 +530,14 @@ mod tests {
     use std::time::Duration;
 
     /// Every target the layer consumes -- event and span side alike
-    /// -- must be admitted at TRACE by the derived filter, the INFO
+    /// -- must be admitted at TRACE by the derived filter, the
     /// default must keep ordinary log events flowing to the log
-    /// pane, and unrouted TRACE noise must stay out. Because the
-    /// filter is built from the routing tables themselves, this
-    /// holds for every future table row too.
+    /// pane at the requested level, and unrouted TRACE noise must
+    /// stay out. Because the filter is built from the routing tables
+    /// themselves, this holds for every future table row too.
     #[test]
     fn target_filter_admits_exactly_what_the_layer_routes() {
-        let filter = target_filter();
+        let filter = target_filter(Level::INFO);
         for (target, _) in EVENT_ROUTES {
             assert!(
                 filter.would_enable(target, &Level::TRACE),
@@ -549,6 +554,48 @@ mod tests {
         assert!(!filter.would_enable("jma::sync::engine", &Level::TRACE));
     }
 
+    /// The on_event floor follows the constructed level, not a
+    /// hardcoded INFO: at ERROR, an INFO event admitted by the
+    /// subscriber still stays out of the log ring, while ERROR
+    /// events land.
+    #[test]
+    fn log_pane_floor_follows_constructed_level() {
+        use tracing_subscriber::prelude::*;
+        let state = Arc::new(TuiState::new());
+        let subscriber =
+            tracing_subscriber::registry().with(TuiLayer::new(state.clone(), Level::ERROR));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("info line");
+            tracing::error!("error line");
+        });
+        let logs = state.log_snapshot().lines;
+        assert!(
+            logs.iter().any(|l| l.message == "error line"),
+            "ERROR event must reach the pane"
+        );
+        assert!(
+            !logs.iter().any(|l| l.message == "info line"),
+            "INFO event must stay out of the pane at an ERROR floor"
+        );
+    }
+
+    /// The log-pane admission follows the user's verbosity dial
+    /// rather than a hardcoded floor: at DEBUG the filter admits
+    /// debug events from ordinary targets, at ERROR it drops INFO,
+    /// and the routed metric targets stay admitted at TRACE in both
+    /// cases.
+    #[test]
+    fn target_filter_follows_the_verbosity_dial() {
+        let debug_filter = target_filter(Level::DEBUG);
+        assert!(debug_filter.would_enable("jma_mail::daemon::watcher", &Level::DEBUG));
+        assert!(debug_filter.would_enable(TARGET_TUI_CYCLE, &Level::TRACE));
+
+        let error_filter = target_filter(Level::ERROR);
+        assert!(!error_filter.would_enable("jma_mail::daemon::watcher", &Level::INFO));
+        assert!(error_filter.would_enable("jma_mail::daemon::watcher", &Level::ERROR));
+        assert!(error_filter.would_enable(TARGET_TUI_CYCLE, &Level::TRACE));
+    }
+
     /// End-to-end through a real subscriber: a metric event emitted
     /// the way the daemon emits it -- TRACE level, through the
     /// derived filter -- must land in the state slot. Layer-only
@@ -559,8 +606,9 @@ mod tests {
     fn routed_event_passes_the_derived_filter_into_state() {
         use tracing_subscriber::prelude::*;
         let state = Arc::new(TuiState::new());
-        let subscriber = tracing_subscriber::registry()
-            .with(TuiLayer::new(state.clone()).with_filter(target_filter()));
+        let subscriber = tracing_subscriber::registry().with(
+            TuiLayer::new(state.clone(), Level::INFO).with_filter(target_filter(Level::INFO)),
+        );
         tracing::subscriber::with_default(subscriber, || {
             tracing::event!(
                 target: TARGET_TUI_CYCLE,
@@ -586,8 +634,9 @@ mod tests {
     fn totals_event_passes_the_derived_filter_into_state() {
         use tracing_subscriber::prelude::*;
         let state = Arc::new(TuiState::new());
-        let subscriber = tracing_subscriber::registry()
-            .with(TuiLayer::new(state.clone()).with_filter(target_filter()));
+        let subscriber = tracing_subscriber::registry().with(
+            TuiLayer::new(state.clone(), Level::INFO).with_filter(target_filter(Level::INFO)),
+        );
         tracing::subscriber::with_default(subscriber, || {
             tracing::event!(
                 target: TARGET_TUI_TOTALS,
