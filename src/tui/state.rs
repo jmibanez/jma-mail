@@ -13,7 +13,8 @@
 
 use chrono::{DateTime, Utc};
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 /// Cap on the log ring buffer. Anything past the cap drops off the
@@ -47,6 +48,48 @@ const RECENT_CAPACITY: usize = 128;
 
 pub struct TuiState {
     inner: Mutex<Inner>,
+    /// Monotonic change counter, advanced once per mutation via
+    /// `lock_mut`. The render loop reads it each tick and repaints
+    /// only when it has moved since the last frame, so a fully idle
+    /// daemon -- no log lines, no active phase, no bandwidth -- drives
+    /// no redraws at all. Relaxed throughout: it is a change flag, not
+    /// a synchronization channel, and the mutex already publishes the
+    /// state the flag stands in for.
+    generation: AtomicU64,
+}
+
+/// Write lock on the shared state that records a display change when
+/// released. Every mutating accessor takes the lock through
+/// [`TuiState::lock_mut`], so the render loop's change counter cannot
+/// drift out of sync with the state: a repaint is owed after any
+/// mutation, and dropping this guard is the single place that debt is
+/// booked. Read accessors lock `inner` directly and leave the counter
+/// alone. Acquiring the write lock always bumps on release, even on a
+/// path that ends up changing nothing (an unmatched phase pop); a
+/// spurious repaint is cheaper than a missed one, and this keeps the
+/// bump off every individual field write.
+struct MutGuard<'a> {
+    inner: MutexGuard<'a, Inner>,
+    generation: &'a AtomicU64,
+}
+
+impl Drop for MutGuard<'_> {
+    fn drop(&mut self) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl std::ops::Deref for MutGuard<'_> {
+    type Target = Inner;
+    fn deref(&self) -> &Inner {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for MutGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Inner {
+        &mut self.inner
+    }
 }
 
 struct Inner {
@@ -272,6 +315,51 @@ impl TuiState {
                 last_cycle: None,
                 totals: None,
             }),
+            generation: AtomicU64::new(0),
+        }
+    }
+
+    /// Acquire the write lock. The returned guard bumps the change
+    /// counter when it drops, so callers just mutate the fields and
+    /// the repaint debt records itself. Every mutating accessor uses
+    /// this; reads lock `inner` directly.
+    fn lock_mut(&self) -> MutGuard<'_> {
+        MutGuard {
+            inner: self.inner.lock().expect("tui state mutex"),
+            generation: &self.generation,
+        }
+    }
+
+    /// Current value of the change counter. The render loop compares
+    /// this frame-to-frame; any advance means an accessor mutated the
+    /// state and the display is owed a repaint.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
+    }
+
+    /// True when something on screen advances with wall-clock time on
+    /// its own, with no state mutation to announce it: an active
+    /// phase's elapsed-so-far clock, or bandwidth rates still within
+    /// the idle threshold of their newest sample and so not yet
+    /// snapped to zero. While this holds the render keeps repainting
+    /// at the tick even absent a generation bump; once it clears -- a
+    /// daemon sitting idle between cycles -- the render parks until the
+    /// next real change. Download progress is deliberately not checked:
+    /// it is only ever set while `download_blobs` is on the phase
+    /// stack, which the phase check already covers.
+    pub fn is_animating(&self) -> bool {
+        let i = self.inner.lock().expect("tui state mutex");
+        if !i.phase_stack.is_empty() {
+            return true;
+        }
+        // `bw_samples` pushes newest at the back and trims the oldest
+        // off the front, so the back is the most recent close. The
+        // rate holds flat until this sample crosses BW_IDLE_THRESHOLD,
+        // then snaps to zero (see `bandwidth`); a trailing repaint in
+        // the render loop paints that snap once this goes false.
+        match i.bw_samples.back() {
+            Some(s) => Instant::now().duration_since(s.at) <= BW_IDLE_THRESHOLD,
+            None => false,
         }
     }
 
@@ -283,7 +371,7 @@ impl TuiState {
     /// push ordinal; the render uses it to keep a scrolled-back
     /// viewport pinned to the same entry as new lines arrive.
     pub fn push_log(&self, line: LogLine) {
-        let mut i = self.inner.lock().expect("tui state mutex");
+        let mut i = self.lock_mut();
         if i.log.len() == LOG_CAPACITY {
             i.log.pop_front();
         }
@@ -326,7 +414,7 @@ impl TuiState {
     /// Driven by the `notify!` macro when the TUI is active; older
     /// statuses are dropped (history lives in the log pane).
     pub fn set_status(&self, message: String) {
-        let mut i = self.inner.lock().expect("tui state mutex");
+        let mut i = self.lock_mut();
         i.status = Some(Status {
             at: chrono::Utc::now(),
             message,
@@ -346,7 +434,7 @@ impl TuiState {
     /// rate calculation walks a bounded list.
     pub fn add_bandwidth(&self, direction: Direction, bytes: u64) {
         let now = Instant::now();
-        let mut i = self.inner.lock().expect("tui state mutex");
+        let mut i = self.lock_mut();
         match direction {
             Direction::In => i.bytes_in_total += bytes,
             Direction::Out => i.bytes_out_total += bytes,
@@ -370,7 +458,7 @@ impl TuiState {
     /// to leave the stack consistent even if phases nest in an
     /// order we didn't anticipate.
     pub fn enter_phase(&self, id: u64, name: String) {
-        let mut i = self.inner.lock().expect("tui state mutex");
+        let mut i = self.lock_mut();
         i.phase_stack.push(ActivePhase {
             name,
             started: Instant::now(),
@@ -383,7 +471,7 @@ impl TuiState {
     /// state we don't understand -- the stack would resync once the
     /// outermost phase ends and the next cycle starts fresh.
     pub fn complete_phase(&self, id: u64) {
-        let mut i = self.inner.lock().expect("tui state mutex");
+        let mut i = self.lock_mut();
         let Some(idx) = i.phase_stack.iter().rposition(|p| p.id == id) else {
             return;
         };
@@ -411,7 +499,7 @@ impl TuiState {
     }
 
     pub fn set_download_progress(&self, done: u64, total: u64) {
-        let mut i = self.inner.lock().expect("tui state mutex");
+        let mut i = self.lock_mut();
         i.download_progress = Some(Progress { done, total });
     }
 
@@ -468,7 +556,7 @@ impl TuiState {
     /// clock (UTC), matching the log pane's convention so the two
     /// panels read the same way.
     pub fn push_recent(&self, folder: String, subject: String) {
-        let mut i = self.inner.lock().expect("tui state mutex");
+        let mut i = self.lock_mut();
         if i.recent.len() == RECENT_CAPACITY {
             i.recent.pop_front();
         }
@@ -493,14 +581,14 @@ impl TuiState {
     /// repeated Reconnecting reports overwrite so the displayed
     /// backoff tracks the runner's actual retry cadence.
     pub fn set_engine_conn(&self, state: ConnState) {
-        let mut i = self.inner.lock().expect("tui state mutex");
+        let mut i = self.lock_mut();
         i.engine_conn = Some(state);
     }
 
     /// Record the SSE push channel's state. Same latest-wins rule as
     /// the engine channel.
     pub fn set_sse_conn(&self, state: ConnState) {
-        let mut i = self.inner.lock().expect("tui state mutex");
+        let mut i = self.lock_mut();
         i.sse_conn = Some(state);
     }
 
@@ -508,7 +596,7 @@ impl TuiState {
     /// as the other channels; in practice the watcher reports
     /// connected once at startup and down at most once, on exit.
     pub fn set_watcher_conn(&self, state: ConnState) {
-        let mut i = self.inner.lock().expect("tui state mutex");
+        let mut i = self.lock_mut();
         i.watcher_conn = Some(state);
     }
 
@@ -525,7 +613,7 @@ impl TuiState {
     /// Record a completed sync cycle's outcome, stamped now. Latest
     /// cycle wins; history lives in the log pane.
     pub fn set_last_cycle(&self, downloaded: u64, uploaded: u64, in_sync: bool, wall: Duration) {
-        let mut i = self.inner.lock().expect("tui state mutex");
+        let mut i = self.lock_mut();
         i.last_cycle = Some(CycleSummary {
             at: chrono::Utc::now(),
             downloaded,
@@ -543,7 +631,7 @@ impl TuiState {
     /// Record the store-wide mail tally. Latest report wins; the
     /// runner is the only producer.
     pub fn set_totals(&self, messages: u64, folders: u64) {
-        let mut i = self.inner.lock().expect("tui state mutex");
+        let mut i = self.lock_mut();
         i.totals = Some(MailTotals { messages, folders });
     }
 
@@ -856,6 +944,62 @@ mod tests {
                 messages: 87_432,
                 folders: 42
             })
+        );
+    }
+
+    /// Every mutating accessor advances the change counter and every
+    /// read leaves it untouched. The render loop keys its repaint on
+    /// this counter, so a mutation that failed to bump it would freeze
+    /// the display and a read that bumped it would spin the CPU the
+    /// counter exists to save.
+    #[test]
+    fn generation_advances_on_mutation_not_on_read() {
+        let state = TuiState::new();
+        let g0 = state.generation();
+        state.push_log(line("hi"));
+        let g1 = state.generation();
+        assert!(g1 > g0, "push_log must advance the counter");
+
+        // A pile of pure reads must not move it.
+        let _ = state.log_snapshot();
+        let _ = state.status();
+        let _ = state.bandwidth();
+        let _ = state.conn_health();
+        let _ = state.current_phase();
+        let _ = state.is_animating();
+        assert_eq!(state.generation(), g1, "reads must not advance the counter");
+
+        state.set_status("m".into());
+        assert!(
+            state.generation() > g1,
+            "set_status must advance the counter"
+        );
+    }
+
+    /// `is_animating` reports whether the screen has content that moves
+    /// with wall-clock time and so must keep repainting absent a state
+    /// change. A fresh state is static; an active phase animates its
+    /// elapsed clock; once the phase completes with no bandwidth
+    /// samples the screen is static again; a just-recorded sample
+    /// animates the decaying rate until it ages out.
+    #[test]
+    fn is_animating_tracks_live_phase_and_fresh_bandwidth() {
+        let state = TuiState::new();
+        assert!(!state.is_animating(), "fresh state has nothing to animate");
+
+        state.enter_phase(1, "download_blobs".into());
+        assert!(state.is_animating(), "an active phase animates its clock");
+
+        state.complete_phase(1);
+        assert!(
+            !state.is_animating(),
+            "no phase and no samples -> static again"
+        );
+
+        state.add_bandwidth(Direction::In, 1_000);
+        assert!(
+            state.is_animating(),
+            "a fresh sample animates the decaying rate"
         );
     }
 

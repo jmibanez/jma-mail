@@ -137,43 +137,79 @@ fn run_loop(
     // wrapping.
     let mut log_scroll = LogScroll::default();
     let mut show_help = false;
+    // Repaint only when something actually changed. Three triggers: a
+    // state mutation (the shared `generation` counter advanced), a key
+    // that altered render-local state (scroll, help overlay, forced
+    // repaint), or time-varying content on screen (an active phase's
+    // elapsed clock, decaying bandwidth) reported by `is_animating`. A
+    // daemon sitting idle between cycles trips none of these, so the
+    // loop blocks in `event::poll` and spends no CPU redrawing an
+    // unchanged frame -- the earlier unconditional 10 Hz repaint is
+    // what burned it.
+    let mut last_gen = state.generation();
+    let mut was_animating = false;
+    // Paint the first frame unconditionally so the screen is populated
+    // before any change arrives.
+    let mut force_redraw = true;
     loop {
-        terminal
-            .draw(|frame| {
-                draw(frame, &state, show_help, &mut log_scroll);
-            })
-            .context("draw frame")?;
+        let cur_gen = state.generation();
+        let animating = state.is_animating();
+        // `was_animating` carries one trailing frame past the end of an
+        // animation so its final resting state -- e.g. bandwidth
+        // snapping to zero once its samples age out -- is painted
+        // rather than left frozen at the last live value.
+        if force_redraw || cur_gen != last_gen || animating || was_animating {
+            terminal
+                .draw(|frame| {
+                    draw(frame, &state, show_help, &mut log_scroll);
+                })
+                .context("draw frame")?;
+            last_gen = cur_gen;
+            force_redraw = false;
+        }
+        was_animating = animating;
 
         if event::poll(TICK).context("poll for terminal event")?
             && let CrosstermEvent::Key(key) = event::read().context("read terminal event")?
         {
+            // Every branch that changes what's on screen sets
+            // `force_redraw` so the next iteration repaints even when no
+            // state mutation bumped the generation counter.
             if is_redraw_key(key) {
                 // Clear resets ratatui's diff baseline, so the next
                 // draw rewrites every cell rather than diffing against
                 // a possibly-corrupted screen. Handled ahead of the
                 // overlay branch so a redraw never doubles as a close.
                 terminal.clear().context("clear on redraw")?;
+                force_redraw = true;
             } else if show_help {
                 match help_overlay_key(key) {
                     HelpKey::Quit => {
                         shutdown.notify_waiters();
                         return Ok(());
                     }
-                    HelpKey::Close => show_help = false,
+                    HelpKey::Close => {
+                        show_help = false;
+                        force_redraw = true;
+                    }
                     HelpKey::Ignore => {}
                 }
             } else if is_help_key(key) {
                 show_help = true;
+                force_redraw = true;
             } else if is_sync_key(key) {
                 // notify_one stores at most one permit, so holding
                 // the key down can't queue a burst of cycles; the
-                // daemon's coalescing window absorbs the rest.
+                // daemon's coalescing window absorbs the rest. No
+                // repaint here -- the sync it triggers enters a phase,
+                // which bumps the generation and drives the redraw.
                 manual_sync.notify_one();
             } else if is_quit_key(key) {
                 shutdown.notify_waiters();
                 return Ok(());
             } else {
                 handle_scroll_key(key, &mut log_scroll);
+                force_redraw = true;
             }
         }
     }
@@ -206,11 +242,13 @@ enum ScrollCmd {
 }
 
 /// Render-owned scroll state for the log pane: where the viewport is
-/// anchored plus a pending key action awaiting the next frame's
-/// width-aware resolution.
+/// anchored, a pending key action awaiting the next frame's width-aware
+/// resolution, and a memoized wrapped height so redraws that didn't
+/// touch the log skip re-wrapping the whole buffer.
 struct LogScroll {
     anchor: Anchor,
     pending: Option<ScrollCmd>,
+    height: Option<HeightCache>,
 }
 
 impl Default for LogScroll {
@@ -218,7 +256,35 @@ impl Default for LogScroll {
         Self {
             anchor: Anchor::Follow,
             pending: None,
+            height: None,
         }
+    }
+}
+
+/// Memoized total wrapped height of the log buffer, keyed by the two
+/// inputs that determine it: the buffer's push counter (its content
+/// identity -- each push increments it and appends, so equal counters
+/// mean identical lines) and the pane width (the wrapping). Computing
+/// the height means word-wrapping every buffered line, one of the two
+/// costliest things a frame does; a hit lets a redraw driven by
+/// anything other than a new line or a resize -- a phase's elapsed
+/// clock ticking through a quiet download, a bandwidth update -- reuse
+/// the prior height instead of re-wrapping.
+#[derive(Clone, Copy)]
+struct HeightCache {
+    pushed_total: u64,
+    width: u16,
+    total_rows: usize,
+}
+
+impl HeightCache {
+    /// The cached height iff it was computed for this exact push
+    /// counter and width; `None` on a miss (stale content, resize, or
+    /// an empty cache).
+    fn get(cache: Option<HeightCache>, pushed_total: u64, width: u16) -> Option<usize> {
+        cache
+            .filter(|c| c.pushed_total == pushed_total && c.width == width)
+            .map(|c| c.total_rows)
     }
 }
 
@@ -714,10 +780,21 @@ fn draw_log(frame: &mut ratatui::Frame<'_>, area: Rect, state: &TuiState, scroll
         .collect();
     let paragraph = Paragraph::new(rendered).wrap(Wrap { trim: false });
 
-    // Total wrapped height in one whole-buffer pass: same WordWrapper
-    // and width as the render path, with no block yet so there are no
-    // border rows to subtract.
-    let total_rows = paragraph.line_count(inner_width);
+    // Total wrapped height: same WordWrapper and width as the render
+    // path, with no block yet so there are no border rows to subtract.
+    // Memoized against the push counter and width (see `HeightCache`)
+    // so a redraw that didn't add a line or resize the pane reuses it
+    // instead of re-wrapping the whole buffer.
+    let total_rows = HeightCache::get(scroll.height, snapshot.pushed_total, inner_width)
+        .unwrap_or_else(|| {
+            let n = paragraph.line_count(inner_width);
+            scroll.height = Some(HeightCache {
+                pushed_total: snapshot.pushed_total,
+                width: inner_width,
+                total_rows: n,
+            });
+            n
+        });
     let max_top = total_rows.saturating_sub(pane_rows);
     // Push ordinal of the oldest still-buffered entry: entry i carries
     // ordinal `oldest_seq + i`.
@@ -1423,6 +1500,78 @@ mod tests {
             })
             .unwrap();
         inner_rows(&terminal, w, h)
+    }
+
+    /// The log-height cache hits only when both the push counter and
+    /// the pane width match what it was computed for: a new line (higher
+    /// counter) or a resize (different width) must miss so the height is
+    /// re-wrapped, an empty cache always misses, and an unrelated redraw
+    /// at the same counter and width must hit so the wrap is skipped.
+    #[test]
+    fn height_cache_hits_only_on_matching_push_counter_and_width() {
+        let cache = Some(HeightCache {
+            pushed_total: 42,
+            width: 80,
+            total_rows: 137,
+        });
+        assert_eq!(HeightCache::get(cache, 42, 80), Some(137));
+        assert_eq!(HeightCache::get(cache, 43, 80), None, "a new line misses");
+        assert_eq!(HeightCache::get(cache, 42, 100), None, "a resize misses");
+        assert_eq!(
+            HeightCache::get(None, 42, 80),
+            None,
+            "an empty cache misses"
+        );
+    }
+
+    /// `draw_log` populates the height cache on first paint and keys it
+    /// to the current buffer and inner width, so a later redraw with no
+    /// new lines is a hit; a new line moves the push counter, misses,
+    /// and the next paint recomputes and re-keys the entry.
+    #[test]
+    fn draw_log_memoizes_wrapped_height_across_frames() {
+        let state = TuiState::new();
+        push_wrapping(&state, 30);
+        let mut scroll = LogScroll::default();
+        assert!(scroll.height.is_none(), "cache starts empty");
+
+        let _ = render_scroll(&state, &mut scroll, 40, 12);
+        let first = scroll.height.expect("first paint populates the cache");
+        let snap = state.log_snapshot();
+        // The pane is 40 wide; `draw_log` keys on the inner width, which
+        // is the pane minus its two border columns.
+        assert_eq!(first.width, 38);
+        assert_eq!(first.pushed_total, snap.pushed_total);
+        assert!(first.total_rows > 0);
+
+        // Same buffer, same size: the cached entry still describes the
+        // current frame, so a lookup hits.
+        let _ = render_scroll(&state, &mut scroll, 40, 12);
+        assert_eq!(
+            HeightCache::get(scroll.height, snap.pushed_total, 38),
+            Some(first.total_rows),
+            "an unchanged buffer at the same width is a hit"
+        );
+
+        // One more line advances the push counter, so the cached entry
+        // no longer matches and the next paint must recompute it.
+        state.push_log(LogLine {
+            ts: chrono::Utc::now(),
+            level: tracing::Level::INFO,
+            target: "t".into(),
+            message: "one more".into(),
+        });
+        let snap2 = state.log_snapshot();
+        assert!(
+            HeightCache::get(scroll.height, snap2.pushed_total, 38).is_none(),
+            "a new line invalidates the cached height"
+        );
+        let _ = render_scroll(&state, &mut scroll, 40, 12);
+        assert_eq!(
+            scroll.height.unwrap().pushed_total,
+            snap2.pushed_total,
+            "the redraw recomputes and re-keys the cache"
+        );
     }
 
     /// A following view keeps the newest line on screen even when lines
