@@ -1,5 +1,7 @@
 use anyhow::Result;
 use futures_util::StreamExt;
+use jmap_client::core::session::URLPart;
+use jmap_client::event_source::URLParameter;
 use reqwest_eventsource::{Event, EventSource};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -138,12 +140,8 @@ async fn connect_and_listen(
     backoff: &mut Duration,
     tx: &mpsc::Sender<SyncTrigger>,
 ) -> Result<ConnectOutcome> {
-    info!("Connecting to JMAP EventSource: {}", event_source_url);
-
-    let url = format!(
-        "{}?types=*&closeafter=no&ping={}",
-        event_source_url, ping_interval
-    );
+    let url = resolve_event_source_url(event_source_url, ping_interval)?;
+    info!("Connecting to JMAP EventSource: {}", url);
 
     let client = reqwest::Client::new();
     let request = client
@@ -259,6 +257,54 @@ async fn connect_and_listen(
             }
         }
     }
+}
+
+/// Expand the JMAP `eventSourceUrl` template into the URL to connect to.
+///
+/// RFC 8620 (section 2) defines `eventSourceUrl` as a level-1 URI
+/// Template (RFC 6570) carrying the variables `{types}`,
+/// `{closeafter}`, and `{ping}`, which the client substitutes: every
+/// type (`*`, filtered client-side against `TRACKED_TYPES`), no
+/// close-after-delivery (`no`), and a ping every `ping_interval`
+/// seconds. Parsing reuses jmap-client's `URLPart` template grammar --
+/// the same one it applies to the download and upload URLs.
+///
+/// A server may instead advertise a bare endpoint carrying none of the
+/// variables, in which case the three parameters are appended as a
+/// query string. Errors if the template is malformed or a bare endpoint
+/// fails to parse as a URL.
+fn resolve_event_source_url(template: &str, ping_interval: u64) -> Result<String> {
+    const TYPES: &str = "*";
+    const CLOSEAFTER: &str = "no";
+
+    let mut url = String::with_capacity(template.len());
+    let mut substituted = false;
+    for part in URLPart::<URLParameter>::parse(template)? {
+        match part {
+            URLPart::Value(value) => url.push_str(&value),
+            URLPart::Parameter(param) => {
+                substituted = true;
+                match param {
+                    URLParameter::Types => url.push_str(TYPES),
+                    URLParameter::CloseAfter => url.push_str(CLOSEAFTER),
+                    URLParameter::Ping => url.push_str(&ping_interval.to_string()),
+                }
+            }
+        }
+    }
+
+    if substituted {
+        return Ok(url);
+    }
+
+    // Bare endpoint with no template variables: append the parameters
+    // ourselves rather than leaving the request unqualified.
+    let mut url = reqwest::Url::parse(template)?;
+    url.query_pairs_mut()
+        .append_pair("types", TYPES)
+        .append_pair("closeafter", CLOSEAFTER)
+        .append_pair("ping", &ping_interval.to_string());
+    Ok(url.into())
 }
 
 /// Pull the `interval` (in seconds) out of a server-emitted ping
@@ -428,5 +474,46 @@ mod tests {
     fn parse_ping_interval_returns_none_for_zero() {
         let data = r#"{"@type":"Ping","interval":0}"#;
         assert_eq!(parse_ping_interval(data), None);
+    }
+
+    #[test]
+    fn resolves_templated_event_source_url() {
+        // Fastmail's templated form: variables are substituted in
+        // place, yielding exactly one of each parameter, `types=*`
+        // actually present, and no leftover braces or double `?`.
+        let template = "https://api.fastmail.com/jmap/event/\
+                        ?types={types}&closeafter={closeafter}&ping={ping}";
+        let url = resolve_event_source_url(template, 60).unwrap();
+        assert_eq!(
+            url,
+            "https://api.fastmail.com/jmap/event/?types=*&closeafter=no&ping=60"
+        );
+    }
+
+    #[test]
+    fn resolves_bare_event_source_url() {
+        // A server (or old Fastmail, and every mock/e2e harness) that
+        // advertises a bare endpoint gets the parameters appended.
+        let url = resolve_event_source_url("https://example.com/es", 30).unwrap();
+        assert_eq!(url, "https://example.com/es?types=*&closeafter=no&ping=30");
+    }
+
+    #[test]
+    fn appends_without_double_question_mark() {
+        // A bare endpoint that already carries a query is extended with
+        // `&`, never a second `?` -- the failure mode of the old
+        // string-concatenation path.
+        let url = resolve_event_source_url("https://example.com/es?foo=bar", 30).unwrap();
+        assert_eq!(
+            url,
+            "https://example.com/es?foo=bar&types=*&closeafter=no&ping=30"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_template_variable() {
+        // jmap-client's URLPart grammar validates variable names, so an
+        // unrecognized one is a hard error rather than a silent literal.
+        assert!(resolve_event_source_url("https://example.com/es?x={bogus}", 60).is_err());
     }
 }
