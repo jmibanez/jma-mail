@@ -1,6 +1,6 @@
 use anyhow::Result;
 use rusqlite::{Connection, params};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ids::{JmapBlobId, JmapEmailId, JmapMailboxId, JmapThreadId, MaildirId, MessageId};
 
@@ -197,6 +197,25 @@ pub fn has_message_map_rows(conn: &Connection) -> Result<bool> {
 pub fn count_messages(conn: &Connection) -> Result<u64> {
     let n: i64 = conn.query_row("SELECT COUNT(*) FROM message_map", [], |row| row.get(0))?;
     Ok(n as u64)
+}
+
+/// Every Maildir id whose disappearance would be interpreted as a local
+/// message deletion. `message_map` is the JMAP binding; `local_state` is
+/// included as a defensive recovery anchor for a transaction that wrote
+/// one table before an older binary crashed. Phase-0 dedupe uses this set
+/// to avoid deleting a tracked path without transferring its identity.
+pub fn list_tracked_maildir_ids(conn: &Connection) -> Result<HashSet<MaildirId>> {
+    let mut stmt = conn.prepare(
+        "SELECT maildir_id FROM message_map WHERE maildir_id IS NOT NULL
+         UNION
+         SELECT maildir_id FROM local_state",
+    )?;
+    let rows = stmt.query_map([], |row| row.get::<_, MaildirId>(0))?;
+    let mut ids = HashSet::new();
+    for row in rows {
+        ids.insert(row?);
+    }
+    Ok(ids)
 }
 
 /// Get all messages in a given mailbox.

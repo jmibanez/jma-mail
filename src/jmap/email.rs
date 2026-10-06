@@ -51,6 +51,8 @@ fn email_properties() -> Vec<email::Property> {
         email::Property::MailboxIds,
         email::Property::Keywords,
         email::Property::MessageId,
+        email::Property::Subject,
+        email::Property::ReceivedAt,
         email::Property::Size,
     ]
 }
@@ -932,7 +934,8 @@ fn parse_email_object(email: &jmap_client::email::Email<jmap_client::Get>) -> Re
         mailbox_ids,
         keywords,
         message_id,
-        subject: None,
+        subject: email.subject().map(str::to_owned),
+        received_at: email.received_at(),
         size: email.size() as u64,
     })
 }
@@ -1104,6 +1107,7 @@ mod tests {
             keywords: HashMap::new(),
             message_id: None,
             subject: None,
+            received_at: None,
             size: 0,
         }
     }

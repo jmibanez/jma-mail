@@ -291,19 +291,34 @@ impl<'a> SyncEngine<'a> {
         } else {
             Vec::new()
         };
-        let dedupe_plan = crate::janitor::dedupe::run(&maildir_root, &dedupe_targets, dry_run)?;
+        let tracked_maildir_ids = queries::list_tracked_maildir_ids(self.conn)?;
+        let dedupe_plan = crate::janitor::dedupe::run(
+            &maildir_root,
+            &dedupe_targets,
+            dry_run,
+            &tracked_maildir_ids,
+        )?;
         let mut local_index = LocalIndex::default();
-        if !queries::has_message_map_rows(self.conn)? {
-            for kept in &dedupe_plan.kept {
-                local_index
-                    .by_message_id
-                    .entry(kept.message_id.clone())
-                    .or_default()
-                    .push(LocalEntry {
-                        folder: kept.folder.clone(),
-                        maildir_id: kept.maildir_id.clone(),
-                    });
-            }
+        // Build this even when message_map is non-empty. A failed initial
+        // cycle commits downloads/uploads one at a time but deliberately
+        // withholds mailbox_map and cursors until the whole executor
+        // succeeds. On the recovery cycle that leaves a *partial* DB:
+        // DB lookup handles the committed subset while LocalIndex is the
+        // only guard that stops uncommitted same-Message-ID files from
+        // being uploaded again and hitting Fastmail's `alreadyExists`.
+        // In a normal steady-state cycle the index is cheap dead weight
+        // for clean folders (folder checkpoints exclude them), but in a
+        // partial bootstrap it is what makes the two sources of truth
+        // meet in the middle.
+        for kept in &dedupe_plan.kept {
+            local_index
+                .by_message_id
+                .entry(kept.message_id.clone())
+                .or_default()
+                .push(LocalEntry {
+                    folder: kept.folder.clone(),
+                    maildir_id: kept.maildir_id.clone(),
+                });
         }
 
         // Phase 1: scan local changes. `Full` walks every synced

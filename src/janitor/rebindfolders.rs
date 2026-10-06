@@ -1122,6 +1122,7 @@ mod tests {
             keywords: StdHashMap::new(),
             message_id: Some(vec![MessageId::from(message_id)]),
             subject: None,
+            received_at: None,
             size: 0,
         }
     }

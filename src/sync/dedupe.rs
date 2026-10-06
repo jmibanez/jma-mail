@@ -1,7 +1,10 @@
 use anyhow::Result;
 use maildir::Maildir;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::path::Path;
+use std::fs::File;
+use std::io::{BufReader, Read};
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tracing::{debug, error, info, warn};
 
@@ -28,12 +31,22 @@ enum Subdir {
     New,
 }
 
-/// One file that might be the kept copy for a `GroupKey`. Built up
-/// during the maildir walk; the oldest mtime per group wins.
+/// One file that might be the kept copy for a `GroupKey`.
 struct Candidate {
     mtime: SystemTime,
     maildir_id: MaildirId,
     subdir: Subdir,
+    path: PathBuf,
+}
+
+/// Cheap key for grouping byte-identical candidates. A matching
+/// size+SHA-256 is still followed by a byte-for-byte comparison before
+/// a deletion is planned: automatic mail deletion gets the conservative
+/// answer even in the astronomically unlikely event of a hash collision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ContentFingerprint {
+    size: u64,
+    sha256: [u8; 32],
 }
 
 /// One entry in the local message-ID index.
@@ -85,13 +98,21 @@ pub struct DedupePlan {
 }
 
 /// Walk every synced maildir folder, parse Message-IDs out of each
-/// file, and classify per-folder duplicates: when several files in the
-/// same folder share a Message-ID, the oldest by mtime is kept and the
-/// rest are marked for deletion (the most recently introduced copy is,
-/// by construction, the duplicate jma wrote on top of an existing
-/// file).
+/// file, and classify per-folder duplicates. Message-ID is only the
+/// candidate-group key; files are eligible for automatic deletion only
+/// when their complete raw bytes are equal. The oldest mtime wins within
+/// each byte-identical content class.
 ///
-/// Two scope exemptions, both load-bearing:
+/// This distinction is load-bearing. Draft editors commonly save many
+/// revisions under one Message-ID, and duplicate deliveries can preserve
+/// the sender's Message-ID while acquiring different Received headers.
+/// Treating Message-ID as proof of byte identity destroyed newer draft
+/// revisions during bootstrap. Content-distinct files now survive and
+/// each contributes a `KeptEntry`; reconcile chooses one canonical local
+/// representative for a server object and leaves the other variants on
+/// disk for explicit user review.
+///
+/// Three scope rules are load-bearing:
 /// 1. Cross-folder copies of the same Message-ID are preserved -- a
 ///    user copying a message into another mailbox is a distinct
 ///    instance, not a duplicate to clean up.
@@ -106,10 +127,10 @@ pub struct DedupePlan {
 ///    file if the MUA's bookkeeping still expects both names to
 ///    resolve. Once the promotion's caller settles, the pair
 ///    collapses to in-subdir and gets cleaned next cycle. Cross-subdir
-///    pairs whose ids are not in a prefix relationship are real
-///    duplicates (e.g., jma re-delivered into `new/` while `cur/`
-///    already held a separate copy) and get the normal mtime-based
-///    dedupe.
+///    pairs whose ids are not in a prefix relationship proceed to the
+///    byte-identity check.
+/// 3. Same-folder, same-Message-ID files with different bytes are not
+///    duplicates for destructive purposes and are preserved.
 ///
 /// Pure: this function does not delete any files. Pair with
 /// `apply_dedupe` to execute the plan, or inspect `plan.deletions`
@@ -156,16 +177,9 @@ pub fn plan_dedupe(maildir_root: &Path, folders: &[String]) -> Result<DedupePlan
     for (GroupKey { folder, msgid }, mut candidates) in groups {
         // Oldest mtime first.
         candidates.sort_by_key(|c| c.mtime);
-        let mut iter = candidates.into_iter();
-        let Some(keep) = iter.next() else {
+        let Some(oldest) = candidates.first() else {
             continue;
         };
-
-        plan.kept.push(KeptEntry {
-            folder: folder.clone(),
-            message_id: msgid.clone(),
-            maildir_id: keep.maildir_id.clone(),
-        });
 
         // A cross-subdir pair where one candidate's id is an
         // extending-prefix of the other's is almost certainly
@@ -183,28 +197,95 @@ pub fn plan_dedupe(maildir_root: &Path, folders: &[String]) -> Result<DedupePlan
         // mtime-based dedupe.
         //
         // Skip deletions for the whole group when any such
-        // prefix-paired cross-subdir pair exists -- the kept
-        // entry already emitted above stays, so LocalIndex
-        // resolves correctly for adoption. Once the MUA
+        // prefix-paired cross-subdir pair exists. Emit only one
+        // kept entry: both paths represent one in-flight file, and
+        // exposing both to LocalIndex would make cold-start upload
+        // suppression treat the transient second path as a durable
+        // content variant. Once the MUA
         // finishes the promotion the pair collapses to
         // in-subdir and gets cleaned next cycle.
-        let all: Vec<Candidate> = std::iter::once(keep).chain(iter).collect();
-        if has_in_flight_promotion(&all) {
+        if has_in_flight_promotion(&candidates) {
+            plan.kept.push(KeptEntry {
+                folder,
+                message_id: msgid,
+                maildir_id: oldest.maildir_id.clone(),
+            });
             continue;
         }
 
-        let (keep, dups) = all.split_first().expect("group has at least one candidate");
-        for dup in dups {
-            plan.deletions.push(DedupeDeletion {
+        // A Message-ID group may contain several real content versions.
+        // Partition it into exact-byte classes, keeping the oldest member
+        // of every class. This is intentionally more work than comparing
+        // every candidate only with the group's oldest file: if A and B
+        // are different revisions but C is a byte-copy of B, C is safely
+        // removable while both A and B must survive.
+        let mut representatives: Vec<(Candidate, ContentFingerprint)> = Vec::new();
+        for candidate in candidates {
+            let fingerprint = fingerprint_file(&candidate.path)?;
+            let mut matching_maildir_id = None;
+            for (representative, representative_fingerprint) in &representatives {
+                if *representative_fingerprint == fingerprint
+                    && files_equal(&representative.path, &candidate.path)?
+                {
+                    matching_maildir_id = Some(representative.maildir_id.clone());
+                    break;
+                }
+            }
+            if let Some(kept_maildir_id) = matching_maildir_id {
+                plan.deletions.push(DedupeDeletion {
+                    folder: folder.clone(),
+                    message_id: msgid.clone(),
+                    maildir_id: candidate.maildir_id,
+                    kept_maildir_id,
+                });
+                continue;
+            }
+            plan.kept.push(KeptEntry {
                 folder: folder.clone(),
                 message_id: msgid.clone(),
-                maildir_id: dup.maildir_id.clone(),
-                kept_maildir_id: keep.maildir_id.clone(),
+                maildir_id: candidate.maildir_id.clone(),
             });
+            representatives.push((candidate, fingerprint));
         }
     }
 
     Ok(plan)
+}
+
+fn fingerprint_file(path: &Path) -> Result<ContentFingerprint> {
+    let file = File::open(path)?;
+    let size = file.metadata()?.len();
+    let mut reader = BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+    Ok(ContentFingerprint {
+        size,
+        sha256: hasher.finalize().into(),
+    })
+}
+
+fn files_equal(a: &Path, b: &Path) -> Result<bool> {
+    let mut a = BufReader::new(File::open(a)?);
+    let mut b = BufReader::new(File::open(b)?);
+    let mut a_buf = [0_u8; 64 * 1024];
+    let mut b_buf = [0_u8; 64 * 1024];
+    loop {
+        let a_n = a.read(&mut a_buf)?;
+        let b_n = b.read(&mut b_buf)?;
+        if a_n != b_n || a_buf[..a_n] != b_buf[..b_n] {
+            return Ok(false);
+        }
+        if a_n == 0 {
+            return Ok(true);
+        }
+    }
 }
 
 /// Execute a `DedupePlan` against disk. Deletes each planned duplicate
@@ -337,6 +418,7 @@ fn push_candidate(
             mtime,
             maildir_id,
             subdir,
+            path,
         },
     ));
     Ok(())
@@ -714,6 +796,45 @@ mod tests {
             "duplicate file must still exist after plan_dedupe alone -- \
              dry-run depends on this"
         );
+    }
+
+    /// Message-ID is an idempotency anchor, not a content digest. Draft
+    /// autosaves and independently-routed deliveries can legitimately
+    /// share it while carrying different bytes. Keep one representative
+    /// of every byte-distinct class, while still removing an exact copy
+    /// within one class.
+    #[test]
+    fn plan_dedupe_preserves_content_variants_and_deletes_only_exact_copy() {
+        let tmp = TempDir::new().unwrap();
+        let inbox_path = tmp.path().join("INBOX");
+        let _inbox = ensure_maildir(&inbox_path).unwrap();
+
+        let first = "Message-ID: <a@x>\r\n\r\nfirst draft\r\n";
+        let second = "Message-ID: <a@x>\r\n\r\nsecond, expanded draft\r\n";
+        fs::write(inbox_path.join("cur").join("1.host:2,S"), first).unwrap();
+        fs::write(inbox_path.join("cur").join("2.host:2,S"), second).unwrap();
+        fs::write(inbox_path.join("cur").join("3.host:2,S"), second).unwrap();
+
+        let base = SystemTime::now() - std::time::Duration::from_secs(120);
+        for (offset, name) in ["1.host:2,S", "2.host:2,S", "3.host:2,S"]
+            .iter()
+            .enumerate()
+        {
+            fs::File::open(inbox_path.join("cur").join(name))
+                .and_then(|f| f.set_modified(base + std::time::Duration::from_secs(offset as u64)))
+                .unwrap();
+        }
+
+        let plan = plan_dedupe(tmp.path(), &["INBOX".to_string()]).unwrap();
+
+        assert_eq!(
+            plan.kept.len(),
+            2,
+            "both byte-distinct draft revisions must survive"
+        );
+        assert_eq!(plan.deletions.len(), 1);
+        assert_eq!(plan.deletions[0].maildir_id.as_ref(), "3.host");
+        assert_eq!(plan.deletions[0].kept_maildir_id.as_ref(), "2.host");
     }
 
     /// Parallel per-folder fan-out must merge results so that

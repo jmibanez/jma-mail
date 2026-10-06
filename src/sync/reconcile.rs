@@ -1981,6 +1981,29 @@ fn handle_local_new(
         return;
     }
 
+    // Cold/partial-bootstrap sibling guard. LocalIndex can legitimately
+    // contain several files in one folder with the same Message-ID now
+    // that destructive dedupe requires byte equality: draft revisions and
+    // separately-routed deliveries are content variants, not disposable
+    // files. Only the first (oldest) representative is eligible to stand
+    // for this Message-ID on a server that rejects a second Email/import
+    // with `alreadyExists`; preserve every other variant on disk but do
+    // not upload it. Without this guard a fresh DB queues all variants in
+    // one parallel upload batch: one wins, the rest reject, and the cycle
+    // fails before publishing mailbox_map/cursors.
+    if let Some(entries) = ctx.local_index.by_message_id.get(message_id)
+        && let Some(canonical) = entries.iter().find(|entry| entry.folder == folder)
+        && canonical.maildir_id != *maildir_id
+    {
+        warn!(
+            "Preserving content-distinct same-Message-ID file {}/{} locally but \
+             skipping upload; canonical local representative is {} and Fastmail \
+             rejects a second import with alreadyExists",
+            folder, maildir_id, canonical.maildir_id
+        );
+        return;
+    }
+
     // Size cap is enforced here, at plan time, rather than in
     // execute: catching the oversized file at this point keeps it
     // out of the upload concurrency budget entirely (a slot held by
@@ -2188,6 +2211,7 @@ mod tests {
             keywords: flags_to_keywords(flags),
             message_id: message_id.map(|m| vec![m.into()]),
             subject: None,
+            received_at: None,
             size: 0,
         }
     }
@@ -2565,6 +2589,60 @@ mod tests {
         };
         assert_eq!(maildir_id.as_ref(), "FILE-1");
         assert_eq!(jmap_email_id.as_ref(), "E1");
+    }
+
+    /// With destructive Message-ID-only dedupe removed, a cold start can
+    /// expose multiple content variants under one Message-ID. Fastmail
+    /// accepts only one import. Reconcile must upload the canonical
+    /// (oldest) LocalIndex entry and preserve-but-skip its siblings.
+    #[test]
+    fn cold_start_uploads_only_one_content_variant_per_message_id() {
+        let binding = Arc::new(MailboxFolderBinding {
+            jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
+            server_name: "INBOX".to_string(),
+            maildir_folder: "INBOX".to_string(),
+            remote_path: "INBOX".to_string(),
+        });
+        let mut idx = empty_index();
+        idx.by_message_id.insert(
+            "<a@x>".into(),
+            vec![
+                LocalEntry {
+                    folder: "INBOX".into(),
+                    maildir_id: "FILE-OLD".into(),
+                },
+                LocalEntry {
+                    folder: "INBOX".into(),
+                    maildir_id: "FILE-NEW".into(),
+                },
+            ],
+        );
+        let changes = vec![
+            LocalChange::NewMessage {
+                maildir_id: "FILE-OLD".into(),
+                binding: Arc::clone(&binding),
+                flags: String::new(),
+                path: PathBuf::from("/tmp/file-old"),
+                message_id: "<a@x>".into(),
+                size_bytes: 1,
+            },
+            LocalChange::NewMessage {
+                maildir_id: "FILE-NEW".into(),
+                binding,
+                flags: String::new(),
+                path: PathBuf::from("/tmp/file-new"),
+                message_id: "<a@x>".into(),
+                size_bytes: 1,
+            },
+        ];
+
+        let plan = run(&[], &[], &changes, &[], &idx, ConflictStrategy::ServerWins);
+
+        assert_eq!(plan.upload_count(), 1, "only canonical variant uploads");
+        let SyncAction::UploadMessage { id, .. } = &plan.actions[0] else {
+            panic!("expected one upload, got {:?}", plan.actions);
+        };
+        assert_eq!(id.maildir_id.as_ref(), "FILE-OLD");
     }
 
     /// Cold-start adoption against a maildir file whose on-disk flag

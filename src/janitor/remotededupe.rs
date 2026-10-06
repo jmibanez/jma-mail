@@ -67,6 +67,10 @@ pub struct RemoteDedupeGroup {
     pub blob_id: JmapBlobId,
     pub survivor: JmapEmailId,
     pub destroy: Vec<JmapEmailId>,
+    /// Full membership, including the survivor, retained so
+    /// `--details` can explain the decision instead of naming only
+    /// the ids selected for destruction.
+    pub members: Vec<RemoteDedupeMember>,
 }
 
 /// A group the planner refused to act on. See `SkipReason` for the
@@ -77,7 +81,42 @@ pub struct RemoteDedupeSkippedGroup {
     pub mailbox_folder: String,
     pub message_id: MessageId,
     pub reason: SkipReason,
-    pub members: Vec<(JmapEmailId, JmapBlobId)>,
+    pub members: Vec<RemoteDedupeMember>,
+}
+
+/// One remote Email object in a same-Message-ID group. The basic
+/// JMAP metadata is always populated. SHA-256 and content fields
+/// are populated only when the planner downloaded the blob:
+/// always for same-size groups (the eligibility check needs it),
+/// and for size-mismatch groups only when detailed reporting was
+/// explicitly requested.
+#[derive(Debug, Clone)]
+pub struct RemoteDedupeMember {
+    pub email_id: JmapEmailId,
+    pub blob_id: JmapBlobId,
+    pub size: u64,
+    pub subject: Option<String>,
+    pub received_at: Option<i64>,
+    pub sha256: Option<[u8; 32]>,
+    pub content_preview: Option<Vec<u8>>,
+    pub downloaded_size: Option<u64>,
+    pub content_truncated: bool,
+}
+
+/// Controls expensive, audit-oriented report enrichment. These
+/// switches never participate in deletion eligibility: in
+/// particular, hashing a size-mismatch group cannot make it
+/// actionable.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RemoteDedupeReportOptions {
+    pub details: bool,
+    pub content_preview_bytes: Option<usize>,
+}
+
+impl RemoteDedupeReportOptions {
+    fn inspect_skipped_blobs(self) -> bool {
+        self.details || self.content_preview_bytes.is_some()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,7 +190,27 @@ pub async fn run(
     folders: &[(String, JmapMailboxId)],
     dry_run: bool,
 ) -> Result<(RemoteDedupePlan, Option<RemoteDedupeOutcome>)> {
-    let plan = build_plan(client, conn, folders).await?;
+    run_with_report(
+        client,
+        conn,
+        folders,
+        dry_run,
+        RemoteDedupeReportOptions::default(),
+    )
+    .await
+}
+
+/// Variant of [`run`] that enriches the returned plan for an
+/// operator-facing audit report. Kept separate so adding reporting
+/// controls does not break callers of the original public API.
+pub async fn run_with_report(
+    client: &Client,
+    conn: &Connection,
+    folders: &[(String, JmapMailboxId)],
+    dry_run: bool,
+    report_options: RemoteDedupeReportOptions,
+) -> Result<(RemoteDedupePlan, Option<RemoteDedupeOutcome>)> {
+    let plan = build_plan(client, conn, folders, report_options).await?;
     if dry_run || plan.destroy_count() == 0 {
         return Ok((plan, None));
     }
@@ -167,6 +226,7 @@ async fn build_plan(
     client: &Client,
     conn: &Connection,
     folders: &[(String, JmapMailboxId)],
+    report_options: RemoteDedupeReportOptions,
 ) -> Result<RemoteDedupePlan> {
     let mut plan = RemoteDedupePlan::default();
     if folders.is_empty() {
@@ -205,33 +265,56 @@ async fn build_plan(
                 email_id: e.id,
                 blob_id: e.blob_id,
                 size: e.size,
+                subject: e.subject,
+                received_at: e.received_at,
             });
         }
 
         for (message_id, members) in by_msgid {
             match classify_group(folder, mailbox_id, &message_id, members, &locally_bound) {
                 Classification::Single => {}
-                Classification::Skipped(s) => plan.skipped.push(s),
+                Classification::Skipped(mut s) => {
+                    // Size mismatch is already a final refusal. In
+                    // audit mode we nevertheless download the blobs
+                    // to report hashes/content; those observations
+                    // deliberately cannot promote the group into the
+                    // destroy plan.
+                    if report_options.inspect_skipped_blobs() {
+                        inspect_member_blobs(
+                            &http,
+                            client,
+                            &mut s.members,
+                            report_options.content_preview_bytes,
+                        )
+                        .await?;
+                    }
+                    plan.skipped.push(s);
+                }
                 Classification::SizeMatched {
-                    group,
-                    members_for_verify,
+                    mut group,
+                    mut members_for_verify,
                 } => {
                     // Cheap pre-check passed (all sizes agree).
                     // Now pay the bandwidth: download every member's
                     // blob and demand byte-equality across the set.
                     // Any pair-wise disagreement demotes the whole
                     // group to ContentMismatch.
-                    if blobs_byte_equal(&http, client, &members_for_verify).await? {
+                    if inspect_member_blobs(
+                        &http,
+                        client,
+                        &mut members_for_verify,
+                        report_options.content_preview_bytes,
+                    )
+                    .await?
+                    {
+                        group.members = members_for_verify;
                         plan.groups.push(group);
                     } else {
                         plan.skipped.push(RemoteDedupeSkippedGroup {
                             mailbox_folder: group.mailbox_folder,
                             message_id: group.message_id,
                             reason: SkipReason::ContentMismatch,
-                            members: members_for_verify
-                                .into_iter()
-                                .map(|m| (m.email_id, m.blob_id))
-                                .collect(),
+                            members: members_for_verify,
                         });
                     }
                 }
@@ -256,59 +339,84 @@ struct Member {
     email_id: JmapEmailId,
     blob_id: JmapBlobId,
     size: u64,
+    subject: Option<String>,
+    received_at: Option<i64>,
 }
 
-/// Stream every member's blob through SHA-256 and compare digests.
-/// Bandwidth scales with the group size and the per-message
-/// payload (one full body per member, paid once), but peak memory
-/// is one HTTP chunk + 32 bytes of digest per member -- not the
-/// `2 * msg_size` a buffered byte-compare would hold. A SHA-256
-/// collision is the only theoretical false-positive shape, and
-/// finding one is computationally infeasible for any attacker who
-/// would otherwise already have account write access.
-async fn blobs_byte_equal(
-    http: &reqwest::Client,
-    jmap: &Client,
-    members: &[Member],
-) -> Result<bool> {
-    // Identical sizes is the planner's precondition for calling
-    // this function (Classification::SizeMatched); an empty or
-    // single-member slice is vacuously equal.
-    if members.len() < 2 {
-        return Ok(true);
-    }
-    let reference_digest = blob_sha256(http, jmap, &members[0].blob_id).await?;
-    for m in &members[1..] {
-        let digest = blob_sha256(http, jmap, &m.blob_id).await?;
-        if digest != reference_digest {
-            debug!(
-                "blob content-equality check failed: sha256({}) != sha256({})",
-                members[0].blob_id, m.blob_id,
-            );
-            return Ok(false);
+impl From<Member> for RemoteDedupeMember {
+    fn from(member: Member) -> Self {
+        Self {
+            email_id: member.email_id,
+            blob_id: member.blob_id,
+            size: member.size,
+            subject: member.subject,
+            received_at: member.received_at,
+            sha256: None,
+            content_preview: None,
+            downloaded_size: None,
+            content_truncated: false,
         }
     }
-    Ok(true)
 }
 
-/// Stream a blob through SHA-256 without ever holding the full
-/// payload in memory. The only caller is `blobs_byte_equal`, hence
-/// the colocation -- reusable JMAP I/O primitives live in
-/// `src/jmap/email.rs`, but per-task content-equality machinery
-/// stays with the task. Peak memory is one HTTP chunk (~16KB) plus
-/// the hasher state, vs. the full message size that the buffered
-/// `download_blob` returns. Retries follow the same `with_retry`
-/// envelope as the rest of the JMAP layer; a mid-stream failure
-/// restarts the whole hash on retry, which is fine because `Sha256`
-/// has no resumption hook and we hold no reference to the partial
-/// digest across retries.
-async fn blob_sha256(
+/// Stream every member's blob through SHA-256, retain the requested
+/// audit material, and compare digests.
+/// Bandwidth scales with the group size and the per-message
+/// payload (one full body per member, paid once), but peak memory
+/// is one HTTP chunk plus the explicitly bounded content preview.
+/// A SHA-256 collision is the only theoretical false-positive
+/// shape, and finding one is computationally infeasible for any
+/// attacker who would otherwise already have account write access.
+async fn inspect_member_blobs(
+    http: &reqwest::Client,
+    jmap: &Client,
+    members: &mut [RemoteDedupeMember],
+    content_preview_bytes: Option<usize>,
+) -> Result<bool> {
+    let mut reference_digest = None;
+    let mut all_equal = true;
+    for member in members {
+        let inspection = inspect_blob(http, jmap, &member.blob_id, content_preview_bytes).await?;
+        if let Some(reference) = reference_digest {
+            if inspection.sha256 != reference {
+                debug!(
+                    "blob content-equality check failed: sha256 reference != sha256({})",
+                    member.blob_id,
+                );
+                all_equal = false;
+            }
+        } else {
+            reference_digest = Some(inspection.sha256);
+        }
+        member.sha256 = Some(inspection.sha256);
+        member.content_preview = inspection.content_preview;
+        member.downloaded_size = Some(inspection.downloaded_size);
+        member.content_truncated = inspection.content_truncated;
+    }
+    Ok(all_equal)
+}
+
+struct BlobInspection {
+    sha256: [u8; 32],
+    content_preview: Option<Vec<u8>>,
+    downloaded_size: u64,
+    content_truncated: bool,
+}
+
+/// Stream a blob through SHA-256 without holding the full payload
+/// in memory. If the operator requested content, retain at most the
+/// stated prefix length; hashing still covers the complete blob.
+/// Retries follow the same `with_retry` envelope as the rest of the
+/// JMAP layer. A mid-stream failure restarts both hash and preview,
+/// so no partial result can leak into the report.
+async fn inspect_blob(
     http: &reqwest::Client,
     jmap: &Client,
     blob_id: &JmapBlobId,
-) -> Result<[u8; 32]> {
+    content_preview_bytes: Option<usize>,
+) -> Result<BlobInspection> {
     let url = jmap_email::build_download_url(jmap, blob_id.as_ref());
-    crate::jmap::retry::with_retry("Email/blob (sha256)", || async {
+    crate::jmap::retry::with_retry("Email/blob (inspect)", || async {
         let resp = http
             .get(&url)
             .send()
@@ -318,19 +426,33 @@ async fn blob_sha256(
             .with_context(|| format!("Server error downloading blob {}", blob_id))?;
         let mut hasher = Sha256::new();
         let mut total: u64 = 0;
+        let mut preview = content_preview_bytes.map(Vec::with_capacity);
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk =
                 chunk.with_context(|| format!("Failed to read chunk for blob {}", blob_id))?;
             total += chunk.len() as u64;
             hasher.update(&chunk);
+            if let (Some(limit), Some(preview)) = (content_preview_bytes, preview.as_mut()) {
+                let remaining = limit.saturating_sub(preview.len());
+                preview.extend_from_slice(&chunk[..remaining.min(chunk.len())]);
+            }
         }
         let digest: [u8; 32] = hasher.finalize().into();
         debug!(
             "Hashed blob {} ({} bytes) -> sha256 prefix {:02x}{:02x}{:02x}{:02x}",
             blob_id, total, digest[0], digest[1], digest[2], digest[3]
         );
-        Ok(digest)
+        let content_truncated = preview
+            .as_ref()
+            .map(|bytes| total > bytes.len() as u64)
+            .unwrap_or(false);
+        Ok(BlobInspection {
+            sha256: digest,
+            content_preview: preview,
+            downloaded_size: total,
+            content_truncated,
+        })
     })
     .await
 }
@@ -373,7 +495,7 @@ enum Classification {
     /// `members_for_verify` carries the blob ids to download.
     SizeMatched {
         group: RemoteDedupeGroup,
-        members_for_verify: Vec<Member>,
+        members_for_verify: Vec<RemoteDedupeMember>,
     },
     /// A pre-check refused the group: size mismatch, or two-or-more
     /// locally-bound members.
@@ -396,10 +518,7 @@ fn classify_group(
             mailbox_folder: mailbox_folder.to_string(),
             message_id: message_id.clone(),
             reason: SkipReason::SizeMismatch,
-            members: members
-                .into_iter()
-                .map(|m| (m.email_id, m.blob_id))
-                .collect(),
+            members: members.into_iter().map(RemoteDedupeMember::from).collect(),
         });
     }
     // At most one member of a same-Message-ID group can carry a
@@ -439,6 +558,10 @@ fn classify_group(
     // verification has to see every id, not just the destroys.
     let mut members_for_verify = sorted;
     members_for_verify.insert(0, survivor_member);
+    let members_for_verify = members_for_verify
+        .into_iter()
+        .map(RemoteDedupeMember::from)
+        .collect();
     Classification::SizeMatched {
         group: RemoteDedupeGroup {
             mailbox_folder: mailbox_folder.to_string(),
@@ -447,6 +570,7 @@ fn classify_group(
             blob_id,
             survivor,
             destroy,
+            members: Vec::new(),
         },
         members_for_verify,
     }
@@ -506,6 +630,8 @@ mod tests {
             email_id: id.into(),
             blob_id: blob.into(),
             size: 100,
+            subject: None,
+            received_at: None,
         }
     }
 
@@ -514,6 +640,8 @@ mod tests {
             email_id: id.into(),
             blob_id: blob.into(),
             size,
+            subject: None,
+            received_at: None,
         }
     }
 
@@ -528,6 +656,7 @@ mod tests {
                     blob_id: "blob-1".into(),
                     survivor: "A1".into(),
                     destroy: vec!["A2".into(), "A3".into()],
+                    members: Vec::new(),
                 },
                 RemoteDedupeGroup {
                     mailbox_folder: "INBOX".into(),
@@ -536,6 +665,7 @@ mod tests {
                     blob_id: "blob-2".into(),
                     survivor: "B1".into(),
                     destroy: vec!["B2".into()],
+                    members: Vec::new(),
                 },
             ],
             skipped: Vec::new(),
