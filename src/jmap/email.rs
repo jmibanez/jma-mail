@@ -373,9 +373,9 @@ pub async fn get_changes(client: &Client, since_state: &str) -> Result<ChangesRe
     Ok(result)
 }
 
-/// One unit of work for `set_email_batch`. Collapses keyword changes,
-/// mailbox moves, and destroys onto a single Email/set method call so
-/// the server sees one transaction per cycle instead of N.
+/// One requested mutation for `set_email_batch`. Keyword and mailbox
+/// changes for the same Email are combined before batching updates and
+/// destroys into Email/set method calls.
 #[derive(Debug, Clone)]
 pub enum EmailSetOp {
     /// Patch keywords on an email. Map is `keyword -> set?`.
@@ -401,7 +401,7 @@ pub enum EmailSetOp {
 ///
 /// `chain_old` / `chain_new` carry the JMAP `oldState` / `newState`
 /// fields from the `Email/set` response(s). Across multiple chunks
-/// (when the op list exceeds `maxObjectsInSet`), the chain is
+/// (when the grouped objects exceed `maxObjectsInSet`), the chain is
 /// considered intact iff each subsequent chunk's `oldState` matches
 /// the previous chunk's `newState` -- i.e. nothing third-party landed
 /// between chunks. When intact, `chain_old` is the very first chunk's
@@ -444,15 +444,27 @@ impl EmailSetOutcome {
     }
 }
 
+#[derive(Default)]
+struct EmailSetUpdate<'a> {
+    keywords: HashMap<&'a str, bool>,
+    target_mailbox_ids: Option<&'a [JmapMailboxId]>,
+}
+
+enum EmailSetObject<'a> {
+    Update(&'a JmapEmailId),
+    Destroy(&'a JmapEmailId),
+}
+
 /// Apply a batch of Email/set operations, splitting across as many
 /// JMAP method calls as needed to honor `maxObjectsInSet`.
 ///
-/// JMAP allows multiple `update` and `destroy` entries in one
-/// Email/set, capped server-side by `maxObjectsInSet`. Caller op
-/// counts can exceed that cap on a busy cycle; we chunk via
-/// `limits::max_objects_in_set` (which itself caps the server's
-/// advertised value at our own ceiling) and fold per-chunk outcomes
-/// into a combined result. Per-id failures land in
+/// Combine all keyword and mailbox changes for an Email into one
+/// update before chunking. Repeated keyword assignments and mailbox
+/// replacements use the last value in caller order. Each combined
+/// update and each destroy consumes one slot in `maxObjectsInSet`.
+/// We chunk via `limits::max_objects_in_set` (which itself caps the
+/// server's advertised value at our own ceiling) and fold per-chunk
+/// outcomes into a combined result. Per-id failures land in
 /// `notUpdated`/`notDestroyed` and are surfaced as warnings; they do
 /// not fail the chunk. A chunk that fails after retries propagates
 /// `Err`, dropping the combined outcome — already-applied chunks
@@ -474,31 +486,60 @@ pub async fn set_email_batch(client: &Client, ops: &[EmailSetOp]) -> Result<Emai
         return Ok(EmailSetOutcome::default());
     }
 
+    // jmap-client's update(id) replaces an existing entry. Group the
+    // entire input first, then call it once per Email, even when the
+    // original operations would have fallen in different chunks.
+    let mut updates: HashMap<&JmapEmailId, EmailSetUpdate<'_>> = HashMap::new();
+    let mut objects = Vec::new();
+    for op in ops {
+        match op {
+            EmailSetOp::Keywords { email_id, keywords } => {
+                let update = updates.entry(email_id).or_insert_with(|| {
+                    objects.push(EmailSetObject::Update(email_id));
+                    EmailSetUpdate::default()
+                });
+                update
+                    .keywords
+                    .extend(keywords.iter().map(|(kw, val)| (kw.as_str(), *val)));
+            }
+            EmailSetOp::SetMailboxes {
+                email_id,
+                target_mailbox_ids,
+            } => {
+                let update = updates.entry(email_id).or_insert_with(|| {
+                    objects.push(EmailSetObject::Update(email_id));
+                    EmailSetUpdate::default()
+                });
+                update.target_mailbox_ids = Some(target_mailbox_ids);
+            }
+            EmailSetOp::Destroy { email_id } => {
+                objects.push(EmailSetObject::Destroy(email_id));
+            }
+        }
+    }
+
     let chunk_size = limits::max_objects_in_set(client);
     let mut combined = EmailSetOutcome::default();
     let mut chunk_count = 0usize;
 
-    for chunk in ops.chunks(chunk_size) {
+    for chunk in objects.chunks(chunk_size) {
         let chunk_outcome = with_retry("Email/set (batch)", || async {
             let mut request = build_request(client);
             {
                 let set = request.set_email().account_id(client.default_account_id());
-                for op in chunk {
-                    match op {
-                        EmailSetOp::Keywords { email_id, keywords } => {
+                for object in chunk {
+                    match object {
+                        EmailSetObject::Update(email_id) => {
+                            let update = &updates[email_id];
                             let upd = set.update(email_id.as_ref());
-                            for (kw, val) in keywords {
+                            for (kw, val) in &update.keywords {
                                 upd.keyword(kw, *val);
                             }
+                            if let Some(target_mailbox_ids) = update.target_mailbox_ids {
+                                upd.mailbox_ids(target_mailbox_ids.iter());
+                            }
                         }
-                        EmailSetOp::SetMailboxes {
-                            email_id,
-                            target_mailbox_ids,
-                        } => {
-                            set.update(email_id.as_ref())
-                                .mailbox_ids(target_mailbox_ids.iter());
-                        }
-                        EmailSetOp::Destroy { email_id } => {
+                        EmailSetObject::Destroy(email_id) => {
                             set.destroy([email_id.as_ref()]);
                         }
                     }
@@ -936,6 +977,10 @@ fn parse_email_object(email: &jmap_client::email::Email<jmap_client::Get>) -> Re
         size: email.size() as u64,
     })
 }
+
+#[cfg(test)]
+#[path = "email_batch_tests.rs"]
+mod batch_tests;
 
 #[cfg(test)]
 mod tests {
