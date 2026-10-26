@@ -6,6 +6,7 @@ pub mod domain;
 pub mod ids;
 pub mod janitor;
 pub mod jmap;
+pub mod keywords;
 pub mod maildir_ops;
 pub mod profile;
 pub mod state;

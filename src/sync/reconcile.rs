@@ -8,9 +8,10 @@ use crate::config::{AllowDestructiveFolderSync, ConflictStrategy, FolderLayout, 
 use crate::domain::{MailboxFolderBinding, MaybeReference};
 use crate::ids::{JmapBlobId, JmapEmailId, JmapMailboxId, JmapThreadId, MaildirId, MessageId};
 use crate::jmap::types::EmailObject;
-use crate::maildir_ops::flags::{flags_to_keyword_patch, flags_to_keywords, keywords_to_flags};
+use crate::maildir_ops::flags::{flags_to_keyword_patch, keywords_to_flags};
 use crate::maildir_ops::layout::decompose_folder_string;
 use crate::maildir_ops::scan::LocalChange;
+use crate::state::flag_sync::{FlagSyncState, mapped_flags};
 use crate::state::queries::MessageRecord;
 use crate::sync::bindings::{LocalOrphanRecord, MailboxBindings};
 use crate::sync::dedupe::LocalIndex;
@@ -74,6 +75,13 @@ pub struct MessageRecordIndex {
     pub by_maildir: HashMap<MaildirId, Arc<MessageRecord>>,
     pub by_jmap: HashMap<JmapEmailId, Arc<MessageRecord>>,
     pub by_message_id: HashMap<MessageId, Vec<Arc<MessageRecord>>>,
+    pub flag_sync: HashMap<JmapEmailId, FlagSyncState>,
+    /// Fresh verification is not necessarily a server-change event.
+    pub remote_observations: HashMap<JmapEmailId, EmailObject>,
+    pub unverified_remote: HashSet<JmapEmailId>,
+    pub retry_only: bool,
+    /// Fresh presence vetoes, not adoption authority or durable work items.
+    pub held_local_folders: HashSet<String>,
 }
 
 /// Bundle of immutable inputs and derived indices that every reconcile
@@ -86,6 +94,14 @@ struct ReconcileCtx<'a> {
     known_by_maildir: &'a HashMap<MaildirId, Arc<MessageRecord>>,
     known_by_jmap: &'a HashMap<JmapEmailId, Arc<MessageRecord>>,
     known_by_message_id: &'a HashMap<MessageId, Vec<Arc<MessageRecord>>>,
+    flag_sync: &'a HashMap<JmapEmailId, FlagSyncState>,
+    fresh_remote: HashMap<&'a JmapEmailId, &'a EmailObject>,
+    /// Known local moves are handled at their observed destination, never
+    /// by a remote pass trying to rename the now-missing old source.
+    moved_ids: &'a HashSet<JmapEmailId>,
+    unverified_remote: &'a HashSet<JmapEmailId>,
+    retry_only: bool,
+    held_local_folders: &'a HashSet<String>,
     local_index: &'a LocalIndex,
     /// Per-file on-disk filename flag suffix from this cycle's scan
     /// (`scan::ScanResult.local_flags`). Reconcile reads it at
@@ -98,6 +114,7 @@ struct ReconcileCtx<'a> {
     /// record's `flags` column.
     local_flags: &'a HashMap<MaildirId, String>,
     local_flag_changes: HashMap<JmapEmailId, &'a LocalChange>,
+    local_new_candidates: HashMap<(&'a MessageId, &'a str), usize>,
     local_deletes: HashSet<JmapEmailId>,
     destroyed_set: HashSet<&'a str>,
     max_upload_size: usize,
@@ -241,6 +258,19 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
         })
         .collect();
 
+    let mut local_new_candidates = HashMap::new();
+    for change in local_changes {
+        if let LocalChange::NewMessage {
+            message_id,
+            binding,
+            ..
+        } = change
+        {
+            *local_new_candidates
+                .entry((message_id, binding.maildir_folder.as_str()))
+                .or_insert(0) += 1;
+        }
+    }
     let mut detected_moves: Vec<DetectedMove> = Vec::new();
     let mut consumed_news: HashSet<MaildirId> = HashSet::new();
     let mut consumed_deletes: HashSet<JmapEmailId> = HashSet::new();
@@ -271,7 +301,7 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
         // share an id but disagree on `maildir_folder` (e.g. a rename
         // that wasn't applied to local_state yet), and we want the
         // move-pair path to fire in that case too.
-        if dst_binding == src_binding {
+        if dst_binding == src_binding && new_id == old_id {
             continue;
         }
 
@@ -282,10 +312,7 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
             from_folder: src_binding.maildir_folder.clone(),
             to_binding: Arc::clone(dst_binding),
             new_flags: new_flags.clone(),
-            jmap_blob_id: rec.jmap_blob_id.clone(),
-            jmap_thread_id: rec.jmap_thread_id.clone(),
             message_id: mid.clone(),
-            prior_flags: rec.flags.clone(),
         });
         consumed_news.insert(new_id.clone());
         consumed_deletes.insert(rec.jmap_email_id.clone());
@@ -310,9 +337,20 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
         known_by_maildir,
         known_by_jmap,
         known_by_message_id,
+        flag_sync: &known.flag_sync,
+        fresh_remote: known
+            .remote_observations
+            .iter()
+            .chain(remote_emails.iter().map(|email| (&email.id, email)))
+            .collect(),
+        moved_ids: &consumed_deletes,
+        unverified_remote: &known.unverified_remote,
+        retry_only: known.retry_only,
+        held_local_folders: &known.held_local_folders,
         local_index,
         local_flags,
         local_flag_changes,
+        local_new_candidates,
         local_deletes,
         destroyed_set,
         max_upload_size,
@@ -365,7 +403,7 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
         &mut plan,
     );
 
-    emit_detected_moves(&detected_moves, &mut plan);
+    emit_detected_moves(&ctx, &detected_moves, &mut plan);
 
     process_local_changes(
         local_changes,
@@ -376,6 +414,8 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
         &consumed_deletes,
         &mut plan,
     );
+
+    reconcile_bound_flags(&ctx, &detected_moves, &mut plan);
 
     // Local-orphan destructive arm: gates on
     // `allows_delete_of_local_folder`. Runs LAST so it sees
@@ -391,8 +431,51 @@ pub fn reconcile(input: ReconcileInput<'_>) -> SyncPlan {
     // from `remote_orphans()` before reconcile ran; here we only
     // see no-Blocker and LocalWins+Blocker cases.
     finalize_remote_orphan_handling(&ctx, &mut plan);
+    defer_superseded_move_flags(&ctx, &mut plan);
 
     plan
+}
+
+/// Folder policy can replace a move with a counter-move and remove its adopt.
+/// Do not let its now-unpaired destination pull escape into the ordinary flag
+/// phase. Replay the fresh remote observation after placement has settled.
+fn defer_superseded_move_flags(ctx: &ReconcileCtx<'_>, plan: &mut SyncPlan) {
+    let paired: HashSet<_> = plan
+        .actions
+        .iter()
+        .filter_map(|action| match action {
+            SyncAction::AdoptLocalMessage {
+                id,
+                old_maildir_id: Some(_),
+                ..
+            } => Some(id.jmap_email_id.clone()),
+            _ => None,
+        })
+        .collect();
+    let mut deferred = Vec::new();
+    plan.actions.retain(|action| match action {
+        SyncAction::UpdateLocalFlags { id, .. }
+            if ctx.moved_ids.contains(&id.jmap_email_id) && !paired.contains(&id.jmap_email_id) =>
+        {
+            deferred.push(id.as_remote());
+            false
+        }
+        _ => true,
+    });
+    if !deferred.is_empty() {
+        plan.new_email_state = None;
+        plan.actions.extend(
+            deferred
+                .into_iter()
+                .map(|id| SyncAction::DeferredFlagState {
+                    id,
+                    retryable: true,
+                    reason:
+                        "Folder policy superseded the move; replan flags after its counter-move"
+                            .into(),
+                }),
+        );
+    }
 }
 
 /// Role of a `SyncAction` with respect to one local orphan,
@@ -452,6 +535,12 @@ fn classify_action_against_orphan(
     known_by_jmap: &HashMap<JmapEmailId, Arc<MessageRecord>>,
 ) -> OrphanActionRole {
     match action {
+        // Metadata is not a user mutation. Deferred work is handled by
+        // the explicit hold in finalize_local_orphan_handling, before this
+        // conflict-policy classifier may authorize folder destruction.
+        SyncAction::ObserveMessage { .. }
+        | SyncAction::RecordFlagState { .. }
+        | SyncAction::DeferredFlagState { .. } => OrphanActionRole::Neutral,
         SyncAction::UploadMessage { binding, .. } => {
             if binding_targets_orphan(binding, dead_id) {
                 OrphanActionRole::Blocker
@@ -564,6 +653,20 @@ fn finalize_local_orphan_handling(ctx: &ReconcileCtx<'_>, plan: &mut SyncPlan) {
     let mut needs_resurrect: Vec<usize> = Vec::new();
 
     for (orphan_idx, orphan) in ctx.mailboxes.local_orphans().iter().enumerate() {
+        let dead_id = orphan
+            .binding
+            .jmap_mailbox_id
+            .expect_resolved("orphan flag hold");
+        if ctx.held_local_folders.contains(&orphan.binding.maildir_folder) || plan.actions.iter().any(|action| matches!(action,
+            SyncAction::DeferredFlagState { id, .. } if email_in_orphan(id, dead_id, ctx.known_by_jmap)
+        )) {
+            warn!("Deferring folder destruction for {}: flag history or presence is unresolved", dead_id);
+            // A live candidate may have a new basename while its cached row
+            // still points at another folder. Presence can veto destruction,
+            // but does not authorize adopting that unknown new/ copy.
+            plan.new_email_state = None;
+            continue;
+        }
         let (blockers, moots) = classify_actions_against_orphan(plan, orphan, ctx, &keep_mask);
         dispatch_orphan_decision(
             ctx,
@@ -678,10 +781,42 @@ fn resolve_server_wins_with_blocker(
         .binding
         .jmap_mailbox_id
         .expect_resolved("resolve_server_wins_with_blocker -- orphan binding is resolved");
-    for i in blockers {
-        if let Some(counter) = build_counter_move_local(&plan.actions[*i], folder, dead_id, ctx) {
-            additions.push(counter);
+    // Index once per orphan, not once per counter in a large move batch.
+    // None records ambiguity; duplicate adoptions never select a random file.
+    let mut destinations = HashMap::new();
+    for action in &plan.actions {
+        if let SyncAction::AdoptLocalMessage { id, binding, .. } = action
+            && binding.maildir_folder == *folder
+        {
+            destinations
+                .entry(&id.jmap_email_id)
+                .and_modify(|candidate| *candidate = None)
+                .or_insert(Some(id));
         }
+    }
+    let mut held = false;
+    for i in blockers {
+        let SyncAction::MoveRemote { id, .. } = &plan.actions[*i] else {
+            continue;
+        };
+        let counter =
+            build_counter_move_local(&plan.actions[*i], folder, dead_id, ctx, &destinations);
+        let retryable = counter.is_some();
+        if let Some(counter) = counter {
+            additions.push(counter);
+        } else {
+            held = true;
+        }
+        additions.push(SyncAction::DeferredFlagState {
+            id: id.clone(),
+            retryable,
+            reason: if retryable {
+                "Folder policy superseded placement; refresh full metadata after the counter-move"
+            } else {
+                "No unique counter-move destination; preserve the orphan for review"
+            }
+            .into(),
+        });
     }
     for i in blockers {
         keep_mask[*i] = false;
@@ -689,9 +824,11 @@ fn resolve_server_wins_with_blocker(
     for i in moots {
         keep_mask[*i] = false;
     }
-    additions.push(SyncAction::DeleteLocalFolder {
-        binding: Arc::clone(&orphan.binding),
-    });
+    if !held {
+        additions.push(SyncAction::DeleteLocalFolder {
+            binding: Arc::clone(&orphan.binding),
+        });
+    }
 }
 
 /// User's intent (preserve local content) wins. Drop Blockers and
@@ -718,17 +855,16 @@ fn resolve_local_wins_with_blocker(
 /// For a `MoveRemote`-into-orphan Blocker, build the
 /// `MoveLocal { from: orphan, to: source }` counter that reverses
 /// the user's move before the orphan-destroy fires. Returns `None`
-/// for non-`MoveRemote` actions and for two warn-and-drop cases:
-/// the source folder isn't in the live set (also an orphan, or
-/// otherwise gone), or `known_by_jmap_to_maildir_id` can't
-/// reconstruct the file's local id (cycle-local adopt with no
-/// `message_map` row yet). In both warn-and-drop cases the file
-/// gets destroyed with the orphan folder rather than rescued.
+/// for non-`MoveRemote` actions or when the source is not live or the
+/// destination adoption is not unique. The adoption carries the actual
+/// observed destination identity; the cached source basename can already be
+/// absent after a MUA move/rename. Never reconstruct the destination from it.
 fn build_counter_move_local(
     action: &SyncAction,
     orphan_folder: &str,
     dead_id: &JmapMailboxId,
     ctx: &ReconcileCtx<'_>,
+    destinations: &HashMap<&JmapEmailId, Option<&BoundId>>,
 ) -> Option<SyncAction> {
     let SyncAction::MoveRemote {
         id, from_folder, ..
@@ -739,26 +875,21 @@ fn build_counter_move_local(
     let Some(source_binding) = ctx.mailboxes.by_folder(from_folder) else {
         warn!(
             "ServerWins counter-MoveLocal for orphan {}: source folder {} is not in live set; \
-             dropping counter and the user's move both -- file destroyed with orphan folder",
+             withholding counter and folder deletion for review",
             dead_id, from_folder
         );
         return None;
     };
-    let Some(maildir_id) = known_by_jmap_to_maildir_id(&id.jmap_email_id, ctx.known_by_jmap) else {
+    let Some(destination) = destinations.get(&&id.jmap_email_id).copied().flatten() else {
         warn!(
-            "ServerWins counter-MoveLocal for orphan {}: no maildir_id known for {} \
-             (cycle-local adopt with no message_map row yet); dropping counter and the user's \
-             move both -- file destroyed with orphan folder",
+            "ServerWins counter-MoveLocal for orphan {}: no unique observed destination for {}; \
+             refusing to guess a cached source basename",
             dead_id, id.jmap_email_id
         );
         return None;
     };
     Some(SyncAction::MoveLocal {
-        id: BoundId {
-            maildir_id,
-            jmap_email_id: id.jmap_email_id.clone(),
-            message_id: id.message_id.clone(),
-        },
+        id: destination.clone(),
         from_folder: orphan_folder.to_string(),
         to_binding: Arc::clone(source_binding),
     })
@@ -781,6 +912,15 @@ fn apply_orphan_decisions(
         .filter_map(|(i, a)| if keep_mask[i] { Some(a) } else { None })
         .collect();
     plan.actions = kept;
+    if additions
+        .iter()
+        .any(|action| matches!(action, SyncAction::DeferredFlagState { .. }))
+    {
+        // The dropped adoption may contain custom-only remote changes even
+        // when no flag rename was planned. Replay them after placement, never
+        // advance the cursor past discarded fresh metadata.
+        plan.new_email_state = None;
+    }
     plan.actions.extend(additions);
     for &orphan_idx in needs_resurrect {
         emit_resurrect_for(&ctx.mailboxes.local_orphans()[orphan_idx], ctx, plan);
@@ -947,20 +1087,6 @@ fn build_counter_move_remote(
     })
 }
 
-/// Look up a maildir_id given a jmap_email_id via the
-/// `known_by_jmap` index. Used by counter-action emission to
-/// reconstruct the `BoundId` for a `MoveLocal` derived from a
-/// `MoveRemote` whose original `id: RemoteId` lacks the
-/// maildir_id.
-fn known_by_jmap_to_maildir_id(
-    jmap_email_id: &JmapEmailId,
-    known_by_jmap: &HashMap<JmapEmailId, Arc<MessageRecord>>,
-) -> Option<MaildirId> {
-    known_by_jmap
-        .get(jmap_email_id)
-        .and_then(|r| r.maildir_id.clone())
-}
-
 /// One paired DeletedMessage(src) + NewMessage(dst) discovered during
 /// the move pre-pass.
 struct DetectedMove {
@@ -970,13 +1096,7 @@ struct DetectedMove {
     from_folder: String,
     to_binding: Arc<MailboxFolderBinding>,
     new_flags: String,
-    jmap_blob_id: Option<JmapBlobId>,
-    jmap_thread_id: Option<JmapThreadId>,
     message_id: MessageId,
-    /// Flags as recorded in message_map at the start of the cycle;
-    /// compared against new_flags to decide whether the move should
-    /// also push keyword changes.
-    prior_flags: String,
 }
 
 /// Emit one `CreateLocalMailbox` action per binding that
@@ -1137,8 +1257,94 @@ fn emit_resurrect_for(orphan: &LocalOrphanRecord, ctx: &ReconcileCtx<'_>, plan: 
     }
 }
 
-fn emit_detected_moves(moves: &[DetectedMove], plan: &mut SyncPlan) {
+fn retryable_flag_observation(ctx: &ReconcileCtx<'_>, id: &JmapEmailId) -> bool {
+    ctx.flag_sync
+        .get(id)
+        .is_none_or(|state| !state.blocked && !state.review)
+}
+
+fn emit_detected_moves(ctx: &ReconcileCtx<'_>, moves: &[DetectedMove], plan: &mut SyncPlan) {
     for m in moves {
+        let record = &ctx.known_by_jmap[&m.jmap_email_id];
+        let remote_id = RemoteId {
+            jmap_email_id: m.jmap_email_id.clone(),
+            message_id: m.message_id.clone(),
+        };
+        if ctx.unverified_remote.contains(&m.jmap_email_id) {
+            plan.actions.push(SyncAction::DeferredFlagState {
+                id: remote_id,
+                reason: "Moved message's remote metadata could not be verified".into(),
+                retryable: retryable_flag_observation(ctx, &m.jmap_email_id),
+            });
+            continue;
+        }
+        let fresh = ctx.fresh_remote.get(&m.jmap_email_id).copied();
+        let destination = m
+            .to_binding
+            .jmap_mailbox_id
+            .expect_resolved("move destination");
+        if fresh.is_some_and(|email| {
+            email.mailbox_ids.iter().any(|(id, present)| {
+                *present
+                    && id != &record.jmap_mailbox_id
+                    && id != destination
+                    && ctx.mailboxes.by_id(id).is_some()
+            })
+        }) {
+            plan.actions.push(SyncAction::DeferredFlagState {
+                id: remote_id,
+                reason: "Local and remote mailbox destinations conflict; placement needs review"
+                    .into(),
+                retryable: false,
+            });
+            // Keep the membership delta available on a no-new-edit retry.
+            plan.new_email_state = None;
+            continue;
+        }
+        let keywords = match fresh {
+            Some(email) => email.keywords.clone(),
+            None => match serde_json::from_str(&record.jmap_keywords) {
+                Ok(keywords) => keywords,
+                Err(error) => {
+                    warn!(
+                        "Cannot move {} from invalid cached keywords: {}",
+                        m.jmap_email_id, error
+                    );
+                    plan.actions.push(SyncAction::DeferredFlagState {
+                        id: remote_id,
+                        reason: "Invalid cached move metadata; fresh verification is required"
+                            .into(),
+                        retryable: true,
+                    });
+                    continue;
+                }
+            },
+        };
+        let bound_id = BoundId {
+            maildir_id: m.new_maildir_id.clone(),
+            jmap_email_id: m.jmap_email_id.clone(),
+            message_id: m.message_id.clone(),
+        };
+        let blob = fresh
+            .map(|email| &email.blob_id)
+            .or(record.jmap_blob_id.as_ref());
+        let thread = fresh
+            .map(|email| &email.thread_id)
+            .or(record.jmap_thread_id.as_ref());
+        let Some(keywords) = emit_adoption_flag_reconciliation(
+            ctx,
+            plan,
+            &AdoptionReconciliation {
+                bound_id: &bound_id,
+                binding: &m.to_binding,
+                server_keywords: &keywords,
+                jmap_blob_id: blob,
+                jmap_thread_id: thread,
+                on_disk_flags: &m.new_flags,
+            },
+        ) else {
+            continue;
+        };
         plan.actions.push(SyncAction::MoveRemote {
             id: RemoteId {
                 jmap_email_id: m.jmap_email_id.clone(),
@@ -1159,31 +1365,16 @@ fn emit_detected_moves(moves: &[DetectedMove], plan: &mut SyncPlan) {
             from_folder: m.from_folder.clone(),
             to_folder: m.to_binding.maildir_folder.clone(),
         });
-        let keywords = flags_to_keywords(&m.new_flags);
         plan.actions.push(SyncAction::AdoptLocalMessage {
-            id: BoundId {
-                maildir_id: m.new_maildir_id.clone(),
-                jmap_email_id: m.jmap_email_id.clone(),
-                message_id: m.message_id.clone(),
-            },
+            id: bound_id,
             binding: Arc::clone(&m.to_binding),
-            jmap_blob_id: m.jmap_blob_id.clone(),
-            jmap_thread_id: m.jmap_thread_id.clone(),
-            keywords: keywords.clone(),
+            jmap_blob_id: blob.cloned(),
+            jmap_thread_id: thread.cloned(),
+            keywords,
             filename_flags: m.new_flags.clone(),
             old_maildir_id: Some(m.old_maildir_id.clone()),
             old_jmap_email_id: None,
         });
-        if m.prior_flags != m.new_flags {
-            plan.actions.push(SyncAction::UpdateRemoteKeywords {
-                id: RemoteId {
-                    jmap_email_id: m.jmap_email_id.clone(),
-                    message_id: m.message_id.clone(),
-                },
-                keywords,
-                filename_flags: m.new_flags.clone(),
-            });
-        }
     }
 }
 
@@ -1236,20 +1427,17 @@ fn process_remote_emails(
             .and_then(|ids| ids.first())
             .cloned();
 
-        // Unknown JMAP id and no Message-ID: refuse to ingest.
-        // jma's idempotency invariant requires Message-ID as the
-        // adopt anchor across state-DB wipes; downloading without one
-        // means the next state-DB wipe would re-download the same
-        // bytes as a fresh local file (dup on disk) instead of
-        // adopting the existing one. Skip the email; it stays on the
-        // server, and the cycle still advances state. error! because
-        // the user (or the server admin) must fix the source: sync
-        // cannot synthesize a Message-ID retroactively.
+        // Unknown JMAP id without a Message-ID: the current ingest model
+        // has no headerless correlation path after a DB rebuild. Leave it
+        // on the server; the cycle can still advance its cursor. This is
+        // a jma limitation, not invalid mail: RFC 5322 section 3.6.4 says
+        // the header SHOULD be present, not MUST. Do not synthesize one
+        // or mistake arbitrary client-supplied values for content identity.
         let Some(local_msg_id) = local_msg_id else {
             error!(
                 "Skipping remote email {} (folder {}): no Message-ID in Email/get response. \
-                 jma requires Message-ID to anchor idempotency across state-DB wipes; \
-                 the server returned an RFC-violating email and we won't ingest it.",
+                 jma currently requires Message-ID for new-message identity; \
+                 leaving the server email untouched (headerless ingest is unsupported).",
                 email.id, binding.maildir_folder
             );
             continue;
@@ -1305,6 +1493,12 @@ fn handle_known_remote(
         target_binding,
     } = *matched;
 
+    if ctx.moved_ids.contains(&email.id) {
+        // The move pass resolves flags and membership together using the
+        // actual destination snapshot, including already-landed remote moves.
+        return;
+    }
+
     // Conflict: local deleted the file while the server updated
     // it. Resolve before any flag/move emission, since the local
     // copy is gone either way.
@@ -1335,46 +1529,11 @@ fn handle_known_remote(
         return;
     }
 
-    let new_flags = keywords_to_flags(&email.keywords);
-    let local_changed = ctx.local_flag_changes.contains_key(&email.id);
-    let server_flag_change = existing.flags != new_flags;
-
-    if server_flag_change && local_changed {
-        let resolved = resolve_flag_conflict(
-            &email.id,
-            existing,
-            email,
-            ctx.local_flag_changes.get(&email.id).copied(),
-            ctx.policy.conflict_strategy,
-        );
-        match resolved {
-            FlagWinner::Server => {
-                emit_local_flag_update(plan, existing, email, ctx.mailboxes);
-            }
-            FlagWinner::Local => {
-                if let Some(LocalChange::FlagsChanged { new_flags, .. }) =
-                    ctx.local_flag_changes.get(&email.id).copied()
-                {
-                    plan.actions.push(SyncAction::UpdateRemoteKeywords {
-                        id: RemoteId {
-                            jmap_email_id: email.id.clone(),
-                            message_id: existing.message_id.clone(),
-                        },
-                        keywords: flags_to_keywords(new_flags),
-                        filename_flags: new_flags.clone(),
-                    });
-                }
-            }
-        }
-    } else if server_flag_change {
-        emit_local_flag_update(plan, existing, email, ctx.mailboxes);
-    }
+    // Flag changes are resolved once, after moves and adoption are known.
 
     // Mailbox-membership change: server claims the email lives in
     // a different mailbox than where our local copy is bound.
-    // TODO: cross-detect when the local copy was *also* moved
-    // (scan emits NewMessage in dest + DeletedMessage in src,
-    // not a true Move). For now, blindly follow the server.
+    // Detected local moves were excluded above; their source no longer exists.
     if existing.jmap_mailbox_id
         != *target_binding
             .jmap_mailbox_id
@@ -1428,9 +1587,9 @@ fn try_adopt_remote(
             old_maildir_id: None,
             old_jmap_email_id,
         });
-        emit_adoption_flag_reconciliation(
+        let _ = emit_adoption_flag_reconciliation(
+            ctx,
             plan,
-            ctx.policy.conflict_strategy,
             &AdoptionReconciliation {
                 bound_id: &bound_id,
                 binding: target_binding,
@@ -1621,42 +1780,10 @@ fn process_remote_destroys(
     }
 }
 
-/// Emit the post-adoption action that bridges the standard-six gap
-/// between the filename's flag suffix and `keywords_to_flags(server_
-/// keywords)`. Adoption itself just records what each side currently
-/// has; if the on-disk file disagrees on any of the six maildir-
-/// mappable keywords, this is where `conflict_strategy` actually
-/// decides which view propagates.
-///
-/// Called from each `AdoptLocalMessage` emit site, so all three
-/// adoption paths (cold-start rescue, alreadyExists-on-upload guard,
-/// post-prior-cycle `known_by_message_id` hit) get the same
-/// convergence behavior. No-ops when filename and server-derived
-/// flags already agree, so the steady-state case stays a pure
-/// adoption with no extra wire traffic.
-///
-/// Non-standard server keywords ($imported, $hasattachment,
-/// $x-me-annot-2, user-defined labels) are untouched: under
-/// `LocalWins` we send an explicit-six patch via
-/// `flags_to_keyword_patch`, leaving every non-standard key
-/// unmentioned in the wire request; under `ServerWins` we rename
-/// the local file to match the server's standard-six derivation and
-/// the local filename has no way to carry non-standard keywords
-/// anyway.
-///
-/// `jmap_blob_id` and `jmap_thread_id` are `Option` because
-/// `MessageRecord` carries them as such (a row may exist before
-/// blob/thread binding completes). `ServerWins` needs both to
-/// emit `UpdateLocalFlags`; if either is missing, we skip the
-/// reconciliation step and rely on the next sync cycle's
-/// regular flag-update path to catch up.
-/// Bundles the per-emit-site context `emit_adoption_flag_
-/// reconciliation` needs. Grouping these here keeps the function
-/// signature under the clippy too_many_arguments ceiling and makes
-/// the two emit sites read identically (each builds one of these
-/// from whatever shape it has -- an `EmailObject` for the remote
-/// adopt path, a `MessageRecord` for the local NewMessage adopt
-/// path).
+/// Actual local snapshot and full remote metadata for an adoption or move.
+/// The shared resolver uses retained history when available, bootstrap policy
+/// otherwise. Only owned keyword bits are patched; suffix extensions and full
+/// custom metadata survive. Missing identity metadata defers required renames.
 struct AdoptionReconciliation<'a> {
     bound_id: &'a BoundId,
     binding: &'a Arc<MailboxFolderBinding>,
@@ -1667,45 +1794,86 @@ struct AdoptionReconciliation<'a> {
 }
 
 fn emit_adoption_flag_reconciliation(
+    ctx: &ReconcileCtx<'_>,
     plan: &mut SyncPlan,
-    strategy: ConflictStrategy,
     rec: &AdoptionReconciliation<'_>,
-) {
+) -> Option<HashMap<String, bool>> {
+    let id = rec.bound_id.as_remote();
+    let initial = ctx
+        .flag_sync
+        .get(&id.jmap_email_id)
+        .cloned()
+        .unwrap_or_default();
     let server_flags = keywords_to_flags(rec.server_keywords);
-    if rec.on_disk_flags == server_flags {
-        return;
+    if ctx.retry_only
+        && (initial.blocked || initial.review)
+        && mapped_flags(rec.on_disk_flags) != server_flags
+    {
+        plan.actions.push(SyncAction::DeferredFlagState {
+            id,
+            retryable: false,
+            reason: initial
+                .error
+                .unwrap_or_else(|| "Flag reconciliation needs operator review".into()),
+        });
+        return None;
     }
-    match strategy {
-        ConflictStrategy::ServerWins => {
-            let (Some(blob_id), Some(thread_id)) = (rec.jmap_blob_id, rec.jmap_thread_id) else {
-                debug!(
-                    "Adoption flag reconciliation for {} skipped under ServerWins: \
-                     missing blob_id/thread_id on the matched record. Next cycle's \
-                     regular flag-update path will reconcile.",
-                    rec.bound_id
-                );
-                return;
-            };
+    let decision = super::flag_resolution::decide(
+        &initial,
+        rec.on_disk_flags,
+        &server_flags,
+        ctx.policy.conflict_strategy,
+    );
+    // A genuinely new adoption has no row yet; commit_adopt initializes its
+    // history. Existing history must not fall back to bootstrap policy.
+    if ctx.known_by_jmap.contains_key(&id.jmap_email_id)
+        && (decision.state != initial || initial.legacy)
+    {
+        plan.actions.push(SyncAction::RecordFlagState {
+            id: id.clone(),
+            state: decision.state.clone(),
+        });
+    }
+    let Some(target) = decision.target else {
+        plan.actions.push(SyncAction::DeferredFlagState {
+            id,
+            reason: decision
+                .state
+                .error
+                .unwrap_or_else(|| "Flag history requires review".into()),
+            retryable: false,
+        });
+        return None;
+    };
+    if mapped_flags(rec.on_disk_flags) != target {
+        if let (Some(blob_id), Some(thread_id)) = (rec.jmap_blob_id, rec.jmap_thread_id) {
             plan.actions.push(SyncAction::UpdateLocalFlags {
                 id: rec.bound_id.clone(),
                 binding: Arc::clone(rec.binding),
-                new_flags: server_flags,
+                expected_flags: rec.on_disk_flags.into(),
+                new_flags: crate::maildir_ops::flags::merge_mapped_flags(
+                    rec.on_disk_flags,
+                    &target,
+                ),
                 keywords: rec.server_keywords.clone(),
                 jmap_blob_id: blob_id.clone(),
                 jmap_thread_id: thread_id.clone(),
             });
-        }
-        ConflictStrategy::LocalWins => {
-            plan.actions.push(SyncAction::UpdateRemoteKeywords {
-                id: RemoteId {
-                    jmap_email_id: rec.bound_id.jmap_email_id.clone(),
-                    message_id: rec.bound_id.message_id.clone(),
-                },
-                keywords: flags_to_keyword_patch(rec.on_disk_flags),
-                filename_flags: rec.on_disk_flags.to_string(),
+        } else {
+            plan.actions.push(SyncAction::DeferredFlagState {
+                id,
+                reason: "Missing identity metadata for adoption flag rename".into(),
+                retryable: true,
             });
         }
+    } else if server_flags != target {
+        plan.actions.push(SyncAction::UpdateRemoteKeywords {
+            id,
+            keywords: flags_to_keyword_patch(&target),
+            filename_flags: rec.on_disk_flags.to_string(),
+        });
     }
+    Some(flags_to_keyword_patch(&target).apply_to(rec.server_keywords))
 }
 
 fn process_local_changes(
@@ -1734,11 +1902,7 @@ fn process_local_changes(
                 }
                 handle_local_new(ctx, change, adopted_maildir_ids, plan);
             }
-            LocalChange::FlagsChanged {
-                maildir_id,
-                new_flags,
-                ..
-            } => handle_local_flags(ctx, maildir_id, new_flags, plan),
+            LocalChange::FlagsChanged { .. } => {}
             LocalChange::DeletedMessage { maildir_id, .. } => {
                 if let Some(rec) = ctx.known_by_maildir.get(maildir_id)
                     && consumed_deletes.contains(&rec.jmap_email_id)
@@ -1916,40 +2080,103 @@ fn handle_local_new(
     // email (DB index), adopt instead of upload. This is the
     // alreadyExists guard.
     if let Some(recs) = ctx.known_by_message_id.get(message_id)
-        && let Some(rec) = recs.iter().find(|r| r.jmap_mailbox_id == mailbox_id)
+        && let Some(rec) = recs
+            .iter()
+            .find(|r| r.jmap_mailbox_id == mailbox_id && r.maildir_id.as_ref() == Some(maildir_id))
+            .or_else(|| recs.iter().find(|r| r.jmap_mailbox_id == mailbox_id))
     {
-        let keywords =
-            serde_json::from_str::<HashMap<String, bool>>(&rec.jmap_keywords).unwrap_or_default();
+        if rec.maildir_id.as_ref() != Some(maildir_id) {
+            if recs
+                .iter()
+                .filter(|record| record.jmap_mailbox_id == mailbox_id)
+                .any(|record| {
+                    record
+                        .maildir_id
+                        .as_ref()
+                        .is_some_and(|id| ctx.local_flags.contains_key(id))
+                })
+            {
+                warn!(
+                    "Preserving untracked same-Message-ID copy {}/{} without replacing a live bound identity or its flags",
+                    folder, maildir_id
+                );
+                return;
+            }
+            if ctx
+                .local_new_candidates
+                .get(&(message_id, folder))
+                .copied()
+                .unwrap_or(0)
+                > 1
+            {
+                plan.actions.push(SyncAction::DeferredFlagState {
+                    id: RemoteId { jmap_email_id: rec.jmap_email_id.clone(), message_id: message_id.clone() },
+                    reason: "Multiple unbound content candidates cannot replace a missing cached identity without review".into(),
+                    retryable: false,
+                });
+                return;
+            }
+        }
         let bound_id = BoundId {
             maildir_id: maildir_id.clone(),
             jmap_email_id: rec.jmap_email_id.clone(),
             message_id: message_id.clone(),
         };
+        if ctx.unverified_remote.contains(&rec.jmap_email_id) {
+            plan.actions.push(SyncAction::DeferredFlagState {
+                id: bound_id.as_remote(),
+                reason: "Adoption's remote metadata could not be verified".into(),
+                retryable: retryable_flag_observation(ctx, &rec.jmap_email_id),
+            });
+            return;
+        }
+        let fresh = ctx.fresh_remote.get(&rec.jmap_email_id).copied();
+        let keywords = match fresh {
+            Some(email) => email.keywords.clone(),
+            None => match serde_json::from_str(&rec.jmap_keywords) {
+                Ok(keywords) => keywords,
+                Err(error) => {
+                    warn!(
+                        "Cannot adopt {} from invalid cached keywords: {}",
+                        bound_id, error
+                    );
+                    plan.actions.push(SyncAction::DeferredFlagState {
+                        id: bound_id.as_remote(),
+                        reason: "Invalid cached adoption metadata; fresh verification is required"
+                            .into(),
+                        retryable: true,
+                    });
+                    return;
+                }
+            },
+        };
+        let blob = fresh
+            .map(|email| &email.blob_id)
+            .or(rec.jmap_blob_id.as_ref());
+        let thread = fresh
+            .map(|email| &email.thread_id)
+            .or(rec.jmap_thread_id.as_ref());
         plan.actions.push(SyncAction::AdoptLocalMessage {
             id: bound_id.clone(),
             binding: Arc::clone(binding),
-            jmap_blob_id: rec.jmap_blob_id.clone(),
-            jmap_thread_id: rec.jmap_thread_id.clone(),
+            jmap_blob_id: blob.cloned(),
+            jmap_thread_id: thread.cloned(),
             keywords: keywords.clone(),
             filename_flags: flags.clone(),
             old_maildir_id: None,
             old_jmap_email_id: None,
         });
-        // Adoption-time flag reconciliation: the local NewMessage's
-        // filename flag suffix may disagree with the DB record's
-        // stored server keyword set. Same convergence step
-        // try_adopt_remote applies -- ServerWins renames the file,
-        // LocalWins pushes an explicit-six patch. Skips silently
-        // when filename and server-derived flags already agree.
-        emit_adoption_flag_reconciliation(
+        // Reuse retained acknowledgement history instead of reapplying
+        // bootstrap authority to a known message's newly observed file.
+        let _ = emit_adoption_flag_reconciliation(
+            ctx,
             plan,
-            ctx.policy.conflict_strategy,
             &AdoptionReconciliation {
                 bound_id: &bound_id,
                 binding,
                 server_keywords: &keywords,
-                jmap_blob_id: rec.jmap_blob_id.as_ref(),
-                jmap_thread_id: rec.jmap_thread_id.as_ref(),
+                jmap_blob_id: blob,
+                jmap_thread_id: thread,
                 on_disk_flags: flags,
             },
         );
@@ -1981,6 +2208,29 @@ fn handle_local_new(
         return;
     }
 
+    // Cold/partial-bootstrap sibling guard. LocalIndex can legitimately
+    // contain several files in one folder with the same Message-ID now
+    // that destructive dedupe requires byte equality: draft revisions and
+    // separately-routed deliveries are content variants, not disposable
+    // files. Only the first (oldest) representative is eligible to stand
+    // for this Message-ID on a server that rejects a second Email/import
+    // with `alreadyExists`; preserve every other variant on disk but do
+    // not upload it. Without this guard a fresh DB queues all variants in
+    // one parallel upload batch: one wins, the rest reject, and the cycle
+    // fails before publishing mailbox_map/cursors.
+    if let Some(entries) = ctx.local_index.by_message_id.get(message_id)
+        && let Some(canonical) = entries.iter().find(|entry| entry.folder == folder)
+        && canonical.maildir_id != *maildir_id
+    {
+        warn!(
+            "Preserving content-distinct same-Message-ID file {}/{} locally but \
+             skipping upload; canonical local representative is {} and Fastmail \
+             rejects a second import with alreadyExists",
+            folder, maildir_id, canonical.maildir_id
+        );
+        return;
+    }
+
     // Size cap is enforced here, at plan time, rather than in
     // execute: catching the oversized file at this point keeps it
     // out of the upload concurrency budget entirely (a slot held by
@@ -2006,36 +2256,6 @@ fn handle_local_new(
         binding: Arc::clone(binding),
         file_path: path.to_path_buf(),
         flags: flags.to_string(),
-    });
-}
-
-fn handle_local_flags(
-    ctx: &ReconcileCtx<'_>,
-    maildir_id: &MaildirId,
-    new_flags: &str,
-    plan: &mut SyncPlan,
-) {
-    let Some(msg) = ctx.known_by_maildir.get(maildir_id) else {
-        return;
-    };
-    // Conflict cases handled inline above when emitting the
-    // server-side action; here we emit only the no-conflict push.
-    let server_also_changed = ctx.remote_emails.iter().any(|e| {
-        e.id == msg.jmap_email_id && {
-            let server_flags = keywords_to_flags(&e.keywords);
-            server_flags != msg.flags
-        }
-    });
-    if server_also_changed {
-        return;
-    }
-    plan.actions.push(SyncAction::UpdateRemoteKeywords {
-        id: RemoteId {
-            jmap_email_id: msg.jmap_email_id.clone(),
-            message_id: msg.message_id.clone(),
-        },
-        keywords: flags_to_keywords(new_flags),
-        filename_flags: new_flags.to_string(),
     });
 }
 
@@ -2089,67 +2309,215 @@ fn resolve_delete_conflict(jmap_id: &JmapEmailId, strategy: ConflictStrategy) ->
     }
 }
 
-/// Outcome of a flag conflict resolution.
-enum FlagWinner {
-    Server,
-    Local,
-}
-
-fn resolve_flag_conflict(
-    jmap_id: &JmapEmailId,
-    _local_record: &MessageRecord,
-    _server_email: &EmailObject,
-    _local_change: Option<&LocalChange>,
-    strategy: ConflictStrategy,
-) -> FlagWinner {
-    match strategy {
-        ConflictStrategy::ServerWins => {
-            warn!(
-                "Flag conflict on {}: server-wins, dropping local change",
-                jmap_id
-            );
-            FlagWinner::Server
+/// Resolve each bound message from observations plus an acknowledged
+/// baseline, not merely from whether a new delta happened to be emitted.
+fn reconcile_bound_flags(ctx: &ReconcileCtx<'_>, moves: &[DetectedMove], plan: &mut SyncPlan) {
+    let bindings: HashMap<_, _> = ctx
+        .mailboxes
+        .scan_set(true)
+        .into_iter()
+        .map(|binding| {
+            (
+                binding
+                    .jmap_mailbox_id
+                    .expect_resolved("flag observation binding")
+                    .clone(),
+                binding,
+            )
+        })
+        .collect();
+    let moved: HashSet<_> = moves.iter().map(|m| &m.jmap_email_id).collect();
+    let adopted: HashSet<_> = plan
+        .actions
+        .iter()
+        .filter_map(|action| match action {
+            SyncAction::AdoptLocalMessage { id, .. } => Some(id.jmap_email_id.clone()),
+            _ => None,
+        })
+        .collect();
+    for record in ctx.known_by_jmap.values() {
+        let id = &record.jmap_email_id;
+        if moved.contains(id)
+            || adopted.contains(id)
+            || ctx.local_deletes.contains(id)
+            || ctx.destroyed_set.contains(id.as_ref())
+        {
+            continue;
         }
-        ConflictStrategy::LocalWins => {
-            warn!(
-                "Flag conflict on {}: local-wins, dropping server change",
-                jmap_id
-            );
-            FlagWinner::Local
+        let Some(maildir_id) = &record.maildir_id else {
+            continue;
+        };
+        let remote_id = RemoteId {
+            jmap_email_id: id.clone(),
+            message_id: record.message_id.clone(),
+        };
+        if ctx.unverified_remote.contains(id) {
+            plan.actions.push(SyncAction::DeferredFlagState {
+                id: remote_id,
+                reason: "Remote flag observation could not be verified".into(),
+                retryable: retryable_flag_observation(ctx, id),
+            });
+            continue;
+        }
+        let delta = ctx.local_flag_changes.get(id).copied();
+        let local = match delta {
+            Some(LocalChange::FlagsChanged { new_flags, .. }) => Some(new_flags),
+            _ => ctx.local_flags.get(maildir_id),
+        };
+        let Some(local) = local else { continue };
+        let binding = match delta {
+            Some(LocalChange::FlagsChanged { binding, .. }) => Some(Arc::clone(binding)),
+            _ => bindings.get(&record.jmap_mailbox_id).cloned(),
+        };
+        let Some(binding) = binding else { continue };
+        let fresh = ctx.fresh_remote.get(id).copied();
+        let initial = ctx.flag_sync.get(id).cloned().unwrap_or_default();
+        if fresh.is_none()
+            && delta.is_none()
+            && !initial.legacy
+            && !initial.review
+            && !initial.blocked
+            && initial.attempt.is_none()
+            && initial.error.is_none()
+            && initial.baseline.as_ref().is_some_and(|baseline| {
+                baseline == &record.flags && baseline == &mapped_flags(local)
+            })
+        {
+            continue;
+        }
+        let cached_result: Result<HashMap<String, bool>, _> =
+            serde_json::from_str(&record.jmap_keywords);
+        let invalid_cache = cached_result.is_err();
+        let cached = match cached_result {
+            Ok(keywords) => keywords,
+            Err(_) if fresh.is_some() => HashMap::new(),
+            Err(error) => {
+                warn!(
+                    "Cannot reconcile flags for {} from invalid cached keywords: {}",
+                    id, error
+                );
+                plan.actions.push(SyncAction::DeferredFlagState {
+                    id: remote_id,
+                    reason: "Invalid cached remote keywords; fresh verification is required".into(),
+                    retryable: true,
+                });
+                continue;
+            }
+        };
+        let remote = fresh.map_or(&cached, |email| &email.keywords);
+        let remote_flags = keywords_to_flags(remote);
+        if ctx.retry_only
+            && (initial.blocked || initial.review)
+            && mapped_flags(local) != remote_flags
+        {
+            plan.actions.push(SyncAction::DeferredFlagState {
+                id: remote_id,
+                reason: initial
+                    .error
+                    .unwrap_or_else(|| "Flag reconciliation needs operator review".into()),
+                retryable: false,
+            });
+            continue;
+        }
+        let decision = super::flag_resolution::decide(
+            &initial,
+            local,
+            &remote_flags,
+            ctx.policy.conflict_strategy,
+        );
+        if let Some(target) = decision.target.as_deref() {
+            let bound_id = BoundId {
+                maildir_id: maildir_id.clone(),
+                jmap_email_id: id.clone(),
+                message_id: record.message_id.clone(),
+            };
+            let blob = fresh
+                .map(|email| email.blob_id.clone())
+                .or_else(|| record.jmap_blob_id.clone());
+            let thread = fresh
+                .map(|email| email.thread_id.clone())
+                .or_else(|| record.jmap_thread_id.clone());
+            let work = mapped_flags(local) != target || remote_flags != target;
+            if mapped_flags(local) != target {
+                if let (Some(blob_id), Some(thread_id)) = (blob.clone(), thread.clone()) {
+                    plan.actions.push(SyncAction::UpdateLocalFlags {
+                        id: bound_id.clone(),
+                        binding: Arc::clone(&binding),
+                        expected_flags: local.clone(),
+                        new_flags: crate::maildir_ops::flags::merge_mapped_flags(local, target),
+                        keywords: remote.clone(),
+                        jmap_blob_id: blob_id,
+                        jmap_thread_id: thread_id,
+                    });
+                } else {
+                    plan.actions.push(SyncAction::DeferredFlagState {
+                        id: remote_id.clone(),
+                        reason: "Missing remote identity metadata for local flag update".into(),
+                        retryable: true,
+                    });
+                }
+            } else if remote_flags != target {
+                plan.actions.push(SyncAction::UpdateRemoteKeywords {
+                    id: remote_id.clone(),
+                    keywords: flags_to_keyword_patch(target),
+                    filename_flags: local.clone(),
+                });
+            }
+            let metadata_changed = invalid_cache
+                || remote != &cached
+                || fresh.is_some_and(|email| {
+                    record.jmap_blob_id.as_ref() != Some(&email.blob_id)
+                        || record.jmap_thread_id.as_ref() != Some(&email.thread_id)
+                });
+            if work
+                || metadata_changed
+                || delta.is_some()
+                || decision.state != initial
+                || initial.legacy
+            {
+                plan.actions.push(SyncAction::ObserveMessage {
+                    id: bound_id,
+                    binding,
+                    keywords: remote.clone(),
+                    filename_flags: local.clone(),
+                    jmap_blob_id: blob,
+                    jmap_thread_id: thread,
+                });
+            }
+        } else {
+            plan.actions.push(SyncAction::DeferredFlagState {
+                id: remote_id.clone(),
+                reason: decision
+                    .state
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "Flag history requires explicit repair policy".into()),
+                retryable: false,
+            });
+            plan.actions.push(SyncAction::ObserveMessage {
+                id: BoundId {
+                    maildir_id: maildir_id.clone(),
+                    jmap_email_id: id.clone(),
+                    message_id: record.message_id.clone(),
+                },
+                binding,
+                keywords: remote.clone(),
+                filename_flags: local.clone(),
+                jmap_blob_id: fresh
+                    .map(|email| email.blob_id.clone())
+                    .or_else(|| record.jmap_blob_id.clone()),
+                jmap_thread_id: fresh
+                    .map(|email| email.thread_id.clone())
+                    .or_else(|| record.jmap_thread_id.clone()),
+            });
+        }
+        if decision.state != initial || initial.legacy {
+            plan.actions.push(SyncAction::RecordFlagState {
+                id: remote_id,
+                state: decision.state,
+            });
         }
     }
-}
-
-fn emit_local_flag_update(
-    plan: &mut SyncPlan,
-    existing: &MessageRecord,
-    email: &EmailObject,
-    mailboxes: &MailboxBindings,
-) {
-    let Some(maildir_id) = &existing.maildir_id else {
-        return;
-    };
-    // The DB row's recorded mailbox is where the file is bound on
-    // disk; the file lives under that binding's folder regardless
-    // of which mailbox the server-side keyword change came from.
-    // The cycle's `mailboxes` table resolves the row's id to its
-    // binding so the executor knows the right on-disk path.
-    let Some(local_binding) = mailboxes.by_id(&existing.jmap_mailbox_id) else {
-        return;
-    };
-    let new_flags = keywords_to_flags(&email.keywords);
-    plan.actions.push(SyncAction::UpdateLocalFlags {
-        id: BoundId {
-            maildir_id: maildir_id.clone(),
-            jmap_email_id: email.id.clone(),
-            message_id: existing.message_id.clone(),
-        },
-        binding: Arc::clone(local_binding),
-        new_flags,
-        keywords: email.keywords.clone(),
-        jmap_blob_id: email.blob_id.clone(),
-        jmap_thread_id: email.thread_id.clone(),
-    });
 }
 
 #[cfg(test)]
@@ -2157,6 +2525,7 @@ mod tests {
     use super::*;
     use crate::domain::{MailboxFolderBinding, MaybeReference};
     use crate::ids::JmapMailboxId;
+    use crate::maildir_ops::flags::flags_to_keywords;
     use crate::sync::dedupe::{LocalEntry, LocalIndex};
     use std::path::PathBuf;
 
@@ -2188,6 +2557,7 @@ mod tests {
             keywords: flags_to_keywords(flags),
             message_id: message_id.map(|m| vec![m.into()]),
             subject: None,
+            received_at: None,
             size: 0,
         }
     }
@@ -2224,9 +2594,59 @@ mod tests {
                 .entry(rec.message_id.clone())
                 .or_default()
                 .push(Arc::clone(&rec));
+            idx.flag_sync.insert(
+                rec.jmap_email_id.clone(),
+                FlagSyncState {
+                    baseline: rec.maildir_id.as_ref().map(|_| mapped_flags(&rec.flags)),
+                    ..Default::default()
+                },
+            );
             idx.by_jmap.insert(rec.jmap_email_id.clone(), rec);
         }
         idx
+    }
+
+    fn observed_flags(
+        records: &[MessageRecord],
+        changes: &[LocalChange],
+        overrides: &HashMap<MaildirId, String>,
+    ) -> HashMap<MaildirId, String> {
+        let deleted: HashSet<_> = changes
+            .iter()
+            .filter_map(|change| match change {
+                LocalChange::DeletedMessage { maildir_id, .. } => Some(maildir_id),
+                _ => None,
+            })
+            .collect();
+        let mut flags: HashMap<_, _> = records
+            .iter()
+            .filter_map(|record| {
+                record
+                    .maildir_id
+                    .as_ref()
+                    .filter(|id| !deleted.contains(id))
+                    .map(|id| (id.clone(), record.flags.clone()))
+            })
+            .collect();
+        for change in changes {
+            match change {
+                LocalChange::NewMessage {
+                    maildir_id,
+                    flags: current,
+                    ..
+                }
+                | LocalChange::FlagsChanged {
+                    maildir_id,
+                    new_flags: current,
+                    ..
+                } => {
+                    flags.insert(maildir_id.clone(), current.clone());
+                }
+                _ => {}
+            }
+        }
+        flags.extend(overrides.clone());
+        flags
     }
 
     fn empty_index() -> LocalIndex {
@@ -2258,6 +2678,29 @@ mod tests {
     /// reconciliation step that builds on it) use this to inject what
     /// production gets from `scan::ScanResult.local_flags`.
     fn run_with_local_flags(
+        remote_emails: &[EmailObject],
+        remote_destroyed: &[JmapEmailId],
+        local_changes: &[LocalChange],
+        records: &[MessageRecord],
+        local_index: &LocalIndex,
+        local_flags: &HashMap<MaildirId, String>,
+        strategy: ConflictStrategy,
+    ) -> SyncPlan {
+        let local_flags = observed_flags(records, local_changes, local_flags);
+        run_with_inventory(
+            remote_emails,
+            remote_destroyed,
+            local_changes,
+            records,
+            local_index,
+            &local_flags,
+            strategy,
+        )
+    }
+
+    /// Actual inventory, without seeding cached IDs as live paths. Recovery
+    /// tests use this when the cached old filename is no longer on disk.
+    fn run_with_inventory(
         remote_emails: &[EmailObject],
         remote_destroyed: &[JmapEmailId],
         local_changes: &[LocalChange],
@@ -2310,7 +2753,7 @@ mod tests {
     ) -> SyncPlan {
         let known = indices(records);
         let mailboxes = mailboxes();
-        let local_flags: HashMap<MaildirId, String> = HashMap::new();
+        let local_flags = observed_flags(records, local_changes, &HashMap::new());
         reconcile(ReconcileInput {
             remote_emails,
             remote_destroyed,
@@ -2567,6 +3010,60 @@ mod tests {
         assert_eq!(jmap_email_id.as_ref(), "E1");
     }
 
+    /// With destructive Message-ID-only dedupe removed, a cold start can
+    /// expose multiple content variants under one Message-ID. Fastmail
+    /// accepts only one import. Reconcile must upload the canonical
+    /// (oldest) LocalIndex entry and preserve-but-skip its siblings.
+    #[test]
+    fn cold_start_uploads_only_one_content_variant_per_message_id() {
+        let binding = Arc::new(MailboxFolderBinding {
+            jmap_mailbox_id: MaybeReference::Value("MB-INBOX".into()),
+            server_name: "INBOX".to_string(),
+            maildir_folder: "INBOX".to_string(),
+            remote_path: "INBOX".to_string(),
+        });
+        let mut idx = empty_index();
+        idx.by_message_id.insert(
+            "<a@x>".into(),
+            vec![
+                LocalEntry {
+                    folder: "INBOX".into(),
+                    maildir_id: "FILE-OLD".into(),
+                },
+                LocalEntry {
+                    folder: "INBOX".into(),
+                    maildir_id: "FILE-NEW".into(),
+                },
+            ],
+        );
+        let changes = vec![
+            LocalChange::NewMessage {
+                maildir_id: "FILE-OLD".into(),
+                binding: Arc::clone(&binding),
+                flags: String::new(),
+                path: PathBuf::from("/tmp/file-old"),
+                message_id: "<a@x>".into(),
+                size_bytes: 1,
+            },
+            LocalChange::NewMessage {
+                maildir_id: "FILE-NEW".into(),
+                binding,
+                flags: String::new(),
+                path: PathBuf::from("/tmp/file-new"),
+                message_id: "<a@x>".into(),
+                size_bytes: 1,
+            },
+        ];
+
+        let plan = run(&[], &[], &changes, &[], &idx, ConflictStrategy::ServerWins);
+
+        assert_eq!(plan.upload_count(), 1, "only canonical variant uploads");
+        let SyncAction::UploadMessage { id, .. } = &plan.actions[0] else {
+            panic!("expected one upload, got {:?}", plan.actions);
+        };
+        assert_eq!(id.maildir_id.as_ref(), "FILE-OLD");
+    }
+
     /// Cold-start adoption against a maildir file whose on-disk flag
     /// suffix already matches `keywords_to_flags(server)` emits a
     /// bare adoption and nothing else. Pins the equality-skip half of
@@ -2734,14 +3231,13 @@ mod tests {
             "filename_flags must carry the on-disk suffix so the mirror writes \
              local_state.flags = filename rather than deriving from the patch"
         );
-        // Explicit-six patch: every standard keyword present with the
-        // local file's value, $forwarded explicitly false to clear it.
-        assert_eq!(keywords.get("$flagged"), Some(&true));
-        assert_eq!(keywords.get("$seen"), Some(&true));
-        assert_eq!(keywords.get("$forwarded"), Some(&false));
-        assert_eq!(keywords.get("$draft"), Some(&false));
-        assert_eq!(keywords.get("$answered"), Some(&false));
-        assert_eq!(keywords.get("$deleted"), Some(&false));
+        use crate::keywords::KeywordMutation::{Remove, Set};
+        assert_eq!(keywords.get("$flagged"), Some(&Set));
+        assert_eq!(keywords.get("$seen"), Some(&Set));
+        assert_eq!(keywords.get("$forwarded"), Some(&Remove));
+        assert_eq!(keywords.get("$draft"), Some(&Remove));
+        assert_eq!(keywords.get("$answered"), Some(&Remove));
+        assert_eq!(keywords.get("$deleted"), Some(&Remove));
         assert!(
             !keywords.contains_key("$imported"),
             "patch must leave non-standard server keywords alone: {:?}",
@@ -2777,7 +3273,8 @@ mod tests {
             jmap_blob_id: Some("B1".into()),
             jmap_thread_id: Some("T1".into()),
             jmap_mailbox_id: "MB-INBOX".into(),
-            maildir_id: Some("M-EXISTING".into()),
+            // Server-known only: this bootstrap case has no common baseline.
+            maildir_id: None,
             message_id: "<a@x>".into(),
             flags: "FPS".into(),
             jmap_keywords: serde_json::to_string(&keywords_map).unwrap(),
@@ -2836,6 +3333,104 @@ mod tests {
             "ServerWins must not push remote keywords on the alreadyExists adopt path: {:?}",
             plan.actions
         );
+    }
+
+    #[test]
+    fn already_exists_adopt_retains_history_for_a_local_only_change() {
+        let rec = record("E1", "MB-INBOX", Some("M-EXISTING"), "FPS", "a@x");
+        let new_change = LocalChange::NewMessage {
+            maildir_id: "M-NEW".into(),
+            binding: Arc::clone(mailboxes().by_id(&"MB-INBOX".into()).unwrap()),
+            flags: "FS".into(),
+            path: "/tmp/m-new".into(),
+            message_id: "a@x".into(),
+            size_bytes: 0,
+        };
+        // Only M-NEW is observed. The cached M-EXISTING is absent, not a
+        // second live copy from which this file may steal flag authority.
+        let plan = run_with_inventory(
+            &[],
+            &[],
+            &[new_change],
+            &[rec],
+            &empty_index(),
+            &HashMap::from([("M-NEW".into(), "FS".into())]),
+            ConflictStrategy::ServerWins,
+        );
+        assert_eq!(plan.adopt_count(), 1);
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|action| matches!(action, SyncAction::UpdateLocalFlags { .. }))
+        );
+        let patches: Vec<_> = plan
+            .actions
+            .iter()
+            .filter_map(|action| match action {
+                SyncAction::UpdateRemoteKeywords { keywords, .. } => Some(keywords),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            patches.len(),
+            1,
+            "ServerWins must not override a derivable local-only edit"
+        );
+        assert_eq!(
+            keywords_to_flags(&patches[0].apply_to(&flags_to_keywords("FPS"))),
+            "FS"
+        );
+    }
+
+    #[test]
+    fn already_exists_adopt_prefers_fresh_remote_metadata() {
+        let rec = record("E1", "MB-INBOX", Some("M-EXISTING"), "S", "a@x");
+        let mut fresh = email("E1", "MB-INBOX", "F", Some("a@x"));
+        fresh.keywords.insert("fresh-custom".into(), true);
+        fresh.blob_id = "fresh-blob".into();
+        fresh.thread_id = "fresh-thread".into();
+        let new_change = LocalChange::NewMessage {
+            maildir_id: "M-NEW".into(),
+            binding: Arc::clone(mailboxes().by_id(&"MB-INBOX".into()).unwrap()),
+            flags: "S".into(),
+            path: "/tmp/m-new".into(),
+            message_id: "a@x".into(),
+            size_bytes: 0,
+        };
+        // This is a missing cached filename being recovered, not an extra
+        // untracked file beside a still-live binding.
+        let plan = run_with_inventory(
+            std::slice::from_ref(&fresh),
+            &[],
+            &[new_change],
+            &[rec],
+            &empty_index(),
+            &HashMap::from([("M-NEW".into(), "S".into())]),
+            ConflictStrategy::LocalWins,
+        );
+        let adopt = plan
+            .actions
+            .iter()
+            .find(|action| matches!(action, SyncAction::AdoptLocalMessage { .. }))
+            .unwrap();
+        let SyncAction::AdoptLocalMessage {
+            keywords,
+            jmap_blob_id,
+            jmap_thread_id,
+            ..
+        } = adopt
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            keywords, &fresh.keywords,
+            "do not adopt a stale six-bit cache over a fresh full observation"
+        );
+        assert_eq!(jmap_blob_id.as_ref(), Some(&fresh.blob_id));
+        assert_eq!(jmap_thread_id.as_ref(), Some(&fresh.thread_id));
+        assert!(plan.actions.iter().any(|action| matches!(action, SyncAction::UpdateLocalFlags { new_flags, .. } if new_flags == "F")),
+            "a remote-only edit must propagate even under LocalWins");
     }
 
     /// Destroy + re-create with the same wire-format Message-ID:
@@ -4518,6 +5113,90 @@ mod tests {
             })
         }
 
+        #[test]
+        fn unresolved_flag_history_holds_folder_without_a_new_local_delta() {
+            for strategy in [ConflictStrategy::ServerWins, ConflictStrategy::LocalWins] {
+                let bindings = bindings_with_orphan(vec![orphan_msg(Some("E1"), "FOO.host")]);
+                let records = vec![record("E1", "MB-ARCH", Some("FOO.host"), "S", "a@x")];
+                let mut known = indices(&records);
+                known.flag_sync.get_mut("E1").unwrap().review = true;
+                let local_flags = HashMap::from([("FOO.host".into(), "".into())]);
+                let plan = reconcile(ReconcileInput {
+                    remote_emails: &[],
+                    remote_destroyed: &[],
+                    local_changes: &[],
+                    known: &known,
+                    local_index: &LocalIndex::default(),
+                    local_flags: &local_flags,
+                    mailboxes: &bindings,
+                    policy: SyncPolicy {
+                        conflict_strategy: strategy,
+                        allow_destructive_folder_sync: AllowDestructiveFolderSync::DeleteLocal,
+                    },
+                    new_email_state: None,
+                    max_upload_size: usize::MAX,
+                    used_initial_path: false,
+                    folder_layout: FolderLayout::Flat,
+                    hierarchy_separator: '.',
+                    maildir_root: std::path::Path::new("/tmp/jma-test-maildir-root"),
+                });
+                assert!(
+                    plan.actions
+                        .iter()
+                        .any(|action| matches!(action, SyncAction::DeferredFlagState { .. }))
+                );
+                assert!(
+                    !plan.actions.iter().any(|action| matches!(
+                        action,
+                        SyncAction::DeleteLocalFolder { .. }
+                            | SyncAction::CreateRemoteMailbox { .. }
+                    )),
+                    "unknown flag history must not authorize deletion or resurrection"
+                );
+            }
+        }
+
+        #[test]
+        fn observation_and_acknowledgement_bookkeeping_are_not_folder_blockers() {
+            let known = indices(&[record_for("E1", "MB-ARCH", "FOO.host")]);
+            let binding = Arc::new(MailboxFolderBinding {
+                jmap_mailbox_id: MaybeReference::Value("MB-ARCH".into()),
+                server_name: "Archive".into(),
+                maildir_folder: "Archive".into(),
+                remote_path: "Archive".into(),
+            });
+            let id = BoundId {
+                maildir_id: "FOO.host".into(),
+                jmap_email_id: "E1".into(),
+                message_id: "a@x".into(),
+            };
+            let actions = [
+                SyncAction::ObserveMessage {
+                    id: id.clone(),
+                    binding,
+                    keywords: HashMap::new(),
+                    filename_flags: "".into(),
+                    jmap_blob_id: None,
+                    jmap_thread_id: None,
+                },
+                SyncAction::RecordFlagState {
+                    id: id.as_remote(),
+                    state: FlagSyncState::default(),
+                },
+            ];
+            for action in actions {
+                assert_eq!(
+                    classify_action_against_orphan(
+                        &action,
+                        &"MB-ARCH".into(),
+                        "Archive",
+                        &known.by_jmap
+                    ),
+                    OrphanActionRole::Neutral
+                );
+            }
+        }
+
         /// Under `delete-local` + no concurrent user action
         /// targeting the orphan, the destructive arm emits a
         /// single `DeleteLocalFolder` for the orphan. No
@@ -4826,6 +5505,68 @@ mod tests {
         /// at its source folder; the orphan goes away with
         /// `remove_dir_all`.
         #[test]
+        fn superseded_move_does_not_apply_destination_flags_before_its_counter_move() {
+            let bindings = bindings_with_orphan(vec![]);
+            let records = [record("E1", "MB-INBOX", Some("M1"), "", "a@x")];
+            let changes = [
+                LocalChange::DeletedMessage {
+                    maildir_id: "M1".into(),
+                    binding: Arc::clone(bindings.by_id(&"MB-INBOX".into()).unwrap()),
+                },
+                LocalChange::NewMessage {
+                    maildir_id: "M1".into(),
+                    binding: Arc::clone(&bindings.local_orphans()[0].binding),
+                    flags: "SX".into(),
+                    path: "/tmp/jma-test/Archive/cur/M1:2,SX".into(),
+                    message_id: "a@x".into(),
+                    size_bytes: 0,
+                },
+            ];
+            let known = indices(&records);
+            let plan = reconcile(ReconcileInput {
+                remote_emails: &[email("E1", "MB-INBOX", "F", Some("a@x"))],
+                remote_destroyed: &[],
+                local_changes: &changes,
+                known: &known,
+                local_index: &LocalIndex::default(),
+                local_flags: &HashMap::from([("M1".into(), "SX".into())]),
+                mailboxes: &bindings,
+                policy: SyncPolicy {
+                    conflict_strategy: ConflictStrategy::ServerWins,
+                    allow_destructive_folder_sync: AllowDestructiveFolderSync::DeleteLocal,
+                },
+                new_email_state: Some("e-2".into()),
+                max_upload_size: usize::MAX,
+                used_initial_path: false,
+                folder_layout: FolderLayout::Fs,
+                hierarchy_separator: '/',
+                maildir_root: Path::new("/tmp/jma-test"),
+            });
+            assert!(
+                plan.actions
+                    .iter()
+                    .any(|action| matches!(action, SyncAction::MoveLocal { .. }))
+            );
+            assert!(
+                !plan
+                    .actions
+                    .iter()
+                    .any(|action| matches!(action, SyncAction::UpdateLocalFlags { .. })),
+                "a superseded move cannot authorize its destination flag effect: {:?}",
+                plan.actions
+            );
+            assert!(
+                plan.actions
+                    .iter()
+                    .any(|action| matches!(action, SyncAction::DeferredFlagState { .. }))
+            );
+            assert!(
+                plan.new_email_state.is_none(),
+                "retain fresh metadata for a post-counter replan"
+            );
+        }
+
+        #[test]
         fn server_wins_emits_counter_movelocal_for_moveremote_into_orphan() {
             let bindings = bindings_with_orphan(vec![]);
             let records = vec![record_for("E1", "MB-INBOX", "OLD.host")];
@@ -4885,8 +5626,8 @@ mod tests {
             assert_eq!(counters.len(), 1, "one counter MoveLocal for the Blocker");
             assert_eq!(
                 counters[0].0.maildir_id.as_ref(),
-                "OLD.host",
-                "maildir_id resolved via known_by_jmap"
+                "NEW.host",
+                "counter must use the observed destination basename"
             );
             assert_eq!(
                 counters[0].1, "Archive",

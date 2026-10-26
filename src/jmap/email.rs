@@ -8,8 +8,9 @@ use jmap_client::core::session::URLPart;
 use jmap_client::email;
 use reqwest::Client as HttpClient;
 use reqwest::header::CONTENT_TYPE;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::field::Empty;
 use tracing::{Instrument, debug, info, instrument, warn};
 
@@ -18,6 +19,7 @@ use crate::jmap::build_request;
 use crate::jmap::limits;
 use crate::jmap::retry::with_retry;
 use crate::jmap::types::{ChangesResponse, EmailObject};
+use crate::keywords::{KeywordMutation, KeywordPatch};
 
 /// True iff `err`'s anyhow chain carries a JMAP method-level
 /// `cannotCalculateChanges`. Walks the chain and downcasts to
@@ -32,6 +34,14 @@ pub fn is_cannot_calculate_changes(err: &anyhow::Error) -> bool {
         }
     }
     false
+}
+
+/// A method-level conditional rejection, not a transport retry condition.
+pub fn is_state_mismatch(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        matches!(cause.downcast_ref::<JmapError>(),
+        Some(JmapError::Method(error)) if matches!(error.error(), MethodErrorType::StateMismatch))
+    })
 }
 
 /// Page size for `Email/query` pagination. JMAP defines no
@@ -51,6 +61,8 @@ fn email_properties() -> Vec<email::Property> {
         email::Property::MailboxIds,
         email::Property::Keywords,
         email::Property::MessageId,
+        email::Property::Subject,
+        email::Property::ReceivedAt,
         email::Property::Size,
     ]
 }
@@ -298,7 +310,8 @@ pub async fn query_mailbox(
 }
 
 /// Fetch the current Email state by issuing Email/get with an empty id list.
-/// Use this to bootstrap the state for delta sync after a full initial pull.
+/// Capture this before an initial enumeration/get, not after it: a newer
+/// after-the-read token could hide updates that were never observed.
 pub async fn get_current_state(client: &Client) -> Result<String> {
     with_retry("Email/get (state bootstrap)", || async {
         let mut request = build_request(client);
@@ -373,15 +386,15 @@ pub async fn get_changes(client: &Client, since_state: &str) -> Result<ChangesRe
     Ok(result)
 }
 
-/// One unit of work for `set_email_batch`. Collapses keyword changes,
-/// mailbox moves, and destroys onto a single Email/set method call so
-/// the server sees one transaction per cycle instead of N.
+/// One requested mutation for `set_email_batch`. Keyword and mailbox
+/// changes for the same Email are combined before batching updates and
+/// destroys into Email/set method calls.
 #[derive(Debug, Clone)]
 pub enum EmailSetOp {
-    /// Patch keywords on an email. Map is `keyword -> set?`.
+    /// Explicit keyword set/remove operations; not a replacement set.
     Keywords {
         email_id: JmapEmailId,
-        keywords: HashMap<String, bool>,
+        keywords: KeywordPatch,
     },
     /// Replace the email's full mailbox-id set. The caller computes
     /// the target set; `set_email_batch` issues a full-replacement
@@ -395,23 +408,40 @@ pub enum EmailSetOp {
     Destroy { email_id: JmapEmailId },
 }
 
-/// Outcome of `set_email_batch`. The two `failed_*` sets contain ids
-/// the server rejected per-row (notUpdated / notDestroyed); callers
-/// should suppress DB mirror for those ids.
+/// A confirmed no-effect result (record/method rejection or an unsent
+/// operation), unlike an absent or ambiguous acknowledgement.
+#[derive(Debug)]
+pub struct EmailSetRejection {
+    pub retryable: bool,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmailSetReplan {
+    StateMismatch,
+    UnverifiedStateChain,
+    MethodRejected,
+}
+
+/// `failed_*` includes unacknowledged and deferred IDs: never mirror them as
+/// successful effects. The rejection maps identify confirmed no-effect results;
+/// only ambiguity retains an in-flight receipt. `replan_*` is the subset that
+/// needs fresh observations rather than per-ID failure/backoff classification.
+/// Earlier positive chunk acknowledgements remain available on guarded rejection.
 ///
-/// `chain_old` / `chain_new` carry the JMAP `oldState` / `newState`
-/// fields from the `Email/set` response(s). Across multiple chunks
-/// (when the op list exceeds `maxObjectsInSet`), the chain is
-/// considered intact iff each subsequent chunk's `oldState` matches
-/// the previous chunk's `newState` -- i.e. nothing third-party landed
-/// between chunks. When intact, `chain_old` is the very first chunk's
-/// `oldState` and `chain_new` is the very last chunk's `newState`.
-/// When the chain breaks, `chain_new` is set to `None` so the section 7.1
-/// cursor ratchet at the call site won't fire.
+/// `chain_old` / `chain_new` carry the first oldState and last newState only
+/// across a continuous, complete response chain (RFC 8620 section 7.1.1).
 #[derive(Debug, Default)]
 pub struct EmailSetOutcome {
     pub failed_updates: std::collections::HashSet<JmapEmailId>,
     pub failed_destroys: std::collections::HashSet<JmapEmailId>,
+    pub update_rejections: HashMap<JmapEmailId, EmailSetRejection>,
+    pub destroy_rejections: HashMap<JmapEmailId, EmailSetRejection>,
+    /// Deferred by a failed precondition or unavailable continuation token.
+    /// These are also failed_* for mirroring, but not per-ID server failures.
+    pub replan_updates: HashSet<JmapEmailId>,
+    pub replan_destroys: HashSet<JmapEmailId>,
+    pub replan: Option<EmailSetReplan>,
     pub chain_old: Option<String>,
     pub chain_new: Option<String>,
 }
@@ -423,6 +453,11 @@ impl EmailSetOutcome {
     pub(crate) fn merge(&mut self, other: EmailSetOutcome) {
         self.failed_updates.extend(other.failed_updates);
         self.failed_destroys.extend(other.failed_destroys);
+        self.update_rejections.extend(other.update_rejections);
+        self.destroy_rejections.extend(other.destroy_rejections);
+        self.replan_updates.extend(other.replan_updates);
+        self.replan_destroys.extend(other.replan_destroys);
+        self.replan = other.replan.or(self.replan);
 
         // Chain extension: each subsequent chunk's `chain_old` must
         // match the previous chunk's `chain_new` for the chain to
@@ -444,20 +479,88 @@ impl EmailSetOutcome {
     }
 }
 
+#[derive(Default)]
+struct EmailSetUpdate<'a> {
+    keywords: HashMap<&'a str, KeywordMutation>,
+    target_mailbox_ids: Option<&'a [JmapMailboxId]>,
+}
+
+enum EmailSetObject<'a> {
+    Update(&'a JmapEmailId),
+    Destroy(&'a JmapEmailId),
+}
+
+#[derive(Clone, Copy)]
+enum SetDeferral {
+    Snapshot { confirmed_not_applied: bool },
+    Method { retryable: bool },
+}
+
+fn method_rejected_without_effects(error: &anyhow::Error) -> bool {
+    // RFC 8620 section 3.6.2: only serverPartialFail may expose changes from
+    // a failed method. A clean serverFail retry is not an ambiguous write.
+    error.chain().any(|cause| matches!(cause.downcast_ref::<JmapError>(),
+        Some(JmapError::Method(method)) if !matches!(method.error(), MethodErrorType::ServerPartialFail)))
+}
+
+fn defer_set_objects(
+    outcome: &mut EmailSetOutcome,
+    objects: &[EmailSetObject<'_>],
+    cause: SetDeferral,
+    reason: &str,
+) {
+    let (confirmed_not_applied, retryable, replan) = match cause {
+        SetDeferral::Snapshot {
+            confirmed_not_applied,
+        } => (confirmed_not_applied, true, true),
+        SetDeferral::Method { retryable } => (true, retryable, false),
+    };
+    for object in objects {
+        let rejection = || EmailSetRejection {
+            retryable,
+            reason: reason.into(),
+        };
+        match object {
+            EmailSetObject::Update(id) => {
+                outcome.failed_updates.insert((*id).clone());
+                if replan {
+                    outcome.replan_updates.insert((*id).clone());
+                }
+                if confirmed_not_applied {
+                    outcome.update_rejections.insert((*id).clone(), rejection());
+                }
+            }
+            EmailSetObject::Destroy(id) => {
+                outcome.failed_destroys.insert((*id).clone());
+                if replan {
+                    outcome.replan_destroys.insert((*id).clone());
+                }
+                if confirmed_not_applied {
+                    outcome
+                        .destroy_rejections
+                        .insert((*id).clone(), rejection());
+                }
+            }
+        }
+    }
+}
+
 /// Apply a batch of Email/set operations, splitting across as many
 /// JMAP method calls as needed to honor `maxObjectsInSet`.
 ///
-/// JMAP allows multiple `update` and `destroy` entries in one
-/// Email/set, capped server-side by `maxObjectsInSet`. Caller op
-/// counts can exceed that cap on a busy cycle; we chunk via
-/// `limits::max_objects_in_set` (which itself caps the server's
-/// advertised value at our own ceiling) and fold per-chunk outcomes
-/// into a combined result. Per-id failures land in
+/// Combine all keyword and mailbox changes for an Email into one
+/// update before chunking. Repeated keyword assignments and mailbox
+/// replacements use the last value in caller order. Each combined
+/// update and each destroy consumes one slot in `maxObjectsInSet`.
+/// We chunk via `limits::max_objects_in_set` (which itself caps the
+/// server's advertised value at our own ceiling) and fold per-chunk
+/// outcomes into a combined result. Per-id failures land in
 /// `notUpdated`/`notDestroyed` and are surfaced as warnings; they do
 /// not fail the chunk. A chunk that fails after retries propagates
-/// `Err`, dropping the combined outcome — already-applied chunks
-/// remain on the server and are picked up by reconcile on the next
-/// cycle.
+/// `Err` for ambiguous terminal errors. The conditional variant instead
+/// preserves earlier ACKs on stateMismatch/clean method rejection, marks
+/// rejected and unsubmitted work, and requires fresh reconciliation.
+/// The unconditioned entry point remains for explicit maintenance/oracle writes.
 ///
 /// Moves are emitted as a *full replacement* of `mailboxIds` (the
 /// caller-supplied `target_mailbox_ids`) rather than a per-key patch.
@@ -470,82 +573,283 @@ impl EmailSetOutcome {
 /// mailbox memberships not in the target set — acceptable for
 /// jma's single-mailbox-per-email model.
 pub async fn set_email_batch(client: &Client, ops: &[EmailSetOp]) -> Result<EmailSetOutcome> {
+    set_email_batch_inner(client, ops, None).await
+}
+
+/// Apply reconciliation writes against the state captured before reading their
+/// observations. Never advance a guard from an unrelated/unverified state.
+pub async fn set_email_batch_if_in_state(
+    client: &Client,
+    ops: &[EmailSetOp],
+    state: &str,
+) -> Result<EmailSetOutcome> {
+    anyhow::ensure!(
+        !state.is_empty(),
+        "Cannot condition Email/set without a planning state"
+    );
+    set_email_batch_inner(client, ops, Some(state.to_owned())).await
+}
+
+async fn set_email_batch_inner(
+    client: &Client,
+    ops: &[EmailSetOp],
+    mut guard_state: Option<String>,
+) -> Result<EmailSetOutcome> {
     if ops.is_empty() {
         return Ok(EmailSetOutcome::default());
     }
 
+    // jmap-client's update(id) replaces an existing entry. Group the
+    // entire input first, then call it once per Email, even when the
+    // original operations would have fallen in different chunks.
+    let mut updates: HashMap<&JmapEmailId, EmailSetUpdate<'_>> = HashMap::new();
+    let mut objects = Vec::new();
+    for op in ops {
+        match op {
+            EmailSetOp::Keywords { email_id, keywords } => {
+                let update = updates.entry(email_id).or_insert_with(|| {
+                    objects.push(EmailSetObject::Update(email_id));
+                    EmailSetUpdate::default()
+                });
+                update
+                    .keywords
+                    .extend(keywords.iter().map(|(kw, val)| (kw.as_str(), *val)));
+            }
+            EmailSetOp::SetMailboxes {
+                email_id,
+                target_mailbox_ids,
+            } => {
+                let update = updates.entry(email_id).or_insert_with(|| {
+                    objects.push(EmailSetObject::Update(email_id));
+                    EmailSetUpdate::default()
+                });
+                update.target_mailbox_ids = Some(target_mailbox_ids);
+            }
+            EmailSetOp::Destroy { email_id } => {
+                objects.push(EmailSetObject::Destroy(email_id));
+            }
+        }
+    }
+
+    let http = super::email_set::http_client(client)?;
     let chunk_size = limits::max_objects_in_set(client);
     let mut combined = EmailSetOutcome::default();
     let mut chunk_count = 0usize;
 
-    for chunk in ops.chunks(chunk_size) {
-        let chunk_outcome = with_retry("Email/set (batch)", || async {
-            let mut request = build_request(client);
-            {
-                let set = request.set_email().account_id(client.default_account_id());
-                for op in chunk {
-                    match op {
-                        EmailSetOp::Keywords { email_id, keywords } => {
-                            let upd = set.update(email_id.as_ref());
-                            for (kw, val) in keywords {
-                                upd.keyword(kw, *val);
+    for (chunk_index, chunk) in objects.chunks(chunk_size).enumerate() {
+        let ambiguous_attempt = AtomicBool::new(false);
+        let chunk_result =
+            with_retry("Email/set (batch)", || async {
+                let mut update_rows = serde_json::Map::new();
+                let mut destroy_ids = Vec::new();
+                for object in chunk {
+                    match object {
+                        EmailSetObject::Update(email_id) => {
+                            let update = &updates[email_id];
+                            let mut patch = serde_json::Map::new();
+                            for (keyword, mutation) in &update.keywords {
+                                let path = format!(
+                                    "keywords/{}",
+                                    keyword.replace('~', "~0").replace('/', "~1")
+                                );
+                                let value = match mutation {
+                                    KeywordMutation::Set => serde_json::Value::Bool(true),
+                                    KeywordMutation::Remove => serde_json::Value::Null,
+                                };
+                                patch.insert(path, value);
                             }
+                            if let Some(mailbox_ids) = update.target_mailbox_ids {
+                                let ids = mailbox_ids
+                                    .iter()
+                                    .map(|id| (id.to_string(), serde_json::Value::Bool(true)))
+                                    .collect();
+                                patch.insert("mailboxIds".into(), serde_json::Value::Object(ids));
+                            }
+                            update_rows
+                                .insert(email_id.to_string(), serde_json::Value::Object(patch));
                         }
-                        EmailSetOp::SetMailboxes {
-                            email_id,
-                            target_mailbox_ids,
-                        } => {
-                            set.update(email_id.as_ref())
-                                .mailbox_ids(target_mailbox_ids.iter());
-                        }
-                        EmailSetOp::Destroy { email_id } => {
-                            set.destroy([email_id.as_ref()]);
-                        }
+                        EmailSetObject::Destroy(email_id) => destroy_ids.push(email_id.to_string()),
                     }
                 }
-            }
+                let mut args = serde_json::Map::new();
+                args.insert(
+                    "accountId".into(),
+                    serde_json::Value::String(client.default_account_id().into()),
+                );
+                if let Some(state) = &guard_state {
+                    args.insert("ifInState".into(), serde_json::Value::String(state.clone()));
+                }
+                if !update_rows.is_empty() {
+                    args.insert("update".into(), serde_json::Value::Object(update_rows));
+                }
+                if !destroy_ids.is_empty() {
+                    args.insert("destroy".into(), serde_json::to_value(destroy_ids)?);
+                }
+                let mut response =
+                    match super::email_set::send(client, &http, serde_json::Value::Object(args))
+                        .await
+                    {
+                        Ok(response) => response,
+                        Err(error) => {
+                            if !method_rejected_without_effects(&error) {
+                                ambiguous_attempt.store(true, Ordering::Relaxed);
+                            }
+                            return Err(error);
+                        }
+                    };
 
-            let response = request
-                .send_single::<jmap_client::core::response::EmailSetResponse>()
-                .await
-                .context("Email/set batch failed")?;
+                let chain_old = response.old_state().map(String::from);
+                // jmap-client 0.4.1 returns "" when `newState` is missing
+                // from the response. See `SetResponse::new_state` at
+                // https://github.com/stalwartlabs/jmap-client/blob/v0.4.1/src/core/set.rs#L255-L257
+                // -- the body is `self.new_state.as_deref().unwrap_or("")`.
+                // Treat the empty string as missing so a non-compliant
+                // server doesn't give us a bogus chain to ratchet against.
+                let chain_new = match response.new_state() {
+                    "" => None,
+                    s => Some(s.to_string()),
+                };
 
-            let chain_old = response.old_state().map(String::from);
-            // jmap-client 0.4.1 returns "" when `newState` is missing
-            // from the response. See `SetResponse::new_state` at
-            // https://github.com/stalwartlabs/jmap-client/blob/v0.4.1/src/core/set.rs#L255-L257
-            // -- the body is `self.new_state.as_deref().unwrap_or("")`.
-            // Treat the empty string as missing so a non-compliant
-            // server doesn't give us a bogus chain to ratchet against.
-            let chain_new = match response.new_state() {
-                "" => None,
-                s => Some(s.to_string()),
-            };
-
-            let mut outcome = EmailSetOutcome {
-                chain_old,
-                chain_new,
-                ..Default::default()
-            };
-            if let Some(not_updated) = response.not_updated_ids() {
-                for id in not_updated {
+                let mut outcome = EmailSetOutcome {
+                    chain_old,
+                    chain_new,
+                    ..Default::default()
+                };
+                let rejected_updates: Vec<_> = response
+                    .not_updated_ids()
+                    .into_iter()
+                    .flatten()
+                    .cloned()
+                    .collect();
+                let rejected_destroys: Vec<_> = response
+                    .not_destroyed_ids()
+                    .into_iter()
+                    .flatten()
+                    .cloned()
+                    .collect();
+                for id in rejected_updates {
                     tracing::warn!("Email/set batch: notUpdated {}", id);
                     outcome.failed_updates.insert(id.as_str().into());
+                    if let Err(error) = response.updated(&id) {
+                        let error = anyhow::Error::from(error);
+                        outcome.update_rejections.insert(
+                            id.into(),
+                            EmailSetRejection {
+                                retryable: super::retry::is_transient_error(&error),
+                                reason: error.to_string(),
+                            },
+                        );
+                    }
                 }
-            }
-            if let Some(not_destroyed) = response.not_destroyed_ids() {
-                for id in not_destroyed {
+                for id in rejected_destroys {
                     tracing::warn!("Email/set batch: notDestroyed {}", id);
                     outcome.failed_destroys.insert(id.as_str().into());
+                    if let Err(error) = response.destroyed(&id) {
+                        let error = anyhow::Error::from(error);
+                        outcome.destroy_rejections.insert(
+                            id.into(),
+                            EmailSetRejection {
+                                retryable: super::retry::is_transient_error(&error),
+                                reason: error.to_string(),
+                            },
+                        );
+                    }
                 }
+
+                let updated: std::collections::HashSet<_> = response
+                    .updated_ids()
+                    .into_iter()
+                    .flatten()
+                    .map(String::as_str)
+                    .collect();
+                let destroyed: std::collections::HashSet<_> = response
+                    .destroyed_ids()
+                    .into_iter()
+                    .flatten()
+                    .map(String::as_str)
+                    .collect();
+                for object in chunk {
+                    match object {
+                        EmailSetObject::Update(id) if !updated.contains(id.as_ref()) => {
+                            if outcome.failed_updates.insert((*id).clone()) {
+                                warn!("Email/set did not acknowledge update {}", id);
+                            }
+                        }
+                        EmailSetObject::Destroy(id) if !destroyed.contains(id.as_ref()) => {
+                            if outcome.failed_destroys.insert((*id).clone()) {
+                                warn!("Email/set did not acknowledge destroy {}", id);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(outcome)
+            })
+            .await;
+        let remaining = objects.get((chunk_index + 1) * chunk_size..).unwrap_or(&[]);
+        let chunk_outcome = match chunk_result {
+            Ok(outcome) => outcome,
+            Err(error) if guard_state.is_some() && is_state_mismatch(&error) => {
+                combined.replan = Some(EmailSetReplan::StateMismatch);
+                defer_set_objects(
+                    &mut combined,
+                    chunk,
+                    SetDeferral::Snapshot {
+                        confirmed_not_applied: !ambiguous_attempt.load(Ordering::Relaxed),
+                    },
+                    "Email/set stateMismatch; fresh reconciliation is required",
+                );
+                defer_set_objects(
+                    &mut combined,
+                    remaining,
+                    SetDeferral::Snapshot {
+                        confirmed_not_applied: true,
+                    },
+                    "Not sent after Email/set stateMismatch",
+                );
+                break;
             }
-
-            Ok(outcome)
-        })
-        .await?;
-
+            Err(error)
+                if guard_state.is_some()
+                    && !ambiguous_attempt.load(Ordering::Relaxed)
+                    && method_rejected_without_effects(&error) =>
+            {
+                combined.replan = Some(EmailSetReplan::MethodRejected);
+                let cause = SetDeferral::Method {
+                    retryable: super::retry::is_transient_error(&error),
+                };
+                let reason =
+                    format!("Email/set method rejected without applying changes: {error:#}");
+                defer_set_objects(&mut combined, chunk, cause, &reason);
+                defer_set_objects(&mut combined, remaining, cause, &reason);
+                break;
+            }
+            Err(error) => return Err(error),
+        };
+        let next_guard = guard_state.as_ref().and_then(|expected| {
+            match (&chunk_outcome.chain_old, &chunk_outcome.chain_new) {
+                (Some(old), Some(new)) if old == expected => Some(new.clone()),
+                _ => None,
+            }
+        });
+        let guarded = guard_state.is_some();
         combined.merge(chunk_outcome);
         chunk_count += 1;
+        if guarded {
+            if next_guard.is_none() {
+                combined.replan = Some(EmailSetReplan::UnverifiedStateChain);
+                defer_set_objects(
+                    &mut combined,
+                    remaining,
+                    SetDeferral::Snapshot {
+                        confirmed_not_applied: true,
+                    },
+                    "Not sent without a verified Email/set continuation state",
+                );
+                break;
+            }
+            guard_state = next_guard;
+        }
     }
 
     debug!(
@@ -932,14 +1236,43 @@ fn parse_email_object(email: &jmap_client::email::Email<jmap_client::Get>) -> Re
         mailbox_ids,
         keywords,
         message_id,
-        subject: None,
+        subject: email.subject().map(str::to_owned),
+        received_at: email.received_at(),
         size: email.size() as u64,
     })
 }
 
 #[cfg(test)]
+#[path = "email_batch_tests.rs"]
+mod batch_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_method_effect_classification_is_typed_and_preserves_partial_failure() {
+        use jmap_client::core::response::{EmailSetResponse, SingleMethodResponse};
+        for (kind, clean) in [
+            ("stateMismatch", true),
+            ("serverFail", true),
+            ("serverUnavailable", true),
+            ("invalidArguments", true),
+            ("serverPartialFail", false),
+        ] {
+            let response: SingleMethodResponse<EmailSetResponse> =
+                serde_json::from_value(serde_json::json!(["error", {"type":kind}, "s0"])).unwrap();
+            let SingleMethodResponse::Error((_, error, _)) = response else {
+                panic!("expected method rejection")
+            };
+            let error = anyhow::Error::from(JmapError::from(error)).context("guarded request");
+            assert_eq!(method_rejected_without_effects(&error), clean, "{kind}");
+            assert_eq!(is_state_mismatch(&error), kind == "stateMismatch");
+        }
+        assert!(!method_rejected_without_effects(&anyhow::anyhow!(
+            "stateMismatch serverFail"
+        )));
+    }
 
     /// Two chunks' worth of failed-id sets merge into the union, with
     /// updates and destroys staying in their respective buckets.
@@ -1104,6 +1437,7 @@ mod tests {
             keywords: HashMap::new(),
             message_id: None,
             subject: None,
+            received_at: None,
             size: 0,
         }
     }

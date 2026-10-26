@@ -2196,7 +2196,10 @@ async fn create_remote_mailbox_issues_mailbox_set_per_action() {
         ],
         new_email_state: None,
     };
-    executor.execute(plan).await.expect("execute succeeds");
+    executor
+        .execute(plan, None)
+        .await
+        .expect("execute succeeds");
 
     let creates = state.lock().unwrap().mailbox_set_creates.clone();
     assert_eq!(
@@ -2270,7 +2273,7 @@ async fn create_remote_mailbox_warns_and_continues_on_rejection() {
         new_email_state: None,
     };
     executor
-        .execute(plan)
+        .execute(plan, None)
         .await
         .expect("execute returns Ok even when one create is rejected");
 
@@ -2337,7 +2340,10 @@ async fn create_remote_mailbox_chained_create_resolves_parent_reference() {
         ],
         new_email_state: None,
     };
-    executor.execute(plan).await.expect("execute succeeds");
+    executor
+        .execute(plan, None)
+        .await
+        .expect("execute succeeds");
 
     // Look up the parent's assigned id from the mock's record
     // instead of hard-coding the mock's counter shape, so the
@@ -2447,7 +2453,10 @@ async fn create_remote_mailbox_skips_child_when_parent_reference_unresolved() {
         }],
         new_email_state: None,
     };
-    executor.execute(plan).await.expect("execute returns Ok");
+    executor
+        .execute(plan, None)
+        .await
+        .expect("execute returns Ok");
 
     let creates = state.lock().unwrap().mailbox_set_creates.clone();
     assert!(
@@ -2531,7 +2540,10 @@ async fn destroy_remote_mailbox_issues_mailbox_set_per_action_and_drops_cache_ro
         }],
         new_email_state: None,
     };
-    executor.execute(plan).await.expect("execute succeeds");
+    executor
+        .execute(plan, None)
+        .await
+        .expect("execute succeeds");
 
     let destroys = state.lock().unwrap().mailbox_set_destroys.clone();
     assert_eq!(
@@ -2645,7 +2657,7 @@ async fn destroy_remote_mailbox_keeps_cache_row_on_rejection_and_continues() {
         new_email_state: None,
     };
     executor
-        .execute(plan)
+        .execute(plan, None)
         .await
         .expect("execute returns Ok even when one destroy is rejected");
 

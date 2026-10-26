@@ -3,9 +3,9 @@ use futures_util::stream::{self, StreamExt};
 use jmap_client::client::Client;
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::domain::{MailboxFolderBinding, MailboxObject, MaybeReference};
@@ -20,11 +20,11 @@ use crate::maildir_ops::layout::{
 use crate::maildir_ops::namespace::is_jma_private;
 use crate::maildir_ops::scan::LocalChange;
 use crate::maildir_ops::{scan, store};
-use crate::state::queries;
+use crate::state::{flag_sync, queries};
 use crate::sync::bindings::{MailboxBindings, MailboxBindingsBuilder};
 use crate::sync::dedupe::{LocalEntry, LocalIndex};
 use crate::sync::execute::Executor;
-use crate::sync::plan::{SyncAction, SyncDirection};
+use crate::sync::plan::{SyncAction, SyncDirection, SyncPlan};
 use crate::sync::reconcile::{self, MessageRecordIndex, ReconcileInput};
 use crate::sync::self_writes::SelfWriteCache;
 use tracing::Instrument;
@@ -40,11 +40,16 @@ use tracing::Instrument;
 pub enum ScanScope {
     Full,
     Paths(Vec<PathBuf>),
+    /// Full inventory for retained message work, without reissuing confirmed
+    /// permanent Email/set rejections or flag histories needing review.
+    Retry {
+        blocked_remote_ids: HashSet<JmapEmailId>,
+    },
 }
 
 /// Outcome of one sync iteration -- enough for the daemon loop to know
 /// whether to fire the post-arrival hook and to flag a degraded cycle.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct SyncOutcome {
     pub downloaded: usize,
     /// Local messages successfully pushed to the server via
@@ -73,10 +78,39 @@ pub struct SyncOutcome {
     /// (notUpdated + notDestroyed). Each one is also logged at warn
     /// level with id and folder context; this count is the
     /// at-a-glance summary so the user doesn't have to grep across a
-    /// long cycle log to notice anything went wrong. These conditions
-    /// are self-healing -- the next cycle re-detects and re-attempts
-    /// each rejected action -- so they stay below the `error!` bar.
+    /// long cycle log to notice anything went wrong. Retryable failures
+    /// remain eligible for a fresh cycle; permanent rejections require
+    /// permission repair or explicit reassessment, not a transport retry.
     pub failed_remote_actions: usize,
+    /// Failed Email/set IDs eligible for automatic retry, including missing
+    /// positive acknowledgement. Confirmed permanent rejection is excluded.
+    pub retryable_remote_actions: usize,
+    /// Daemon-lifetime suppression for confirmed permanent Email/set rejection.
+    /// This is not a durable job queue; a normal Full/manual cycle may retry.
+    pub blocked_remote_ids: HashSet<JmapEmailId>,
+    /// Actual local flag/move effects which failed, not direction-filtered or
+    /// membership-gated effects which were never attempted.
+    pub retryable_local_actions: usize,
+    /// Deferred observations/effects explicitly eligible for a fresh cycle.
+    pub retryable_deferred_actions: usize,
+    /// Explicit review/ambiguity deferrals, distinct from effects merely
+    /// waiting for a retryable membership acknowledgement.
+    pub review_actions: usize,
+    /// True only after a non-preview, bidirectional full inventory. A Paths
+    /// no-op cannot clear a daemon's outstanding retry deadline.
+    pub retry_scope_checked: bool,
+    /// Conditional Email/set work needs a new observed generation, never a
+    /// blind retry of the old serialized plan.
+    pub replan_required: bool,
+    /// Local changes deferred because the current inventory cannot establish
+    /// a safe identity transition. These are not successful synchronization.
+    pub deferred_actions: usize,
+    /// Unsettled flag generations remain visible even without a new delta.
+    pub pending_flag_actions: usize,
+    /// Pending flag histories that require explicit review or permission repair.
+    pub blocked_flag_actions: usize,
+    /// Bound selected messages which have no acknowledgement-history row yet.
+    pub unverified_flag_actions: usize,
     /// True when reconcile produced an empty plan -- neither side had
     /// work to do. The daemon uses this to flag spurious `LocalChange`
     /// triggers (FS notification fired but nothing actually changed)
@@ -96,6 +130,77 @@ pub struct SyncOutcome {
     /// in `remote_orphans_detected`. Same post-resurrect semantics:
     /// resurrected orphans don't contribute.
     pub remote_orphan_total_emails: u64,
+}
+
+impl SyncOutcome {
+    pub fn needs_retry(&self) -> bool {
+        self.replan_required
+            || self.pending_flag_actions > self.blocked_flag_actions
+            || self.retryable_remote_actions > 0
+            || self.retryable_local_actions > 0
+            || self.retryable_deferred_actions > 0
+    }
+
+    pub fn has_blocked_work(&self) -> bool {
+        self.blocked_flag_actions > 0
+            || !self.blocked_remote_ids.is_empty()
+            || self.review_actions > 0
+    }
+
+    pub fn has_pending_work(&self) -> bool {
+        self.replan_required
+            || self.pending_flag_actions > 0
+            || self.has_blocked_work()
+            || self.unverified_flag_actions > 0
+            || self.failed_remote_actions > 0
+            || self.deferred_actions > 0
+            || self.retryable_local_actions > 0
+    }
+
+    fn observe_flag_status(&mut self, status: &flag_sync::FlagPending) {
+        self.pending_flag_actions = status.pending.len();
+        self.blocked_flag_actions = status.blocked.len();
+        self.unverified_flag_actions = status.unverified.len();
+    }
+
+    pub fn pending_summary(&self) -> String {
+        format!(
+            "flags: {} pending ({} blocked/review), {} unverified; remote: {} retryable, {} blocked; local: {} retryable; deferred: {} ({} retryable, {} review)",
+            self.pending_flag_actions,
+            self.blocked_flag_actions,
+            self.unverified_flag_actions,
+            self.retryable_remote_actions,
+            self.blocked_remote_ids.len(),
+            self.retryable_local_actions,
+            self.deferred_actions,
+            self.retryable_deferred_actions,
+            self.review_actions
+        )
+    }
+}
+
+struct CycleRun {
+    outcome: SyncOutcome,
+    used_initial_path: bool,
+    report: bool,
+}
+
+fn cycle_summary(outcome: &SyncOutcome, initial: bool) -> String {
+    if outcome.already_in_sync {
+        return "Already in sync".into();
+    }
+    if outcome.has_pending_work() {
+        return format!("Sync incomplete ({})", outcome.pending_summary());
+    }
+    let label = if initial {
+        "Initial sync complete"
+    } else {
+        "Sync complete"
+    };
+    format!(
+        "{label} ({} downloaded, {} uploaded, {} flag updates, {} moved, {} deleted)",
+        outcome.downloaded, outcome.uploaded, outcome.flag_updates, outcome.moved, outcome.deleted
+    )
 }
 
 /// Bundles the immutable state every engine helper threads through
@@ -206,10 +311,89 @@ impl<'a> SyncEngine<'a> {
         &self,
         dry_run: bool,
         direction: SyncDirection,
-        scan_scope: ScanScope,
+        mut scan_scope: ScanScope,
     ) -> Result<SyncOutcome> {
+        const MAX_GENERATION_ATTEMPTS: usize = 3;
+        let mut previous: Option<SyncOutcome> = None;
+        let mut attempt = 0;
+        let mut report = false;
+        let mut initial = false;
+        loop {
+            let cycle = self.run_once(dry_run, direction, scan_scope).await?;
+            report |= cycle.report;
+            initial |= cycle.used_initial_path;
+            let mut outcome = cycle.outcome;
+            if let Some(completed) = previous {
+                outcome.downloaded += completed.downloaded;
+                outcome.uploaded += completed.uploaded;
+                outcome.flag_updates += completed.flag_updates;
+                outcome.moved += completed.moved;
+                outcome.deleted += completed.deleted;
+                outcome.failed_remote_actions += completed.failed_remote_actions;
+                outcome.already_in_sync &= completed.already_in_sync;
+            }
+            attempt += 1;
+            // Explicit per-ID failures keep their normal backoff/permission
+            // handling. Only a snapshot rejection gets an immediate replan.
+            if !outcome.replan_required
+                || outcome.failed_remote_actions > 0
+                || dry_run
+                || attempt >= MAX_GENERATION_ATTEMPTS
+            {
+                if !dry_run && report {
+                    crate::notify!("{}", cycle_summary(&outcome, initial));
+                }
+                return Ok(outcome);
+            }
+            warn!(
+                "Conditional Email/set requires fresh observations; rebuilding the plan ({}/{})",
+                attempt, MAX_GENERATION_ATTEMPTS
+            );
+            scan_scope = ScanScope::Retry {
+                blocked_remote_ids: outcome.blocked_remote_ids.clone(),
+            };
+            previous = Some(outcome);
+        }
+    }
+
+    async fn run_once(
+        &self,
+        dry_run: bool,
+        direction: SyncDirection,
+        mut scan_scope: ScanScope,
+    ) -> Result<CycleRun> {
+        let (retry_only, blocked_remote_ids) = match &scan_scope {
+            ScanScope::Retry { blocked_remote_ids } => (true, blocked_remote_ids.clone()),
+            _ => (false, HashSet::new()),
+        };
+        if retry_only {
+            scan_scope = ScanScope::Full;
+        }
         let mut mailboxes = self.resolve_mailboxes().await?;
+        let flag_scope = flag_mailbox_ids(&mailboxes);
+        let pending_before = flag_sync::summarize(self.conn, &flag_scope)?;
+        if matches!(scan_scope, ScanScope::Paths(_))
+            && (pending_before.retryable() > 0 || !pending_before.unverified.is_empty())
+        {
+            scan_scope = ScanScope::Full;
+        }
         let maildir_root = self.config.canonical_maildir_root()?;
+        if let ScanScope::Paths(paths) = &scan_scope
+            && paths_need_full_identity_scan(
+                self.conn,
+                &maildir_root,
+                &mailboxes,
+                paths,
+                self.config
+                    .sync
+                    .allow_destructive_folder_sync
+                    .allows_delete_local(),
+            )?
+        {
+            // Decide before Phase 0: new/relocated identities need the full
+            // dedupe/LocalIndex bridge, not only a widened post-dedupe scan.
+            scan_scope = ScanScope::Full;
+        }
 
         // Push-only on a fresh config has nothing local to upload:
         // CreateLocalMailbox actions would be dropped by the
@@ -238,19 +422,10 @@ impl<'a> SyncEngine<'a> {
             }
         }
 
-        // Phase 0: classify duplicates and (conditionally) index. Always
-        // before scan so newly-introduced duplicates from a prior aborted
-        // run don't get treated as local changes to push.
-        //
-        // Reconcile only consults `LocalIndex` when its DB-derived
-        // lookup misses (initial sync, post-`c7a86e6`-recovery wipe, or
-        // any other state where `message_map` is empty). In steady
-        // state every remote Message-ID resolves through the DB, the
-        // index is allocated and never read. Skip the build entirely
-        // when the DB has rows: plan_dedupe still runs (cheap pure
-        // walk), `local_index` stays at default-empty, and
-        // Empty-HashMap lookups return None -- which is exactly what
-        // the existing reconcile stage-2 check already handles.
+        // Phase 0: classify byte-identical duplicates and index every kept
+        // content representative before scanning for changes. A partially
+        // committed bootstrap can have bindings and unbound files together;
+        // a nonempty message_map does not make LocalIndex unnecessary.
         //
         // Plan now, apply later: `apply_dedupe` only runs on non-dry
         // cycles, so `jma sync --dry-run` no longer destroys local
@@ -260,27 +435,19 @@ impl<'a> SyncEngine<'a> {
         // of the duplicates so reconcile sees the post-dedupe shape
         // even under dry-run.
         //
-        // Path-scoped cycles skip the dedupe walk entirely. The walk
-        // is folder-wide -- it parses Message-IDs out of every cur/
-        // and new/ file across every synced folder -- so its cost
-        // doesn't shrink when the trigger only touches a handful of
-        // paths. Paths-scope only fires from the daemon's LocalChange
-        // triggers, where (a) the DB always has rows (Initial seeded
-        // it via Full), so the LocalIndex bridge is unused; (b)
-        // dry-run never applies (the daemon never runs dry); and (c)
-        // any duplicate the cycle misses is caught by the next
-        // Full-scope trigger (SSE pulse, Initial, CLI sync), which
-        // arrives soon on a connected daemon.
+        // Known-ID flag-only Paths cycles still skip the folder-wide walk.
+        // New/relocated identities were widened to Full above so canonical
+        // content siblings and existing live anchors are visible now, without
+        // requiring a later unrelated event to trigger a full scan.
         //
         // Within a Full cycle, the walk is further narrowed against
         // `folder_checkpoint`: any folder whose current (cur_mtime,
         // new_mtime, cur_count, new_count) snapshot matches the row
         // written at the tail of the last successful cycle cannot
         // have grown a per-folder Message-ID duplicate since then.
-        // mtime advances on any add, remove, or in-place rename;
-        // count advances only on add/remove. Requiring both to match
-        // means an in-place rename (the common MUA flag-flip path)
-        // is correctly recognised as not-dupe-inducing. A missing
+        // mtime catches renames/replacements even when counts stay equal;
+        // counts catch additions/removals. Only exact snapshot agreement
+        // skips the walk; rename-only churn is conservatively dirty. A missing
         // checkpoint row (first sync, post-recovery wipe, freshly
         // added folder) is treated as dirty, so the LocalIndex
         // bridge still gets populated on first sync.
@@ -291,19 +458,34 @@ impl<'a> SyncEngine<'a> {
         } else {
             Vec::new()
         };
-        let dedupe_plan = crate::janitor::dedupe::run(&maildir_root, &dedupe_targets, dry_run)?;
+        let tracked_maildir_ids = queries::list_tracked_maildir_ids(self.conn)?;
+        let dedupe_plan = crate::janitor::dedupe::run(
+            &maildir_root,
+            &dedupe_targets,
+            dry_run,
+            &tracked_maildir_ids,
+        )?;
         let mut local_index = LocalIndex::default();
-        if !queries::has_message_map_rows(self.conn)? {
-            for kept in &dedupe_plan.kept {
-                local_index
-                    .by_message_id
-                    .entry(kept.message_id.clone())
-                    .or_default()
-                    .push(LocalEntry {
-                        folder: kept.folder.clone(),
-                        maildir_id: kept.maildir_id.clone(),
-                    });
-            }
+        // Build this even when message_map is non-empty. A failed initial
+        // cycle commits downloads/uploads one at a time but deliberately
+        // withholds mailbox_map and cursors until the whole executor
+        // succeeds. On the recovery cycle that leaves a *partial* DB:
+        // DB lookup handles the committed subset while LocalIndex is the
+        // only guard that stops uncommitted same-Message-ID files from
+        // being uploaded again and hitting Fastmail's `alreadyExists`.
+        // In a normal steady-state cycle the index is cheap dead weight
+        // for clean folders (folder checkpoints exclude them), but in a
+        // partial bootstrap it is what makes the two sources of truth
+        // meet in the middle.
+        for kept in &dedupe_plan.kept {
+            local_index
+                .by_message_id
+                .entry(kept.message_id.clone())
+                .or_default()
+                .push(LocalEntry {
+                    folder: kept.folder.clone(),
+                    maildir_id: kept.maildir_id.clone(),
+                });
         }
 
         // Phase 1: scan local changes. `Full` walks every synced
@@ -322,103 +504,96 @@ impl<'a> SyncEngine<'a> {
             .sync
             .allow_destructive_folder_sync
             .allows_delete_local();
-        let (scan_changes, local_flags) = {
-            let _phase =
-                tracing::info_span!(target: crate::profile::TARGET_PHASE, "scan").entered();
-            match &scan_scope {
-                ScanScope::Full => {
-                    let mut changes = Vec::new();
-                    let mut local_flags: HashMap<MaildirId, String> = HashMap::new();
-                    for binding in mailboxes.scan_set(include_orphans) {
-                        let maildir_path = maildir_root.join(&binding.maildir_folder);
-                        // Three reasons a binding's maildir might
-                        // not exist on disk:
-                        //   - First-cycle binding awaiting
-                        //     `CreateLocalMailbox` (filtered via
-                        //     `is_new_mailbox`).
-                        //   - Sentinel survived elsewhere (the
-                        //     user `mv`-ed the folder; rename
-                        //     detection in `resolve_mailboxes` is
-                        //     authoritative).
-                        //   - Sentinel gone everywhere -- the user
-                        //     deleted the folder.
-                        // Only the third emits
-                        // `LocalChange::LocalFolderDeleted`; the
-                        // first two skip silently. Pull-side
-                        // orphan bindings (only present under
-                        // `include_orphans`) aren't in `by_id`, so
-                        // the live-binding check filters them too.
-                        let Some(maildir) = store::try_open_maildir(&maildir_path) else {
-                            if let MaybeReference::Value(id) = &binding.jmap_mailbox_id
-                                && mailboxes.by_id(id).is_some()
-                                && !mailboxes.is_new_mailbox(id)
-                                && !mailboxes.sentinel_survives_for(id)
-                            {
-                                changes.push(scan::LocalChange::LocalFolderDeleted {
-                                    binding: Arc::clone(&binding),
-                                });
-                            }
-                            continue;
-                        };
-                        let known_state = hydrate_known_state(self.conn, &binding)?;
-                        let result = scan::scan_folder(&maildir, &binding, &known_state)?;
-                        changes.extend(result.changes);
-                        local_flags.extend(result.local_flags);
-                    }
-                    // Folder-discovery pass: enumerate maildir-shaped
-                    // directories under `maildir_root` that no binding
-                    // covers and emit a `LocalFolderCreated` for each.
-                    // Walk strategy is layout-aware -- see
-                    // `scan::discover_unbound_folders`. Full-scope is
-                    // the comprehensive sweep that catches folders
-                    // created while the daemon wasn't running (or
-                    // missed by fsevents); `scan_paths` emits the same
-                    // variant per-event for folders the watcher saw
-                    // live, so both scopes converge on the same shape.
-                    changes.extend(scan::discover_unbound_folders(
-                        &maildir_root,
-                        self.config.sync.folder_layout,
-                        mailboxes.index(),
-                    ));
-                    (changes, local_flags)
-                }
-                ScanScope::Paths(paths) => {
-                    let mut known_states = HashMap::new();
-                    for binding in mailboxes.scan_set(include_orphans) {
-                        // Path-driven cycles only fire for fsevent
-                        // paths the watcher already saw, so a
-                        // maildir-shaped folder absent at this
-                        // point means no events referenced it.
-                        // Skip the state hydration for absent
-                        // folders rather than creating them as a
-                        // side effect.
-                        //
-                        // Push-side orphan detection
-                        // (`LocalFolderDeleted` emission for an
-                        // absent maildir) lives only in the
-                        // Full-scope branch above; Paths cycles
-                        // converge on the next periodic Full
-                        // sweep (or post-disconnect catchup),
-                        // since `scan_paths` operates on event
-                        // paths rather than bindings.
-                        if store::try_open_maildir(&maildir_root.join(&binding.maildir_folder))
-                            .is_none()
-                        {
-                            continue;
+        let mut scan_states = HashMap::new();
+        let mut global_scan_state = HashMap::new();
+        for binding in mailboxes.scan_set(include_orphans) {
+            let state = hydrate_known_state(self.conn, &binding)?;
+            global_scan_state.extend(state.clone());
+            scan_states.insert(binding.maildir_folder.clone(), state);
+        }
+        let (scan_changes, local_flags) = loop {
+            let scanned = {
+                let _phase =
+                    tracing::info_span!(target: crate::profile::TARGET_PHASE, "scan").entered();
+                match &scan_scope {
+                    ScanScope::Full | ScanScope::Retry { .. } => {
+                        let mut changes = Vec::new();
+                        let mut local_flags: HashMap<MaildirId, String> = HashMap::new();
+                        for binding in mailboxes.scan_set(include_orphans) {
+                            let maildir_path = maildir_root.join(&binding.maildir_folder);
+                            // Three reasons a binding's maildir might
+                            // not exist on disk:
+                            //   - First-cycle binding awaiting
+                            //     `CreateLocalMailbox` (filtered via
+                            //     `is_new_mailbox`).
+                            //   - Sentinel survived elsewhere (the
+                            //     user `mv`-ed the folder; rename
+                            //     detection in `resolve_mailboxes` is
+                            //     authoritative).
+                            //   - Sentinel gone everywhere -- the user
+                            //     deleted the folder.
+                            // Only the third emits
+                            // `LocalChange::LocalFolderDeleted`; the
+                            // first two skip silently. Pull-side
+                            // orphan bindings (only present under
+                            // `include_orphans`) aren't in `by_id`, so
+                            // the live-binding check filters them too.
+                            let Some(maildir) = store::try_open_maildir(&maildir_path) else {
+                                if let MaybeReference::Value(id) = &binding.jmap_mailbox_id
+                                    && mailboxes.by_id(id).is_some()
+                                    && !mailboxes.is_new_mailbox(id)
+                                    && !mailboxes.sentinel_survives_for(id)
+                                {
+                                    changes.push(scan::LocalChange::LocalFolderDeleted {
+                                        binding: Arc::clone(&binding),
+                                    });
+                                }
+                                continue;
+                            };
+                            let result = scan::scan_folder(&maildir, &binding, &global_scan_state)?;
+                            changes.extend(result.changes);
+                            local_flags.extend(result.local_flags);
                         }
-                        let state = hydrate_known_state(self.conn, &binding)?;
-                        known_states.insert(binding.maildir_folder.clone(), state);
+                        // Folder-discovery pass: enumerate maildir-shaped
+                        // directories under `maildir_root` that no binding
+                        // covers and emit a `LocalFolderCreated` for each.
+                        // Walk strategy is layout-aware -- see
+                        // `scan::discover_unbound_folders`. Full-scope is
+                        // the comprehensive sweep that catches folders
+                        // created while the daemon wasn't running (or
+                        // missed by fsevents); `scan_paths` emits the same
+                        // variant per-event for folders the watcher saw
+                        // live, so both scopes converge on the same shape.
+                        changes.extend(scan::discover_unbound_folders(
+                            &maildir_root,
+                            self.config.sync.folder_layout,
+                            mailboxes.index(),
+                        ));
+                        (changes, local_flags)
                     }
-                    let result = scan::scan_paths(
-                        &maildir_root,
-                        paths,
-                        &known_states,
-                        mailboxes.index(),
-                        self.config.sync.folder_layout,
-                    )?;
-                    (result.changes, result.local_flags)
+                    ScanScope::Paths(paths) => {
+                        let result = scan::scan_paths(
+                            &maildir_root,
+                            paths,
+                            &scan_states,
+                            mailboxes.index(),
+                            self.config.sync.folder_layout,
+                        )?;
+                        (result.changes, result.local_flags)
+                    }
                 }
+            };
+            if matches!(scan_scope, ScanScope::Paths(_))
+                && scanned
+                    .0
+                    .iter()
+                    .any(|change| matches!(change, LocalChange::DeletedMessage { .. }))
+            {
+                debug!("Partial scan contains a deletion candidate; widening to a full inventory");
+                scan_scope = ScanScope::Full;
+                continue;
             }
+            break scanned;
         };
 
         // Suppress scan's view of files plan_dedupe flagged for
@@ -429,44 +604,49 @@ impl<'a> SyncEngine<'a> {
         // filter reconcile would print a plan with phantom actions
         // for the soon-to-be-deduped duplicates, lying about what a
         // real `jma sync` would do.
-        let all_local_changes: Vec<LocalChange> = if dry_run && !dedupe_plan.deletions.is_empty() {
-            let suppressed: HashSet<(String, MaildirId)> = dedupe_plan
-                .deletions
-                .iter()
-                .map(|d| (d.folder.clone(), d.maildir_id.clone()))
-                .collect();
-            scan_changes
-                .into_iter()
-                .filter(|c| {
-                    let key = match c {
-                        LocalChange::NewMessage {
-                            binding,
-                            maildir_id,
-                            ..
-                        }
-                        | LocalChange::FlagsChanged {
-                            binding,
-                            maildir_id,
-                            ..
-                        }
-                        | LocalChange::DeletedMessage {
-                            binding,
-                            maildir_id,
-                            ..
-                        } => (binding.maildir_folder.clone(), maildir_id.clone()),
-                        // Folder-lifecycle variants are not message-level
-                        // and don't participate in dedupe; always pass
-                        // through.
-                        LocalChange::LocalFolderCreated { .. }
-                        | LocalChange::LocalFolderDeleted { .. }
-                        | LocalChange::LocalFolderRenamed { .. } => return true,
-                    };
-                    !suppressed.contains(&key)
-                })
-                .collect()
-        } else {
-            scan_changes
-        };
+        let mut all_local_changes: Vec<LocalChange> =
+            if dry_run && !dedupe_plan.deletions.is_empty() {
+                let suppressed: HashSet<(String, MaildirId)> = dedupe_plan
+                    .deletions
+                    .iter()
+                    .map(|d| (d.folder.clone(), d.maildir_id.clone()))
+                    .collect();
+                scan_changes
+                    .into_iter()
+                    .filter(|c| {
+                        let key = match c {
+                            LocalChange::NewMessage {
+                                binding,
+                                maildir_id,
+                                ..
+                            }
+                            | LocalChange::FlagsChanged {
+                                binding,
+                                maildir_id,
+                                ..
+                            }
+                            | LocalChange::DeletedMessage {
+                                binding,
+                                maildir_id,
+                                ..
+                            } => (binding.maildir_folder.clone(), maildir_id.clone()),
+                            // Folder-lifecycle variants are not message-level
+                            // and don't participate in dedupe; always pass
+                            // through.
+                            LocalChange::LocalFolderCreated { .. }
+                            | LocalChange::LocalFolderDeleted { .. }
+                            | LocalChange::LocalFolderRenamed { .. } => return true,
+                        };
+                        !suppressed.contains(&key)
+                    })
+                    .collect()
+            } else {
+                scan_changes
+            };
+
+        let deferred_presence =
+            defer_ambiguous_deletes(self.conn, &maildir_root, &mailboxes, &mut all_local_changes)?;
+        let deferred_actions = deferred_presence.count;
 
         // Convert `LocalChange::LocalFolderDeleted` events into
         // entries on `mailboxes.remote_orphans()`. Scan emits the
@@ -534,9 +714,18 @@ impl<'a> SyncEngine<'a> {
         // so they bypass this entirely and always fetch.
         if matches!(scan_scope, ScanScope::Paths(_)) && all_local_changes.is_empty() {
             debug!("Path-scan produced no local changes; skipping remote fetch");
-            return Ok(SyncOutcome {
-                already_in_sync: true,
+            let mut outcome = SyncOutcome {
+                deferred_actions,
+                review_actions: deferred_actions,
                 ..Default::default()
+            };
+            outcome.observe_flag_status(&pending_before);
+            outcome.already_in_sync = !outcome.has_pending_work();
+            let report = outcome.has_pending_work();
+            return Ok(CycleRun {
+                outcome,
+                used_initial_path: false,
+                report,
             });
         }
 
@@ -559,11 +748,56 @@ impl<'a> SyncEngine<'a> {
             .resurrect_remote_orphans_for_server_wins(mailboxes, remote_emails)
             .await?;
 
-        // Phase 3: build known indices and reconcile.
-        let plan = {
+        // Verification reads are observations, not Email/changes events.
+        // In particular they must not create a spurious delete/update conflict.
+        let mut known = build_known_indices(self.conn, &mailboxes)?;
+        known.retry_only = retry_only;
+        known.held_local_folders = deferred_presence.folders;
+        let observed: HashSet<_> = remote_emails.iter().map(|email| email.id.clone()).collect();
+        let destroyed: HashSet<_> = remote_destroyed.iter().cloned().collect();
+        let verify: Vec<_> = known
+            .by_jmap
+            .values()
+            .filter(|record| {
+                record.maildir_id.is_some()
+                    && !observed.contains(&record.jmap_email_id)
+                    && !destroyed.contains(&record.jmap_email_id)
+                    && (record.jmap_blob_id.is_none()
+                        || record.jmap_thread_id.is_none()
+                        || serde_json::from_str::<HashMap<String, bool>>(&record.jmap_keywords)
+                            .is_err()
+                        || known
+                            .flag_sync
+                            .get(&record.jmap_email_id)
+                            .is_some_and(|state| {
+                                state.legacy
+                                    || state.review
+                                    || state.baseline.is_none()
+                                    || state.attempt.is_some()
+                                    || state.error.is_some()
+                            }))
+            })
+            .map(|record| record.jmap_email_id.clone())
+            .collect();
+        if !verify.is_empty() {
+            let fresh = self.batched_get(&verify).await?;
+            known
+                .remote_observations
+                .extend(fresh.into_iter().map(|email| (email.id.clone(), email)));
+            known.unverified_remote.extend(
+                verify
+                    .into_iter()
+                    .filter(|id| !known.remote_observations.contains_key(id)),
+            );
+        }
+
+        // Keep the observation guard separate from cursor advancement: move
+        // policy or direction gates may deliberately withhold that cursor.
+        let planning_state = new_state.clone();
+        // Phase 3: build a pure plan from observations and acknowledged state.
+        let mut plan = {
             let _phase =
                 tracing::info_span!(target: crate::profile::TARGET_PHASE, "reconcile").entered();
-            let known = build_known_indices(self.conn, &mailboxes)?;
             reconcile::reconcile(ReconcileInput {
                 remote_emails: &remote_emails,
                 remote_destroyed: &remote_destroyed,
@@ -580,6 +814,12 @@ impl<'a> SyncEngine<'a> {
                 hierarchy_separator: self.config.sync.hierarchy_separator,
                 maildir_root: &maildir_root,
             })
+        };
+
+        let withheld_remote = if retry_only {
+            defer_blocked_remote_actions(&mut plan, &blocked_remote_ids)
+        } else {
+            HashSet::new()
         };
 
         // Structural write barrier: folder-level primitives
@@ -620,7 +860,8 @@ impl<'a> SyncEngine<'a> {
         // removal would be a lie under both dry-run (the user is
         // about to see them in the plan) and non-dry-run (apply_dedupe
         // just ran and removed them).
-        let already_in_sync = plan.is_empty() && dedupe_plan.deletions.is_empty();
+        let already_in_sync =
+            plan.is_empty() && dedupe_plan.deletions.is_empty() && deferred_actions == 0;
 
         if dry_run {
             if !dedupe_plan.deletions.is_empty() {
@@ -637,9 +878,23 @@ impl<'a> SyncEngine<'a> {
                 println!();
             }
             print!("{}", plan);
-            return Ok(SyncOutcome {
-                already_in_sync,
+            let mut outcome = SyncOutcome {
+                deferred_actions,
+                review_actions: deferred_actions,
                 ..Default::default()
+            };
+            outcome.observe_flag_status(&pending_before);
+            outcome.already_in_sync = already_in_sync && !outcome.has_pending_work();
+            if outcome.has_pending_work() {
+                println!(
+                    "Existing pending work (unchanged by preview): {}",
+                    outcome.pending_summary()
+                );
+            }
+            return Ok(CycleRun {
+                outcome,
+                used_initial_path,
+                report: false,
             });
         }
 
@@ -693,13 +948,19 @@ impl<'a> SyncEngine<'a> {
             self.self_writes.clone(),
         )?;
         let mut outcome = executor
-            .execute(filtered)
+            .execute(filtered, Some(&planning_state))
             .instrument(tracing::info_span!(
                 target: crate::profile::TARGET_PHASE,
                 "execute",
             ))
             .await?;
-        outcome.already_in_sync = already_in_sync;
+        outcome.observe_flag_status(&flag_sync::summarize(self.conn, &flag_scope)?);
+        outcome.blocked_remote_ids.extend(withheld_remote);
+        outcome.retry_scope_checked =
+            matches!(scan_scope, ScanScope::Full) && matches!(direction, SyncDirection::Both);
+        outcome.deferred_actions += deferred_actions;
+        outcome.review_actions += deferred_actions;
+        outcome.already_in_sync = already_in_sync && !outcome.has_pending_work();
         outcome.remote_orphans_detected = mailboxes.remote_orphans().len();
         outcome.remote_orphan_total_emails = mailboxes
             .remote_orphans()
@@ -774,28 +1035,11 @@ impl<'a> SyncEngine<'a> {
             warn!("Failed to record folder_checkpoint rows; next cycle will re-walk dedupe: {e:#}");
         }
 
-        if already_in_sync {
-            crate::notify!("Already in sync");
-        } else if used_initial_path {
-            crate::notify!(
-                "Initial sync complete ({} downloaded, {} uploaded, {} flag updates, {} moved, {} deleted)",
-                outcome.downloaded,
-                outcome.uploaded,
-                outcome.flag_updates,
-                outcome.moved,
-                outcome.deleted
-            );
-        } else {
-            crate::notify!(
-                "Sync complete ({} downloaded, {} uploaded, {} flag updates, {} moved, {} deleted)",
-                outcome.downloaded,
-                outcome.uploaded,
-                outcome.flag_updates,
-                outcome.moved,
-                outcome.deleted
-            );
-        }
-        Ok(outcome)
+        Ok(CycleRun {
+            outcome,
+            used_initial_path,
+            report: true,
+        })
     }
 
     /// Resolve this cycle's mailbox set and the `Mailbox` state token
@@ -1074,6 +1318,9 @@ impl<'a> SyncEngine<'a> {
         &self,
         mailboxes: &MailboxBindings,
     ) -> Result<(Vec<EmailObject>, Vec<JmapEmailId>, String, bool)> {
+        // An after-the-read token could skip an intervening update or authorize
+        // stale metadata. The initial cookie must precede all enumeration/get.
+        let state = jmap_email::get_current_state(&self.client).await?;
         let mut all_ids: Vec<JmapEmailId> = Vec::new();
         let mut seen: HashSet<JmapEmailId> = HashSet::new();
 
@@ -1115,7 +1362,6 @@ impl<'a> SyncEngine<'a> {
         }
 
         let emails = self.batched_get(&all_ids).await?;
-        let state = jmap_email::get_current_state(&self.client).await?;
         Ok((emails, Vec::new(), state, true))
     }
 
@@ -1300,7 +1546,7 @@ fn compute_dirty_folders(
         // reads `cur/`/`new/`; a maildir-shaped folder absent at
         // this point can't have grown duplicates since the last
         // checkpoint (it has no files at all).
-        if !path.join("cur").is_dir() {
+        if !store::is_maildir(&path) {
             continue;
         }
         let current = crate::maildir_ops::snapshot::snapshot_folder(&path)?;
@@ -1411,7 +1657,7 @@ fn record_folder_checkpoints(
         // has nothing to checkpoint. The next cycle's
         // `compute_dirty_folders` will treat the still-absent
         // folder as trivially clean too.
-        if !path.join("cur").is_dir() {
+        if !store::is_maildir(&path) {
             continue;
         }
         let snapshot = crate::maildir_ops::snapshot::snapshot_folder(&path)?;
@@ -1442,6 +1688,193 @@ fn hydrate_known_state(
         .collect())
 }
 
+/// A partial or ambiguous inventory must not authorize a remote destroy.
+/// Exact move pairs remain for reconcile; other live identity candidates
+/// defer the deletion without implicitly importing an unknown new/ file.
+#[derive(Default)]
+struct DeferredLocalDeletes {
+    count: usize,
+    folders: HashSet<String>,
+}
+
+fn defer_ambiguous_deletes(
+    conn: &Connection,
+    root: &Path,
+    mailboxes: &MailboxBindings,
+    changes: &mut Vec<LocalChange>,
+) -> Result<DeferredLocalDeletes> {
+    if !changes
+        .iter()
+        .any(|change| matches!(change, LocalChange::DeletedMessage { .. }))
+    {
+        return Ok(DeferredLocalDeletes::default());
+    }
+    let known = build_known_indices(conn, mailboxes)?;
+    let mut candidates = HashMap::new();
+    for change in changes.iter() {
+        let LocalChange::DeletedMessage { maildir_id, .. } = change else {
+            continue;
+        };
+        let Some(record) = known.by_maildir.get(maildir_id) else {
+            continue;
+        };
+        let pairs = changes
+            .iter()
+            .filter(|other| {
+                matches!(other,
+                    LocalChange::NewMessage { message_id, .. } if message_id == &record.message_id
+                )
+            })
+            .count();
+        if pairs != 1 {
+            candidates.insert(maildir_id.clone(), record.message_id.clone());
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(DeferredLocalDeletes::default());
+    }
+    let bindings = mailboxes.scan_set(true);
+    let inventory = scan::inventory_identities(
+        root,
+        bindings
+            .iter()
+            .map(|binding| binding.maildir_folder.as_str()),
+    )?;
+    let mut folders = HashSet::new();
+    let deferred: HashSet<_> = candidates.into_iter().filter_map(|(id, message_id)| {
+        let live = inventory.contains(&id, &message_id);
+        if live {
+            warn!("Deferring deletion of {}: a live identity candidate still exists in cur/ or new/", id);
+            folders.extend(inventory.candidate_folders(&id, &message_id));
+            Some(id)
+        } else { None }
+    }).collect();
+    changes.retain(|change| {
+        !matches!(change,
+            LocalChange::DeletedMessage { maildir_id, .. } if deferred.contains(maildir_id)
+        )
+    });
+    Ok(DeferredLocalDeletes {
+        count: deferred.len(),
+        folders,
+    })
+}
+
+/// Keep ordinary flag renames path-scoped, but inventory new identities before
+/// adoption/upload planning. A partial filename map cannot prove that a cached
+/// anchor is absent, and without Phase 0 it has no canonical content siblings.
+fn paths_need_full_identity_scan(
+    conn: &Connection,
+    root: &Path,
+    mailboxes: &MailboxBindings,
+    paths: &[PathBuf],
+    include_orphans: bool,
+) -> Result<bool> {
+    let bindings = mailboxes.scan_set(include_orphans);
+    let managed: HashSet<_> = bindings
+        .iter()
+        .map(|binding| binding.maildir_folder.as_str())
+        .collect();
+    let mut live = HashSet::new();
+    let mut disappeared = HashSet::new();
+    for path in paths {
+        let Some((folder, side, id, _)) = scan::parse_event_path(root, path) else {
+            continue;
+        };
+        if !managed.contains(folder.as_str()) || id.as_ref().starts_with('.') {
+            continue;
+        }
+        let present = path.is_file();
+        let recorded = queries::get_local_state(conn, &id)?;
+        if present {
+            live.insert((folder.clone(), id.clone()));
+        }
+        match recorded {
+            Some((previous, _)) if present && previous != folder => return Ok(true),
+            None if present && side == "cur" => return Ok(true),
+            Some((previous, _)) if !present && previous == folder => {
+                disappeared.insert((folder, id));
+            }
+            _ => {}
+        }
+    }
+    Ok(disappeared.iter().any(|identity| !live.contains(identity)))
+}
+
+fn flag_mailbox_ids(mailboxes: &MailboxBindings) -> Vec<JmapMailboxId> {
+    mailboxes
+        .scan_set(true)
+        .iter()
+        .map(|binding| {
+            binding
+                .jmap_mailbox_id
+                .expect_resolved("flag history scope")
+                .clone()
+        })
+        .collect()
+}
+
+/// A timer must not turn another ID's retry into repeated attempts of a
+/// confirmed permanent rejection. This mask is daemon-lifetime state only;
+/// ordinary event/manual cycles can reassess the request with fresh inputs.
+fn defer_blocked_remote_actions(
+    plan: &mut SyncPlan,
+    blocked: &HashSet<JmapEmailId>,
+) -> HashSet<JmapEmailId> {
+    let held: HashMap<_, _> = plan
+        .actions
+        .iter()
+        .filter_map(|action| match action {
+            SyncAction::UpdateRemoteKeywords { id, .. }
+            | SyncAction::MoveRemote { id, .. }
+            | SyncAction::DestroyRemote { id }
+                if blocked.contains(&id.jmap_email_id) =>
+            {
+                Some((id.jmap_email_id.clone(), id.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    if held.is_empty() {
+        return HashSet::new();
+    }
+    let held_moves: HashSet<_> = plan
+        .actions
+        .iter()
+        .filter_map(|action| match action {
+            SyncAction::MoveRemote { id, .. } if held.contains_key(&id.jmap_email_id) => {
+                Some(id.jmap_email_id.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    plan.actions.retain(|action| match action {
+        SyncAction::UpdateRemoteKeywords { id, .. }
+        | SyncAction::MoveRemote { id, .. }
+        | SyncAction::DestroyRemote { id } => !held.contains_key(&id.jmap_email_id),
+        SyncAction::AdoptLocalMessage {
+            id,
+            old_maildir_id: Some(_),
+            ..
+        }
+        | SyncAction::UpdateLocalFlags { id, .. }
+        | SyncAction::ObserveMessage { id, .. } => !held_moves.contains(&id.jmap_email_id),
+        _ => true,
+    });
+    plan.new_email_state = None;
+    let ids = held.keys().cloned().collect();
+    plan.actions.extend(held.into_values().map(|id| {
+        SyncAction::DeferredFlagState {
+            id,
+            retryable: false,
+            reason:
+                "Confirmed permanent remote rejection; a normal event/manual cycle must reassess it"
+                    .into(),
+        }
+    }));
+    ids
+}
+
 /// Build the three message_map projections the reconcile step consumes.
 /// Free function rather than a `SyncEngine` method because it only
 /// needs `&Connection` -- keeping it free lets the in-module unit tests
@@ -1459,13 +1892,67 @@ fn build_known_indices(
     mailboxes: &MailboxBindings,
 ) -> Result<MessageRecordIndex> {
     let mut idx = MessageRecordIndex::default();
+    let flag_states = flag_sync::load_for_mailboxes(conn, &flag_mailbox_ids(mailboxes))?;
+    // ServerWins resurrection of a locally deleted folder clears these old
+    // bindings in CreateLocalMailbox before message effects. Plan against that
+    // projected state, not ghost paths which would suppress body restoration.
+    // Different-ID replacements still retain local-orphan history checks.
+    let rebuilt: HashSet<_> = mailboxes
+        .new_mailboxes()
+        .iter()
+        .filter_map(|new| {
+            new.replaces_orphan_id
+                .as_ref()
+                .filter(|old| {
+                    *old == new
+                        .binding
+                        .jmap_mailbox_id
+                        .expect_resolved("rebuilt local mailbox")
+                })
+                .cloned()
+        })
+        .collect();
 
-    for binding in mailboxes.iter() {
+    // Pending flag histories in local orphans must remain visible to the
+    // destructive-folder conflict pass too, even without a new local delta.
+    for binding in mailboxes.scan_set(true) {
         let mailbox_id = binding
             .jmap_mailbox_id
-            .expect_resolved("build_known_indices -- live bindings must be resolved");
+            .expect_resolved("build_known_indices -- scan bindings must be resolved");
+        if rebuilt.contains(mailbox_id) {
+            continue;
+        }
         let messages = queries::get_messages_by_jmap_mailbox_id(conn, mailbox_id)?;
+        let local = queries::get_local_state_for_folder(conn, &binding.maildir_folder)?;
         for msg in messages {
+            let state = flag_states
+                .get(&msg.jmap_email_id)
+                .cloned()
+                .unwrap_or_else(|| {
+                    let local_flags = msg
+                        .maildir_id
+                        .as_ref()
+                        .and_then(|id| local.get(id))
+                        .map(|(_, flags)| flag_sync::mapped_flags(flags));
+                    let cached: Option<HashMap<String, bool>> =
+                        serde_json::from_str(&msg.jmap_keywords).ok();
+                    let cached_flags = cached
+                        .as_ref()
+                        .map(crate::maildir_ops::flags::keywords_to_flags);
+                    let common = local_flags
+                        .as_ref()
+                        .filter(|flags| {
+                            *flags == &msg.flags && cached_flags.as_ref() == Some(*flags)
+                        })
+                        .cloned();
+                    flag_sync::FlagSyncState {
+                        review: common.is_none(),
+                        baseline: common,
+                        legacy: true,
+                        ..Default::default()
+                    }
+                });
+            idx.flag_sync.insert(msg.jmap_email_id.clone(), state);
             // Wrap once; the three projections share via Arc
             // refcount instead of cloning the full record into two
             // of them. Per-cycle peak shrinks roughly 2.5x at the
@@ -2235,40 +2722,8 @@ fn enumerate_local_orphan_messages(
         .jmap_mailbox_id
         .expect_resolved("enumerate_local_orphan_messages -- orphan binding is resolved");
     let folder_path = maildir_root.join(&orphan.binding.maildir_folder);
-    let maildir = match store::try_open_maildir(&folder_path) {
-        Some(md) => md,
-        None => {
-            // `try_open_maildir` returns None for: folder
-            // missing (external action already resolved the
-            // orphan from our side), folder present but
-            // missing `cur/` (no maildir-shaped content), or
-            // a stat failure (permission, EIO, etc.). The
-            // first two reduce to "nothing to catalog." The
-            // third is user-actionable -- surface so the
-            // cause is visible before a downstream destroy
-            // or resurrect fails for the same reason with
-            // less context.
-            match std::fs::metadata(&folder_path) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                    error!(
-                        "Cannot read orphan folder {}: {} -- skipping its \
-                         message catalog; downstream destroy or resurrect \
-                         will likely fail for the same reason",
-                        folder_path.display(),
-                        e
-                    );
-                }
-                _ => {
-                    debug!(
-                        "Orphan folder {} has nothing to catalog (folder \
-                         absent or no `cur/`)",
-                        folder_path.display()
-                    );
-                }
-            }
-            return Ok(Vec::new());
-        }
-    };
+    // Missing peers are empty, but an unreadable present side must abort
+    // resolution rather than authorize destruction from an empty catalog.
 
     // Index DB rows by `maildir_id` for an O(1) file->row join
     // during the directory walk. Files always have a
@@ -2286,10 +2741,10 @@ fn enumerate_local_orphan_messages(
     }
 
     let mut messages = Vec::new();
-    for entry in maildir.list_cur().chain(maildir.list_new()) {
+    for entry in crate::maildir_ops::entries::read(&folder_path)? {
         let entry = entry?;
-        let maildir_id = MaildirId::from(entry.id());
-        let path = entry.path().to_path_buf();
+        let maildir_id = entry.maildir_id;
+        let path = entry.path;
         // I/O failures propagate; `Ok(None)` (no parseable
         // Message-ID header) drops at `debug!` rather than
         // `error!` because the orphan folder is destined for
@@ -2306,7 +2761,7 @@ fn enumerate_local_orphan_messages(
                 continue;
             }
         };
-        let flags = entry.flags().to_string();
+        let flags = entry.flags;
         let size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         let jmap_email_id = bound_by_maildir
             .get(&maildir_id)
@@ -2447,8 +2902,11 @@ fn log_dropped(direction: SyncDirection, dropped: &[SyncAction]) {
                 "{:?}: dropped DestroyRemoteMailbox {} (id {})",
                 direction, binding.remote_path, binding.jmap_mailbox_id
             ),
-            // Adoption is always kept; it never appears here.
-            SyncAction::AdoptLocalMessage { .. } => {}
+            // Direction-neutral metadata is always kept; it never appears here.
+            SyncAction::AdoptLocalMessage { .. }
+            | SyncAction::ObserveMessage { .. }
+            | SyncAction::RecordFlagState { .. }
+            | SyncAction::DeferredFlagState { .. } => {}
         }
     }
 }
@@ -2456,6 +2914,38 @@ fn log_dropped(direction: SyncDirection, dropped: &[SyncAction]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_outcomes_distinguish_retryable_membership_waits_from_review() {
+        let retryable = SyncOutcome {
+            failed_remote_actions: 1,
+            retryable_remote_actions: 1,
+            deferred_actions: 1,
+            ..Default::default()
+        };
+        assert!(retryable.needs_retry() && retryable.has_pending_work());
+        assert!(
+            !retryable.has_blocked_work(),
+            "a gated pull awaiting a retryable ACK is not review work"
+        );
+        let review = SyncOutcome {
+            deferred_actions: 1,
+            review_actions: 1,
+            ..Default::default()
+        };
+        assert!(review.has_pending_work() && review.has_blocked_work());
+        assert!(!review.needs_retry());
+        let unverified = SyncOutcome {
+            unverified_flag_actions: 1,
+            ..Default::default()
+        };
+        assert!(unverified.has_pending_work());
+        assert!(
+            !unverified.needs_retry(),
+            "verification scheduling follows the actual deferred classification"
+        );
+    }
+
     use crate::ids::{JmapEmailId, MaildirId, MessageId};
     use crate::state::db;
     use crate::state::queries::MessageRecord;

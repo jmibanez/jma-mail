@@ -150,6 +150,11 @@ async fn main() -> Result<()> {
         Command::Init { no_interactive } => cmd_init(&cli, no_interactive).await,
         Command::Mailboxes => cmd_mailboxes(&cli).await,
         Command::Status => cmd_status(&cli).await,
+        Command::RepairFlags {
+            authority,
+            apply,
+            email_ids,
+        } => cmd_repair_flags(&cli, authority, apply, email_ids).await,
         Command::Sync { args } => cmd_sync(&cli, args.dry_run).await,
         Command::Pull { dry_run } => cmd_pull(&cli, dry_run).await,
         Command::Push { dry_run } => cmd_push(&cli, dry_run).await,
@@ -428,6 +433,12 @@ async fn cmd_status(cli: &Cli) -> Result<()> {
     print_account_cursors(&conn)?;
 
     println!();
+    println!(
+        "{}",
+        jma_mail::sync::status::cached_flag_status(&conn, &config.sync)?
+    );
+
+    println!();
     print_maildir_drift(&conn, &config)?;
 
     Ok(())
@@ -604,6 +615,47 @@ fn acquire_mutator_locks(config: &Config) -> Result<()> {
     Ok(())
 }
 
+async fn cmd_repair_flags(
+    cli: &Cli,
+    authority: jma_mail::sync::flag_repair::FlagAuthority,
+    apply: bool,
+    email_ids: Vec<String>,
+) -> Result<()> {
+    let config = load_config(cli)?;
+    anyhow::ensure!(
+        config.db_path().is_file(),
+        "Flag repair requires an existing state DB; it never rebuilds bindings"
+    );
+    // Serialize the preview as well as apply against cooperating jma mutators.
+    // Unlike ordinary sync, never recreate a mismatched history database.
+    acquire_mutator_locks(&config)?;
+    let conn = state::db::open_preserving_history(&config.db_path())?;
+    let client = Arc::new(session::connect(&config.account, &conn).await?);
+    let ids: Vec<_> = email_ids.into_iter().map(Into::into).collect();
+    let preview =
+        jma_mail::sync::flag_repair::inspect(&client, &conn, &config, &ids, authority).await?;
+    println!("{preview}");
+    if !apply {
+        return Ok(());
+    }
+    let outcome = preview.apply(client, &conn, &config).await
+        .context("Flag repair incomplete; review is retained for unfinished effects; rerun repair-flags explicitly")?;
+    anyhow::ensure!(
+        outcome.failed_remote_actions == 0
+            && outcome.retryable_local_actions == 0
+            && !outcome.replan_required,
+        "Flag repair incomplete: {} failed remote, {} failed local, fresh preview required={}; rerun repair-flags explicitly",
+        outcome.failed_remote_actions,
+        outcome.retryable_local_actions,
+        outcome.replan_required
+    );
+    println!(
+        "Flag repair applied: {} flag effect(s) acknowledged. Account cursors unchanged.",
+        outcome.flag_updates
+    );
+    Ok(())
+}
+
 async fn cmd_sync(cli: &Cli, dry_run: bool) -> Result<()> {
     let config = load_config(cli)?;
     acquire_mutator_locks(&config)?;
@@ -713,9 +765,13 @@ async fn cmd_janitor(cli: &Cli, action: Option<JanitorAction>) -> Result<()> {
     let action = action.unwrap_or(JanitorAction::Dedupe { apply: false });
     match action {
         JanitorAction::Dedupe { apply } => cmd_janitor_dedupe(cli, apply).await,
-        JanitorAction::Remotededupe { mailbox, yes } => {
-            cmd_janitor_remotededupe(cli, mailbox, yes).await
-        }
+        JanitorAction::Remotededupe {
+            mailbox,
+            details,
+            content_preview,
+            yes,
+        } => cmd_janitor_remotededupe(cli, mailbox, details, content_preview, yes).await,
+        JanitorAction::Destroyids { from, yes } => cmd_janitor_destroyids(cli, from, yes).await,
         JanitorAction::Rebindfolders {
             sample_size,
             bind,
@@ -734,7 +790,7 @@ async fn cmd_janitor(cli: &Cli, action: Option<JanitorAction>) -> Result<()> {
 async fn cmd_janitor_dedupe(cli: &Cli, apply: bool) -> Result<()> {
     let config = load_config(cli)?;
     acquire_mutator_locks(&config)?;
-    let conn = state::db::open_or_recreate(&config.db_path())?;
+    let conn = state::db::open_preserving_history(&config.db_path())?;
 
     // Offline path: enumerate folders from the DB's mailbox_map
     // instead of going through JMAP. Janitor work shouldn't
@@ -747,7 +803,9 @@ async fn cmd_janitor_dedupe(cli: &Cli, apply: bool) -> Result<()> {
     }
 
     let maildir_root = config.canonical_maildir_root()?;
-    let plan = jma_mail::janitor::dedupe::run(&maildir_root, &folders, !apply)?;
+    let tracked_maildir_ids = jma_mail::state::queries::list_tracked_maildir_ids(&conn)?;
+    let plan =
+        jma_mail::janitor::dedupe::run(&maildir_root, &folders, !apply, &tracked_maildir_ids)?;
 
     if plan.deletions.is_empty() {
         jma_mail::notify!(
@@ -776,7 +834,13 @@ async fn cmd_janitor_dedupe(cli: &Cli, apply: bool) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_janitor_remotededupe(cli: &Cli, mailbox: Option<String>, yes: bool) -> Result<()> {
+async fn cmd_janitor_remotededupe(
+    cli: &Cli,
+    mailbox: Option<String>,
+    details: bool,
+    content_preview: Option<usize>,
+    yes: bool,
+) -> Result<()> {
     let config = load_config(cli)?;
     // Acquire the same locks any mutating command does. We don't
     // write the maildir, but a running `jma sync` holds *both* the
@@ -785,7 +849,7 @@ async fn cmd_janitor_remotededupe(cli: &Cli, mailbox: Option<String>, yes: bool)
     // without communicating to the operator that the conflict is
     // total. The honest posture is "this and sync don't co-exist."
     acquire_mutator_locks(&config)?;
-    let conn = state::db::open_or_recreate(&config.db_path())?;
+    let conn = state::db::open_preserving_history(&config.db_path())?;
 
     // Resolve --mailbox (if given) against the synced set so we
     // never query a folder the user has no local mapping for; the
@@ -826,10 +890,20 @@ async fn cmd_janitor_remotededupe(cli: &Cli, mailbox: Option<String>, yes: bool)
     // sees what *would* have been destroyed; we just skip the apply
     // step.
     let effective_dry_run = !yes;
-    let (plan, outcome) =
-        jma_mail::janitor::remotededupe::run(&client, &conn, &folders, effective_dry_run).await?;
+    let report_options = jma_mail::janitor::remotededupe::RemoteDedupeReportOptions {
+        details: details || content_preview.is_some(),
+        content_preview_bytes: content_preview,
+    };
+    let (plan, outcome) = jma_mail::janitor::remotededupe::run_with_report(
+        &client,
+        &conn,
+        &folders,
+        effective_dry_run,
+        report_options,
+    )
+    .await?;
 
-    render_remotededupe_plan(&plan);
+    render_remotededupe_plan(&plan, &report_options);
 
     if plan.destroy_count() == 0 && plan.skipped.is_empty() {
         jma_mail::notify!(
@@ -865,6 +939,136 @@ async fn cmd_janitor_remotededupe(cli: &Cli, mailbox: Option<String>, yes: bool)
     Ok(())
 }
 
+async fn cmd_janitor_destroyids(cli: &Cli, from: std::path::PathBuf, yes: bool) -> Result<()> {
+    use jma_mail::ids::JmapEmailId;
+    use jma_mail::jmap::email::{EmailSetOp, get_by_ids, set_email_batch};
+    use std::collections::HashSet;
+
+    let config = load_config(cli)?;
+    acquire_mutator_locks(&config)?;
+    let conn = state::db::open_preserving_history(&config.db_path())?;
+
+    let contents = std::fs::read_to_string(&from)
+        .with_context(|| format!("Failed to read exact destroy manifest {}", from.display()))?;
+    let mut ids = Vec::new();
+    let mut seen = HashSet::new();
+    for (index, raw) in contents.lines().enumerate() {
+        let value = raw.trim();
+        if value.is_empty() || value.starts_with('#') {
+            continue;
+        }
+        if value.split_whitespace().count() != 1 {
+            anyhow::bail!(
+                "{}:{} must contain exactly one JMAP Email id",
+                from.display(),
+                index + 1
+            );
+        }
+        if !seen.insert(value.to_string()) {
+            anyhow::bail!(
+                "{}:{} repeats JMAP Email id {}",
+                from.display(),
+                index + 1,
+                value
+            );
+        }
+        ids.push(JmapEmailId::from(value));
+    }
+    if ids.is_empty() {
+        anyhow::bail!(
+            "Exact destroy manifest {} contains no JMAP Email ids",
+            from.display()
+        );
+    }
+
+    // This path exists for reviewed remote-only objects. A mapped id has a
+    // local file whose identity depends on it, so one mapped id aborts the
+    // entire manifest rather than silently shrinking a destructive batch.
+    let mut mapped = Vec::new();
+    for id in &ids {
+        if state::queries::get_message_by_jmap_id(&conn, id)?.is_some() {
+            mapped.push(id.clone());
+        }
+    }
+    if !mapped.is_empty() {
+        mapped.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+        let values = mapped
+            .iter()
+            .map(AsRef::<str>::as_ref)
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!(
+            "Refusing exact destroy manifest: {} id(s) still have local message_map bindings: {}",
+            mapped.len(),
+            values
+        );
+    }
+
+    let client = session::connect(&config.account, &conn).await?;
+    let chunk_size = jma_mail::jmap::limits::max_objects_in_get(&client);
+    let mut present = HashSet::new();
+    for chunk in ids.chunks(chunk_size) {
+        for email in get_by_ids(&client, chunk).await? {
+            present.insert(email.id);
+        }
+    }
+    let already_absent: Vec<&JmapEmailId> =
+        ids.iter().filter(|id| !present.contains(*id)).collect();
+
+    jma_mail::notify!(
+        "Exact destroy manifest: {} unique id(s), {} present on server, \
+         {} already absent, 0 locally mapped.",
+        ids.len(),
+        present.len(),
+        already_absent.len()
+    );
+    for id in &ids {
+        let disposition = if present.contains(id) {
+            "DESTROY"
+        } else {
+            "ALREADY-ABSENT"
+        };
+        println!("  [{disposition}] {id}");
+    }
+
+    if !yes {
+        jma_mail::notify!(
+            "Dry run only; re-run with --yes to destroy the {} present id(s).",
+            present.len()
+        );
+        return Ok(());
+    }
+    if present.is_empty() {
+        jma_mail::notify!("Exact destroy manifest is already fully applied.");
+        return Ok(());
+    }
+
+    let ops: Vec<EmailSetOp> = ids
+        .iter()
+        .filter(|id| present.contains(*id))
+        .cloned()
+        .map(|email_id| EmailSetOp::Destroy { email_id })
+        .collect();
+    let outcome = set_email_batch(&client, &ops).await?;
+    let failed = outcome.failed_destroys;
+    let succeeded = ops.len() - failed.len();
+    jma_mail::notify!(
+        "Exact destroy: {} destroyed, {} already absent, {} failed.",
+        succeeded,
+        already_absent.len(),
+        failed.len()
+    );
+    if !failed.is_empty() {
+        let mut sorted: Vec<&JmapEmailId> = failed.iter().collect();
+        sorted.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+        for id in sorted {
+            println!("  [DESTROY-FAILED] {id}");
+        }
+        anyhow::bail!("{} exact Email destroy(s) failed", failed.len());
+    }
+    Ok(())
+}
+
 async fn cmd_janitor_rebindfolders(
     cli: &Cli,
     sample_size: Option<u32>,
@@ -876,7 +1080,7 @@ async fn cmd_janitor_rebindfolders(
     // network and can write sentinels, so the honest stance is
     // "this does not co-exist with sync." Acquire both.
     acquire_mutator_locks(&config)?;
-    let conn = state::db::open_or_recreate(&config.db_path())?;
+    let conn = state::db::open_preserving_history(&config.db_path())?;
 
     let client = session::connect(&config.account, &conn).await?;
     let maildir_root = config.canonical_maildir_root()?;
@@ -975,7 +1179,7 @@ fn cmd_janitor_prune(
 
     let config = load_config(cli)?;
     acquire_mutator_locks(&config)?;
-    let conn = state::db::open_or_recreate(&config.db_path())?;
+    let conn = state::db::open_preserving_history(&config.db_path())?;
     let maildir_root = config.canonical_maildir_root()?;
 
     let mut plan = prune::plan(
@@ -1127,7 +1331,10 @@ fn render_rebindfolders_plan(plan: &jma_mail::janitor::rebindfolders::RebindFold
     }
 }
 
-fn render_remotededupe_plan(plan: &jma_mail::janitor::remotededupe::RemoteDedupePlan) {
+fn render_remotededupe_plan(
+    plan: &jma_mail::janitor::remotededupe::RemoteDedupePlan,
+    report_options: &jma_mail::janitor::remotededupe::RemoteDedupeReportOptions,
+) {
     for g in &plan.groups {
         println!(
             "  [REMOTE-DEDUPE] {}/  Message-ID {}  blob {}  keep {}  destroy {}",
@@ -1141,19 +1348,112 @@ fn render_remotededupe_plan(plan: &jma_mail::janitor::remotededupe::RemoteDedupe
                 .collect::<Vec<_>>()
                 .join(","),
         );
+        if report_options.details {
+            for member in &g.members {
+                let disposition = if member.email_id == g.survivor {
+                    "keep"
+                } else {
+                    "destroy"
+                };
+                render_remotededupe_member(member, disposition);
+            }
+        }
     }
     for s in &plan.skipped {
         let members = s
             .members
             .iter()
-            .map(|(id, blob)| format!("{}@{}", id, blob))
+            .map(|member| format!("{}@{}", member.email_id, member.blob_id))
             .collect::<Vec<_>>()
             .join(",");
         println!(
             "  [REMOTE-DEDUPE-SKIP] {}/  Message-ID {}  reason {:?}  members {}",
             s.mailbox_folder, s.message_id, s.reason, members,
         );
+        if report_options.details {
+            for member in &s.members {
+                render_remotededupe_member(member, "preserve");
+            }
+        }
     }
+}
+
+fn render_remotededupe_member(
+    member: &jma_mail::janitor::remotededupe::RemoteDedupeMember,
+    disposition: &str,
+) {
+    let received_at = member
+        .received_at
+        .and_then(|timestamp| chrono::DateTime::from_timestamp(timestamp, 0))
+        .map(|timestamp| timestamp.to_rfc3339())
+        .unwrap_or_else(|| {
+            member
+                .received_at
+                .map(|timestamp| format!("invalid-unix-timestamp:{timestamp}"))
+                .unwrap_or_else(|| "<none>".to_string())
+        });
+    let sha256 = member
+        .sha256
+        .as_ref()
+        .map(hex_sha256)
+        .unwrap_or_else(|| "<not-downloaded>".to_string());
+    let subject = member
+        .subject
+        .as_deref()
+        .map(|subject| format!("{subject:?}"))
+        .unwrap_or_else(|| "<none>".to_string());
+    println!(
+        "    [REMOTE-DEDUPE-MEMBER] action={} id={} blob={} size={} \
+         receivedAt={} sha256={} subject={}",
+        disposition, member.email_id, member.blob_id, member.size, received_at, sha256, subject,
+    );
+
+    if let Some(content) = &member.content_preview {
+        println!(
+            "    [REMOTE-DEDUPE-CONTENT-BEGIN] id={} shown={} total={} truncated={}",
+            member.email_id,
+            content.len(),
+            member.downloaded_size.unwrap_or(member.size),
+            member.content_truncated,
+        );
+        let printable = terminal_safe_message_content(content);
+        print!("{printable}");
+        if !printable.ends_with('\n') {
+            println!();
+        }
+        println!("    [REMOTE-DEDUPE-CONTENT-END] id={}", member.email_id);
+    }
+}
+
+fn hex_sha256(digest: &[u8; 32]) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        write!(&mut out, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    out
+}
+
+/// Raw mail is untrusted terminal input. Preserve readable text and
+/// line structure while escaping control characters (especially
+/// ESC, which could otherwise execute terminal control sequences).
+fn terminal_safe_message_content(content: &[u8]) -> String {
+    let decoded = String::from_utf8_lossy(content);
+    let normalized = decoded.replace("\r\n", "\n");
+    let mut out = String::with_capacity(normalized.len());
+    for ch in normalized.chars() {
+        match ch {
+            '\n' | '\t' => out.push(ch),
+            '\r' => out.push_str("\\r"),
+            ch if ch.is_control() => {
+                use std::fmt::Write;
+                write!(&mut out, "\\u{{{:x}}}", ch as u32).expect("writing to String cannot fail");
+            }
+            ch => out.push(ch),
+        }
+    }
+    out
 }
 
 fn load_config(cli: &Cli) -> Result<Config> {
@@ -1168,4 +1468,20 @@ fn load_config(cli: &Cli) -> Result<Config> {
         max_backoff: Duration::from_millis(config.sync.retry_max_backoff_ms),
     });
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::terminal_safe_message_content;
+
+    #[test]
+    fn message_preview_normalizes_crlf_and_escapes_terminal_controls() {
+        let rendered = terminal_safe_message_content(b"Subject: safe\r\n\r\nbody\x1b[31m\0");
+        assert_eq!(rendered, "Subject: safe\n\nbody\\u{1b}[31m\\u{0}");
+    }
+
+    #[test]
+    fn message_preview_marks_invalid_utf8_without_panicking() {
+        assert_eq!(terminal_safe_message_content(b"a\xffb"), "a\u{fffd}b");
+    }
 }

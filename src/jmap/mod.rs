@@ -1,5 +1,6 @@
 pub mod discovery;
 pub mod email;
+mod email_set;
 pub mod limits;
 pub mod mailbox;
 pub mod retry;

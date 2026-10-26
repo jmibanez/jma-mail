@@ -186,6 +186,8 @@ pub struct CycleSummary {
     pub downloaded: u64,
     pub uploaded: u64,
     pub in_sync: bool,
+    pub pending: bool,
+    pub blocked: bool,
     pub wall: Duration,
 }
 
@@ -613,13 +615,27 @@ impl TuiState {
     /// Record a completed sync cycle's outcome, stamped now. Latest
     /// cycle wins; history lives in the log pane.
     pub fn set_last_cycle(&self, downloaded: u64, uploaded: u64, in_sync: bool, wall: Duration) {
+        self.set_last_cycle_status(downloaded, uploaded, in_sync, wall, false, false);
+    }
+
+    pub fn set_last_cycle_status(
+        &self,
+        downloaded: u64,
+        uploaded: u64,
+        in_sync: bool,
+        wall: Duration,
+        pending: bool,
+        blocked: bool,
+    ) {
         let mut i = self.lock_mut();
         i.last_cycle = Some(CycleSummary {
             at: chrono::Utc::now(),
             downloaded,
             uploaded,
-            in_sync,
+            in_sync: in_sync && !pending && !blocked,
             wall,
+            pending,
+            blocked,
         });
     }
 

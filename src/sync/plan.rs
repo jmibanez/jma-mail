@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use crate::domain::{MailboxFolderBinding, MaybeReference};
 use crate::ids::{JmapBlobId, JmapEmailId, JmapMailboxId, JmapThreadId, MaildirId, MessageId};
+use crate::keywords::KeywordPatch;
 
 /// A message known by its local maildir handle. The Message-ID rides
 /// along so logs can name the message in human-readable form, and so
@@ -87,6 +88,27 @@ impl BoundId {
 /// discriminator.
 #[derive(Debug)]
 pub enum SyncAction {
+    /// Persist observations without acknowledging a flag mutation.
+    ObserveMessage {
+        id: BoundId,
+        binding: Arc<MailboxFolderBinding>,
+        keywords: HashMap<String, bool>,
+        filename_flags: String,
+        jmap_blob_id: Option<JmapBlobId>,
+        jmap_thread_id: Option<JmapThreadId>,
+    },
+    /// Initialize or recover the acknowledged generation separately from observations.
+    RecordFlagState {
+        id: RemoteId,
+        state: crate::state::flag_sync::FlagSyncState,
+    },
+    /// Unresolved history/presence is visible work, not an empty successful plan.
+    DeferredFlagState {
+        id: RemoteId,
+        reason: String,
+        /// True only when an autonomous fresh cycle can finish the work.
+        retryable: bool,
+    },
     // Server -> Local
     DownloadMessage {
         id: RemoteId,
@@ -98,6 +120,8 @@ pub enum SyncAction {
     UpdateLocalFlags {
         id: BoundId,
         binding: Arc<MailboxFolderBinding>,
+        /// Raw filename suffix observed by the planner, not a later MUA edit.
+        expected_flags: String,
         new_flags: String,
         keywords: HashMap<String, bool>,
         jmap_blob_id: JmapBlobId,
@@ -184,7 +208,7 @@ pub enum SyncAction {
     },
     UpdateRemoteKeywords {
         id: RemoteId,
-        keywords: HashMap<String, bool>,
+        keywords: KeywordPatch,
         /// On-disk maildir filename flag suffix at the time the
         /// patch was emitted -- the filesystem-truth view of flags,
         /// mirrored by every emit site from the same source it used
@@ -424,7 +448,10 @@ impl SyncAction {
             | SyncAction::CreateRemoteMailbox { .. }
             | SyncAction::RenameRemoteMailbox { .. }
             | SyncAction::DestroyRemoteMailbox { .. } => ActionDirection::Push,
-            SyncAction::AdoptLocalMessage { .. } => ActionDirection::Both,
+            SyncAction::AdoptLocalMessage { .. }
+            | SyncAction::ObserveMessage { .. }
+            | SyncAction::RecordFlagState { .. }
+            | SyncAction::DeferredFlagState { .. } => ActionDirection::Both,
         }
     }
 }
@@ -575,10 +602,10 @@ impl SyncPlan {
     }
 
     /// Split the plan into (kept, dropped) according to `direction`.
-    /// AdoptLocalMessage is always kept — it is byte-identical and pure
-    /// DB, so adopting in pull-only or push-only mode is still strictly
-    /// progress. Pull-only keeps pull-side actions; push-only keeps
-    /// push-side; Both keeps everything.
+    /// Adoption/history actions are kept in either mode. Execute still gates
+    /// move-paired adoption and destination flags on submitted, acknowledged
+    /// membership; keeping metadata does not acknowledge an excluded effect.
+    /// Pull-only keeps pull-side actions; push-only keeps push-side actions.
     pub fn into_filtered(self, direction: SyncDirection) -> (SyncPlan, Vec<SyncAction>) {
         let SyncPlan {
             actions,
@@ -639,6 +666,15 @@ impl fmt::Display for SyncPlan {
 
         for action in &self.actions {
             match action {
+                SyncAction::ObserveMessage { id, .. } => {
+                    writeln!(f, "  [STATE] Observe {}", id.as_remote())?
+                }
+                SyncAction::RecordFlagState { id, .. } => {
+                    writeln!(f, "  [STATE] Record flag baseline for {}", id)?
+                }
+                SyncAction::DeferredFlagState { id, reason, .. } => {
+                    writeln!(f, "  [PENDING] {}: {}", id, reason)?
+                }
                 SyncAction::DownloadMessage { id, binding, .. } => writeln!(
                     f,
                     "  [PULL]  Download {} -> {}/",

@@ -25,6 +25,11 @@ $ jma
 $ jma watch
 ```
 
+Watch mode retries eligible unfinished message work with bounded backoff even
+without a new server or filesystem event. Permission/review failures remain
+visible as pending or blocked rather than "in sync"; normal event/manual
+cycles can reassess them. `jma status` reports cached selected flag history,
+not a fresh server verification.
 
 ## Installation
 
@@ -62,24 +67,50 @@ If you want finer-grained control over how specific folders are mapped to on-dis
 
 `jma` tracks state between your local Maildirs and the upstream JMAP server on an SQLite database. By default the database lives at `<sync.maildir_path>/.jma.db` -- a hidden file at the maildir root, so state and data move together when you copy or relocate the maildir, and multiple accounts each get their own DB without sharing a path. Set `[state].db_path` to override (for example, to keep state on a local-only path when the maildir lives on a synced or networked volume). State is intentionally disposable: you should be able to delete its state and rerun a `jma pull` to reconverge.
 
-If you delete the state DB and run `jma pull`, `jma` will re-walk the server. It parses the `Message-ID` of each existing local message and "adopts" messages if they exist on the server, instead of re-downloading them. If you previously killed `jma` in the middle of a previous initial `pull` and then deleted the state DB, `jma` does The Right Thing and continues where it left off (i.e. it doesn't redownload previously downloaded messages).
+After a DB reset, `jma pull` re-walks the server and attempts to adopt existing
+files by Message-ID rather than download another copy. This is a fresh
+reconciliation under the configured policy, not a continuation of the lost
+history. Message-ID alone is not a content digest or proof of an unambiguous
+match. A normal restart with the same DB preserves more recovery information.
+
+Message-ID is client-supplied: unrelated messages and different draft versions
+can reuse it. Content-distinct local copies are preserved, not deleted merely
+because their headers match.
+
+**Current limitation:** new local messages and previously unbound remote emails
+require a Message-ID for ingest. Without one they are skipped and left at the
+source, not synced. Existing JMAP-ID bindings can still receive flag/move
+updates without that header. Its absence is not itself an RFC violation:
+[RFC 5322 recommends it, but does not require it](https://www.rfc-editor.org/rfc/rfc5322.html#section-3.6.4).
 
 So what's stored in the state DB?
 
   * A bidirectional `message_map`, mapping between a JMAP email and its local maildir file. `jma` stores the name of the local Maildir file and its corresponding `message_id` as a fast lookup cache
   * A mapping between JMAP mailbox IDs and local Maildir folder names in `mailbox_map`, including role and parent
   * `jmap_state` containing per-entity sync cursors so `jma` only needs to ask for changes since the last sync
-  * And `local_state`, which is a snapshot of the local state (flags, size, mtime) so any local filesystem changes are quickly detected
+  * `local_state`, which records local observations for change detection
+  * `message_flag_sync`, which separates acknowledged mapped flags from observations, review state, and in-flight flag receipts
 
-None of the state DB's contents are required to do a `sync`, `push`, or `pull`.
+Ordinary `sync`, `push`, and `pull` can bootstrap without the DB, but a rebuild
+loses acknowledged flag history and unfinished-operation receipts. Reusing a
+Message-ID-matched file is not lossless recovery of earlier flag intent. Back
+up the closed DB (including any WAL state) and Maildir before a reset. Use
+`repair-flags` below for targeted disagreement; it requires existing bindings.
 
 ### Breaking Changes
 
-If there are any changes that break state tracking, as mentioned above you can simply delete the state DB and re-run `jma`. For most cases, `jma` marks its SQLite state database with a schema version -- if there's a mismatch, a mutating command (`sync`, `pull`, `push`, `watch`) will automatically nuke the state DB and do a full sync to catch up. Read-only commands (`status`, `mailboxes`, `auth rediscover`) refuse to open a mismatched DB and tell you to run a mutating command first, so a concurrent `sync`/`watch` doesn't get the DB yanked out from under it.
+`jma` marks its SQLite state database with a schema version. On a mismatch,
+ordinary mutating commands (`sync`, `pull`, `push`, `watch`) automatically
+recreate it and start a full reconciliation, losing the old history. Back up
+before an upgrade/downgrade that may do this. Read-only commands (`status`,
+`mailboxes`, `auth rediscover`) refuse a mismatch so a concurrent mutator does
+not lose its open DB. `repair-flags` and every `janitor` task also refuse:
+maintenance must preserve the bindings/history used by its safety checks.
+Compatible additive cache updates still run under the normal locks.
 
 ### Concurrency: One Mutator at a Time
 
-Mutating commands (`sync`, `pull`, `push`, `watch`) take **two** exclusive OS-level advisory locks before doing any work:
+Mutating commands (`sync`, `pull`, `push`, `watch`) and `repair-flags` (including its preview) take **two** exclusive OS-level advisory locks before doing any work:
 
 1. `<maildir_root>/.jma.lock` -- guards the maildir against concurrent mutation by any other jma process pointed at the same maildir, even if their state DB paths differ.
 2. `<db_path>.lock` (e.g. `<maildir_root>/.jma.db.lock`) -- guards the state DB against the schema-mismatch unlink/recreate path racing a concurrent process that opened the same DB.
@@ -186,6 +217,7 @@ Commands:
   init       Initialize config file
   mailboxes  List remote mailboxes and their local mapping
   status     Show sync staleness, cursor health, and maildir drift
+  repair-flags  Review/repair flags for explicit bound JMAP Email IDs
   auth       Manage account credentials and the JMAP discovery cache
   janitor    Run maintenance tasks against the maildir tree and state DB
   help       Print this message or the help of the given subcommand(s)
@@ -266,20 +298,22 @@ On-disk name                                Total   Unread  Role
 
 ```
 
-### status : Sync staleness, cursor health, and maildir drift
+### status : Sync staleness, flag history, cursor health, and maildir drift
 
-`status` is a read-only, offline subcommand for the questions that aren't answered by `mailboxes` (which goes to the server) or by counting files on disk. It opens the state DB without taking any locks, so it's safe to run alongside an in-progress `sync` or `watch`.
+`status` is a read-only, offline subcommand for the questions that aren't answered by `mailboxes` (which goes to the server) or by counting files on disk. It opens the state DB without taking the sync/watch advisory locks, so it can inspect cached state alongside an in-progress `sync` or `watch`; ordinary SQLite locking still applies.
 
 ```console
 $ jma status
 Configured account: foo@example.com
 Maildir root: /Users/foo/Mail
-State DB: /Users/foo/Mail/.jma.db (132.4 KB, schema v1)
+State DB: /Users/foo/Mail/.jma.db (132.4 KB, schema v2)
 
 JMAP cursors (account a1b2c3d4e):
   Last cursor write: 2026-05-06 14:22:01 (12m ago)
   Email cursor: healthy
   Mailbox cursor: healthy
+
+Flag histories (cached selected bindings): 0 pending, 0 blocked/review, 0 unverified
 
 Maildir vs DB drift (under /Users/foo/Mail):
   Folders on disk not in DB: SomeNewFolder
@@ -292,10 +326,47 @@ What each section is for:
 
   * **Last cursor write.** "When did the JMAP cursor for this account last advance?" Answers the staleness question without going online. The semantic is "last cursor write," not "last sync attempt completed" -- a sync run that produces no state change is invisible here, since we don't write a row when there's nothing to write. Reasonable proxy for "is this account stale, should I run sync?" but not a sync-attempt log.
   * **Cursor health.** Each tracked entity (`Email`, `Mailbox`) is either `healthy` (a state cookie is set) or `FORCED RESYNC`. The latter means the cursor was tripped by a `cannotCalculateChanges` error from the server, and the next mutating run (`sync`/`pull`/`watch`) will do a full re-pull instead of a delta. Surfaced here so a slow next cycle isn't a surprise.
+  * **Flag histories.** Pending generations have unfinished flag work; blocked/review generations need permission repair or explicit reassessment; unverified messages have no acknowledged history yet. Counts follow `[sync].mailboxes` using cached remote paths, with a warning when missing paths prevent classification. These are cached flag counts, not proof that all mailbox placement or remote state is synchronized. `status` does not acknowledge or repair them.
   * **Maildir vs DB drift.** Four classes of disagreement between the maildir tree and `mailbox_map`: folders on disk with no DB row ("I `mkdir`'d a folder, why hasn't jma noticed"), DB rows with no folder on disk ("the DB thinks I have a folder I don't"), folders still on both sides but no longer selected by `[sync].mailboxes` (you shrank the sync set), and local renames not yet pushed to the server. `status` only reports these; `janitor prune` is the command that clears them.
   * **DB metadata.** Path, size, and schema version of the state DB. Useful for bug reports and for noticing when the DB has gotten unexpectedly large.
 
 The JMAP account ID is shown raw rather than mapped to an email -- mapping back would need either a JMAP roundtrip (which would defeat the offline-capable design) or a new column to remember the email-to-ID binding. The configured email prints once at the top so you can match the section to the account it belongs to.
+
+### repair-flags : Targeted flag review and explicit authority
+
+Stop `watch` first. Select explicit **JMAP Email IDs**, not RFC Message-IDs,
+and choose which current six-flag set is authoritative:
+
+```sh
+jma repair-flags --config /path/to/config.toml --authority local EMAIL_ID
+jma repair-flags --config /path/to/config.toml --authority local --apply EMAIL_ID
+# Or use --authority server to take the fresh server flags instead.
+```
+
+Without `--apply`, this fetches fresh metadata and prints the actual local
+path/suffix, full server keywords, baseline (including NULL), review state and
+receipt. It does not change flag observations/history or messages. Both modes
+hold the normal locks; ordinary DB initialization/discovery-cache behavior
+still applies. Apply refuses incompatible DBs rather than rebuilding them.
+
+Only D/F/P/R/S/T and their mapped server keywords are repaired. Empty is a
+valid authoritative set. Custom server keywords, other suffix letters, message
+bytes and identities survive. There is no download, upload/import, destroy,
+dedupe, mailbox change, folder move or account-cursor advance. Adding Seen may
+promote `new/` to `cur/`; clearing Seen does not move `cur/` back to `new/`.
+
+Targets must have unique, live cached-folder identities within the configured
+selection and consistent Message-ID, blob/thread, sentinel and placement
+anchors. Missing, duplicate, moved, multiply-bound or partial-Maildir targets
+are refused, not adopted or provisioned. Message-ID is not a content digest.
+
+Authority is independent of `conflict_strategy`; a review row's baseline is
+not permission to reconstruct erased history. Apply is not an all-target
+transaction: completed effects can survive a later failure. A failed effect,
+conditional state rejection or failed acknowledgement retains review and the
+old/NULL baseline until completion is established. Re-preview and rerun with
+explicit authority; ordinary sync cannot silently settle that disagreement
+using the opposite global policy. Exit status is nonzero for incomplete apply.
 
 ### auth : Manage account credentials and the JMAP discovery cache
 
@@ -309,7 +380,34 @@ The JMAP account ID is shown raw rather than mapped to an email -- mapping back 
 
 ### janitor : Maintenance tasks
 
-`janitor` groups offline maintenance tasks that operate on the maildir tree and state DB outside a sync cycle: `dedupe` (remove per-folder Message-ID duplicates), `remotededupe` (server-side dedupe via `Email/set`), `rebindfolders` (rebind sentinel-less maildirs by Message-ID probing), and `prune` (below). Each takes the same maildir and state-DB locks a sync does, so it won't run concurrently with one.
+`janitor` groups maintenance outside a sync cycle. Every task takes the normal
+maildir and state-DB locks and refuses incompatible history rather than
+rebuilding it, including during preview.
+
+- `dedupe` removes only byte-identical same-folder copies after content
+  verification, never a DB-tracked filename. Same-Message-ID content variants
+  stay on disk; the header alone is not a digest.
+- `remotededupe` verifies remote duplicate groups before `Email/set` destruction.
+  `--details` shows per-member IDs, size, subject, received date and SHA-256.
+  `--content-preview[=BYTES]` implies details and adds terminal-safe raw content
+  (default 16 KiB, maximum 1 MiB per message). Audit downloads do not relax
+  deletion eligibility. Multiple locally bound members are preserved. Apply
+  still requires `--yes`.
+- `rebindfolders` probes Message-IDs to rebind sentinel-less folders.
+- `destroyids` previews an **externally reviewed, account-wide** exact ID list:
+
+  ```sh
+  jma janitor destroyids --config /path/to/config.toml --from reviewed-ids.txt
+  # Add --yes only after reviewing the verified plan.
+  ```
+
+  The file has one JMAP Email ID per line; blank lines and `#` comments are
+  ignored. Duplicate/multi-token lines are errors. Any message_map binding
+  refuses the entire batch before network mutation. Already-absent IDs are
+  tolerated; incomplete apply exits nonzero. This is not a mailbox-selection
+  heuristic or flag repair, and it does not authorize deleting locally mapped
+  messages.
+- `prune` remediates the drift described below.
 
 #### janitor prune : Clear maildir/DB drift
 

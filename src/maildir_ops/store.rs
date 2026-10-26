@@ -4,6 +4,7 @@ use std::path::Path;
 use tracing::{Level, debug, event};
 
 use crate::ids::MaildirId;
+use crate::maildir_ops::entries;
 use crate::profile::TARGET_FILE_OP;
 
 /// Ensure a maildir folder exists with cur/new/tmp subdirectories.
@@ -14,20 +15,11 @@ pub fn ensure_maildir(path: &Path) -> Result<Maildir> {
     Ok(md)
 }
 
-/// Return a `Maildir` handle iff the folder is shaped like a
-/// maildir: specifically, `<path>/cur/` exists. `None` when
-/// either the folder itself is missing or its `cur/` subdir
-/// hasn't been provisioned yet -- the caller (typically scan)
-/// should treat the folder as having no local files this cycle.
-///
-/// Differs from `ensure_maildir` in not creating anything: the
-/// dry-run / pre-`CreateLocalMailbox` path needs to inspect the
-/// filesystem without leaving side effects. `cur/` is the
-/// load-bearing subdir for the scan walk; a bare directory
-/// (no `cur/`) isn't a maildir even if it happens to exist,
-/// and walking it would fail downstream at `read_dir(cur/)`.
+/// Non-creating handle for either full or partial Maildir shape. A missing
+/// peer is not an absent folder. Authoritative enumeration must use entries::read
+/// so an unreadable present peer is not silently treated as empty.
 pub fn try_open_maildir(path: &Path) -> Option<Maildir> {
-    if path.join("cur").is_dir() {
+    if is_maildir(path) {
         Some(Maildir::from(path.to_path_buf()))
     } else {
         None
@@ -41,10 +33,8 @@ pub fn try_open_maildir(path: &Path) -> Option<Maildir> {
 /// a maildir on disk," shared by the drift walk and the `present`
 /// predicate so they can't drift apart.
 ///
-/// Distinct from `try_open_maildir`, which is the stricter
-/// "ready to enumerate" check: walking a maildir reads `cur/`, so a
-/// `new/`-only folder must be healed (its `cur/` recreated) before it
-/// can be opened.
+/// This is a presence predicate, not proof that present peers can be read.
+/// entries::read performs that validation without healing directories.
 pub fn is_maildir(path: &Path) -> bool {
     path.join("cur").is_dir() || path.join("new").is_dir()
 }
@@ -152,10 +142,9 @@ pub fn delete_message(maildir: &Maildir, id: &str) -> Result<()> {
 
 /// Set flags on a message (replaces all existing flags). Only
 /// applies to messages already in `cur/`; the maildir crate's
-/// underlying `set_flags` won't find a `new/` file. Callers that
-/// don't know which subdir the file lives in should dispatch via
-/// `message_is_in_new`, falling back to `promote_to_cur_with_flags`
-/// for new/-side files.
+/// underlying `set_flags` won't find a `new/` file. Sync effects should
+/// use `set_flags_if_unchanged` to validate their captured generation
+/// and handle either subdirectory without overwriting a newer MUA edit.
 pub fn set_flags(maildir: &Maildir, id: &str, flags: &str) -> Result<()> {
     maildir
         .set_flags(id, flags)
@@ -165,30 +154,71 @@ pub fn set_flags(maildir: &Maildir, id: &str, flags: &str) -> Result<()> {
     Ok(())
 }
 
+/// Apply a flag decision only to the filename generation it observed.
+/// A newer MUA rename is left alone for reconciliation, not overwritten by
+/// searching for the latest suffix. Unseen new-side messages stay in new/.
+pub fn set_flags_if_unchanged(
+    maildir: &Maildir,
+    id: &str,
+    expected: &str,
+    flags: &str,
+) -> Result<()> {
+    let mut found = Vec::new();
+    for entry in entries::read(maildir.path())? {
+        let entry = entry?;
+        if entry.maildir_id.as_ref() == id && entry.path.is_file() {
+            found.push(entry);
+        }
+    }
+    if found.len() != 1 {
+        anyhow::bail!("Expected one local path for {id}, found {}", found.len());
+    }
+    let entry = found.pop().unwrap();
+    if entry.flags != expected {
+        anyhow::bail!("Local flags for {id} changed since observation; replanning required");
+    }
+    let source = &entry.path;
+    let subdir = if entry.in_new && !flags.contains('S') {
+        "new"
+    } else {
+        "cur"
+    };
+    let target = maildir.path().join(subdir).join(format!("{id}:2,{flags}"));
+    if source != &target {
+        if target.exists() {
+            anyhow::bail!(
+                "Refusing to overwrite existing flag target {}",
+                target.display()
+            );
+        }
+        ensure_message_subdir(target.parent().unwrap())?;
+        std::fs::rename(source, &target)
+            .with_context(|| format!("Failed to apply flag snapshot for {id}"))?;
+        #[cfg(unix)]
+        {
+            std::fs::File::open(source.parent().unwrap())?.sync_all()?;
+            if source.parent() != target.parent() {
+                std::fs::File::open(target.parent().unwrap())?.sync_all()?;
+            }
+        }
+    }
+    event!(target: TARGET_FILE_OP, Level::TRACE, op = "set_flags");
+    Ok(())
+}
+
 /// True if the message with this id currently lives in `new/`. Used
-/// by the sync executor to decide between `set_flags` (cur/-only
-/// rename) and `promote_to_cur_with_flags` (new/ -> cur/ promotion)
-/// when applying an `UpdateLocalFlags` action. Routed through the
-/// upstream `list_new()` iterator so any future fix to its
-/// suffix-aware id parsing carries through here automatically;
-/// hand-rolled filename matching would drift.
+/// for self-write-cache predictions, not as mutation authorization.
+/// The snapshot-aware setter performs its own unique-path validation.
 pub fn message_is_in_new(maildir: &Maildir, id: &str) -> bool {
     maildir
         .list_new()
         .any(|e| e.map(|entry| entry.id() == id).unwrap_or(false))
 }
 
-/// Promote a message from `new/` to `cur/`, attaching the given
-/// flag set as the `:2,<flags>` info suffix. Strict maildir says a
-/// file transitions through this rename when a client first observes
-/// it; jma drives the rename whenever the server reports a
-/// `new/`-side message has gained any JMAP keyword (typically
-/// `$seen`, the maildir-`S` analogue, but any non-empty flag set
-/// triggers the same promotion).
-///
-/// Distinct from `set_flags` because the underlying `maildir` crate
-/// won't search `new/`; the sync executor picks between the two
-/// based on `message_is_in_new`.
+/// Explicitly promote a message from `new/` to `cur/`, attaching
+/// the given suffix. Unlike `set_flags`, this searches `new/`.
+/// Ordinary flag synchronization uses `set_flags_if_unchanged` instead:
+/// a non-Seen keyword change alone does not require promotion.
 ///
 /// Refuses to clobber an existing cur/-side file at the destination
 /// path. That's an illegal-but-observed state (typically left over
@@ -204,10 +234,9 @@ pub fn message_is_in_new(maildir: &Maildir, id: &str) -> bool {
 /// `apply_update_local_flags`'s warn-and-skip path; the next sync
 /// cycle catches up.
 pub fn promote_to_cur_with_flags(maildir: &Maildir, id: &str, flags: &str) -> Result<()> {
-    let entry = maildir
-        .list_new()
+    let entry = entries::read(maildir.path())?
         .find_map(|e| match e {
-            Ok(entry) if entry.id() == id => Some(Ok(entry)),
+            Ok(entry) if entry.in_new && entry.maildir_id.as_ref() == id => Some(Ok(entry)),
             Ok(_) => None,
             Err(e) => Some(Err(e)),
         })
@@ -220,7 +249,7 @@ pub fn promote_to_cur_with_flags(maildir: &Maildir, id: &str, flags: &str) -> Re
                 maildir.path().display()
             )
         })?;
-    let src = entry.path().clone();
+    let src = entry.path;
     let dest = maildir.path().join("cur").join(format!("{id}:2,{flags}"));
     if dest.exists() {
         return Err(anyhow::anyhow!(
@@ -231,6 +260,7 @@ pub fn promote_to_cur_with_flags(maildir: &Maildir, id: &str, flags: &str) -> Re
             dest.display()
         ));
     }
+    ensure_message_subdir(dest.parent().unwrap())?;
     std::fs::rename(&src, &dest).with_context(|| {
         format!(
             "Failed to promote {} from new/ to cur/ at {}",
@@ -246,13 +276,67 @@ pub fn promote_to_cur_with_flags(maildir: &Maildir, id: &str, flags: &str) -> Re
     Ok(())
 }
 
-/// Move a message from one maildir to another.
-pub fn move_message(from: &Maildir, to: &Maildir, id: &str) -> Result<()> {
-    from.move_to(id, to)
-        .with_context(|| format!("Failed to move message {}", id))?;
+/// Move one unique live identity, preserving its actual filename/suffix.
+/// Returns the raw moved flags for the local observation mirror. Like the
+/// previous Maildir move helper, the destination is cur/, including for a
+/// new/-side source. Refuse ambiguity and target collisions rather than
+/// choosing a random copy or overwriting it. This is snapshot validation,
+/// not atomic exclusion against arbitrary concurrent MUA writers.
+pub fn move_message(from: &Maildir, to: &Maildir, id: &str) -> Result<String> {
+    let mut found = Vec::new();
+    for entry in entries::read(from.path())? {
+        let entry = entry?;
+        if entry.maildir_id.as_ref() == id && entry.path.is_file() {
+            found.push(entry);
+        }
+    }
+    anyhow::ensure!(
+        found.len() == 1,
+        "Expected one move source for {id}, found {}",
+        found.len()
+    );
+    let entry = found.pop().unwrap();
+    let flags = entry.flags.clone();
+    let source = &entry.path;
+    let filename = source.file_name().context("Move source has no filename")?;
+    let target = to.path().join("cur").join(filename);
+    anyhow::ensure!(
+        source != &target && !target.exists(),
+        "Refusing existing move target {}",
+        target.display()
+    );
+    for entry in entries::read(to.path())? {
+        anyhow::ensure!(
+            entry?.maildir_id.as_ref() != id,
+            "Move target already contains identity {id}"
+        );
+    }
+    ensure_message_subdir(target.parent().unwrap())?;
+    std::fs::rename(source, &target).with_context(|| format!("Failed to move message {id}"))?;
+    #[cfg(unix)]
+    {
+        std::fs::File::open(source.parent().unwrap())?.sync_all()?;
+        std::fs::File::open(target.parent().unwrap())?.sync_all()?;
+    }
     event!(target: TARGET_FILE_OP, Level::TRACE, op = "move");
     debug!("Moved message {} to {:?}", id, to.path());
-    Ok(())
+    Ok(flags)
+}
+
+/// Only a real message write may provision its destination leaf. Do not use
+/// create_dir_all: a concurrently vanished mailbox must not be recreated.
+fn ensure_message_subdir(path: &Path) -> Result<()> {
+    match std::fs::create_dir(path) {
+        Ok(()) => {
+            #[cfg(unix)]
+            std::fs::File::open(path.parent().context("Message destination has no parent")?)?
+                .sync_all()?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("Cannot create message destination {}", path.display())),
+    }
 }
 
 #[cfg(test)]
@@ -280,6 +364,102 @@ mod tests {
                 nested.join(sub).display()
             );
         }
+    }
+
+    #[test]
+    fn move_snapshot_returns_actual_raw_suffix_from_cur_and_new() {
+        for subdir in ["cur", "new"] {
+            let dir = tempfile::tempdir().unwrap();
+            let from = ensure_maildir(&dir.path().join("from")).unwrap();
+            let to = ensure_maildir(&dir.path().join("to")).unwrap();
+            let source = from.path().join(subdir).join("id:2,FX");
+            std::fs::write(&source, b"same message bytes").unwrap();
+            assert_eq!(move_message(&from, &to, "id").unwrap(), "FX");
+            assert!(!source.exists());
+            assert_eq!(
+                std::fs::read(to.path().join("cur/id:2,FX")).unwrap(),
+                b"same message bytes"
+            );
+            assert_eq!(from.list_cur().chain(from.list_new()).count(), 0);
+            assert_eq!(to.list_cur().chain(to.list_new()).count(), 1);
+        }
+    }
+
+    #[test]
+    fn move_snapshot_refuses_an_existing_target_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = ensure_maildir(&dir.path().join("from")).unwrap();
+        let to = ensure_maildir(&dir.path().join("to")).unwrap();
+        let source = from.path().join("cur/id:2,SX");
+        let target = to.path().join("cur/id:2,SX");
+        std::fs::write(&source, b"source").unwrap();
+        std::fs::write(&target, b"do not overwrite").unwrap();
+        assert!(move_message(&from, &to, "id").is_err());
+        assert_eq!(std::fs::read(source).unwrap(), b"source");
+        assert_eq!(std::fs::read(target).unwrap(), b"do not overwrite");
+    }
+
+    #[test]
+    fn move_snapshot_refuses_duplicate_source_identities() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = ensure_maildir(&dir.path().join("from")).unwrap();
+        let to = ensure_maildir(&dir.path().join("to")).unwrap();
+        let source = from.path().join("cur/id:2,SX");
+        let duplicate = from.path().join("new/id:2,FX");
+        std::fs::write(&source, b"source").unwrap();
+        std::fs::write(&duplicate, b"duplicate").unwrap();
+        assert!(move_message(&from, &to, "id").is_err());
+        assert!(source.is_file() && duplicate.is_file());
+        assert_eq!(to.list_cur().count(), 0);
+    }
+
+    #[test]
+    fn flag_snapshot_preserves_new_cur_placement_and_suffix_extensions() {
+        for (initial, desired, expected_subdir) in [
+            ("F", "", "new"),
+            ("", "F", "new"),
+            ("F", "S", "cur"),
+            ("S", "", "cur"),
+            ("SX", "FX", "cur"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let md = ensure_maildir(dir.path()).unwrap();
+            let id = store_message(&md, b"body", initial).unwrap();
+            set_flags_if_unchanged(&md, id.as_ref(), initial, desired).unwrap();
+            let expected = dir
+                .path()
+                .join(expected_subdir)
+                .join(format!("{id}:2,{desired}"));
+            assert_eq!(std::fs::read(expected).unwrap(), b"body");
+            assert_eq!(md.list_cur().chain(md.list_new()).count(), 1);
+        }
+    }
+
+    #[test]
+    fn flag_snapshot_refuses_a_newer_local_edit_or_a_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let md = ensure_maildir(dir.path()).unwrap();
+        let id = store_message(&md, b"body", "FS").unwrap();
+        assert!(set_flags_if_unchanged(&md, id.as_ref(), "S", "").is_err());
+        assert_eq!(md.list_cur().next().unwrap().unwrap().flags(), "FS");
+        assert!(set_flags_if_unchanged(&md, "absent", "", "S").is_err());
+    }
+
+    #[test]
+    fn flag_snapshot_refuses_duplicate_ids_and_existing_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let md = ensure_maildir(dir.path()).unwrap();
+        let id = store_message(&md, b"body", "S").unwrap();
+        let source = dir.path().join("cur").join(format!("{id}:2,S"));
+        let duplicate = dir.path().join("new").join(format!("{id}:2,F"));
+        std::fs::copy(&source, &duplicate).unwrap();
+        assert!(set_flags_if_unchanged(&md, id.as_ref(), "S", "FS").is_err());
+        assert!(source.is_file() && duplicate.is_file());
+        std::fs::remove_file(duplicate).unwrap();
+        let target = dir.path().join("cur").join(format!("{id}:2,FS"));
+        std::fs::create_dir(&target).unwrap();
+        assert!(set_flags_if_unchanged(&md, id.as_ref(), "S", "FS").is_err());
+        assert!(source.is_file() && target.is_dir());
     }
 
     /// Read the single delivered filename from a maildir subfolder,

@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use maildir::Maildir;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -13,11 +13,11 @@ use crate::maildir_ops::namespace::is_jma_private;
 use crate::maildir_ops::sentinel::MailboxMapping;
 use crate::maildir_ops::store;
 
-/// One live `cur/` entry passed into `classify_changes`. Both
+/// One live message entry passed into `classify_changes`. Both
 /// `scan_folder` (full enumeration via the maildir crate) and
 /// `scan_paths` (partial, driven by fsevents) build these from their
 /// respective inputs so the classifier sees a uniform shape.
-struct CurEntry {
+struct FileEntry {
     maildir_id: MaildirId,
     flags: String,
     path: PathBuf,
@@ -46,17 +46,93 @@ pub struct ScanResult {
     pub local_flags: HashMap<MaildirId, String>,
 }
 
+/// A fresh presence check used before interpreting disappearance as deletion.
+#[derive(Default)]
+pub(crate) struct IdentityInventory {
+    ids: HashMap<MaildirId, HashSet<String>>,
+    message_ids: HashMap<String, HashSet<String>>,
+}
+
+impl IdentityInventory {
+    pub(crate) fn contains(&self, id: &MaildirId, message_id: &MessageId) -> bool {
+        self.ids.contains_key(id)
+            || self
+                .message_ids
+                .contains_key(message_id.as_ref().trim_matches(['<', '>']))
+    }
+
+    /// Presence can veto destruction of these folders as well as the Email.
+    /// It is not authority to adopt a candidate by Message-ID alone.
+    pub(crate) fn candidate_folders(
+        &self,
+        id: &MaildirId,
+        message_id: &MessageId,
+    ) -> HashSet<String> {
+        self.ids
+            .get(id)
+            .into_iter()
+            .chain(
+                self.message_ids
+                    .get(message_id.as_ref().trim_matches(['<', '>'])),
+            )
+            .flatten()
+            .cloned()
+            .collect()
+    }
+}
+
+pub(crate) fn inventory_identities<'a>(
+    root: &Path,
+    folders: impl IntoIterator<Item = &'a str>,
+) -> Result<IdentityInventory> {
+    let mut inventory = IdentityInventory::default();
+    for folder in folders {
+        for subdir in ["cur", "new"] {
+            let directory = root.join(folder).join(subdir);
+            let entries = match std::fs::read_dir(&directory) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("Cannot verify message presence in {}", directory.display())
+                    });
+                }
+            };
+            for entry in entries {
+                let entry = entry?;
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                inventory
+                    .ids
+                    .entry(MaildirId::from(name.split(":2,").next().unwrap_or(&name)))
+                    .or_default()
+                    .insert(folder.to_owned());
+                if !entry.file_type()?.is_file() {
+                    continue;
+                }
+                if let Some(id) = parse_message_id_from_file(&entry.path())? {
+                    inventory
+                        .message_ids
+                        .entry(id.as_ref().trim_matches(['<', '>']).to_string())
+                        .or_default()
+                        .insert(folder.to_owned());
+                }
+            }
+        }
+    }
+    Ok(inventory)
+}
+
 /// A change detected in the local maildir.
 #[derive(Debug)]
 pub enum LocalChange {
     /// A new message file appeared that we don't have in the DB.
     ///
-    /// `message_id` is required: scan refuses to emit `NewMessage` for a
-    /// file whose `Message-ID` header is missing or unparseable. Without
-    /// it, the disposable-state-DB invariant breaks (a wipe + re-sync
-    /// would re-upload the file as a fresh server email rather than
-    /// adopting the existing one), so the file is dropped at the scan
-    /// boundary with an `error!` and stays on disk untouched.
+    /// `message_id` is required by jma's current ingest model: scan
+    /// refuses to emit `NewMessage` without a usable header, logging an
+    /// `error!` and leaving the file untouched. Headerless identity after
+    /// a DB rebuild is not implemented. The client-supplied header is a
+    /// correlation hint, not proof of uniqueness or byte identity.
     NewMessage {
         maildir_id: MaildirId,
         /// The mailbox this file lives in, as a single typed unit.
@@ -176,18 +252,13 @@ pub enum LocalChange {
 ///   serves both exhaustive (folder-walk) and event-driven
 ///   (fsevents) deletion sources without an extra mode flag.
 ///
-/// Live new/ entries aren't passed in: jma (as the MDA) is the only
-/// writer to new/, MUAs only ever promote new/ -> cur/, and anything
-/// delivered to new/ is tracked in the DB at write time. Any later
-/// MUA promotion shows up through the cur/ scan as either a
-/// NewMessage (post-DB-wipe rescue) or a FlagsChanged. The caller
-/// (scan_folder / scan_paths) still observes new/ entries so it can
-/// build its own observed-on-disk set before deciding which DB-
-/// anchored ids belong in `explicit_deletes`, but classify_changes
-/// itself has no use for them.
+/// Tracked new/ entries are classified too: their suffixes and mailbox
+/// locations can change without promotion to cur/. Unknown new/ entries
+/// are observed for identity/adoption and deletion safety, but are not
+/// implicitly imported by this classifier.
 fn classify_changes(
     binding: &Arc<MailboxFolderBinding>,
-    cur_entries: &[CurEntry],
+    cur_entries: &[FileEntry],
     explicit_deletes: &[MaildirId],
     known_state: &HashMap<MaildirId, (JmapMailboxId, String)>,
 ) -> Result<Vec<LocalChange>> {
@@ -297,35 +368,28 @@ pub fn scan_folder(
     known_state: &HashMap<MaildirId, (JmapMailboxId, String)>,
 ) -> Result<ScanResult> {
     let mut cur_entries = Vec::new();
-    for entry in maildir.list_cur() {
-        let entry = entry?;
-        cur_entries.push(CurEntry {
-            maildir_id: MaildirId::from(entry.id()),
-            flags: entry.flags().to_string(),
-            path: entry.path().to_path_buf(),
-        });
-    }
-
     let mut new_entries = Vec::new();
-    for entry in maildir.list_new() {
+    for entry in crate::maildir_ops::entries::read(maildir.path())? {
         let entry = entry?;
-        new_entries.push(MaildirId::from(entry.id()));
+        let in_new = entry.in_new;
+        let file = FileEntry {
+            maildir_id: entry.maildir_id,
+            flags: entry.flags,
+            path: entry.path,
+        };
+        if in_new {
+            new_entries.push(file);
+        } else {
+            cur_entries.push(file);
+        }
     }
 
-    // Per-file filename-flag-suffix map for reconcile's adoption
-    // emit sites. Built from the same `entry.flags()` reads
-    // classify_changes inspects -- no extra I/O. new/ ids carry an
-    // empty suffix because the maildir crate doesn't expose flags
-    // for new/ entries (and the spec doesn't define them there);
-    // they're included for completeness so a downstream lookup
-    // never misses due to placement.
+    // The pinned Maildir dependency exposes suffixes in both directories.
+    // Observing new/ is separate from importing an unknown new message.
     let mut local_flags: HashMap<MaildirId, String> =
         HashMap::with_capacity(cur_entries.len() + new_entries.len());
-    for entry in &cur_entries {
+    for entry in cur_entries.iter().chain(&new_entries) {
         local_flags.insert(entry.maildir_id.clone(), entry.flags.clone());
-    }
-    for id in &new_entries {
-        local_flags.entry(id.clone()).or_default();
     }
 
     // Exhaustive deletion detection: any DB entry anchored to this
@@ -335,7 +399,7 @@ pub fn scan_folder(
     let observed: HashSet<&MaildirId> = cur_entries
         .iter()
         .map(|e| &e.maildir_id)
-        .chain(new_entries.iter())
+        .chain(new_entries.iter().map(|entry| &entry.maildir_id))
         .collect();
     let explicit_deletes: Vec<MaildirId> = known_state
         .iter()
@@ -353,6 +417,13 @@ pub fn scan_folder(
         })
         .collect();
 
+    // Tracked new/ files can change flags or move between mailboxes just
+    // like cur/ files. Untracked new/ files remain observation-only.
+    cur_entries.extend(
+        new_entries
+            .into_iter()
+            .filter(|entry| known_state.contains_key(&entry.maildir_id)),
+    );
     let changes = classify_changes(binding, &cur_entries, &explicit_deletes, known_state)?;
     Ok(ScanResult {
         changes,
@@ -385,16 +456,11 @@ pub fn scan_folder(
 /// of `classify_changes` and reconcile pairs the two halves by
 /// Message-ID.
 ///
-/// Cross-folder deletion semantic depends on coalescing: both halves
-/// of a move (source-delete and dest-create renames) need to land in
-/// the same `scan_paths` call so the source folder's "live path
-/// missing" emits `DeletedMessage(src)` and the destination folder's
-/// "live path present, DB anchors elsewhere" emits `NewMessage(dst)`,
-/// for reconcile to pair. The daemon's trigger loop holds open a
-/// coalesce window for exactly this reason; if that window were ever
-/// removed or set too tight to cover back-to-back debouncer batches,
-/// a split move would degrade into destroy + reupload, losing the
-/// JMAP id, thread, and keyword history.
+/// Coalescing both halves of a move lets this scan pair the source
+/// and destination cheaply. A one-sided result is only a deletion
+/// candidate: the engine widens such results to a full inventory
+/// before authorizing a remote destroy. Correctness must not depend
+/// on both rename events arriving in one debouncer batch.
 ///
 /// Limitation: events the watcher never received (macOS
 /// `MustScanSubDirs` drops, jma offline) leave drift this function
@@ -413,7 +479,11 @@ pub fn scan_paths(
     type GroupEntry = (String, String, PathBuf);
     // Per-folder classification input: cur/ live entries, new/ ids,
     // and ids that disappeared (live path missing).
-    type FolderBucket = (Vec<CurEntry>, Vec<MaildirId>, Vec<MaildirId>);
+    type FolderBucket = (Vec<FileEntry>, Vec<FileEntry>, Vec<MaildirId>);
+    let global_known: HashMap<_, _> = known_states
+        .values()
+        .flat_map(|state| state.iter().map(|(id, value)| (id.clone(), value.clone())))
+        .collect();
 
     // Per-event dispatch, in order:
     //   1. Parse the path; drop if it doesn't fit the
@@ -491,15 +561,21 @@ pub fn scan_paths(
 
         let bucket = by_folder.entry(folder.clone()).or_default();
         match live {
-            Some((subdir, flags, path)) if subdir == "cur" => {
-                bucket.0.push(CurEntry {
+            Some((subdir, flags, path))
+                if subdir == "cur" || global_known.contains_key(&maildir_id) =>
+            {
+                bucket.0.push(FileEntry {
                     maildir_id,
                     flags: flags.clone(),
                     path: path.clone(),
                 });
             }
-            Some(_) => {
-                bucket.1.push(maildir_id);
+            Some((_, flags, path)) => {
+                bucket.1.push(FileEntry {
+                    maildir_id,
+                    flags: flags.clone(),
+                    path: path.clone(),
+                });
             }
             None => {
                 if let Some((known_mailbox_id, _)) = known_state.get(&maildir_id)
@@ -523,7 +599,7 @@ pub fn scan_paths(
         // Same defensive guard as above; by_folder is built from
         // `groups`, which was filtered against `known_states`, so this
         // should always succeed.
-        let Some(known_state) = known_states.get(&folder) else {
+        let Some(_) = known_states.get(&folder) else {
             debug!(
                 "scan_paths: known_states missing folder {} at classify; skipping",
                 folder
@@ -533,8 +609,8 @@ pub fn scan_paths(
         for entry in &cur {
             local_flags.insert(entry.maildir_id.clone(), entry.flags.clone());
         }
-        for id in &new {
-            local_flags.entry(id.clone()).or_default();
+        for entry in &new {
+            local_flags.insert(entry.maildir_id.clone(), entry.flags.clone());
         }
         let Some(binding) = index.by_folder(&folder) else {
             debug!(
@@ -543,7 +619,7 @@ pub fn scan_paths(
             );
             continue;
         };
-        let changes = classify_changes(binding, &cur, &deletes, known_state)?;
+        let changes = classify_changes(binding, &cur, &deletes, &global_known)?;
         all_changes.extend(changes);
     }
 
@@ -741,7 +817,7 @@ fn walk_for_maildir_dirs_recursive(dir: &Path, found: &mut Vec<PathBuf>) {
 /// suffix-bearing shape to `new/` for non-Seen flag preservation;
 /// see `store_message`). Both shapes split on the first `:2,`, with
 /// no-`:2,` interpreted as empty flags.
-fn parse_event_path(
+pub(crate) fn parse_event_path(
     maildir_root: &Path,
     path: &Path,
 ) -> Option<(String, String, MaildirId, String)> {
@@ -780,9 +856,9 @@ fn stat_size(path: &Path) -> u64 {
 }
 
 /// Parse the file's `Message-ID` header, returning `Ok(Some(_))` when
-/// a usable id is present and `Ok(None)` (with an `error!` log) when
-/// the header is missing — the user produced an RFC-violating file
-/// that sync can't anchor idempotently, so the caller skips it.
+/// a usable id is present and `Ok(None)` (with an `error!` log) otherwise.
+/// RFC 5322 section 3.6.4 recommends, but does not require, this header;
+/// skipping headerless ingest is jma's current limitation, not invalid mail.
 ///
 /// I/O errors (file vanished mid-scan, EACCES, malformed UTF-8 in a
 /// header) propagate as `Err` and abort the scan: those are systemic
@@ -794,9 +870,9 @@ fn require_message_id(maildir_id: &MaildirId, path: &Path) -> Result<Option<Mess
         Some(mid) => Ok(Some(mid)),
         None => {
             error!(
-                "Skipping {} ({}): no Message-ID header. \
-                 jma requires Message-ID to anchor idempotency; \
-                 fix the file or remove it.",
+                "Skipping {} ({}): no usable Message-ID header. \
+                 jma currently requires Message-ID for new-message identity; \
+                 leaving the file unchanged (headerless ingest is unsupported).",
                 maildir_id,
                 path.display()
             );
@@ -1210,15 +1286,38 @@ mod tests {
         );
     }
 
-    /// A file with no Message-ID header (RFC 5322 says it SHOULD be
-    /// present, but isn't a hard MUST) must NOT be ingested: jma
-    /// anchors idempotency on Message-ID, and emitting NewMessage
-    /// without one would either drop the message at reconcile or
-    /// produce a server-side duplicate after a state DB wipe. Scan
-    /// drops the file (logs error!) so it stays on disk untouched
-    /// -- crucially, it does NOT emit DeletedMessage either,
-    /// because the file is still observed on disk; only files
-    /// missing from disk trigger deletion-detection.
+    #[test]
+    fn fresh_message_without_message_id_is_preserved_by_full_and_path_scans() {
+        for side in ["cur", "new"] {
+            let tmp = TempDir::new().unwrap();
+            let inbox_path = tmp.path().join("INBOX");
+            let inbox = ensure_maildir(&inbox_path).unwrap();
+            let id = MaildirId::from("1700000000.M1.host");
+            let filename = format!("{id}:2,F");
+            let body = "From: sender@example.org\r\nDate: Thu, 01 Jan 2026 00:00:00 +0000\r\nSubject: no msgid\r\n\r\nbody\r\n";
+            write_message(&inbox_path, side, &filename, body);
+            let path = inbox_path.join(side).join(filename);
+
+            let full = scan_folder(&inbox, &binding("INBOX", "MB-INBOX"), &HashMap::new()).unwrap();
+            let paths = scan_paths(
+                tmp.path(),
+                std::slice::from_ref(&path),
+                &HashMap::from([("INBOX".to_string(), HashMap::new())]),
+                &bindings_with("INBOX", "MB-INBOX"),
+                FolderLayout::Fs,
+            )
+            .unwrap();
+            for result in [full, paths] {
+                assert!(result.changes.is_empty(), "{side}: {:?}", result.changes);
+                assert_eq!(result.local_flags.get(&id).map(String::as_str), Some("F"));
+            }
+            assert_eq!(fs::read(&path).unwrap(), body.as_bytes());
+        }
+    }
+
+    /// A missing Message-ID does not make a live file a deletion. The
+    /// current ingest policy leaves it untouched; presence still matters
+    /// even when no NewMessage can be emitted.
     #[test]
     fn scan_folder_msgid_missing_does_not_trigger_deleted_message() {
         let tmp = TempDir::new().unwrap();

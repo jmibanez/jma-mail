@@ -16,7 +16,6 @@ use crate::ids::JmapMailboxId;
 use crate::jmap::mailbox::{MailboxSelectionInput, get_selected_mailboxes};
 use crate::maildir_ops::drift::{DriftReport, RenameInFlight, compute_drift};
 use crate::maildir_ops::removal::{RemovalOutcome, remove_maildir_tree};
-use crate::maildir_ops::store;
 use crate::state::queries;
 
 /// The drift class a prune entry came from.
@@ -96,7 +95,7 @@ pub fn plan(
     // Disk-bearing classes: removal recurses the maildir, so a folder
     // with mail in it needs --force-non-empty.
     for folder in classes.disk_only {
-        let file_count = count_folder_files(maildir_root, &folder);
+        let file_count = count_folder_files(maildir_root, &folder)?;
         entries.push(PruneEntry {
             safety: non_empty_safety(file_count),
             folder,
@@ -106,7 +105,7 @@ pub fn plan(
         });
     }
     for folder in classes.config_dropped {
-        let file_count = count_folder_files(maildir_root, &folder);
+        let file_count = count_folder_files(maildir_root, &folder)?;
         entries.push(PruneEntry {
             safety: non_empty_safety(file_count),
             folder,
@@ -203,29 +202,13 @@ fn non_empty_safety(file_count: usize) -> PruneSafety {
     }
 }
 
-/// Count the mail files in a folder's `cur/` + `new/`. When the folder
-/// has no `cur/` (so it can't be opened as a maildir) but still has a
-/// `new/` -- a maildir whose empty `cur/` was removed -- fall back to
-/// counting `new/` directly, so its mail still trips the non-empty
-/// gate. A folder that is gone or was never created counts as 0.
-fn count_folder_files(maildir_root: &Path, folder: &str) -> usize {
-    let base = maildir_root.join(folder);
-    match store::try_open_maildir(&base) {
-        Some(maildir) => maildir.list_cur().chain(maildir.list_new()).count(),
-        None => count_dir_files(&base.join("new")),
-    }
-}
-
-/// Best-effort count of regular files directly under `dir`. A missing
-/// or unreadable directory counts as 0.
-fn count_dir_files(dir: &Path) -> usize {
-    std::fs::read_dir(dir)
-        .map(|rd| {
-            rd.filter_map(Result::ok)
-                .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
-                .count()
-        })
-        .unwrap_or(0)
+/// Missing peers contribute zero, but incomplete inventory cannot label an
+/// unreadable folder empty/Safe. This path never creates directories.
+fn count_folder_files(maildir_root: &Path, folder: &str) -> Result<usize> {
+    crate::maildir_ops::entries::read(&maildir_root.join(folder))?.try_fold(0, |count, entry| {
+        entry?;
+        Ok(count + 1)
+    })
 }
 
 /// Which force gates the caller has opted into.
@@ -409,6 +392,21 @@ mod tests {
             db_folder: db.to_string(),
             disk_folder: disk.to_string(),
         }
+    }
+
+    #[test]
+    fn partial_maildir_with_unreadable_peer_is_not_a_safe_empty_prune() {
+        let temp = tempdir().unwrap();
+        let conn = db::open_in_memory().unwrap();
+        upsert_mailbox(&conn, "MB-ARCH", "Archive", "Archive", None);
+        touch_maildir(temp.path(), "Archive");
+        std::fs::remove_dir(temp.path().join("Archive/cur")).unwrap();
+        std::fs::write(temp.path().join("Archive/cur"), b"not a directory").unwrap();
+        assert!(
+            plan(&conn, temp.path(), &["INBOX".into()], false).is_err(),
+            "an unreadable peer cannot be labelled empty/Safe"
+        );
+        assert!(temp.path().join("Archive/cur").is_file());
     }
 
     /// A `--mailbox` that names nothing in the plan is an error, not a

@@ -1,4 +1,5 @@
 pub mod drift;
+pub(crate) mod entries;
 pub mod flags;
 pub mod headers;
 pub mod layout;

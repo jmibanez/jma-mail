@@ -26,6 +26,62 @@ Single test, by name path:
 CC=/usr/bin/cc cargo test --lib maildir_ops::headers::tests::parses_folded_value
 ```
 
+### Real Stalwart flag gate
+
+`tests/e2e_flag_sync.rs` is ignored by the ordinary test run but explicitly
+included in the E2E workflow's locked, serial `e2e_* --ignored` invocation.
+The default backend is the existing Docker Stalwart/MySQL snapshot:
+
+```sh
+cargo test --locked --test e2e_flag_sync -- --ignored --nocapture --test-threads=1
+```
+
+For native Stalwart v0.16 on Linux, use the isolated runner (requires enabled
+unprivileged user/network/mount namespaces). A tested Guix invocation is:
+
+```sh
+guix shell git gcc-toolchain openssl pkg-config stalwart util-linux iproute2 python -- bash <<'SH'
+set -e
+export LD_LIBRARY_PATH="$(dirname "$(cc -print-file-name=libgcc_s.so.1)")${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+tools/test-stalwart-native.sh
+SH
+```
+
+The runner defaults to `e2e_flag_sync`. Pass Cargo test-target names or quoted
+patterns to select more suites, for example `tools/test-stalwart-native.sh 'e2e_*'`
+for all seven Stalwart targets. Every selected binary and its tests run serially.
+
+The runner builds outside the sandbox, then executes the compiled test binaries
+with loopback-only networking and a private tmpfs /var. Native fixture startup
+refuses an unsafe host environment. `JMA_TEST_NATIVE_STALWART` selects the
+executable; it is not a URL or permission to use an existing server. Every
+fixture has fresh temporary config/storage, clears inherited Stalwart config
+environment, and stops/waits for its child before deleting its directory.
+
+`tests/common/native.rs` bootstraps fresh RocksDB with typed JSON through
+`x:Bootstrap/set` **updating** the singleton. That returns generated fixture
+admin credentials; restart into the normal account, mint a Bearer via
+`x:ApiKey/set`, replace default listeners with high loopback HTTP/IMAP ports,
+enable test-only plaintext IMAP authentication, and restart again. Before seeding,
+the fixture also creates `x:Search` with the Docker snapshot's `indexEmailFields`
+map, including `headers: true`, requiring positive creation ACK and persisted
+readback after restart. Bootstrap defaults leave headers unindexed: mailbox pulls
+and flag tests can pass while rebind header queries return no matches. Bootstrap
+listeners and default log paths are confined to the private namespaces. The
+Docker path and its container teardown order remain unchanged. Existing public
+fixture fields/seeding helpers still support examples/bench-server.rs.
+
+IMAP APPEND seeds Seen/Flagged/custom-keyword messages independently of jma's
+mutation path. Tests run real SyncEngine cycles, fresh independent Email/get
+and full-keyword oracle writes (never SDK keyword(false)), actual filenames,
+SQLite observations/baselines and later idle checks. Coverage includes local
+removals plus a tracked move into new/, server pulls/promotion, both missing-peer
+shapes, custom preservation, identity/blob/thread/body stability and real
+stateMismatch rejection. This focused F/S gate is separate from the exhaustive
+six-bit stateful model; neither proves arbitrary cross-writer linearizability.
+Native v0.16.4 execution does not establish the Docker/MySQL backend, a hosted CI
+result, or required-branch status.
+
 ## Source layout
 
 - `src/main.rs` -- subcommand dispatch and lock acquisition.
@@ -36,20 +92,21 @@ CC=/usr/bin/cc cargo test --lib maildir_ops::headers::tests::parses_folded_value
 - `src/ids.rs` -- newtype wrappers for the various string IDs (see [ID newtypes](#id-newtypes)).
 - `src/domain.rs` -- neutral domain types shared across layers (`MailboxObject`, `MailboxFolderBinding`, `MaybeReference`, `MailboxIndex`). Depends only on `ids` + `std`; produced by `jmap`, consumed by `maildir_ops` and `sync`, so it lives below both peers rather than inside either (see [Data model](#data-model)).
 - `src/jmap/` -- JMAP client wrapper. `session.rs` opens the connection, `discovery.rs` resolves the session URL via DNS SRV / well-known per RFC 8620 section 2.2, `limits.rs` clamps every server-advertised cap against a hardcoded ceiling (so a hostile or buggy server can't induce DoS via absurd values), `email.rs` is the per-method veneer over `jmap-client`, `mailbox.rs` handles `Mailbox/get`, `retry.rs` classifies errors as transient vs hard, `types.rs` holds the internal `EmailObject` shape.
-- `src/maildir_ops/` -- anything that touches the filesystem. `store.rs` wraps the `maildir` crate for read/write, `flags.rs` translates between maildir suffix flags and JMAP keywords, `scan.rs` walks a folder and emits `LocalChange`s, `dedupe.rs` does the Message-ID-based duplicate sweep, `headers.rs` parses `Message-ID` out of a maildir file, `layout.rs` resolves a JMAP mailbox tree onto a single on-disk folder name under the configured `FolderLayout` and applies any matching `[[rename_rules]]`, `lock.rs` takes the per-maildir advisory lock, `drift.rs` classifies maildir-vs-DB drift into the four classes `status` and `janitor prune` consume (see [Maildir/DB drift and prune](#maildirdb-drift-and-janitor-prune)), `removal.rs` owns `remove_maildir_tree` -- the single guarded folder delete (path-escape guard, rescue of unmapped local-only files before deletion, then the state-DB cascade) that every in-crate destroy path routes through.
+- `src/maildir_ops/` -- anything that touches the filesystem. `store.rs` wraps message writes, `entries.rs` supplies strict non-creating cur/new inventory, `flags.rs` translates between maildir suffix flags and JMAP keywords, `scan.rs` walks a folder and emits `LocalChange`s, `sync/dedupe.rs` does the Message-ID-based duplicate sweep, `headers.rs` parses `Message-ID` out of a maildir file, `layout.rs` resolves a JMAP mailbox tree onto a single on-disk folder name under the configured `FolderLayout` and applies any matching `[[rename_rules]]`, `lock.rs` takes the per-maildir advisory lock, `drift.rs` classifies maildir-vs-DB drift into the four classes `status` and `janitor prune` consume (see [Maildir/DB drift and prune](#maildirdb-drift-and-janitor-prune)), `removal.rs` owns `remove_maildir_tree` -- the single guarded folder delete (path-escape guard, rescue of unmapped local-only files before deletion, then the state-DB cascade) that every in-crate destroy path routes through.
 - `src/state/` -- SQLite. Schema defined inline in `db.rs`; version constant is `db.rs::SCHEMA_VERSION`. Tables:
   - `jmap_state` -- per-entity sync cursor, one row per `(account, entity)`. `("acct", "Email")` ratchets in `execute`; `("acct", "Mailbox")` is stamped at the cycle tail from the `Mailbox/get` state, gated on the cycle's staged `mailbox_map` writes having landed so the cursor never advances past a cache that is still catching up. The Mailbox cursor also gates the fetch: a `Mailbox/changes` delta touching no structural property (empty, or only `totalEmails`/`unreadEmails`/`totalThreads`/`unreadThreads` per RFC 8621 section 2.2) lets `resolve_mailboxes` rebuild the set from `mailbox_map` and skip the full `Mailbox/get`; `janitor prune` clears it when it drops a `mailbox_map` row out of band, since the server-state cursor cannot otherwise see that local mutation. Both seed the daemon's SSE state-change dedup cache so the first event after connect isn't a redundant trigger.
   - `message_map` -- JMAP<->maildir binding, indexed on `maildir_id`, `message_id`, `jmap_mailbox_id`.
   - `mailbox_map` -- server mailbox metadata.
-  - `local_state` -- filesystem snapshot for change detection.
+  - `local_state` -- raw filesystem observations for change detection, not proof of successful reconciliation.
+  - `message_flag_sync` -- nullable acknowledged six-flag baseline, review/error state, and optional in-flight flag receipt. Access is owned by `state/flag_sync.rs`.
   - `jmap_discovery` -- cached session URL keyed on the account's email domain; populated by `session::connect` after autodiscovery, cleared and rediscovered on a structural connect failure.
   - `folder_checkpoint` -- per-folder `(cur_mtime, new_mtime, cur_count, new_count)` snapshot written at the tail of every successful Full cycle. Phase 0 reads it to skip the dedupe walk for folders whose on-disk state hasn't changed; see [The sync cycle](#the-sync-cycle).
 
-  All access goes through `queries.rs`. Don't `prepare` ad-hoc SQL elsewhere; if you need a new query, add it there.
-- `src/sync/` -- orchestration (engine, plan, reconcile, execute, plus `self_writes.rs` for the daemon's self-write cache). See [Sync internals](#sync-internals) below.
+  Access goes through `queries.rs` or the narrowly scoped `flag_sync.rs` history API. Keep SQL in the state layer.
+- `src/sync/` -- orchestration (engine, plan, reconcile, execute), the shared flag decision in `flag_resolution.rs`, explicit targeted authority in `flag_repair.rs`, cached selected-history reporting in `status.rs`, and the daemon's self-write cache in `self_writes.rs`. See [Sync internals](#sync-internals) below.
 - `src/janitor/` -- maintenance tasks invokable from the engine's Phase 0 and from `jma janitor <task>` CLI subcommands. Today: `dedupe`, `remotededupe`, `rebindfolders`, `prune` (issue #8). Reserved-but-empty: `db_gc`. Each task is a thin orchestration over the underlying primitive (e.g. `janitor::dedupe::run` wraps `sync::dedupe::plan_dedupe` + `apply_dedupe` with the empty-folder-list short-circuit); `prune` is offline drift remediation built on `maildir_ops::drift` + `removal` (see [Maildir/DB drift and prune](#maildirdb-drift-and-janitor-prune)).
 - `src/profile.rs` -- per-run profiling layer. Aggregates `tracing` spans and events from the sync engine and maildir ops into a phase-by-phase summary (timings, blob throughput, file-op counts, RSS deltas). Output is opt-in via `--profile` (stderr table) and `--profile-json <PATH>` (NDJSON per cycle in daemon mode).
-- `src/daemon/` -- `watch` mode. `runner.rs` runs an initial sync then concurrently spawns `eventsource.rs` (SSE listener on the JMAP `eventSourceUrl` from the session) and `watcher.rs` (filesystem `notify` with debouncing; classifies each batch via `classify.rs` before emitting, so noise never enters the channel). Both feed a `tokio::sync::mpsc` channel of `SyncTrigger`s; the trigger loop holds open a coalescing window after the first arrival to absorb back-to-back batches, then dispatches one `SyncEngine::run` per coalesced cycle (path-driven scan for `LocalChange`, full scan for everything else). Every trigger that reaches the loop starts a cycle. See [Trigger pipeline](#trigger-pipeline) for the layering. `hook.rs` runs `post_arrival_command` after cycles that downloaded mail, coalescing overlapping triggers.
+- `src/daemon/` -- `watch` mode. `runner.rs` owns the FS watcher and long-lived engine, performs the initial full sync, then runs SSE sessions. `eventsource.rs` listens on the JMAP `eventSourceUrl`; `watcher.rs` debounces filesystem notifications and classifies batches via `classify.rs` before emitting. Both feed a `tokio::sync::mpsc` channel of `SyncTrigger`s. `retry.rs` owns the independent retained-work deadline and permanent-rejection mask across sessions. The trigger loop dispatches path-driven local cycles, normal full cycles, or full retry cycles. See [Trigger pipeline](#trigger-pipeline). `hook.rs` runs `post_arrival_command` after cycles that downloaded mail, coalescing overlapping triggers.
 
 ## Identifiers
 
@@ -69,7 +126,7 @@ The system juggles several opaque IDs from different namespaces. Knowing which i
 
 **Cross-cutting.**
 
-- `Message-ID` -- the RFC 5322 header. The **only** identifier shared by both sides. Parsed out of the maildir file by `maildir_ops::headers`; reported by JMAP as `EmailObject.message_id` (a `Vec<MessageId>`, since RFC 5322 technically allows multiple values). NOT unique in `message_map`: the same Message-ID can legitimately appear in multiple rows (same email delivered to two folders, or sent messages stored in both Sent and the conversation thread folder). This is the identifier that survives a state DB wipe and lets us rebind known files without re-downloading.
+- `Message-ID` -- the client-supplied RFC 5322 header used for best-effort cross-side correlation. Parsed out of the maildir file by `maildir_ops::headers`; reported by JMAP as `EmailObject.message_id` (a `Vec<MessageId>`). It may be absent, constant across unrelated messages, or reused across content-distinct draft versions. NOT unique in `message_map`: multiple files/server objects can carry the same header. It can help rebind existing files after a DB wipe, but is not proof of byte identity, a unique match, or destructive authority.
 
 ### ID newtypes
 
@@ -97,13 +154,13 @@ The sync pipeline moves a small set of internal types between phases. Each one l
 
 **JMAP-side types** (`src/jmap/types.rs`). Hand-rolled rather than re-exported from `jmap-client` so the rest of the codebase doesn't depend on the upstream crate's shape.
 
-- `EmailObject` -- `{ id, blob_id, thread_id, mailbox_ids: HashMap<JmapMailboxId, bool>, keywords: HashMap<String, bool>, message_id: Option<Vec<MessageId>>, subject }`. Produced by `Email/get` and `Email/changes`-then-`Email/get`; consumed by `reconcile`. The `mailbox_ids` map's bool is always `true` (JMAP's convention for set membership); we keep the type as-is to match the wire format.
+- `EmailObject` -- `{ id, blob_id, thread_id, mailbox_ids: HashMap<JmapMailboxId, bool>, keywords: HashMap<String, bool>, message_id: Option<Vec<MessageId>>, subject, received_at: Option<i64>, size }`. Produced by `Email/get` and `Email/changes`-then-`Email/get`; consumed by `reconcile`. The `mailbox_ids` map's bool is always `true` (JMAP's convention for set membership); we keep the type as-is to match the wire format.
 - `ChangesResponse` -- `{ old_state, new_state, created, updated, destroyed, has_more_changes }`. The shape `Email/changes` returns; loop control for `fetch_remote_state`.
 - `SessionInfo` -- session URLs and account id, captured at connect time.
 
 **State-side types** (`src/state/queries.rs`). One struct per row-shape; every read or write goes through these.
 
-- `MessageRecord` -- one `message_map` row. Carries everything needed to act on an email without re-querying: server identifiers (`jmap_email_id`, `jmap_blob_id`, `jmap_thread_id`, `jmap_mailbox_id`), the local `maildir_id`, the cross-cutting `message_id`, and a flags pair (`flags` for the maildir suffix view, `jmap_keywords` for the JSON-serialised JMAP view). The on-disk folder name is *not* stored on the row -- it's derived by looking `jmap_mailbox_id` up against `mailbox_map`'s `maildir_folder` column (or against the in-memory `MailboxBindings` table during a sync cycle), so the binding lives in exactly one place. `message_id` is non-`Option` (and `NOT NULL` in the DB schema): scan and reconcile both refuse to write a row without one. The `maildir_id`, `jmap_blob_id`, and `jmap_thread_id` fields remain `Option` because a row can be JMAP-known but not yet bound to an on-disk file during in-flight phases (and the blob/thread ids aren't always carried through every code path that constructs a `MessageRecord`).
+- `MessageRecord` -- one `message_map` row. Carries everything needed to act on an email without re-querying: server identifiers (`jmap_email_id`, `jmap_blob_id`, `jmap_thread_id`, `jmap_mailbox_id`), the local `maildir_id`, the cross-cutting `message_id`, and a server-observation pair (`flags` for its mapped six-flag projection, `jmap_keywords` for the full JSON-serialised keyword set). The raw filename suffix, including unowned letters, is observed separately in `local_state`; acknowledgement is separate again in `message_flag_sync`. The on-disk folder name is *not* stored on the row -- it's derived by looking `jmap_mailbox_id` up against `mailbox_map`'s `maildir_folder` column (or against the in-memory `MailboxBindings` table during a sync cycle), so the binding lives in exactly one place. `message_id` is non-`Option` (and `NOT NULL` in the DB schema): scan and reconcile both refuse to write a row without one. The `maildir_id`, `jmap_blob_id`, and `jmap_thread_id` fields remain `Option` because a row can be JMAP-known but not yet bound to an on-disk file during in-flight phases (and the blob/thread ids aren't always carried through every code path that constructs a `MessageRecord`).
 - `MailboxRecord` -- one `mailbox_map` row. Mostly a snapshot of `MailboxObject` plus the resolved `maildir_folder` (with the `INBOX` magic alias applied) and a cached `remote_path: Option<String>` -- the slash-joined server-name path (e.g. `Personal/Archive`) that disambiguates same-named mailboxes at different points in the hierarchy. JMAP scopes its mailbox uniqueness to `(parent_id, name)` per RFC 8621 section 2, so the bare `name` column is ambiguous while this path is not. The column is nullable; older DBs upgraded via the runtime additive `ALTER` read NULL on existing rows until the next `resolve_mailboxes` upsert stamps a value. Reads tolerate the gap; writes always supply one.
 
 **Maildir-side types** (`src/maildir_ops/`). What `scan` and `dedupe` produce for `reconcile` to chew on.
@@ -121,7 +178,7 @@ The sync pipeline moves a small set of internal types between phases. Each one l
 - `SyncAction` (enum) -- the action vocabulary. Each variant carries every field its handler needs, so execute never re-queries.
 - `SyncPlan` -- `{ actions: Vec<SyncAction>, new_email_state }`. The plan plus the JMAP cursor to commit on success.
 - `SyncDirection` -- `Both | PullOnly | PushOnly`. Top-level mode set by the CLI subcommand.
-- `ActionDirection` -- `Pull | Push | Both`. Per-action classification used by `into_filtered`. The asymmetry (`Both` exists for actions but not modes) is on purpose: only `AdoptLocalMessage` is `Both`, and it's a hybrid that survives every direction filter.
+- `ActionDirection` -- `Pull | Push | Both`. Per-action classification used by `into_filtered`. The asymmetry (`Both` exists for actions but not modes) is on purpose: adoption and observation/history metadata are `Both` and survive every direction filter. They must not acknowledge a filtered-out mutation.
 
 **Reconcile context** (`src/sync/reconcile.rs`). `ReconcileCtx<'a>` is a private struct that bundles the immutable inputs every helper in `reconcile` needs (the three `known_by_*` indices, the `LocalIndex`, the `mailboxes` slice, the conflict strategy, plus a few derived sets). Threaded by `&` through helpers so each one stays short on parameters.
 
@@ -132,17 +189,67 @@ Read this before touching anything in `src/sync/` or `src/maildir_ops/`.
 Two distinct identifiers anchor the system:
 
 - **JMAP `email_id`** -- stable per server, lives in `message_map`.
-- **RFC 5322 `Message-ID`** -- stable across both sides, survives a state DB wipe.
+- **RFC 5322 `Message-ID`** -- an unreliable client-supplied correlation hint that may survive a state DB wipe; not a unique identity or content digest.
 
-The state DB is **disposable**. Nuking `state.db` and re-running must converge on the existing maildir without re-downloading or duplicating files. That property is enforced by:
+The state DB is **rebuildable, not a lossless journal**. Recreating it starts a new reconciliation from the current maildir and server state. Message-ID-based adoption is intended to reuse existing files rather than download another copy; it cannot reconstruct the history of changes made before the reset. The current recovery mechanisms are:
 
-1. `sync::dedupe::plan_dedupe` runs at the start of every sync cycle. It walks each synced folder, groups files by Message-ID (parsed from headers in `maildir_ops::headers`), and classifies the newest by mtime within each group as a duplicate. Newer copies are presumed to be jma-introduced duplicates from a prior aborted run. Groups containing a cross-subdir pair (one candidate in `cur/`, one in `new/`) whose qmail unique ids are in an extending-prefix relationship are exempt from deletion -- every realistic MUA preserves the unique across `rename(2)` promotion, and mbsync additionally appends `,U=<imap-uid>` to it, so such a pair is the signature of a `rename(2)` we observed across two separate readdirs rather than two distinct duplicates. The pair stays on disk, `plan.kept` still emits an entry for `LocalIndex`, and the cycle after the promotion's caller settles the pair collapses to in-subdir and gets cleaned then. Cross-subdir pairs with unrelated uniques are *not* exempt -- those are real duplicates (e.g., jma re-delivered into `new/` while a different copy already lived in `cur/`) and get normal mtime-based dedupe. Returns a `DedupePlan { kept, deletions }` without touching disk; `SyncEngine::run` uses `plan.kept` to build a `LocalIndex` keyed on Message-ID and calls `sync::dedupe::apply_dedupe` to **delete** the planned duplicates on non-dry-run cycles only. Under `--dry-run` the deletions are surfaced in the printed plan instead of executed.
+1. `sync::dedupe::plan_dedupe` groups files by Message-ID, then partitions
+   each group by complete content. Size/SHA-256 are prefilters followed by a
+   byte-for-byte comparison; the oldest mtime survives within each identical
+   class. Content-distinct revisions remain on disk and each contributes a
+   KeptEntry. Cross-folder copies stay separate, and extending-prefix cur/new
+   promotion pairs retain their existing exemption. The plan is non-mutating.
+   `janitor::dedupe::run` additionally vetoes deletion of any ID in
+   `message_map` or `local_state`, preserving live synchronization anchors even
+   when byte-identical. Only remaining deletions run on apply; previews do not
+   delete files.
 
-2. `reconcile` consults `message_map` (by JMAP id) -> `LocalIndex` (by Message-ID) before emitting a `DownloadMessage`. The Message-ID lookup is what saves us after a DB wipe: a known server email whose Message-ID we already have on disk is adopted into `message_map` rather than re-downloaded.
+2. Reconcile consults bindings and LocalIndex before downloading. The index
+   is built from dedupe-kept entries even when message_map is nonempty, so
+   partially committed bootstraps can still discover their unbound files.
+   Checkpoints narrow the walk; it is not a permanent whole-tree index. One
+   oldest local content representative per Message-ID/folder may upload;
+   siblings remain locally for review rather than competing for Fastmail's
+   one-import-per-Message-ID rule. Message-ID-based adoption reuses supported,
+   unambiguous matches; it is not proof of byte identity or lost-history recovery.
 
-3. **Both ingest boundaries refuse Message-ID-less messages.** Local files without a parseable `Message-ID` header are skipped with `error!` by `maildir_ops::scan::scan_folder` and `sync::dedupe::plan_dedupe`. Remote emails whose `Email/get` response carries no `messageId` and aren't already bound by JMAP id are skipped at `sync::reconcile::process_remote_emails`. The known-JMAP-id path still applies flag/move updates -- the existing `message_map` row is itself the anchor, so a server that strips Message-ID from updates doesn't break flag sync. The result: no row enters `message_map`, and no `LocalChange::NewMessage` is emitted, without an anchor.
+3. **Both ingest boundaries still refuse Message-ID-less messages.** This is jma's current identity-policy limitation, not a transport requirement: [RFC 5322 section 3.6.4](https://www.rfc-editor.org/rfc/rfc5322.html#section-3.6.4) recommends the header with SHOULD, not MUST. Local files without a parseable `Message-ID` header are skipped with `error!` by `maildir_ops::scan::scan_folder` and `sync::dedupe::plan_dedupe`, leaving the bytes untouched. Remote emails whose `Email/get` response carries no `messageId` and aren't already bound by JMAP id are skipped at `sync::reconcile::process_remote_emails`; they stay on the server, but the cycle may advance its cursor, so this is not queued headerless ingestion. The known-JMAP-id path still applies flag/move updates -- the existing `message_map` row is itself the anchor, so a server that strips Message-ID from updates doesn't break flag sync. No synthetic header or headerless identity is introduced.
 
 Don't add a code path that writes to a maildir outside `Executor::execute` (or `apply_dedupe`'s deletion of duplicates). Every other writer would skip the Message-ID check.
+
+### PR #21 integration and live-binding authority
+
+Content-safe dedupe preserves more copies; that does not authorize adopting an
+untracked copy over a still-live cached Maildir ID or treating its suffix as a
+new edit of the bound message. Same-folder adoption first prefers an exact
+Maildir-ID binding, preserves extra copies when an anchor is live, and defers
+multiple unbound candidates when the old anchor is missing. Remote dedupe
+likewise refuses a group with multiple locally bound Email IDs: uniqueness of
+Maildir IDs does not imply uniqueness of Message-ID. These cases preserve
+both files/objects and their flag histories instead of guessing or panicking.
+
+Path cycles preflight new/relocated identities and disappeared known identities
+before Phase 0. They widen to Full so dedupe and LocalIndex participate as well
+as the scan. Ordinary known-ID flag renames remain path-scoped; unknown new-side
+files remain observation-only. Missing unknown paths and excluded paths do not widen merely
+because their filenames are unfamiliar. The older post-scan deletion
+widening remains a conservative race-window fallback.
+
+Permanent per-message import rejections alreadyExists/invalidEmail are detected
+through the anyhow source chain, not outer Display text, and preserve the
+local file without recording an upload. Account/transport/protocol failures
+still propagate. Skipped files may be reassessed on later Full cycles; this is
+not a durable body-payload retry or suppression queue.
+
+Remote-dedupe audit options retain member subject/receivedAt, size, SHA-256 and
+an optional bounded terminal-safe content prefix. Reporting never promotes a
+refused group into deletion eligibility. Email/get requests subject and
+receivedAt (optional Unix seconds) for that report; they are observations, not
+flag acknowledgement history. `janitor destroyids` accepts an externally
+reviewed, account-wide exact ID manifest, refuses the entire batch if any ID
+has a message_map row, verifies fresh presence and requires --yes to destroy.
+Explicit maintenance uses its existing unconditioned Email/set path; normal
+reconciliation still requires its planning-state guard.
 
 ### Schema versioning: nuke-and-resync as the migration story
 
@@ -151,12 +258,263 @@ There is no in-place migration system. Whenever the SQLite schema or the invaria
 On open, the binary compares the on-disk version against `SCHEMA_VERSION`:
 
 - **Match** -- proceed.
-- **Mismatch** under a mutating command (`sync`, `pull`, `push`, `watch`) -- `open_or_recreate` `warn!`s and unlinks `state.db` plus its `-wal` and `-shm` siblings, then recreates an empty schema. The mutating command holds the state DB lock at this point, so no concurrent jma sharing this DB can race with the unlink. The disposability invariant is what makes this safe: the maildir + JMAP server are the source of truth, and the dedupe pass plus Message-ID-anchored adoption rebind every existing local file without re-downloading bytes.
-- **Mismatch** under a read-only command (`status`, `mailboxes`, `auth rediscover`) -- `open` refuses with an actionable error pointing the user at `jma sync`. Read-only paths don't hold the state DB lock and so can't safely nuke; deferring to the next mutating run keeps the locking invariant intact.
+- **Mismatch** under a mutating command (`sync`, `pull`, `push`, `watch`) -- `open_or_recreate` logs a warning and unlinks `state.db` plus its `-wal` and `-shm` siblings, then recreates an empty schema. There is no confirmation prompt or automatic backup. The caller is required to hold the state DB lock, preventing another cooperating jma from using the DB during the unlink. This lock prevents that race; it does not make discarding synchronization history lossless.
+- **Mismatch** under a read-only command (`status`, `mailboxes`, `auth rediscover`) -- `open` refuses with backup/rebuild guidance. Read-only paths don't hold the state DB lock and cannot safely unlink it.
+- **Maintenance and targeted repair** -- `open_preserving_history` refuses a mismatch even while holding the locks. Compatible additive migrations run, but binding/history rows are never discarded before dedupe, reviewed-destroy or repair preflight. This includes previews. Ordinary sync/pull/push/watch rebuild policy is unchanged.
 
-Both directions of mismatch (older binary, newer DB; or newer binary, older DB) take the same auto-nuke path. Disposability cuts both ways. A pre-versioning DB (`user_version = 0` with populated tables) is treated as stale.
+Both directions of mismatch (older binary, newer DB; or newer binary, older DB) take the same auto-nuke path for ordinary sync mutators. Disposability cuts both ways. A pre-versioning DB (`user_version = 0` with populated tables) is treated as stale.
 
-When you bump `SCHEMA_VERSION`, you don't need to write migration code -- but you DO need to mention the field/invariant change in the commit message, and ideally add a regression test that constructs an old-schema DB on disk and checks `open_or_recreate` rebuilds correctly.
+When you bump `SCHEMA_VERSION`, the current implementation rebuilds rather than migrates. Mention the field/invariant change and the recovery consequences in the commit message, and test the old-schema open path. Do not infer that every future state addition can safely be discarded merely because the current open path does so.
+
+### What a DB rebuild can recover
+
+The unlink itself removes only the DB and its WAL/SHM files, not maildir messages. The subsequent sync is a normal mutating sync: it can adopt, download, upload, deduplicate, change flags, or propagate deletions according to the inputs and configured policy. It is not a read-only reconstruction operation.
+
+Current data does not uniquely determine the lost history. For example, local flags `S` and remote flags `FS` can mean either that both sides previously had `FS` and the user unflagged locally, or that both previously had `S` and another client flagged remotely. Without the previous synchronized snapshots, those histories are indistinguishable. A fresh adoption may use the configured conflict strategy, but cannot promise the same result as finishing the interrupted reconciliation.
+
+Rebuilding therefore does not promise to preserve unacknowledged flag intent, replay an interrupted operation, restore a destroyed JMAP Email id, or recover server-only metadata from a local filename. Adoption also requires a usable Message-ID and an unambiguous supported match; Message-ID alone is not proof of byte identity.
+
+Before a reset or an upgrade/downgrade that may trigger one, stop concurrent mutators and back up the DB with a consistent SQLite backup (or copy it only after closing all connections, including any WAL state). Preserve the maildir as well. Treat a rebuild as a fresh reconciliation with explicit policy, not as transparent crash recovery. Normal restart recovery with the DB intact is a separate guarantee and must be tested separately.
+
+### Flag observations, acknowledgement, and restart recovery
+
+`state/flag_sync.rs` separates three things that old flag synchronization
+conflated:
+
+- `local_state.flags`: last observed raw filename suffix.
+- `message_map.flags` / `jmap_keywords`: last observed server projection
+  and full keyword set, including unowned keywords.
+- `message_flag_sync.baseline`: last acknowledged common mapped flag set;
+  NULL means initial reconciliation is unfinished, not an empty flag set.
+
+Cold adoption records observations and a NULL baseline when they disagree.
+It does not acknowledge a rejected push, failed local rename, or operation
+excluded by a direction filter. Observed agreement can initialize a baseline.
+The shared bound-message pass uses actual scan observations and the baseline
+on later cycles, even when neither side emitted a new delta. One-sided
+changes propagate; competing changes use the configured whole-flag-set
+policy, not a union. Local suffix extensions survive owned-bit replacement.
+
+Before flag I/O, the executor commits a small receipt containing the captured
+local suffix/identity/location and mapped target. Successful remote keyword
+acknowledgement or local rename commits that processed target with the
+corresponding mirrors, not any newer MUA edit. A failed acknowledgement DB
+transaction leaves the receipt intact. A fresh remote target can establish
+completion of an older push (source projection equals target), allowing a
+newer local edit to propagate. It does **not** prove completion of a pull:
+its required local rename may have failed. Confirmed per-ID rejections clear
+the receipt but retain the previous/NULL baseline; missing acknowledgements
+and transport failures retain it. Failure classification is committed
+separately from successful-ID mirrors, so one ID's ACK rollback cannot
+turn another ID's confirmed rejection into an ambiguous receipt. Typed
+permanent rejections are marked blocked, distinct from retryable rejections
+and ambiguous outcomes.
+
+An unacknowledged pull can also have renamed successfully before its ACK
+transaction failed. If the filename now matches that old pull target but fresh
+remote flags differ, the old suffix must not be pushed back as an invented MUA
+edit. When normal resolution would do that (including a server return to the
+old baseline), the shared resolver retains the baseline/receipt and marks
+explicit review. Current values cannot distinguish our rename from a
+coincident local edit, so `repair-flags` supplies the missing authority. This
+is not virtual pull acknowledgement: safe fresh pulls and distinct newer local
+mapped edits still proceed normally, and fresh agreement can still initialize
+a common baseline. Preparing a replacement pull from an older unacknowledged
+pull target marks review before overwriting its receipt; positive ACK clears
+it. If that replacement also fails or is interrupted, review preserves the
+older own-effect ambiguity instead of permitting a later repush when the
+server returns to the baseline. Review keeps its explanatory error instead of
+being relabeled as a legacy-only failure on the next cycle. Stateful SAME-DB tests in
+`flag_tests/pull_ack.rs` cover both unsafe pushes and automatic safe-pull
+recovery, followed by independent fresh verification and later idle cycles.
+
+`store::set_flags_if_unchanged` requires a unique live path and the planner's
+exact raw suffix, refuses existing targets, and syncs renamed directories on
+Unix. A stale plan cannot deliberately find the latest suffix and overwrite
+it. Non-Seen changes keep a new-side file in `new/`; adding Seen promotes it;
+clearing Seen in `cur/` does not make it new. This is snapshot validation,
+not global linearizability against non-cooperating filesystem writers.
+
+The table is additive at schema version 2: both opening APIs initialize it
+without rebuilding existing v2 bindings/cursors. Missing history rows are
+legacy/unverified. Fresh Email/get snapshots are kept separate from actual
+Email/changes events so verification does not fabricate delete-vs-update
+conflicts. Confirmed agreement initializes history; a still-confirmed old
+common observation can identify a local-only edit. Other legacy disagreement
+is deferred for explicit review, not automatically overwritten. Do not mix
+old and new mutating binaries against one DB: older binaries do not maintain
+this history. Reset/rebuild still discards it and invokes bootstrap policy;
+this is not a lossless migration or a general durable operation queue.
+
+`pending_flag_actions`, `blocked_flag_actions` and `unverified_flag_actions`
+keep unfinished work from being reported as already synchronized, including
+path no-ops and previews. `flag_sync::summarize` and `load_for_mailboxes` are
+scoped to resolved selected bindings (plus managed local orphans), not the
+whole DB. Excluded histories cannot force full scans, pollute counts, or
+break a selected cycle by containing an invalid receipt. Queries normalize
+unowned suffix letters and retain known errors even when old cached views
+agree. Missing history is unverified, not a settled or empty baseline.
+
+Retryable pending/legacy work widens Paths to Full. `SyncOutcome` separates
+retryable remote/local effects and deferred observations from permanent
+remote rejections and explicit review deferrals. An effect withheld by a
+membership or direction gate is not an attempted local failure. The engine
+computes scoped history status; the executor no longer counts the entire DB.
+Console and daemon/TUI reporting show unfinished/blocked work rather than
+claiming idle. `sync/status.rs` supplies SELECT-only cached history queries
+for `jma status`; configured selection uses cached remote paths and warns
+about unclassifiable bound mailboxes. It does not verify remote state or
+acknowledge histories. Existing DB-opening/schema initialization is unchanged.
+
+Full/manual cycles can reassess retained discrepancies. Watch mode also has
+an event-independent retry deadline (see below). Email-state preconditions
+and fresh generation replanning are described below; targeted legacy
+authority repair uses the separate flags-only path below. Neither a timer nor
+a conditional write recovers discarded DB history.
+Unresolved flag histories hold destructive local-orphan handling, while mere
+metadata observations are not user-change blockers. Moves and adoption use
+the same baseline decision as ordinary updates. A move uses the observed
+destination suffix and full fresh remote keywords (or the verified cache),
+not a filename-derived replacement for server metadata. Ordinary adoption
+also prefers fresh full metadata over its cached record when available.
+
+Move-paired destination binding and local flag effects require an actually
+submitted, positively acknowledged membership update, including under direction
+filters. Placement and full observations commit first; a required destination
+flag rename acknowledges flags only after it succeeds. Failure retains the
+old baseline and a destination snapshot receipt so a reopened DB can finish
+without a fresh edit or an old-source rename. Push receipts also capture the
+moved destination, not the stale binding. Failed or excluded placement holds
+the Email cursor so replay retains its fresh metadata. Flag-only receipts do
+not acknowledge mailbox placement. Truly competing selected mailbox
+destinations are deferred for review rather than arbitrarily counter-moved.
+When folder policy replaces a move with a counter-move, its destination flag
+pull is deferred, not allowed into the ordinary pre-membership flag phase.
+Every counter holds the Email cursor and requests a fresh full replan, even
+when mapped flags agree: the discarded adoption may contain custom-only
+metadata which must not disappear behind an advanced cursor.
+
+Counter-moves take the actual destination BoundId from the unique paired
+adoption, never the cached old basename. `store::move_message` requires one
+live source across cur/new, refuses target identity collisions and returns the
+raw moved suffix. The executor atomically rebinds that Maildir ID, removes the
+old local observation and stores the actual suffix, preserving server keyword
+observations and the flag baseline separately. It retains the existing move
+to-cur convention, including for a new-side source. Failed counters withhold
+dependent folder deletion and keep the cycle retryable; missing/ambiguous
+counter destinations hold the orphan for review rather than guessing.
+
+Deletion presence inventory now retains candidate folders as well as IDs.
+`engine::DeferredLocalDeletes` feeds fresh per-cycle `held_local_folders` into
+the planner independently of the adoption-only LocalIndex (which is usually
+empty in steady state). An unresolved changed-ID new-side candidate therefore
+vetoes both Email destruction and removal of the folder containing it across
+idle cycles/reopen. This presence veto does not authorize adopting or importing
+unknown new mail. Ordinary promotion to cur can make it a supported move pair;
+unresolved copies remain visibly deferred. These are not durable payload jobs
+or a content-digest identity proof. Regression cases are in
+`flag_tests/maildir_cases.rs`, with collision/duplicate controls in store.rs.
+
+### Explicit targeted flag repair
+
+`sync/flag_repair.rs::inspect` powers `jma repair-flags --authority
+local|server EMAIL_ID...`, with preview by default and explicit `--apply`.
+It never calls `SyncEngine::run`: no dedupe, body transfer, imports, destroys,
+mailbox resolution writes or placement repair. It captures Email state before
+fresh metadata gets, verifies live configured selection, unique cached-folder
+identity, exact file path/raw suffix and Message-ID, blob/thread and sentinel
+anchors. Missing/duplicate/moved/multiple-mailbox/partial-Maildir targets are
+refused. The conservative inventory reads bounded headers across cached
+folders, including excluded ones to detect ambiguity; it is not a body digest.
+
+Inspection performs SELECTs only. Its private, consuming `FlagRepair` preview
+revalidates server/account, selection, bindings, histories, files (including
+inode/device on Unix) and Email state before writes. Apply constructs only
+ObserveMessage, RecordFlagState, UpdateLocalFlags and UpdateRemoteKeywords
+for the explicit targets. It passes the captured guard to the executor but
+leaves `new_email_state=None`: targeted inspection cannot advance the global
+Email cursor. Keyword patches preserve fresh full custom metadata; local
+renames preserve unowned suffix letters. The shared local flag handler no
+longer calls ensure_maildir; a vanished source fails without creating folders.
+
+Explicit authority does not infer history from a reviewed candidate baseline.
+Before disagreeing effects, apply retains the old/NULL baseline and sets review.
+Receipt preparation/failure preserves review; only successful rename/positive
+conditional ACK (or later verified agreement) clears it. Thus an interrupted
+repair cannot be undone by ordinary sync under the opposite global conflict
+policy. Re-preview and explicit rerun are required for remaining disagreement;
+there is no new durable authority queue and no all-target transaction. Existing
+receipt ambiguity and partial-chunk acknowledgement rules still apply. CLI
+incomplete apply returns nonzero; it does not automatically replay stale input.
+
+The command takes maildir then DB locks for preview and apply and requires an
+existing DB, using `db::open_preserving_history`, never `open_or_recreate`.
+Compatible additive migrations and session discovery-cache writes still apply; preview's
+SELECT-only guarantee concerns repair observations/history, not those existing
+open/connect behaviors or the lock files. It does not fix folder identity or
+recreate missing directories. A DB rebuild still discards flag history.
+Stateful regressions live in `flag_tests/repair.rs`; `tests/flag_repair.rs`
+executes the real CLI against a strict stateful metadata/keyword-only peer.
+
+### Email snapshot guards and generation replanning
+
+A reconciliation Email/set is conditioned on the **Email object state for the
+same account**, captured before its remote observations. Incremental cycles
+use the final Email/changes state before Email/get. Initial enumeration now
+captures `get_current_state` **before** query/get, not after: a later cookie
+could both authorize stale metadata and skip an intervening change on the
+next delta cycle. Query-state and session-state strings are not substitutes.
+
+The guard is passed separately to `Executor::execute(plan, planning_state)`.
+`SyncPlan.new_email_state` is a cursor target and may intentionally be None
+for unfinished placement or suppressed work; it must not silently disable
+conditional writes. Actual Email/set without a non-empty planning state is
+refused before its flag receipts or network call. Pure-local/mailbox-only plans and
+execution-time-vetoed destroys need no Email guard. Explicit maintenance and
+independent oracle writes retain the unconditioned `set_email_batch` helper;
+reconciliation uses `set_email_batch_if_in_state`.
+
+Own Email/import state edges advance the guard only if they form a verified
+continuous chain from the planning state. An unrelated/unreachable edge or
+missing chain half cannot authorize the old plan with a newer token. Each
+Email/set chunk carries `ifInState`; a following chunk uses newState only
+when oldState matches its guard and both response states are present. Missing
+continuation state stops the batch for fresh reconciliation, never an
+unguarded fallback. This follows RFC 8620 sections 5.3 and 7.1.1; it is
+optimistic concurrency, not a cross-entity/filesystem transaction or a claim
+of global linearizability against arbitrary writers.
+
+`stateMismatch` is a typed method-level rejection, not a transport-retry
+condition. Earlier positive chunk acknowledgements are preserved and mirrored;
+current rejected and never-submitted IDs are not mirrored. A clean rejection
+or unsent operation clears its flag receipt but retains the old/NULL baseline.
+If an earlier HTTP/parse attempt could have applied, a later mismatch does
+**not** erase that ambiguous receipt. Typed method errors other than
+`serverPartialFail` guarantee no visible effects under RFC 8620 section 3.6.2;
+clean serverFail retries cannot become evidence of an older own write. A
+terminal clean method rejection preserves earlier ACKs, parks the cursor,
+and postpones dependent destructive work until fresh policy is available.
+It uses normal retryable/permanent classification rather than inventing
+ambiguity or immediately retrying a rejected per-ID operation.
+
+`SyncOutcome.replan_required` keeps the cursor parked and reports remaining
+generation work. Queued downstream mailbox destruction is postponed; only
+positively acknowledged move pairs may finish their placement/flag steps.
+For same-ID resurrection of a locally deleted mailbox, the planner excludes
+old bindings that CreateLocalMailbox will clear, so ghost paths cannot
+suppress the required downloads. Different-ID local-orphan history checks
+remain intact.
+
+`SyncEngine::run` permits three generation attempts, rebuilding a full plan
+from fresh files, observations and retained baselines. Direction filters stay
+unchanged. Successfully mirrored effects are not replayed; completed counts
+are accumulated while pending/status comes from the final attempt, and the
+final console summary uses those totals. Explicit per-ID failures keep their
+normal backoff/permission handling rather than being immediately retried by
+the generation loop. Exhaustion remains visibly incomplete and retryable by
+the daemon or another Full cycle. Tests in `sync/flag_tests/generation.rs`
+exercise these races against the stateful protocol model and real files/DB;
+real Stalwart remains a separate validation gate.
 
 ## Concurrency model
 
@@ -164,7 +522,7 @@ Two distinct surfaces need protection from concurrent mutation, plus write-coher
 
 ### Maildir mutual exclusion
 
-`maildir_ops::lock::acquire_lock` takes a `flock`-backed advisory lock on `<maildir_root>/.jma.lock`. Mutating jma invocations (`sync`, `pull`, `push`, `watch`) against the same maildir can't both run; the second fails with the first's PID in the error message. Read-only commands (`status`, `mailboxes`) and maildir-less commands (`init`, `auth`) skip this.
+`maildir_ops::lock::acquire_lock` takes a `flock`-backed advisory lock on `<maildir_root>/.jma.lock`. Mutating jma invocations (`sync`, `pull`, `push`, `watch`, `repair-flags`, including repair preview) against the same maildir can't both run; the second fails with the first's PID in the error message. Read-only commands (`status`, `mailboxes`) and maildir-less commands (`init`, `auth`) skip this.
 
 The lock keys on the maildir root, not the state DB, because the maildir is the shared mutation surface across processes. Two configs pointing at *different* state DBs but the *same* maildir would otherwise race -- both could write the same Message-ID under different filenames and clobber each other. Per-account-Maildir-root is the universal convention across mbsync, OfflineIMAP, getmail, etc., so this serializes exactly what needs serializing without artificially preventing legitimate multi-account setups (different accounts -> different roots -> different locks).
 
@@ -264,11 +622,20 @@ planning; phase 5 is the only place we mutate the maildir or server, and phase 6
   - Server claims a Message-ID we already have on disk (after a state DB wipe, or after a half-completed prior run).
   - User dropped a file into a maildir for a message that already exists upstream (would otherwise hit `alreadyExists` on import).
 
-  Adoption belongs to neither side, so `direction()` returns `Both` and `into_filtered` always keeps it: it's strictly forward progress in either pull-only or push-only mode and never costs a network round-trip.
+  Adoption belongs to neither side, so `direction()` returns `Both` and `into_filtered` keeps it. Ordinary adoption is pure DB work. Move-paired adoption is conditional: execute must still verify that its membership update was submitted and acknowledged; retaining it through a direction filter does not establish completion.
 
   `old_maildir_id: Option<MaildirId>` on `AdoptLocalMessage` covers the cross-folder local-move case: the same JMAP id is being rebound from an old maildir_id (about to be removed by the move's paired `DeletedMessage`) to a new one. Execute deletes the stale `local_state` row before upserting the new binding so the next scan doesn't re-emit `DeletedMessage` for the orphan.
 
   `old_jmap_email_id: Option<JmapEmailId>` is the remote-side analog and covers the destroy+create-with-shared-Message-ID rebind: the server destroyed Email A and created Email B carrying the same wire-format Message-ID header, and reconcile has paired them so the same maildir_id can be rebound from A to B. `commit_adopt` drops A's `message_map` row inside the same txn before upserting B, so the partial unique index on `message_map(maildir_id)` never observes both rows holding the same value. `try_adopt_remote` populates a `consumed_remote_destroys` set when it emits one of these rebinds, and `process_remote_destroys` skips ids in that set so the paired destroy doesn't emit a `DeleteLocal` against the file we just rebound.
+
+#### Direction-neutral observation/history actions
+
+`ObserveMessage` persists full server metadata and raw local observations
+without acknowledging a mutation. `RecordFlagState` initializes or recovers
+history independently of an effect. `DeferredFlagState` exposes unresolved
+history/presence instead of silently producing an idle plan. All survive
+direction filters, but an excluded push/pull remains unsettled. Dry-run
+executes none of their writes.
 
 #### Local orphans
 
@@ -303,7 +670,9 @@ reconcile()
 |-- process_remote_emails    (download / adopt / flag-update / move-local / conflict)
 |-- process_remote_destroys  (DeleteLocal for any locally-bound id)
 |-- emit_detected_moves      (MoveRemote + AdoptLocalMessage(old_maildir_id))
-\-- process_local_changes    (upload / flag-push / destroy-remote)
+|-- process_local_changes    (upload / destroy-remote)
+|-- reconcile_bound_flags    (observations + baseline -> flag decision)
+\-- orphan finalizers       (folder conflict-policy decisions)
 ```
 
 Every helper takes an immutable `&ReconcileCtx<'a>` so the parameter lists stay bounded as new branches are added. Mutable per-cycle state (`adopted_maildir_ids`, `deletes_overruled_by_server`, `consumed_remote_destroys`, the move bookkeeping sets) is threaded explicitly because the order of the passes matters. `consumed_remote_destroys` is the hand-off between `process_remote_emails` (where the destroy+create-with-shared-Message-ID rebind is detected and the source JMAP id is marked consumed) and `process_remote_destroys` (which skips ids in the set so the paired delete doesn't undo the rebind).
@@ -313,16 +682,22 @@ Every helper takes an immutable `&ReconcileCtx<'a>` so the parameter lists stay 
 `scan::scan_folder` doesn't know about cross-folder moves: when the user moves a file from `INBOX/cur/X` to `Archive/cur/Y`, scan emits `DeletedMessage(X)` and `NewMessage(Y, message_id=M)`. Reconcile pairs them by Message-ID:
 
 1. For each `DeletedMessage` whose record has a Message-ID, look for a `NewMessage` with the same Message-ID in a different folder.
-2. If found, build a `DetectedMove` capturing both the JMAP-side move (old/new mailbox ids) and the local-side rebind (old/new maildir_ids, prior/new flags).
+2. If found, build a `DetectedMove` capturing the source/destination binding, old/new maildir_ids and actual destination suffix. Index these IDs before remote processing so a simultaneous server update cannot produce a stale-source `MoveLocal`.
 3. Mark both ends as consumed so `process_local_changes` won't emit a separate `DestroyRemote` and `UploadMessage`.
 
-`emit_detected_moves` then writes three actions per detected move:
+`emit_detected_moves` uses `flag_resolution::decide` with the acknowledged
+baseline, destination snapshot, full remote keywords and whole-set policy.
+It emits:
 
-- `MoveRemote` -- change the server-side mailbox membership.
-- `AdoptLocalMessage { old_maildir_id: Some(...) }` -- rebind in DB, drop the orphan local_state row.
-- `UpdateRemoteKeywords` -- only if flags also changed during the move.
+- `MoveRemote` -- change server-side mailbox membership.
+- `AdoptLocalMessage { old_maildir_id: Some(...) }` -- conditionally rebind and drop the old local_state row. Keywords are the full remote observation after applying only the selected owned-bit patch, preserving custom metadata.
+- `UpdateRemoteKeywords` or `UpdateLocalFlags` when the shared decision requires a flag effect. Local flag work addresses the destination and is deferred until membership succeeds.
 
-The whole point of this pass is to avoid the `DestroyRemote + UploadMessage` shape, which would lose the JMAP id, the thread id, and the keyword history.
+Competing selected remote/local mailbox destinations are deferred, with the
+Email cursor held for replay. The pass avoids `DestroyRemote + UploadMessage`,
+which would lose the JMAP id, thread id and keyword history. Genuine new
+adoption uses bootstrap policy; adoption with retained history uses the same
+baseline decision instead of reapplying bootstrap authority.
 
 #### `process_remote_emails`
 
@@ -330,19 +705,19 @@ For each email the server returned:
 
 1. **Skipped** if it's also in `destroyed_set` (handled separately).
 2. **Skipped** if it isn't in any synced mailbox (with debug log).
-3. **Path 1 -- known by JMAP id** -> `handle_known_remote`. This is the steady-state branch: resolve any flag conflict, emit `UpdateLocalFlags` if server flags drifted, emit `MoveLocal` if the server's mailbox membership disagrees with ours.
+3. **Path 1 -- known by JMAP id** -> `handle_known_remote`. Handle delete-vs-update and emit `MoveLocal` if server membership disagrees with ours. Ordinary flags and metadata are reconciled later by `reconcile_bound_flags`.
 4. **Path 2 -- Message-ID matches a local file** -> `try_adopt_remote`. First check `known_by_message_id` (DB), then the in-memory `local_index` from the dedupe pass. The latter is what saves us after a `state.db` wipe. Emits `AdoptLocalMessage` and marks the maildir_id as adopted so phase 4 won't double-emit an upload.
 5. **Path 3 -- nothing local** -> `DownloadMessage`.
 
 #### `handle_known_remote` and conflict resolution
 
-Two conflict shapes are handled inline:
+Delete-vs-update is handled inline; ordinary flag conflicts use the shared baseline pass:
 
 - **delete-vs-update** -- local `DeletedMessage` for a JMAP id the server is still updating. `resolve_delete_conflict`:
   - `ServerWins`: re-download (restores the file). The orphan `local_state` row gets cleaned by the next scan cycle.
   - `LocalWins`: skip the remote-side action; `process_local_changes` will emit `DestroyRemote` unimpeded.
 
-- **flag-vs-flag** -- both sides changed flags since last sync. `resolve_flag_conflict` picks one side, the loser is dropped, the winner is emitted as the corresponding action.
+- **flag-vs-flag** -- `flag_resolution::decide` compares both mapped projections with the acknowledged baseline, chooses a whole set, and returns updated history separately from the required effect. `reconcile_bound_flags` emits one flag effect plus independent observation/history actions. Custom-only server metadata changes refresh the cache even when mapped flags agree. Moves and adoption use the same resolver through `emit_adoption_flag_reconciliation`; full moved metadata is committed after membership acknowledgement.
 
 `deletes_overruled_by_server` is the cross-pass channel for the `ServerWins` delete case: when path 1 decides server wins,
 `process_local_changes::handle_local_delete` must skip the `DestroyRemote` it would otherwise emit. Without this set the local loop would happily destroy the remote we just decided to re-download.
@@ -356,8 +731,10 @@ After remote-side actions are settled, walk `local_changes` again:
   - Match in the *same* folder -> adopt.
   - Match in a *different* folder, with no paired delete -> warn and skip. This is a user-introduced duplicate that would hit `alreadyExists` on import every cycle and never converge.
   - No match -> `UploadMessage`.
-- `FlagsChanged`: emit `UpdateRemoteKeywords` unless the server also changed flags (already handled in `handle_known_remote`).
+- `FlagsChanged`: leave emission to `reconcile_bound_flags`, which also sees retained pending work without a new delta.
 - `DeletedMessage`: emit `DestroyRemote` unless `consumed_deletes` (move pre-pass), `destroyed_set` (server already destroyed it), or `deletes_overruled_by_server` says so.
+
+The local scan observes suffixes in both `cur/` and `new/`. Tracked new-side files participate in flag and move classification; unknown new-side files are not implicitly uploaded. Classification uses the tracked state across mailboxes, not only the destination folder's rows. A path-only result containing a deletion candidate is widened to a full inventory before reconciliation. If a live identity candidate still prevents establishing a unique move or a real deletion, the engine defers the destructive action and reports `deferred_actions` rather than claiming an idle synchronized state. The executor repeats the presence check before adding remote destroys to a request; unreadable inventory fails closed, and a live candidate prevents the request and its DB cleanup.
 
 #### Invariants reconcile maintains
 
@@ -371,17 +748,19 @@ After remote-side actions are settled, walk `local_changes` again:
 Execute is the only place that mutates anything. It buckets the plan by variant, then drains buckets in a fixed order:
 
 ```
-adopt (unconditional) -> download -> local-flags -> local-move ->
+observe / record flag history -> adopt (unconditional) -> download -> local-flags -> local-move ->
 local-delete -> upload -> remote-set (keywords + moves + destroys, batched)
--> adopt (move-paired)
+-> adopt/observe placement (move-paired) -> destination local-flags
 ```
 
 This ordering is load-bearing in a few places:
 
 - **Adopt before everything (mostly).** Unconditional adopts -- those that bind a maildir file to a server email without an associated remote-side move -- run first, because subsequent actions (`UpdateLocalFlags`, `MoveLocal`) may reference the maildir_id / jmap_email_id being bound and only succeed if `message_map` already has the row.
-- **Move-paired adopts run last, after the remote-set batch.** When `AdoptLocalMessage` carries an `old_maildir_id` it is the DB half of a cross-folder local move whose JMAP half was emitted as a `MoveRemote`. Committing the adopt up front would advance the DB to the destination folder; if the paired `MoveRemote` then fails per-id inside `apply_remote_set`, the next reconcile cycle would see a divergence (server still in source, DB in destination) and emit a backwards `MoveLocal` that undoes the user's move. Deferring until after `apply_remote_set` lets `apply_move_pair_adopts` consult the call's `failed_updates` set and skip the adopt for any move-pair the server rejected.
-- **Pull side before push side.** We want the local DB to settle to its post-pull state before we tell the server about local changes -- both because the conflict resolution in reconcile assumed the pull would land first, and because failed pushes leave the DB in a state where the next cycle can still see the original local changes.
-- **Remote-set batched.** `apply_remote_set` collapses every `UpdateRemoteKeywords`, `MoveRemote`, and `DestroyRemote` into a single `Email/set` call (JMAP allows arbitrary `update` and `destroy` entries in one method call). This minimises round trips and keeps the per-id failure handling uniform: the call returns `failed_updates` and `failed_destroys` sets, and we mirror successes into the DB while skipping the failures.
+- **Move-paired placement and local flags run after remote-set.** `old_maildir_id` identifies the conditional adoption and its paired destination flag effect. Execute intersects actually submitted move IDs with the adapter's acknowledged results; neither an excluded move nor a rejected/missing ACK authorizes adoption or a destination rename. `apply_move_pair_adopts` commits placement and full observations first, acknowledging flags only on actual agreement (a completed push or no-effect case). Required destination renames then use snapshot validation and acknowledge separately. A rename failure retains destination binding/observations plus unfinished flag history, so the next cycle need not rediscover a move or touch an old source. No later adoption overwrites a successful rename. Unfinished placement holds the Email cursor and counts as deferred work.
+- **Ordinary pull side before push side.** The local DB settles to its post-pull state before ordinary pushes. Move-paired destination flag pulls are the explicit exception: membership must succeed before they can land.
+- **Remote-set batched.** `apply_remote_set` collects every `UpdateRemoteKeywords`, `MoveRemote`, and `DestroyRemote` for `set_email_batch`. That function merges keyword patches and mailbox replacements for each Email id into one update before splitting by `maxObjectsInSet`; each combined update and each destroy counts as one object. `keywords::KeywordPatch` distinguishes Set/Remove mutations from full keyword observations. `jmap/email_set.rs` sends explicit JSON patches because jmap-client 0.4.1 cannot encode null-valued Email patches: Set becomes true, Remove becomes null, and pointer segments are escaped. A move and its flag changes remain in the same per-object update. The adapter retains connected-client authentication, API URL, timeout, typed JMAP responses and retry classification; HTTP redirects are refused rather than forwarding credentials. An id must appear in the positive updated/destroyed acknowledgement before its operation is mirrored; rejection or missing acknowledgement remains a failed id.
+
+Flag-sync regression tests in `src/sync/flag_tests.rs` run actual `SyncEngine` cycles against real temporary Maildirs and a stateful JMAP model. The model applies patches, rejects invalid keyword values, and exposes fresh `Email/get` results; assertions compare those results with filenames, DB views, and later idle cycles. These tests do not replace the Docker-backed Stalwart tests, which remain a separate integration check.
 
 #### Per-handler responsibilities
 
@@ -398,9 +777,9 @@ info!("...");
 A handful of handler-specific notes:
 
 - `adopt_messages` -- when `old_maildir_id` is set (cross-folder local move), call `delete_local_state(old)` first so the orphan row from the source folder is removed before the new binding is written.
-- `update_local_flags` -- flag changes go to disk via `store::set_flags` (which renames the file), then DB. If the disk rename fails the DB is left untouched and the cycle continues (the next cycle will re-derive the change).
-- `upload_messages` -- extracts flags from the on-disk filename rather than trusting the action payload, because the maildir filename is the single source of truth for flag state. Catches `alreadyExists` and warns rather than failing the cycle: hitting this means reconcile's adoption guard didn't fire (typically a race with another writer between scan and import), and bailing on a single bad message shouldn't kill the run.
-- `apply_remote_set` -- see above. Per-id failures are silently skipped from the DB-mirror pass so the local DB never claims the server is in a state it isn't.
+- `update_local_flags` -- persist the receipt, validate the captured suffix with `store::set_flags_if_unchanged`, rename, then commit mirrors and acknowledgement together. Failure leaves history pending, without acknowledging the failed effect.
+- `upload_messages` -- imports the captured `UploadMessage.flags` snapshot and mirrors/acknowledges that same snapshot. It does not re-parse a later filename. A moved-away path is skipped if unreadable. Catches `alreadyExists` and warns rather than failing the cycle.
+- `apply_remote_set` -- persist flag receipts before I/O; after positive acknowledgement, commit keyword mirrors and processed baselines together. Rejected/ambiguous IDs do not advance the baseline; rejection details are retained for recovery/status.
 
 #### Download and upload concurrency
 
@@ -439,7 +818,7 @@ Things to avoid:
 
 ### Trigger pipeline
 
-`watch` mode receives change signals from two sources and funnels them into one sync cycle at a time. There are three layers between a kernel FS event and `engine.run`, and they each smooth a different slice of the noise; a self-write cache rides alongside layer 1 to suppress fsevents echoes of jma's own disk writes:
+`watch` mode receives external change signals from two sources and funnels them, plus a daemon-owned retained-work deadline, into one sync cycle at a time. There are three layers between a kernel FS event and `engine.run`, and they each smooth a different slice of the noise; a self-write cache rides alongside layer 1 to suppress fsevents echoes of jma's own disk writes:
 
 ```
 FS kernel events -> notify-debouncer-mini -> [self-write cache] -> mpsc trigger channel -> coalescing window -> engine.run
@@ -450,11 +829,50 @@ SSE state events ---------------------------------------------------/
 
 **Layer 1: per-path debouncing** (`notify-debouncer-mini`, configured via `[watch].debounce_secs`, default 2s). The crate keeps one global wakeup timer plus a per-path event map. When the timer fires, every path whose `update.elapsed() >= timeout` is drained and emitted in the same batch; surviving paths re-arm a fresh deadline off the youngest survivor. With `batch_mode = true` (the crate default), an arriving event never shortens an existing deadline, so paths batch together against the deadline that was set by the *first* event of the current burst rather than each path setting its own. Practical consequence: a flurry of writes against the same file collapses into one emit; writes against different paths usually emit together but can land in adjacent ticks (see below).
 
-**Layer 2: trigger-loop coalescing** (`runner.rs`, configured via `[watch].coalesce_window_ms`, default 500ms). After the first `SyncTrigger` arrives on the mpsc channel, the loop holds open a small window before starting the cycle. Each subsequent trigger resets the window. The cycle runs only once the channel is quiet for the full window. This layer also decides the trigger shape via dominance, broadest scan first: `Initial` beats `Manual` beats `RemoteChange` beats `LocalStructuralChange` beats `LocalChange`. `LocalChange` paths concatenate across every absorbed `LocalChange`; a merge landing on `LocalStructuralChange` unions the `candidates` from every absorbed structural trigger and folds every absorbed trigger's message paths -- structural and plain `LocalChange` alike -- into the merged trigger's `message_paths`, so a folder-level event doesn't lose the FS-event paths from the same batch.
+**Layer 2: trigger-loop coalescing** (`runner.rs`, configured via `[watch].coalesce_window_ms`, default 500ms). After the first `SyncTrigger` arrives on the mpsc channel, the loop holds open a small window before starting the cycle. Each subsequent trigger resets the window. The cycle normally runs once the channel is quiet for the full window, but a due retry caps that wait and a timer-first cycle bypasses coalescing. This layer also decides the trigger shape via dominance, broadest scan first: `Initial` beats `Manual` beats `RemoteChange` beats `LocalStructuralChange` beats `LocalChange`. `LocalChange` paths concatenate across every absorbed `LocalChange`; a merge landing on `LocalStructuralChange` unions the `candidates` from every absorbed structural trigger and folds every absorbed trigger's message paths -- structural and plain `LocalChange` alike -- into the merged trigger's `message_paths`, so a folder-level event doesn't lose the FS-event paths from the same batch.
 
 Before the watcher emits a `LocalStructuralChange` trigger, `daemon::classify::batch_fires` judges the batch's structural candidates on two cheap signals: a candidate fires if it is a `cur`/`new`/`tmp` path event, or if it is a maildir on disk via `store::is_maildir` (a folder that appears by create, rename, or move stats as a maildir, which a rename delivers atomically without trio events; this arm is unguarded, since a renamed folder carries its sentinel with it and gating here would suppress the rename). The trio arm is gated on the folder's `.jma.mapping` sentinel: a missing trio always fires (a folder being torn down), but an intact trio fires only when its parent folder has no sentinel, i.e. jma has not bound it yet. An intact trio under a sentinel'd (already-bound) folder is treated as churn noise rather than a create or teardown -- FSEvents on macOS can coalesce heavy in-`cur/` churn (renames and hardlinks that never leave the folder, as in Gnus/nnmaildir's bookkeeping) up into a directory-level event naming `cur` itself, and without the gate that echo reads as a folder appearing. Everything else -- sidecar files, foreign index directories like `.notmuch/` that churn temp files, junk directory trees, bare `mkdir`s, missing non-trio paths -- is noise. This is accurate rather than precise: no binding lookup and no subtree walk, at the cost of two structural changes that carry neither signal at the candidate path and wait for the next full scan -- a folder moved out of the tree, and a nested tree moved in under a bare (non-maildir) parent. A batch whose candidates are all noise degrades at the watcher to a plain `LocalChange` over its surviving message paths, or to nothing at all, so folder-level filesystem noise never enters the trigger channel and every trigger that reaches the runner starts a cycle.
 
 The two layers exist because they smooth different things. `debounce_secs` smooths each filesystem path's event stream; `coalesce_window_ms` smooths *across* paths and across signal sources (FS + SSE). Neither subsumes the other: layer 1 on its own cannot merge two debouncer batches that fire on adjacent ticks, nor can it merge an FS batch with an SSE state event; layer 2 on its own would see one mpsc send per kernel event and have to dedupe everything that the per-path crate already collapses.
+
+#### Retained-work retries
+
+`daemon/retry.rs::OperationRetry` keeps one Tokio-monotonic deadline on the
+`WatchDaemon`, not on an SSE session. Bootstrap and ordinary cycle outcomes
+arm it for retryable message work. Backoff is 1s, 2s, 4s ... capped at 60s,
+separate from transport reconnect backoff. Exhausted transient startup RPCs
+also arm it, so recovery does not depend on a first external event. A
+transport reconnect retains the deadline and rejection mask. Typed SQLite
+BUSY/LOCKED errors also schedule a fresh cycle without rebuilding the JMAP
+session; constraint/corruption errors are not guessed retryable from their
+text. Other hard cycle errors pause automatic retries until another
+external/manual cycle; hard connect/configuration errors still abort rather
+than spinning.
+
+A timer selects `ScanScope::Retry`: a fresh full managed inventory and
+bidirectional reconciliation, not replay of a serialized stale mutation.
+Retry-only flag decisions skip blocked/review disagreement but can recognize
+fresh agreement. A daemon-lifetime set of confirmed permanent Email/set
+rejections also suppresses mailbox-only updates and destroys, with their
+paired destination bindings/local effects. Suppression holds the Email
+cursor and reports blocked work. Missing positive ACK is ambiguous/retryable,
+not a confirmed permanent rejection. Ordinary event/manual Full cycles may
+reassess permissions; restart performs a normal Full bootstrap. The mask is
+not persisted as a general operation queue.
+
+A path no-op cannot clear or postpone a deadline. For successful outcomes,
+only a completed, non-preview, bidirectional full check may disarm it when
+no retryable work remains. Blocked/review-only work does not arm a timer. If a deadline expires
+during path coalescing, the merged external cycle is promoted to normal Full
+so it neither loses fresh local edits nor consumes a mailbox-only retry as a
+path no-op. A timer-first cycle runs without waiting for a quiet FS stream.
+
+This is retained flag/message-effect recovery, not a new retry guarantee for
+all body imports or mailbox RPCs. Retry cycles retain normal managed-folder
+policy; they are not the targeted flag-only repair command. Tests drive the
+real runner/engine/HTTP model with controlled producers (no accidental FS/SSE
+follow-up), plus paused-clock scheduling tests. Real Stalwart/OS producer
+coverage remains a separate gate.
 
 #### Self-write cache
 
@@ -492,6 +910,37 @@ All three knobs are advanced/debug-only and intentionally undocumented in the us
 If you find yourself wanting to recommend a tuning change to a user, the right move is usually to investigate whether the default actually broke or whether something upstream (an MUA bug, a non-atomic move, fsevents drops) is the real cause.
 
 ## Maildir semantics
+
+### Partial Maildirs and strict inventory
+
+Either cur/ or new/ makes a Maildir present; an empty peer removed by a cleanup
+tool does not make its live messages disappear. `store::try_open_maildir`
+uses that shape without creating directories. Authoritative reads use
+`maildir_ops::entries::read`: the pinned Maildir iterator silently suppresses
+*all* initial read_dir errors, not just NotFound. The shared reader opens both
+present peers before yielding entries, skips only missing peers and dot files,
+keeps raw suffixes and typed IDs, and propagates other open/entry errors.
+Bare new-side IDs remain valid; malformed cur-side filenames are errors.
+
+Scan, dedupe/adoption indexing, orphan catalogs, rescue-before-delete, prune
+counts and flag/move snapshots use this reader. An unreadable peer cannot
+become an empty inventory or a prune Safe label. Reads and previews do not heal
+folders. Checkpoints represent a missing peer with zero mtime/count, so later
+creation dirties the folder; present unreadable sides remain errors. Both
+checkpoint gates recognize either peer, allowing new-only files to participate
+in rebuild adoption rather than being downloaded again.
+
+Only an actual message write may create its required target peer (for example
+new-to-cur Seen promotion). The helper creates that leaf only, not the mailbox
+or its ancestors, and syncs its parent on Unix. A missing mailbox still fails
+snapshot validation. Non-Seen updates in new/ and cur-only renames do not
+create unrelated peers. The explicit repair-flags command intentionally keeps
+its stricter complete-Maildir validation; ordinary sync handles partial shapes.
+Tests cover local pushes/previews, remote pulls, rebuild adoption, checkpoints,
+and present-but-unreadable-peer refusals. This does not change Message-ID's
+identity limits, DB rebuild semantics or unrelated best-effort sampling tools.
+
+### Format conventions
 
 Three under-specified parts of the maildir format have shaped specific choices in `maildir_ops`. The in-code docstrings cover *what* jma does; this section covers the surrounding ecosystem that explains *why*.
 

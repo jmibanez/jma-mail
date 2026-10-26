@@ -9,6 +9,7 @@ use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
+use super::retry::{OperationRetry, wait_until_due};
 use super::{RECONNECT_INITIAL_BACKOFF, RECONNECT_MAX_BACKOFF};
 use crate::config::Config;
 use crate::jmap::retry::is_transient_error;
@@ -42,6 +43,8 @@ pub enum SyncTrigger {
     /// The user asked for a cycle now (the TUI's 's' key). Carries
     /// no hint about what changed, so it implies a full scan.
     Manual,
+    /// The daemon's retained-work deadline, independent of external events.
+    Retry,
 }
 
 impl fmt::Display for SyncTrigger {
@@ -60,6 +63,7 @@ impl fmt::Display for SyncTrigger {
             ),
             Self::Initial => f.write_str("Initial"),
             Self::Manual => f.write_str("Manual"),
+            Self::Retry => f.write_str("Retry"),
         }
     }
 }
@@ -95,10 +99,12 @@ fn coalesce_triggers(first: SyncTrigger, rest: Vec<SyncTrigger>) -> SyncTrigger 
     let mut has_manual = false;
     let mut has_remote = false;
     let mut has_structural = false;
+    let mut has_retry = false;
     for t in std::iter::once(first).chain(rest) {
         match t {
             SyncTrigger::Initial => has_initial = true,
             SyncTrigger::Manual => has_manual = true,
+            SyncTrigger::Retry => has_retry = true,
             SyncTrigger::RemoteChange => has_remote = true,
             SyncTrigger::LocalStructuralChange {
                 candidates,
@@ -123,7 +129,11 @@ fn coalesce_triggers(first: SyncTrigger, rest: Vec<SyncTrigger>) -> SyncTrigger 
             candidates: structural_candidates,
             message_paths: structural_message_paths,
         }
+    } else if has_retry && local_change_paths.is_empty() {
+        SyncTrigger::Retry
     } else {
+        // Preserve fresh local edits. The runner widens this merged cycle to
+        // a normal Full pass rather than suppressing it as retry-only work.
         SyncTrigger::LocalChange(local_change_paths)
     }
 }
@@ -185,6 +195,11 @@ struct WatchDaemon<'a> {
     manual_handle: Option<JoinHandle<()>>,
     profile_sink: Option<ProfileSink>,
     backoff: Duration,
+    retry: OperationRetry,
+    listen_for_events: bool,
+    stop: Option<Arc<Notify>>,
+    #[cfg(test)]
+    cycle_observer: Option<mpsc::UnboundedSender<std::result::Result<SyncOutcome, String>>>,
 }
 
 impl<'a> WatchDaemon<'a> {
@@ -278,6 +293,11 @@ impl<'a> WatchDaemon<'a> {
             manual_handle,
             profile_sink,
             backoff: RECONNECT_INITIAL_BACKOFF,
+            retry: OperationRetry::default(),
+            listen_for_events: true,
+            stop: None,
+            #[cfg(test)]
+            cycle_observer: None,
         })
     }
 
@@ -318,12 +338,15 @@ impl<'a> WatchDaemon<'a> {
     async fn initial_sync(&mut self) {
         crate::notify!("Running initial sync before entering watch mode");
         let started = std::time::Instant::now();
-        match self
+        let result = self
             .engine
             .run(false, SyncDirection::Both, ScanScope::Full)
-            .await
-        {
+            .await;
+        #[cfg(test)]
+        self.observe_cycle(&result);
+        match result {
             Ok(outcome) => {
+                self.retry.observe(&outcome);
                 report_cycle(&outcome, started.elapsed());
                 report_totals(self.conn);
                 if outcome.downloaded > 0 {
@@ -331,12 +354,22 @@ impl<'a> WatchDaemon<'a> {
                 }
             }
             Err(e) if is_transient_error(&e) => {
+                self.retry.arm();
                 warn!(
-                    "Initial sync hit transient error ({:#}); watch mode will reconnect on the first trigger",
+                    "Initial sync hit transient error ({:#}); retry is scheduled without another event",
                     e
                 );
             }
-            Err(e) => error!("Initial sync failed: {:#}", e),
+            Err(e) if is_busy_state_error(&e) => {
+                self.retry.arm();
+                warn!(
+                    "Initial sync could not acquire the state DB writer; retry is scheduled: {e:#}"
+                );
+            }
+            Err(e) => {
+                self.retry.pause();
+                error!("Initial sync failed; automatic retry paused: {:#}", e);
+            }
         }
         flush_profile(self.profile_sink.as_ref());
     }
@@ -355,6 +388,7 @@ impl<'a> WatchDaemon<'a> {
             match self.session().await {
                 Ok(SessionExit::ChannelClosed) => return Ok(()),
                 Ok(SessionExit::TransportError(e)) => {
+                    self.retry.arm();
                     warn!(
                         "Reconnecting after transport error ({:#}); backoff {:?}",
                         e, self.backoff
@@ -376,6 +410,15 @@ impl<'a> WatchDaemon<'a> {
                             .await?;
                     self.backoff = (self.backoff * 2).min(RECONNECT_MAX_BACKOFF);
                 }
+                Err(e) if is_busy_state_error(&e) => {
+                    self.retry.arm();
+                    warn!(
+                        "Session state DB is busy; retrying setup after {:?}: {e:#}",
+                        self.backoff
+                    );
+                    tokio::time::sleep(self.backoff).await;
+                    self.backoff = (self.backoff * 2).min(RECONNECT_MAX_BACKOFF);
+                }
                 Err(e) => {
                     error!("Session aborted: {:#}", e);
                     return Ok(());
@@ -389,6 +432,9 @@ impl<'a> WatchDaemon<'a> {
     /// spawn), then drives `engine.run` per trigger until the channel
     /// closes or a transient error escapes the retry layer.
     async fn session(&mut self) -> Result<SessionExit> {
+        if !self.listen_for_events {
+            return self.trigger_loop().await;
+        }
         // Post-initial-sync steps -- redone on every reconnect so a
         // freshly-built engine picks up rotated tokens, fresh URLs, and a
         // current view of the DB cursor before the SSE listener starts.
@@ -405,14 +451,6 @@ impl<'a> WatchDaemon<'a> {
         };
         let account_id = session_info.account_id.clone();
         let ping_interval = self.config.watch.ping_interval;
-        // Coalescing window for the trigger loop: hold open after the
-        // first trigger to absorb back-to-back debouncer batches into one
-        // cycle. See `WatchConfig::coalesce_window_ms` for the rationale
-        // (cross-folder move halves must land in the same scan_paths
-        // call, otherwise reconcile can't pair source-delete with
-        // dest-create and the move degrades into destroy + reupload).
-        let coalesce_window = Duration::from_millis(self.config.watch.coalesce_window_ms);
-
         // Seed the SSE dedup cache from current DB state so the first
         // event after (re)connect isn't a guaranteed redundant trigger.
         // Seed every TRACKED_TYPE the listener acts on: without the
@@ -456,9 +494,28 @@ impl<'a> WatchDaemon<'a> {
         // cycle. The window resets every time another trigger lands, so
         // bursts collapse naturally and the cycle only starts once the
         // pipe goes quiet.
+        let exit = self.trigger_loop().await;
+        sse_handle.abort();
+        exit
+    }
+
+    async fn trigger_loop(&mut self) -> Result<SessionExit> {
+        // Both halves of a local move must reach the same scan_paths call.
+        let coalesce_window = Duration::from_millis(self.config.watch.coalesce_window_ms);
         let exit = loop {
-            let Some(first) = self.rx.recv().await else {
+            let first = tokio::select! {
+                biased;
+                _ = wait_for_stop(self.stop.as_ref()) => None,
+                _ = wait_until_due(self.retry.deadline()) => Some(SyncTrigger::Retry),
+                trigger = self.rx.recv() => trigger,
+            };
+            let Some(first) = first else {
                 break SessionExit::ChannelClosed;
+            };
+            let mut retry_blocked = if matches!(first, SyncTrigger::Retry) {
+                Some(self.retry.begin_retry())
+            } else {
+                None
             };
             // Drain the pipe until the coalescing window elapses without
             // a new trigger. Channel-closed mid-drain (Ok(None)) just
@@ -467,11 +524,23 @@ impl<'a> WatchDaemon<'a> {
             // with ChannelClosed. Worth at most one extra cycle on the
             // way out.
             let mut rest: Vec<SyncTrigger> = Vec::new();
-            loop {
-                match tokio::time::timeout(coalesce_window, self.rx.recv()).await {
-                    Ok(Some(next)) => rest.push(next),
-                    Ok(None) => break,
-                    Err(_) => break,
+            // A due retry is not held behind an indefinitely busy coalescing
+            // stream. A deadline expiring during a local burst caps the drain.
+            if !matches!(first, SyncTrigger::Retry) {
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = wait_for_stop(self.stop.as_ref()) => return Ok(SessionExit::ChannelClosed),
+                        _ = wait_until_due(self.retry.deadline()) => {
+                            retry_blocked = Some(self.retry.begin_retry());
+                            rest.push(SyncTrigger::Retry);
+                            break;
+                        }
+                        next = tokio::time::timeout(coalesce_window, self.rx.recv()) => match next {
+                            Ok(Some(next)) => rest.push(next),
+                            Ok(None) | Err(_) => break,
+                        }
+                    }
                 }
             }
             let coalesced_count = 1 + rest.len();
@@ -496,6 +565,10 @@ impl<'a> WatchDaemon<'a> {
             // loop starts a cycle; noise never gets sent (see
             // `watcher::classify_batch`).
             let scope = match &trigger {
+                SyncTrigger::Retry => ScanScope::Retry {
+                    blocked_remote_ids: retry_blocked.unwrap_or_default(),
+                },
+                SyncTrigger::LocalChange(_) if retry_blocked.is_some() => ScanScope::Full,
                 SyncTrigger::LocalChange(paths) => ScanScope::Paths(paths.clone()),
                 SyncTrigger::LocalStructuralChange { .. }
                 | SyncTrigger::RemoteChange
@@ -503,12 +576,16 @@ impl<'a> WatchDaemon<'a> {
                 | SyncTrigger::Manual => ScanScope::Full,
             };
             let started = std::time::Instant::now();
-            match self.engine.run(false, SyncDirection::Both, scope).await {
+            let result = self.engine.run(false, SyncDirection::Both, scope).await;
+            #[cfg(test)]
+            self.observe_cycle(&result);
+            match result {
                 Ok(outcome) => {
                     // A successful cycle means the link is healthy --
                     // reset the outer backoff so the next disconnect
                     // starts fresh rather than at whatever cap we hit.
                     self.backoff = RECONNECT_INITIAL_BACKOFF;
+                    self.retry.observe(&outcome);
                     report_cycle(&outcome, started.elapsed());
                     report_totals(self.conn);
                     if outcome.downloaded > 0 {
@@ -542,17 +619,87 @@ impl<'a> WatchDaemon<'a> {
                     }
                 }
                 Err(e) if is_transient_error(&e) => {
+                    self.retry.arm();
                     flush_profile(self.profile_sink.as_ref());
                     break SessionExit::TransportError(e);
                 }
-                Err(e) => error!("Sync failed: {:#}", e),
+                Err(e) if is_busy_state_error(&e) => {
+                    self.retry.arm();
+                    warn!(
+                        "State DB writer is busy; a fresh cycle is scheduled without reconnecting: {e:#}"
+                    );
+                }
+                Err(e) => {
+                    self.retry.pause();
+                    error!(
+                        "Sync failed; automatic retry paused until another event/manual cycle: {:#}",
+                        e
+                    );
+                }
             }
             flush_profile(self.profile_sink.as_ref());
         };
 
-        sse_handle.abort();
         Ok(exit)
     }
+
+    #[cfg(test)]
+    fn observe_cycle(&self, result: &Result<SyncOutcome>) {
+        if let Some(observer) = &self.cycle_observer {
+            let _ = observer.send(
+                result
+                    .as_ref()
+                    .cloned()
+                    .map_err(|error| format!("{error:#}")),
+            );
+        }
+    }
+}
+
+fn is_busy_state_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| matches!(cause.downcast_ref::<rusqlite::Error>(),
+        Some(rusqlite::Error::SqliteFailure(code, _))
+            if matches!(code.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)))
+}
+
+async fn wait_for_stop(stop: Option<&Arc<Notify>>) {
+    match stop {
+        Some(stop) => stop.notified().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Exercise the real daemon loop with controlled producers. No filesystem or
+/// SSE producer can accidentally supply the event a timer regression needs.
+#[cfg(test)]
+pub(crate) async fn run_controlled(
+    conn: &Connection,
+    config: &Config,
+    triggers: (mpsc::Sender<SyncTrigger>, mpsc::Receiver<SyncTrigger>),
+    cycles: mpsc::UnboundedSender<std::result::Result<SyncOutcome, String>>,
+    stop: Arc<Notify>,
+) -> Result<()> {
+    let self_writes = Arc::new(SelfWriteCache::new(config.watch.effective_self_write_ttl()));
+    let mut engine = SyncEngine::connect(conn, config).await?;
+    engine.set_self_writes(Arc::clone(&self_writes));
+    let mut daemon = WatchDaemon {
+        conn,
+        config,
+        engine,
+        hook: super::hook::Hook::new(None, 0),
+        tx: triggers.0,
+        rx: triggers.1,
+        self_writes,
+        fs_handle: tokio::spawn(std::future::pending()),
+        manual_handle: None,
+        profile_sink: None,
+        backoff: RECONNECT_INITIAL_BACKOFF,
+        retry: OperationRetry::default(),
+        listen_for_events: false,
+        stop: Some(stop),
+        cycle_observer: Some(cycles),
+    };
+    daemon.run().await
 }
 
 /// Forward each manual-sync permit (the TUI's 's' key notifying the
@@ -582,6 +729,16 @@ fn report_cycle(outcome: &SyncOutcome, wall: Duration) {
         downloaded = outcome.downloaded as u64,
         uploaded = outcome.uploaded as u64,
         in_sync = outcome.already_in_sync,
+        pending = outcome.has_pending_work(),
+        blocked = outcome.has_blocked_work(),
+        pending_flags = outcome.pending_flag_actions as u64,
+        blocked_flags = outcome.blocked_flag_actions as u64,
+        unverified_flags = outcome.unverified_flag_actions as u64,
+        retryable_remote = outcome.retryable_remote_actions as u64,
+        blocked_remote = outcome.blocked_remote_ids.len() as u64,
+        retryable_local = outcome.retryable_local_actions as u64,
+        deferred = outcome.deferred_actions as u64,
+        review = outcome.review_actions as u64,
         wall_ms = wall.as_millis() as u64,
     );
 }
@@ -649,7 +806,7 @@ async fn connect_with_backoff<'a>(
                 );
                 return Ok(engine);
             }
-            Err(e) if is_transient_error(&e) => {
+            Err(e) if is_transient_error(&e) || is_busy_state_error(&e) => {
                 warn!("Connect failed ({:#}); retrying in {:?}", e, backoff);
                 tracing::event!(
                     target: crate::tui::layer::TARGET_TUI_CONN,
@@ -669,6 +826,46 @@ async fn connect_with_backoff<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sqlite_contention_is_retryable_but_constraints_are_not() {
+        for code in [rusqlite::ffi::SQLITE_BUSY, rusqlite::ffi::SQLITE_LOCKED] {
+            let error = anyhow::Error::from(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                None,
+            ))
+            .context("committing a processed generation");
+            assert!(is_busy_state_error(&error));
+        }
+        let hard = anyhow::Error::from(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            Some("database is locked".into()),
+        ));
+        assert!(
+            !is_busy_state_error(&hard),
+            "classification is typed, not a display-string guess"
+        );
+    }
+
+    #[test]
+    fn retry_coalescing_preserves_external_paths_and_manual_authority() {
+        let path = PathBuf::from("/Mail/INBOX/cur/message:2,S");
+        assert!(matches!(
+            coalesce_triggers(SyncTrigger::Retry, vec![]),
+            SyncTrigger::Retry
+        ));
+        match coalesce_triggers(
+            SyncTrigger::LocalChange(vec![path.clone()]),
+            vec![SyncTrigger::Retry],
+        ) {
+            SyncTrigger::LocalChange(paths) => assert_eq!(paths, vec![path]),
+            other => panic!("external paths were lost: {other:?}"),
+        }
+        assert!(matches!(
+            coalesce_triggers(SyncTrigger::Retry, vec![SyncTrigger::Manual]),
+            SyncTrigger::Manual
+        ));
+    }
 
     /// A single trigger passes through unchanged; coalesce_triggers
     /// is identity on a one-element batch. Pins the no-op case so a

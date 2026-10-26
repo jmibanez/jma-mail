@@ -273,11 +273,13 @@ fn route_cycle(state: &TuiState, event: &Event<'_>) {
         visitor.in_sync,
         visitor.wall_ms,
     ) {
-        state.set_last_cycle(
+        state.set_last_cycle_status(
             downloaded,
             uploaded,
             in_sync,
             std::time::Duration::from_millis(wall_ms),
+            visitor.pending,
+            visitor.blocked,
         );
     }
 }
@@ -487,6 +489,8 @@ struct CycleVisitor {
     uploaded: Option<u64>,
     in_sync: Option<bool>,
     wall_ms: Option<u64>,
+    pending: bool,
+    blocked: bool,
 }
 
 impl Visit for CycleVisitor {
@@ -500,8 +504,11 @@ impl Visit for CycleVisitor {
     }
 
     fn record_bool(&mut self, field: &Field, value: bool) {
-        if field.name() == "in_sync" {
-            self.in_sync = Some(value);
+        match field.name() {
+            "in_sync" => self.in_sync = Some(value),
+            "pending" => self.pending = value,
+            "blocked" => self.blocked = value,
+            _ => {}
         }
     }
 
@@ -622,6 +629,26 @@ mod tests {
         let cycle = state.last_cycle().expect("cycle must reach the state slot");
         assert_eq!((cycle.downloaded, cycle.uploaded), (12, 3));
         assert_eq!(cycle.wall, Duration::from_millis(1_200));
+    }
+
+    #[test]
+    fn pending_and_blocked_cycle_status_reaches_the_display_state() {
+        use tracing_subscriber::prelude::*;
+        let state = Arc::new(TuiState::new());
+        let subscriber = tracing_subscriber::registry().with(
+            TuiLayer::new(state.clone(), Level::INFO).with_filter(target_filter(Level::INFO)),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::event!(target: TARGET_TUI_CYCLE, tracing::Level::TRACE,
+                downloaded = 0u64, uploaded = 0u64, in_sync = true,
+                pending = true, blocked = true, wall_ms = 100u64);
+        });
+        let cycle = state.last_cycle().unwrap();
+        assert!(cycle.pending && cycle.blocked);
+        assert!(
+            !cycle.in_sync,
+            "retained work must never display an in-sync state"
+        );
     }
 
     /// The tally's own end-to-end proof, same shape as the cycle

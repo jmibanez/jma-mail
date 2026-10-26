@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use crate::keywords::{KeywordMutation, KeywordPatch};
+
 /// JMAP keyword to Maildir flag mapping.
 ///
 /// Maildir flags (in the :2, suffix) are single uppercase chars, sorted:
@@ -12,10 +14,10 @@ use std::collections::HashMap;
 /// but do not currently appear in the maildir filename suffix. Opt-in
 /// Dovecot-compatible lowercase-keyword storage is a separate feature.
 ///
-/// JMAP keywords (RFC 8621): $draft, $flagged, $answered, $forwarded,
-/// $seen, $deleted are the spec-defined names mirrored here. Other
-/// standard names ($phishing, $junk, $notjunk) and any user-defined
-/// keywords pass through the state DB only.
+/// RFC 8621 defines $draft, $flagged, $answered, $forwarded and $seen.
+/// jma additionally maps Maildir T to $deleted; that name is a jma
+/// convention, not one of those RFC system keywords. Other server
+/// keywords pass through the state DB without a filename mapping.
 const FLAG_MAPPINGS: &[(&str, &str)] = &[
     ("$draft", "D"),
     ("$flagged", "F"),
@@ -47,27 +49,40 @@ pub fn flags_to_keywords(flags: &str) -> HashMap<String, bool> {
     keywords
 }
 
-/// Build a full-coverage patch for the six standard JMAP keywords from
-/// a Maildir flags string: each of $draft, $flagged, $forwarded,
-/// $answered, $seen, $deleted gets an explicit `true` or `false` entry
-/// according to whether its flag letter is present in `flags`. Used in
-/// patch-style `Email/set` `keywords/<name>` updates where the goal is
-/// to make the server's view of the *standard* set agree with the
-/// on-disk filename, without touching server-only keywords ($imported,
-/// $hasattachment, $x-me-annot-2, user-defined labels).
-///
-/// `flags_to_keywords` only emits `true` entries, which under JMAP's
-/// patch semantics means "set these on, leave everything else alone"
-/// -- it cannot remove a standard keyword the server has set. This
-/// function pairs with `set_email_batch`'s per-key `upd.keyword(kw,
-/// val)` wire shape so a `false` here patches `keywords/<name>: null`
-/// and actually clears the keyword.
-pub fn flags_to_keyword_patch(flags: &str) -> HashMap<String, bool> {
-    let mut keywords = HashMap::new();
-    for (kw, flag) in FLAG_MAPPINGS {
-        keywords.insert(kw.to_string(), flags.contains(*flag));
-    }
-    keywords
+/// Replace only owned filename flags, retaining local suffix extensions.
+pub fn merge_mapped_flags(current: &str, desired: &str) -> String {
+    let owned = |flag: char| {
+        FLAG_MAPPINGS
+            .iter()
+            .any(|(_, mapped)| mapped.starts_with(flag))
+    };
+    let mut result: Vec<char> = current
+        .chars()
+        .filter(|flag| !owned(*flag))
+        .chain(desired.chars().filter(|flag| owned(*flag)))
+        .collect();
+    result.sort_unstable();
+    result.dedup();
+    result.into_iter().collect()
+}
+
+/// Set or remove each of the six mapped keywords, leaving every
+/// unowned keyword unmentioned. The wire encoder emits Set as true and
+/// Remove as null; this is not a replacement keyword property map.
+pub fn flags_to_keyword_patch(flags: &str) -> KeywordPatch {
+    FLAG_MAPPINGS
+        .iter()
+        .map(|(keyword, flag)| {
+            (
+                keyword.to_string(),
+                if flags.contains(*flag) {
+                    KeywordMutation::Set
+                } else {
+                    KeywordMutation::Remove
+                },
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -125,37 +140,31 @@ mod tests {
         assert_eq!(keywords.get("$answered"), None);
     }
 
-    /// Patch shape must include every standard JMAP keyword with
-    /// an explicit `true`/`false` value derived from the filename
-    /// suffix. The `false` half is the load-bearing part: the JMAP
-    /// patch wire-shape only clears a keyword when its value is
-    /// patched to `null` (which the jmap-client `keyword(name,
-    /// false)` call serializes as), so a caller that wants to
-    /// remove e.g. server-side `$forwarded` to match a filename
-    /// missing the `P` letter relies on this function's `false`
-    /// entries. Pin all six so a refactor narrowing the loop
-    /// can't silently break removal semantics.
+    /// Every owned key needs an explicit operation, including removals.
+    /// Wire-format assertions live in the request and stateful tests.
     #[test]
     fn test_flags_to_keyword_patch_covers_all_six_explicitly() {
         let patch = flags_to_keyword_patch("FS");
         assert_eq!(patch.len(), 6, "patch must cover every standard keyword");
-        assert_eq!(patch.get("$flagged"), Some(&true));
-        assert_eq!(patch.get("$seen"), Some(&true));
-        assert_eq!(patch.get("$forwarded"), Some(&false));
-        assert_eq!(patch.get("$draft"), Some(&false));
-        assert_eq!(patch.get("$answered"), Some(&false));
-        assert_eq!(patch.get("$deleted"), Some(&false));
+        assert_eq!(patch.get("$flagged"), Some(&KeywordMutation::Set));
+        assert_eq!(patch.get("$seen"), Some(&KeywordMutation::Set));
+        assert_eq!(patch.get("$forwarded"), Some(&KeywordMutation::Remove));
+        assert_eq!(patch.get("$draft"), Some(&KeywordMutation::Remove));
+        assert_eq!(patch.get("$answered"), Some(&KeywordMutation::Remove));
+        assert_eq!(patch.get("$deleted"), Some(&KeywordMutation::Remove));
     }
 
-    /// Empty suffix => every standard keyword explicitly `false`.
-    /// Matches the wire intent for "make the server forget every
-    /// standard keyword on this email."
+    /// Empty suffix removes all six owned keys, not unowned keywords.
     #[test]
     fn test_flags_to_keyword_patch_empty_clears_all_six() {
         let patch = flags_to_keyword_patch("");
         assert_eq!(patch.len(), 6);
         for (kw, _) in FLAG_MAPPINGS {
-            assert_eq!(patch.get(*kw), Some(&false), "{kw} must patch to false");
+            assert_eq!(
+                patch.get(*kw),
+                Some(&KeywordMutation::Remove),
+                "{kw} must be removed"
+            );
         }
     }
 }

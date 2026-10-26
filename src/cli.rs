@@ -96,6 +96,18 @@ pub enum Command {
     Mailboxes,
     /// Show sync staleness, cursor health, and maildir drift.
     Status,
+    /// Review/repair flags for explicit bound JMAP Email IDs (preview by default)
+    RepairFlags {
+        /// Which current six-flag set to use; independent of conflict_strategy
+        #[arg(long, value_enum)]
+        authority: crate::sync::flag_repair::FlagAuthority,
+        /// Apply the preview. Interrupted repairs require an explicit rerun.
+        #[arg(long)]
+        apply: bool,
+        /// Explicit JMAP Email IDs, not RFC Message-IDs; no wildcard or all mode
+        #[arg(required = true, num_args = 1.., value_name = "EMAIL_ID")]
+        email_ids: Vec<String>,
+    },
     /// Manage account credentials and the JMAP discovery cache
     Auth {
         #[command(subcommand)]
@@ -148,8 +160,41 @@ pub enum JanitorAction {
         /// known to the state DB.
         #[arg(long, value_name = "FOLDER")]
         mailbox: Option<String>,
+        /// Print one audit line per remote Email object, including
+        /// JMAP/blob ids, size, received date, subject, and SHA-256.
+        /// This downloads size-mismatch blobs too; it never changes
+        /// which groups are eligible for deletion.
+        #[arg(long)]
+        details: bool,
+        /// Also print a terminal-safe preview of each raw RFC 5322
+        /// message. With no value, shows the first 16 KiB; specify a
+        /// byte limit as --content-preview=65536. Implies --details.
+        #[arg(
+            long,
+            value_name = "BYTES",
+            num_args = 0..=1,
+            default_missing_value = "16384",
+            value_parser = parse_content_preview_bytes
+        )]
+        content_preview: Option<usize>,
         /// Apply the destroy plan. Without this flag the plan is
         /// printed and the command refuses to destroy anything.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Preview or destroy an explicit, externally reviewed list of
+    /// JMAP Email ids. The file contains one id per line. Before any
+    /// mutation, every id is checked against the state DB and the
+    /// command refuses the entire operation if even one has a local
+    /// message mapping. Without --yes, only the verified plan is
+    /// printed.
+    Destroyids {
+        /// File containing one opaque JMAP Email id per line. Empty
+        /// lines and lines beginning with '#' are ignored.
+        #[arg(long, value_name = "PATH")]
+        from: std::path::PathBuf,
+        /// Apply the exact destroy list. Without this flag Fastmail
+        /// is queried for verification but nothing is destroyed.
         #[arg(long)]
         yes: bool,
     },
@@ -196,4 +241,86 @@ pub enum PruneOnly {
     Disk,
     /// Stale DB rows whose maildir is gone.
     Db,
+}
+
+fn parse_content_preview_bytes(value: &str) -> Result<usize, String> {
+    let bytes = value
+        .parse::<usize>()
+        .map_err(|_| format!("{value:?} is not a positive byte count"))?;
+    if (1..=1_048_576).contains(&bytes) {
+        Ok(bytes)
+    } else {
+        Err("content preview must be between 1 and 1048576 bytes".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn remotededupe_args(args: &[&str]) -> (bool, Option<usize>, bool) {
+        let cli = Cli::try_parse_from(
+            ["jma", "janitor", "remotededupe"]
+                .into_iter()
+                .chain(args.iter().copied()),
+        )
+        .expect("CLI should parse");
+        let Some(Command::Janitor {
+            action:
+                Some(JanitorAction::Remotededupe {
+                    details,
+                    content_preview,
+                    yes,
+                    ..
+                }),
+        }) = cli.command
+        else {
+            panic!("expected janitor remotededupe");
+        };
+        (details, content_preview, yes)
+    }
+
+    #[test]
+    fn remotededupe_details_is_independent_of_deletion_gate() {
+        assert_eq!(remotededupe_args(&["--details"]), (true, None, false));
+    }
+
+    #[test]
+    fn remotededupe_content_preview_has_default_and_explicit_limits() {
+        assert_eq!(
+            remotededupe_args(&["--content-preview"]),
+            (false, Some(16_384), false)
+        );
+        assert_eq!(
+            remotededupe_args(&["--content-preview=4096"]),
+            (false, Some(4096), false)
+        );
+    }
+
+    #[test]
+    fn remotededupe_content_preview_rejects_zero() {
+        assert!(
+            Cli::try_parse_from(["jma", "janitor", "remotededupe", "--content-preview=0",])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn destroyids_requires_manifest_and_defaults_to_dry_run() {
+        let cli =
+            Cli::try_parse_from(["jma", "janitor", "destroyids", "--from", "reviewed-ids.txt"])
+                .expect("destroyids CLI should parse");
+        let Some(Command::Janitor {
+            action: Some(JanitorAction::Destroyids { from, yes }),
+        }) = cli.command
+        else {
+            panic!("expected janitor destroyids");
+        };
+        assert_eq!(from, std::path::PathBuf::from("reviewed-ids.txt"));
+        assert!(!yes);
+        assert!(
+            Cli::try_parse_from(["jma", "janitor", "destroyids", "--yes"]).is_err(),
+            "--from is mandatory"
+        );
+    }
 }

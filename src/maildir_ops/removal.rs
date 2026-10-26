@@ -126,25 +126,8 @@ pub(crate) fn remove_maildir_tree(
         );
         return Ok(RemovalOutcome::Skipped);
     }
-    // A folder that is a maildir on disk (store::is_maildir) but not
-    // ready to enumerate (no cur/) is one that lost its cur/ -- e.g. an
-    // empty-dir cleanup tool removed the empty cur/ while new/ still
-    // held messages. Without healing, the rescue pass below would skip
-    // it and remove_dir_all would drop those messages. Recreate the
-    // missing cur/ so the rescue sees and protects them, the same heal
-    // an MUA performs on open. A folder that isn't a maildir at all has
-    // no messages to rescue, so the removal below handles it directly.
-    if store::is_maildir(&target)
-        && store::try_open_maildir(&target).is_none()
-        && let Err(e) = store::ensure_maildir(&target)
-    {
-        warn!(
-            "remove_maildir_tree {}/ (id {}): folder has new/ but no cur/ and \
-             healing it failed: {}; skipping so a later retry can rescue its mail",
-            folder, id_label, e
-        );
-        return Ok(RemovalOutcome::Skipped);
-    }
+    // Rescue reads partial Maildirs without healing their source. Every
+    // present peer must be readable before recursive deletion is authorized.
     match rescue_unmapped_files(conn, maildir_root, &target, mailbox_id) {
         Ok(0) => {}
         Ok(n) => {
@@ -242,9 +225,6 @@ fn rescue_unmapped_files(
     folder_path: &Path,
     jmap_mailbox_id: Option<&JmapMailboxId>,
 ) -> Result<usize> {
-    let Some(maildir) = store::try_open_maildir(folder_path) else {
-        return Ok(0);
-    };
     // A row-less folder has no mapped files, so the known set is empty
     // and every file is rescued.
     let known: HashSet<MaildirId> = match jmap_mailbox_id {
@@ -257,9 +237,9 @@ fn rescue_unmapped_files(
     let rescue_root = maildir_root.join(namespace::RESCUE_FOLDER_NAME);
     let mut rescued = 0usize;
     let mut rescue_dir_created = false;
-    for entry in maildir.list_cur().chain(maildir.list_new()) {
+    for entry in crate::maildir_ops::entries::read(folder_path)? {
         let entry = entry?;
-        if known.contains(entry.id()) {
+        if known.contains(&entry.maildir_id) {
             continue;
         }
         if !rescue_dir_created {
@@ -268,7 +248,7 @@ fn rescue_unmapped_files(
             })?;
             rescue_dir_created = true;
         }
-        let src = entry.path();
+        let src = &entry.path;
         let filename = src.file_name().ok_or_else(|| {
             anyhow::anyhow!("rescue source has no filename component: {}", src.display())
         })?;
@@ -691,14 +671,10 @@ mod tests {
         );
     }
 
-    /// A maildir whose (empty) `cur/` was removed -- e.g. by an
-    /// empty-dir cleanup tool -- while `new/` still holds mail is not
-    /// maildir-shaped, so without healing the rescue pass would skip it
-    /// and `remove_dir_all` would silently drop the `new/` messages.
-    /// `remove_maildir_tree` recreates the missing `cur/` so the
-    /// unmapped message is rescued before the folder is removed.
+    /// A partial Maildir remains present. Rescue its unmapped new-side
+    /// message before deletion without first healing the source directories.
     #[test]
-    fn heals_and_rescues_maildir_missing_cur() {
+    fn rescues_maildir_missing_cur_without_healing_source() {
         let dir = tempdir().unwrap();
         let conn = db::open_in_memory().unwrap();
         let maildir_root = dir.path();

@@ -1,6 +1,7 @@
 pub mod classify;
 pub mod eventsource;
 pub mod hook;
+mod retry;
 pub mod runner;
 pub mod watcher;
 

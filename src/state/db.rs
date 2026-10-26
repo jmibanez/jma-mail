@@ -81,6 +81,17 @@ CREATE TABLE IF NOT EXISTS local_state (
     recorded_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- Additive history cache. Missing rows are legacy/unverified, not
+-- silently assumed to be acknowledged. Rebuilds intentionally discard it.
+CREATE TABLE IF NOT EXISTS message_flag_sync (
+    jmap_email_id TEXT NOT NULL PRIMARY KEY REFERENCES message_map(jmap_email_id) ON DELETE CASCADE,
+    baseline TEXT,
+    review INTEGER NOT NULL DEFAULT 0,
+    attempt TEXT,
+    blocked INTEGER NOT NULL DEFAULT 0,
+    error TEXT
+);
+
 CREATE TABLE IF NOT EXISTS jmap_discovery (
     domain         TEXT NOT NULL PRIMARY KEY,
     session_url    TEXT NOT NULL,
@@ -132,9 +143,10 @@ pub fn open(path: &Path) -> Result<Connection> {
     if let Some(stale) = stale_schema_version(path)? {
         anyhow::bail!(
             "State DB at {} is schema version {}, but this jma expects {}. \
-             Run `jma sync` (or pull/push/watch) to recreate the DB \
-             automatically -- existing local files are rebound by Message-ID, \
-             so nothing re-downloads.",
+             This command will not discard the existing history. Back up the \
+             DB and Maildir before `jma sync` (or pull/push/watch), which \
+             recreates incompatible DBs and starts fresh reconciliation; \
+             lost flag history cannot be reconstructed automatically.",
             path.display(),
             stale,
             SCHEMA_VERSION,
@@ -144,12 +156,21 @@ pub fn open(path: &Path) -> Result<Connection> {
     open_and_apply_schema(path)
 }
 
+/// Open for identity-sensitive maintenance while preserving synchronization
+/// history. Refuse incompatible versions instead of unlinking bindings before
+/// a destructive safety check. Compatible additive migrations still run.
+/// Caller must hold the state DB lock (maildir lock first, as usual).
+pub fn open_preserving_history(path: &Path) -> Result<Connection> {
+    let conn = open(path)?;
+    apply_additive_migrations(&conn)?;
+    Ok(conn)
+}
+
 /// Open the state database for mutating callers (`sync`, `pull`, `push`,
-/// `watch`). On schema-version mismatch, nuke `state.db` and its
-/// WAL/SHM siblings and recreate empty. The disposability invariant
-/// (state.db rebuildable from maildir + server) is what makes this
-/// safe; the dedupe pass and Message-ID-anchored adoption rebind
-/// existing local files without re-downloading.
+/// `watch`). On schema-version mismatch, unlink the DB and its WAL/SHM
+/// siblings and recreate empty. This discards flag acknowledgement/history;
+/// the following bootstrap may adopt existing files by Message-ID but is not
+/// lossless restart recovery. Back up DB and Maildir before a possible reset.
 ///
 /// Caller must hold the state DB lock from `acquire_lock` before
 /// calling this. Otherwise a concurrent jma sharing this state DB
@@ -169,8 +190,8 @@ pub fn open_or_recreate(path: &Path) -> Result<Connection> {
     if let Some(stale) = stale_schema_version(path)? {
         warn!(
             "State DB at {} is schema version {}, binary expects {}. \
-             Nuking and re-syncing; Message-ID-anchored adoption will rebind \
-             existing local files without re-downloading.",
+             Recreating the DB and starting fresh reconciliation. Previous \
+             flag history is lost; adoption may reuse existing files by Message-ID.",
             path.display(),
             stale,
             SCHEMA_VERSION,
@@ -318,6 +339,7 @@ fn unlink_state_db(path: &Path) -> Result<()> {
 #[cfg(test)]
 pub fn open_in_memory() -> Result<Connection> {
     let conn = Connection::open_in_memory().context("Failed to open in-memory state DB")?;
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
     conn.execute_batch(SCHEMA)
         .context("Failed to initialize in-memory schema")?;
     conn.execute_batch(&format!("PRAGMA user_version = {};", SCHEMA_VERSION))
@@ -422,6 +444,78 @@ fn read_pid(path: &Path) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preserving_open_migrates_compatible_columns_without_losing_history() {
+        use crate::state::{flag_sync, queries};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        acquire_lock(&path).unwrap();
+        // Start with the legacy schema in this new, isolated test database.
+        // Do not drop/rebuild a populated current table to simulate it.
+        let legacy = Connection::open(&path).unwrap();
+        legacy
+            .execute_batch(
+                "CREATE TABLE mailbox_map (
+            jmap_mailbox_id TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT,
+            parent_id TEXT, maildir_folder TEXT NOT NULL, sort_order INTEGER DEFAULT 0
+        ); INSERT INTO mailbox_map VALUES ('MB1','Inbox','inbox',NULL,'INBOX',7);",
+            )
+            .unwrap();
+        legacy
+            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .unwrap();
+        drop(legacy);
+        // open initializes the other compatible tables but deliberately does
+        // not run the additive remote_path migration under test.
+        let conn = open(&path).unwrap();
+        queries::set_jmap_state(&conn, "acct", "Email", "before").unwrap();
+        queries::upsert_message(
+            &conn,
+            &queries::MessageRecord {
+                jmap_email_id: "E1".into(),
+                jmap_blob_id: None,
+                jmap_thread_id: None,
+                jmap_mailbox_id: "MB1".into(),
+                maildir_id: Some("local".into()),
+                message_id: "a@x".into(),
+                flags: "S".into(),
+                jmap_keywords: r#"{"$seen":true}"#.into(),
+            },
+        )
+        .unwrap();
+        flag_sync::acknowledge(&conn, &"E1".into(), "S").unwrap();
+        flag_sync::prepare_attempt(
+            &conn,
+            &"E1".into(),
+            flag_sync::FlagAttempt {
+                source_flags: "S".into(),
+                target_flags: "FS".into(),
+                source_maildir_id: Some("local".into()),
+                source_folder: Some("INBOX".into()),
+            },
+        )
+        .unwrap();
+        let history = flag_sync::get(&conn, &"E1".into()).unwrap();
+        drop(conn);
+        let conn = open_preserving_history(&path).unwrap();
+        let mailboxes = queries::get_all_mailboxes(&conn).unwrap();
+        assert_eq!(mailboxes.len(), 1);
+        assert_eq!(mailboxes[0].jmap_mailbox_id.as_ref(), "MB1");
+        assert_eq!(mailboxes[0].name, "Inbox");
+        assert_eq!(mailboxes[0].role.as_deref(), Some("inbox"));
+        assert_eq!(mailboxes[0].maildir_folder, "INBOX");
+        assert_eq!(mailboxes[0].sort_order, 7);
+        assert!(mailboxes[0].remote_path.is_none());
+        assert_eq!(
+            queries::get_jmap_state(&conn, "acct", "Email")
+                .unwrap()
+                .as_deref(),
+            Some("before")
+        );
+        assert_eq!(queries::count_messages(&conn).unwrap(), 1);
+        assert_eq!(flag_sync::get(&conn, &"E1".into()).unwrap(), history);
+    }
 
     #[test]
     fn lock_path_appends_lock_suffix() {
@@ -615,12 +709,72 @@ mod tests {
         assert_eq!(user_version(&db), SCHEMA_VERSION);
     }
 
-    /// Hand-build a DB whose `mailbox_map` lacks the
-    /// `remote_path` column (simulating a pre-foundation
-    /// binary writing the table); the additive migration on
-    /// `open_or_recreate` must add the column without bumping
-    /// `SCHEMA_VERSION` or nuking the DB. Pins the
-    /// additive-ALTER contract.
+    /// Adding the history table must not reset existing v2 data or
+    /// silently acknowledge legacy rows, through either opening API.
+    #[test]
+    fn flag_history_is_additive_for_legacy_v2_openers() {
+        use crate::state::{flag_sync, queries};
+        for mutating in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("state.db");
+            {
+                let conn = open_or_recreate(&path).unwrap();
+                conn.execute_batch("DROP TABLE message_flag_sync;
+                    INSERT INTO message_map (jmap_email_id,jmap_mailbox_id,maildir_id,message_id,flags)
+                        VALUES ('E1','MB1','local','a@x','S');
+                    INSERT INTO jmap_state (account_id,entity_type,state) VALUES ('a','Email','cursor');").unwrap();
+            }
+            let conn = if mutating {
+                open_or_recreate(&path)
+            } else {
+                open(&path)
+            }
+            .unwrap();
+            assert_eq!(user_version(&path), SCHEMA_VERSION);
+            assert_eq!(queries::count_messages(&conn).unwrap(), 1);
+            assert_eq!(
+                queries::get_jmap_state(&conn, "a", "Email")
+                    .unwrap()
+                    .as_deref(),
+                Some("cursor")
+            );
+            assert!(flag_sync::has_unverified(&conn).unwrap());
+            assert!(
+                flag_sync::load(&conn).unwrap().is_empty(),
+                "opening a legacy DB must not invent an acknowledgement"
+            );
+        }
+    }
+
+    #[test]
+    fn acknowledged_baseline_and_inflight_receipt_survive_reopen() {
+        use crate::state::flag_sync::{self, FlagAttempt};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let attempt = FlagAttempt {
+            source_flags: "S".into(),
+            target_flags: "S".into(),
+            source_maildir_id: Some("local".into()),
+            source_folder: Some("INBOX".into()),
+        };
+        {
+            let conn = open_or_recreate(&path).unwrap();
+            conn.execute_batch(
+                "INSERT INTO message_map (jmap_email_id,jmap_mailbox_id,maildir_id,message_id)
+                VALUES ('E1','MB1','local','a@x');",
+            )
+            .unwrap();
+            flag_sync::acknowledge(&conn, &"E1".into(), "F").unwrap();
+            flag_sync::prepare_attempt(&conn, &"E1".into(), attempt.clone()).unwrap();
+        }
+        let conn = open_or_recreate(&path).unwrap();
+        let state = flag_sync::get(&conn, &"E1".into()).unwrap().unwrap();
+        assert_eq!(state.baseline.as_deref(), Some("F"));
+        assert_eq!(state.attempt, Some(attempt));
+    }
+
+    /// Hand-build a DB lacking mailbox_map.remote_path; the additive
+    /// ALTER must preserve its rows and schema version.
     #[test]
     fn open_adds_missing_remote_path_column() {
         let dir = tempfile::tempdir().unwrap();

@@ -31,5 +31,5 @@ jobs:
       # it up front lets the cargo build phase overlap network with
       # compilation.
       run: docker pull stalwartlabs/stalwart:v0.16
-    - name: Run E2E tests
-      run: cargo test --test 'e2e_*' -- --ignored --nocapture
+    - name: Run serial E2E suite (including flag sync)
+      run: cargo test --locked --test 'e2e_*' -- --ignored --nocapture --test-threads=1

@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures_util::stream::{self, StreamExt};
 use jmap_client::client::Client;
 use maildir::TemporaryMailFile;
@@ -17,7 +17,9 @@ use crate::ids::{JmapAccountId, JmapEmailId, JmapMailboxId};
 use crate::jmap::email::{self as jmap_email, EmailSetOp};
 use crate::jmap::limits;
 use crate::jmap::retry::is_transient_error;
+use crate::keywords::KeywordPatch;
 use crate::maildir_ops::{flags::keywords_to_flags, store};
+use crate::state::flag_sync::{self, FlagAttempt, FlagSyncState};
 use crate::state::queries::{self, MessageRecord};
 use crate::sync::engine::SyncOutcome;
 use crate::sync::plan::{BoundId, LocalId, RemoteId, SyncAction, SyncPlan};
@@ -73,6 +75,12 @@ pub struct Executor<'a> {
     self_writes: Option<Arc<SelfWriteCache>>,
 }
 
+#[derive(Default)]
+struct LocalMoveOutcome {
+    succeeded: usize,
+    failed_folders: HashSet<String>,
+}
+
 impl<'a> Executor<'a> {
     pub fn new(
         client: Arc<Client>,
@@ -92,20 +100,29 @@ impl<'a> Executor<'a> {
         })
     }
 
-    /// Walk a SyncPlan in dependency order:
-    /// adopt -> download -> local-flags -> local-move -> local-delete ->
-    /// delete-local-folder -> upload -> remote-keywords -> remote-move ->
-    /// remote-destroy.
+    /// Observe/history -> ordinary adopt/pull -> upload -> remote set ->
+    /// acknowledged move-pair placement -> destination flag effects.
     ///
-    /// Adoptions run first so subsequent actions on the same maildir_id /
-    /// jmap_email_id see the binding. Server-side mutations come last so
-    /// pull-side state is settled before we report it back.
-    pub async fn execute(&self, plan: SyncPlan) -> Result<SyncOutcome> {
+    /// Ordinary adoptions precede their effects. Move-paired adoption and
+    /// local flags instead wait for positively acknowledged membership;
+    /// placement observations do not acknowledge a still-unfinished rename.
+    /// `planning_state` is the pre-observation Email state, independent of the
+    /// cursor. None is permitted only when no actual Email/set is requested.
+    pub async fn execute(
+        &self,
+        plan: SyncPlan,
+        planning_state: Option<&str>,
+    ) -> Result<SyncOutcome> {
         let SyncPlan {
             actions,
             new_email_state,
         } = plan;
 
+        let mut observations = Vec::new();
+        let mut flag_states = Vec::new();
+        let mut deferred_flags = 0;
+        let mut retryable_deferred_actions = 0;
+        let mut review_actions = 0;
         let mut remote_mailbox_destroys = Vec::new();
         let mut local_creates = Vec::new();
         let mut local_renames = Vec::new();
@@ -125,6 +142,21 @@ impl<'a> Executor<'a> {
 
         for action in actions {
             match action {
+                SyncAction::ObserveMessage { .. } => observations.push(action),
+                SyncAction::RecordFlagState { .. } => flag_states.push(action),
+                SyncAction::DeferredFlagState {
+                    id,
+                    reason,
+                    retryable,
+                } => {
+                    warn!(
+                        "Flags for {} remain pending (retryable={}): {}",
+                        id, retryable, reason
+                    );
+                    deferred_flags += 1;
+                    retryable_deferred_actions += usize::from(retryable);
+                    review_actions += usize::from(!retryable);
+                }
                 SyncAction::CreateLocalMailbox { .. } => local_creates.push(action),
                 SyncAction::RenameLocalMailbox { .. } => local_renames.push(action),
                 // A move-pair adopt mirrors the DB half of a local cross-folder
@@ -171,12 +203,57 @@ impl<'a> Executor<'a> {
         // subtree lets each descendant's own action recover via
         // the source-missing/target-present branch.
         self.rename_local_mailboxes(local_renames)?;
+        {
+            let txn = self.conn.unchecked_transaction()?;
+            for action in flag_states {
+                if let SyncAction::RecordFlagState { id, state } = action {
+                    flag_sync::store(&txn, &id.jmap_email_id, &state)?;
+                }
+            }
+            for action in observations {
+                commit_observation(&txn, action)?;
+            }
+            txn.commit()?;
+        }
         adopt_messages(self.conn, unconditional_adopts)?;
         let downloaded = self.download_messages(downloads).await?;
         let local_flags_attempted = local_flags.len();
-        let local_flag_updates = self.update_local_flags(local_flags)?;
+        let paired_ids: HashSet<_> = move_pair_adopts
+            .iter()
+            .filter_map(|action| match action {
+                SyncAction::AdoptLocalMessage { id, .. } => Some(id.jmap_email_id.clone()),
+                _ => None,
+            })
+            .collect();
+        let (move_pair_flags, local_flags): (Vec<_>, Vec<_>) = local_flags.into_iter().partition(|action| {
+            matches!(action, SyncAction::UpdateLocalFlags { id, .. } if paired_ids.contains(&id.jmap_email_id))
+        });
+        let mut local_flags_actually_attempted = local_flags.len();
+        let mut local_flag_updates = self.update_local_flags(local_flags)?;
         let local_moves_attempted = local_moves.len();
-        let local_moves_count = self.move_local_messages(local_moves)?;
+        let local_move_outcome = self.move_local_messages(local_moves)?;
+        let local_moves_count = local_move_outcome.succeeded;
+        let folder_deletes_attempted = local_folder_deletes.len();
+        let local_folder_deletes: Vec<_> = local_folder_deletes
+            .into_iter()
+            .filter(|action| {
+                let SyncAction::DeleteLocalFolder { binding } = action else {
+                    return true;
+                };
+                let held = local_move_outcome
+                    .failed_folders
+                    .iter()
+                    .any(|folder| Path::new(folder).starts_with(&binding.maildir_folder));
+                if held {
+                    warn!(
+                        "Withholding deletion of {} after an incomplete local counter-move",
+                        binding.maildir_folder
+                    );
+                }
+                !held
+            })
+            .collect();
+        let deferred_folder_deletes = folder_deletes_attempted - local_folder_deletes.len();
         let local_deletes_count = self.delete_local_messages(local_deletes)?;
         // DeleteLocalFolder runs after every per-message
         // local-side phase so any MoveLocal counter-action
@@ -210,21 +287,78 @@ impl<'a> Executor<'a> {
         let uploads = resolve_upload_references(uploads, &creation_refs);
         let upload_results = self.upload_messages(uploads).await?;
         let uploaded = upload_results.uploaded;
+        let set_state = guard_after_uploads(planning_state, &upload_results);
+        let requested_moves: HashSet<_> = remote_moves
+            .iter()
+            .filter_map(|action| match action {
+                SyncAction::MoveRemote { id, .. } => Some(id.jmap_email_id.clone()),
+                _ => None,
+            })
+            .collect();
         let (outcome, remote_counts) = self
-            .apply_remote_set(remote_keywords, remote_moves, remote_destroys)
+            .apply_remote_set(
+                remote_keywords,
+                remote_moves,
+                remote_destroys,
+                &move_pair_adopts,
+                set_state.as_deref(),
+            )
             .await?;
+        // set_email_batch marks every submitted ID lacking a positive ACK as
+        // failed. Absence from failures proves nothing for a filtered-out move.
+        let acknowledged_moves: HashSet<_> = requested_moves
+            .difference(&outcome.failed_updates)
+            .cloned()
+            .collect();
+        let move_pairs_attempted = move_pair_adopts.len();
+        let move_pairs_applied =
+            apply_move_pair_adopts(self.conn, move_pair_adopts, &acknowledged_moves)?;
+        // Placement/observations land first. A failed destination rename then
+        // leaves the old flag baseline and a destination receipt for recovery.
+        let move_pair_flags: Vec<_> = move_pair_flags.into_iter().filter(|action| {
+            matches!(action, SyncAction::UpdateLocalFlags { id, .. } if acknowledged_moves.contains(&id.jmap_email_id))
+        }).collect();
+        local_flags_actually_attempted += move_pair_flags.len();
+        local_flag_updates += self.update_local_flags(move_pair_flags)?;
         // DestroyRemoteMailbox runs after every per-email push
         // phase so any cycle-local Upload/Move/Update targeting
         // the soon-to-be-destroyed mailbox lands first. Matches
         // the pull-side `delete_local_folders` "run after
         // per-message phases" discipline.
-        self.destroy_remote_mailboxes(remote_mailbox_destroys)
-            .await?;
+        let replan_required = outcome.replan.is_some();
+        if !replan_required {
+            self.destroy_remote_mailboxes(remote_mailbox_destroys)
+                .await?;
+        }
         let flag_updates = local_flag_updates + remote_counts.keyword_updates;
         let moved = local_moves_count + remote_counts.moves;
         let deleted = local_deletes_count + remote_counts.destroys;
-        apply_move_pair_adopts(self.conn, move_pair_adopts, &outcome.failed_updates)?;
-        let failed_remote_actions = outcome.failed_updates.len() + outcome.failed_destroys.len();
+        let failed_remote_actions = outcome
+            .failed_updates
+            .difference(&outcome.replan_updates)
+            .count()
+            + outcome
+                .failed_destroys
+                .difference(&outcome.replan_destroys)
+                .count();
+        let blocked_updates: HashSet<_> = outcome
+            .update_rejections
+            .iter()
+            .filter(|(id, failure)| !failure.retryable && !outcome.replan_updates.contains(*id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let blocked_destroys: HashSet<_> = outcome
+            .destroy_rejections
+            .iter()
+            .filter(|(id, failure)| !failure.retryable && !outcome.replan_destroys.contains(*id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let retryable_remote_actions =
+            failed_remote_actions - blocked_updates.len() - blocked_destroys.len();
+        let blocked_remote_ids = blocked_updates
+            .into_iter()
+            .chain(blocked_destroys)
+            .collect();
 
         // RFC 8620 section 7.1 cursor ratchet, combined across every
         // server-state-advancing call we made this cycle (every
@@ -254,8 +388,12 @@ impl<'a> Executor<'a> {
         // left its paired DB write unwritten. Advancing the cursor
         // past the delta that produced it would strand the change
         // silently -- see `resolve_email_cursor`.
-        let pull_apply_incomplete =
-            local_flag_updates < local_flags_attempted || local_moves_count < local_moves_attempted;
+        let deferred_move_pairs = move_pairs_attempted - move_pairs_applied;
+        let pull_apply_incomplete = local_flag_updates < local_flags_attempted
+            || local_moves_count < local_moves_attempted
+            || deferred_move_pairs > 0
+            || deferred_folder_deletes > 0
+            || replan_required;
         let new_email_state = resolve_email_cursor(
             new_email_state,
             pull_apply_incomplete,
@@ -279,11 +417,24 @@ impl<'a> Executor<'a> {
             moved,
             deleted,
             failed_remote_actions,
-            // Engine sets these from the unfiltered plan / bindings;
-            // executor doesn't have the visibility to compute them.
-            already_in_sync: false,
-            remote_orphans_detected: 0,
-            remote_orphan_total_emails: 0,
+            retryable_remote_actions,
+            blocked_remote_ids,
+            retryable_local_actions: local_flags_actually_attempted - local_flag_updates
+                + local_moves_attempted
+                - local_moves_count,
+            replan_required,
+            retryable_deferred_actions: retryable_deferred_actions
+                + deferred_folder_deletes
+                + usize::from(replan_required),
+            review_actions: review_actions + remote_counts.deferred,
+            deferred_actions: remote_counts.deferred
+                + deferred_flags
+                + deferred_move_pairs
+                + deferred_folder_deletes
+                + usize::from(replan_required),
+            // Selected history/status and scope authority belong to the engine,
+            // which knows the resolved bindings. Never query the whole DB here.
+            ..Default::default()
         })
     }
 
@@ -300,11 +451,11 @@ impl<'a> Executor<'a> {
         )
     }
 
-    /// Returns the number of cross-folder local moves that landed
-    /// (file moved + DB row updated). Per-message `store::move_message`
-    /// failures are logged at warn and skipped here.
-    fn move_local_messages(&self, actions: Vec<SyncAction>) -> Result<usize> {
-        let mut succeeded = 0usize;
+    /// Mirror the actual moved identity and raw suffix, not the stale source
+    /// binding or mapped server flags. Failed sources retain any dependent
+    /// folder destruction for a later full inventory/replan.
+    fn move_local_messages(&self, actions: Vec<SyncAction>) -> Result<LocalMoveOutcome> {
+        let mut outcome = LocalMoveOutcome::default();
         for action in actions {
             let SyncAction::MoveLocal {
                 id,
@@ -314,63 +465,60 @@ impl<'a> Executor<'a> {
             else {
                 continue;
             };
-            let bound_for_log = id.clone();
-            let BoundId {
-                maildir_id,
-                jmap_email_id,
-                ..
-            } = id;
-            let from = store::ensure_maildir(&self.maildir_root.join(&from_folder))?;
-            let to = store::ensure_maildir(&self.maildir_root.join(&to_binding.maildir_folder))?;
-            if let Err(e) = store::move_message(&from, &to, maildir_id.as_ref()) {
-                warn!(
-                    "Failed to move {} from {} to {}: {}",
-                    bound_for_log, from_folder, to_binding.maildir_folder, e
-                );
+            let Some(record) = queries::get_message_by_jmap_id(self.conn, &id.jmap_email_id)?
+            else {
+                warn!("Cannot move {} without its cached binding", id);
+                outcome.failed_folders.insert(from_folder);
                 continue;
-            }
-            // Per-iteration transaction: the read, the conditional upsert
-            // of message_map, and the upsert of local_state must all land
-            // together so this row's two tables never disagree on the
-            // destination folder. With DEFERRED semantics the writer lock
-            // is only taken on the first write, so an external (non-engine)
-            // writer that bypasses the flock could in principle slip a
-            // change in between the read and the write -- accepted as
-            // layer-3 divergence; the next sync cycle re-reconciles.
-            let txn = self.conn.unchecked_transaction()?;
-            let flags = if let Some(rec) = queries::get_message_by_jmap_id(&txn, &jmap_email_id)? {
-                let preserved_flags = rec.flags.clone();
-                queries::upsert_message(
-                    &txn,
-                    &MessageRecord {
-                        jmap_mailbox_id: to_binding
-                            .jmap_mailbox_id
-                            .expect_resolved(
-                                "execute::move_local_messages -- jmap_mailbox_id DB write",
-                            )
-                            .clone(),
-                        ..rec
-                    },
-                )?;
-                preserved_flags
-            } else {
-                String::new()
             };
+            let from = maildir::Maildir::from(self.maildir_root.join(&from_folder));
+            let to = store::ensure_maildir(&self.maildir_root.join(&to_binding.maildir_folder))?;
+            let flags = match store::move_message(&from, &to, id.maildir_id.as_ref()) {
+                Ok(flags) => flags,
+                Err(error) => {
+                    warn!(
+                        "Failed to move {} from {} to {}: {}",
+                        id, from_folder, to_binding.maildir_folder, error
+                    );
+                    outcome.failed_folders.insert(from_folder);
+                    continue;
+                }
+            };
+            // A changed-basename counter must rebind and remove the old local
+            // observation atomically. Flags in message_map remain the server
+            // observation; this placement step does not acknowledge flags.
+            let txn = self.conn.unchecked_transaction()?;
+            if let Some(old_id) = &record.maildir_id
+                && old_id != &id.maildir_id
+            {
+                queries::delete_local_state(&txn, old_id)?;
+            }
+            queries::upsert_message(
+                &txn,
+                &MessageRecord {
+                    maildir_id: Some(id.maildir_id.clone()),
+                    jmap_mailbox_id: to_binding
+                        .jmap_mailbox_id
+                        .expect_resolved("move_local_messages -- destination")
+                        .clone(),
+                    ..record
+                },
+            )?;
             queries::upsert_local_state(
                 &txn,
-                &maildir_id,
+                &id.maildir_id,
                 &to_binding.maildir_folder,
                 &flags,
                 None,
             )?;
             txn.commit()?;
-            succeeded += 1;
+            outcome.succeeded += 1;
             info!(
                 "Moved {} from {} to {}",
-                bound_for_log, from_folder, to_binding.maildir_folder
+                id, from_folder, to_binding.maildir_folder
             );
         }
-        Ok(succeeded)
+        Ok(outcome)
     }
 
     /// Returns the number of local deletions that landed (DB rows
@@ -1021,7 +1169,7 @@ impl<'a> Executor<'a> {
                         .clone(),
                     maildir_id: Some(id.maildir_id.clone()),
                     message_id: id.message_id.clone(),
-                    flags: flags.clone(),
+                    flags: keywords_to_flags(&keywords),
                     jmap_keywords: keywords_json,
                 },
             )?;
@@ -1032,6 +1180,7 @@ impl<'a> Executor<'a> {
                 flags,
                 None,
             )?;
+            flag_sync::acknowledge(&txn, jmap_email_id, flags)?;
             txn.commit()?;
             let target = RemoteId {
                 jmap_email_id: jmap_email_id.clone(),
@@ -1059,7 +1208,16 @@ impl<'a> Executor<'a> {
         keywords: Vec<SyncAction>,
         moves: Vec<SyncAction>,
         destroys: Vec<SyncAction>,
+        move_pair_adopts: &[SyncAction],
+        planning_state: Option<&str>,
     ) -> Result<(jmap_email::EmailSetOutcome, ApplyRemoteSetCounts)> {
+        let move_snapshots: HashMap<_, _> = move_pair_adopts
+            .iter()
+            .filter_map(|action| match action {
+                SyncAction::AdoptLocalMessage { id, .. } => Some((&id.jmap_email_id, action)),
+                _ => None,
+            })
+            .collect();
         let mut ops: Vec<EmailSetOp> = Vec::new();
         for action in &keywords {
             if let SyncAction::UpdateRemoteKeywords { id, keywords, .. } = action {
@@ -1082,32 +1240,160 @@ impl<'a> Executor<'a> {
                 });
             }
         }
-        for action in &destroys {
-            if let SyncAction::DestroyRemote { id } = action {
-                ops.push(EmailSetOp::Destroy {
-                    email_id: id.jmap_email_id.clone(),
-                });
+        let mut deferred_destroys = HashSet::new();
+        if !destroys.is_empty() {
+            let mailboxes = queries::get_all_mailboxes(self.conn)?;
+            let inventory = crate::maildir_ops::scan::inventory_identities(
+                &self.maildir_root,
+                mailboxes
+                    .iter()
+                    .map(|mailbox| mailbox.maildir_folder.as_str()),
+            )?;
+            for action in &destroys {
+                if let SyncAction::DestroyRemote { id } = action {
+                    let record = queries::get_message_by_jmap_id(self.conn, &id.jmap_email_id)?;
+                    let still_present = record
+                        .as_ref()
+                        .and_then(|record| record.maildir_id.as_ref())
+                        .is_some_and(|maildir_id| {
+                            mailboxes.is_empty() || inventory.contains(maildir_id, &id.message_id)
+                        });
+                    if still_present {
+                        warn!(
+                            "Withholding remote destroy for {}: a local identity candidate is still present",
+                            id
+                        );
+                        deferred_destroys.insert(id.jmap_email_id.clone());
+                    } else {
+                        ops.push(EmailSetOp::Destroy {
+                            email_id: id.jmap_email_id.clone(),
+                        });
+                    }
+                }
             }
         }
 
         if ops.is_empty() {
             return Ok((
                 jmap_email::EmailSetOutcome::default(),
-                ApplyRemoteSetCounts::default(),
+                ApplyRemoteSetCounts {
+                    deferred: deferred_destroys.len(),
+                    ..Default::default()
+                },
             ));
         }
 
-        let outcome = jmap_email::set_email_batch(&self.client, &ops).await?;
+        let planning_state = planning_state
+            .filter(|state| !state.is_empty())
+            .context("Remote Email/set requires the state captured before planning")?;
 
-        // One transaction wraps the entire post-network mirroring section.
-        // The server's outcome is fixed; either we reflect all of it into
-        // the local DB or none of it (next cycle re-detects the missing
-        // mirrorings via Email/changes and retries). Pure-DB after this
-        // point, so the txn is short-lived.
+        // Commit receipts before network I/O. A later acknowledgement DB
+        // failure must not erase evidence of the generation we actually sent.
+        {
+            let txn = self.conn.unchecked_transaction()?;
+            for action in &keywords {
+                if let SyncAction::UpdateRemoteKeywords {
+                    id,
+                    keywords,
+                    filename_flags,
+                } = action
+                    && let Some(record) = queries::get_message_by_jmap_id(&txn, &id.jmap_email_id)?
+                {
+                    let attempt = if let Some(SyncAction::AdoptLocalMessage {
+                        id,
+                        binding,
+                        keywords,
+                        filename_flags,
+                        ..
+                    }) = move_snapshots.get(&id.jmap_email_id).copied()
+                    {
+                        FlagAttempt {
+                            source_flags: filename_flags.clone(),
+                            target_flags: keywords_to_flags(keywords),
+                            source_maildir_id: Some(id.maildir_id.clone()),
+                            source_folder: Some(binding.maildir_folder.clone()),
+                        }
+                    } else {
+                        let source_folder = record
+                            .maildir_id
+                            .as_ref()
+                            .map(|mid| queries::get_local_state(&txn, mid))
+                            .transpose()?
+                            .flatten()
+                            .map(|(folder, _)| folder);
+                        FlagAttempt {
+                            source_flags: filename_flags.clone(),
+                            target_flags: keywords_to_flags(&apply_keyword_patch(
+                                &record.jmap_keywords,
+                                keywords,
+                            )),
+                            source_maildir_id: record.maildir_id,
+                            source_folder,
+                        }
+                    };
+                    flag_sync::prepare_attempt(&txn, &id.jmap_email_id, attempt)?;
+                }
+            }
+            txn.commit()?;
+        }
+        let outcome =
+            match jmap_email::set_email_batch_if_in_state(&self.client, &ops, planning_state).await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    let txn = self.conn.unchecked_transaction()?;
+                    for action in &keywords {
+                        if let SyncAction::UpdateRemoteKeywords { id, .. } = action
+                            && queries::get_message_by_jmap_id(&txn, &id.jmap_email_id)?.is_some()
+                        {
+                            flag_sync::failure(
+                                &txn,
+                                &id.jmap_email_id,
+                                false,
+                                false,
+                                &format!("{error:#}"),
+                            )?;
+                        }
+                    }
+                    txn.commit()?;
+                    return Err(error);
+                }
+            };
+
+        // Record confirmed rejection/ambiguity separately from success
+        // mirroring. If an accepted ID's ACK transaction fails, a different
+        // ID's confirmed rejection must not revert to an ambiguous receipt.
+        {
+            let txn = self.conn.unchecked_transaction()?;
+            for action in &keywords {
+                if let SyncAction::UpdateRemoteKeywords { id, .. } = action
+                    && outcome.failed_updates.contains(&id.jmap_email_id)
+                    && queries::get_message_by_jmap_id(&txn, &id.jmap_email_id)?.is_some()
+                {
+                    let rejection = outcome.update_rejections.get(&id.jmap_email_id);
+                    flag_sync::failure(
+                        &txn,
+                        &id.jmap_email_id,
+                        rejection.is_some_and(|failure| !failure.retryable),
+                        rejection.is_some(),
+                        rejection.map_or("Email/set omitted positive acknowledgement", |failure| {
+                            failure.reason.as_str()
+                        }),
+                    )?;
+                }
+            }
+            txn.commit()?;
+        }
+
+        // Mirror successful effects atomically, including their processed
+        // flag baselines. A rollback leaves successful IDs' receipts intact.
         let txn = self.conn.unchecked_transaction()?;
 
         // Mirror keyword updates into the local DB.
-        let mut counts = ApplyRemoteSetCounts::default();
+        let mut counts = ApplyRemoteSetCounts {
+            deferred: deferred_destroys.len(),
+            ..Default::default()
+        };
         for action in keywords {
             let SyncAction::UpdateRemoteKeywords {
                 id,
@@ -1119,10 +1405,17 @@ impl<'a> Executor<'a> {
             };
             if outcome.failed_updates.contains(&id.jmap_email_id) {
                 warn!(
-                    "UpdateRemoteKeywords for {} rejected by server. \
-                     DB retains stale keywords; will be re-detected and re-attempted next cycle.",
+                    "UpdateRemoteKeywords for {} was not acknowledged; flags remain pending",
                     id
                 );
+                continue;
+            }
+            if move_snapshots.contains_key(&id.jmap_email_id) {
+                // The post-membership stage commits the full selected remote
+                // view with the destination snapshot. Do not mirror into the
+                // missing source or retire its destination receipt beforehand.
+                counts.keyword_updates += 1;
+                info!("Updated remote keywords for moved {}", id);
                 continue;
             }
             if let Some(rec) = queries::get_message_by_jmap_id(&txn, &id.jmap_email_id)? {
@@ -1146,7 +1439,7 @@ impl<'a> Executor<'a> {
                 queries::upsert_message(
                     &txn,
                     &MessageRecord {
-                        flags: server_flags,
+                        flags: server_flags.clone(),
                         jmap_keywords: keywords_json,
                         ..rec
                     },
@@ -1154,6 +1447,9 @@ impl<'a> Executor<'a> {
                 if let Some(mid) = maildir_id {
                     queries::update_local_state_flags(&txn, &mid, &filename_flags)?;
                 }
+                // Acknowledge only this request's captured target, not a
+                // newer suffix a MUA may have installed while it was in flight.
+                flag_sync::acknowledge(&txn, &id.jmap_email_id, &server_flags)?;
             }
             counts.keyword_updates += 1;
             info!("Updated remote keywords for {}", id);
@@ -1176,8 +1472,8 @@ impl<'a> Executor<'a> {
             };
             if outcome.failed_updates.contains(&id.jmap_email_id) {
                 warn!(
-                    "MoveRemote {} from {} to {} rejected by server. \
-                     DB retains source folder; will be re-detected and re-attempted next cycle.",
+                    "MoveRemote {} from {} to {} was not acknowledged. \
+                     DB retains source folder; fresh reconciliation will reassess it.",
                     id, from_folder, to_folder
                 );
             } else {
@@ -1194,11 +1490,14 @@ impl<'a> Executor<'a> {
             let SyncAction::DestroyRemote { id } = action else {
                 continue;
             };
+            if deferred_destroys.contains(&id.jmap_email_id) {
+                continue;
+            }
             if outcome.failed_destroys.contains(&id.jmap_email_id) {
                 warn!(
-                    "DestroyRemote {} rejected by server. \
-                     Local file is already gone; server still holds the message. \
-                     Next scan will re-emit DeletedMessage and the destroy will be re-attempted.",
+                    "DestroyRemote {} was not acknowledged. \
+                     Local file is already gone; fresh reconciliation must verify \
+                     remote presence before deciding the next effect.",
                     id
                 );
                 continue;
@@ -1502,6 +1801,7 @@ impl<'a> Executor<'a> {
             },
         )?;
         queries::upsert_local_state(&txn, &mid, &binding.maildir_folder, &flags, None)?;
+        flag_sync::acknowledge(&txn, &id.jmap_email_id, &flags)?;
         txn.commit()?;
         progress.downloaded += 1;
         // Per-message progress signal for the TUI panel. Fires at
@@ -1695,6 +1995,16 @@ struct ChannelStats {
     send_count: u64,
 }
 
+fn guard_after_uploads(planning_state: Option<&str>, uploads: &UploadResults) -> Option<String> {
+    let edges = uploads.chain_pairs.iter().cloned().collect();
+    resolve_email_cursor(
+        planning_state.map(str::to_owned),
+        false,
+        uploads.chain_intact,
+        &edges,
+    )
+}
+
 /// Walk a state-advance chain forward from `cursor`. The chain is the
 /// set of `(oldState -> newState)` edges produced by every server-
 /// state-advancing call we made in the cycle (Email/import per
@@ -1823,36 +2133,36 @@ fn adopt_messages(conn: &Connection, actions: Vec<SyncAction>) -> Result<()> {
     Ok(())
 }
 
-/// Apply the move-pair adopts deferred from `Executor::execute` until
-/// after `apply_remote_set`. Skip any whose paired MoveRemote landed in
-/// `failed_updates`: the server still has the email at the source,
-/// so committing the DB to the destination would diverge the two
-/// sides and produce a backwards MoveLocal next cycle.
+/// Persist completed placement and full observations only for a submitted,
+/// positively acknowledged MoveRemote. Differing flags retain their old
+/// baseline until the subsequent destination rename succeeds. Agreement can
+/// acknowledge a completed push/no-effect generation with the placement.
 fn apply_move_pair_adopts(
     conn: &Connection,
     actions: Vec<SyncAction>,
-    failed_updates: &HashSet<JmapEmailId>,
-) -> Result<()> {
+    acknowledged_moves: &HashSet<JmapEmailId>,
+) -> Result<usize> {
     if actions.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
     let txn = conn.unchecked_transaction()?;
+    let mut applied = 0;
     for action in actions {
         let SyncAction::AdoptLocalMessage { ref id, .. } = action else {
             continue;
         };
-        if failed_updates.contains(&id.jmap_email_id) {
+        if !acknowledged_moves.contains(&id.jmap_email_id) {
             warn!(
-                "Skipping move-pair adopt for {}: paired MoveRemote rejected by server. \
-                 DB retains source folder; the move will be re-detected and re-attempted next cycle.",
+                "Skipping move-pair adopt for {}: membership was not requested and acknowledged; DB retains source binding",
                 id
             );
             continue;
         }
         commit_adopt(&txn, action)?;
+        applied += 1;
     }
     txn.commit()?;
-    Ok(())
+    Ok(applied)
 }
 
 /// Apply the local-side flag updates from a reconcile plan.
@@ -1867,6 +2177,7 @@ fn apply_update_local_flags(
         let SyncAction::UpdateLocalFlags {
             id,
             binding,
+            expected_flags,
             new_flags,
             keywords,
             jmap_blob_id,
@@ -1882,26 +2193,34 @@ fn apply_update_local_flags(
             message_id,
         } = id;
         let maildir_path = maildir_root.join(&binding.maildir_folder);
-        let maildir = store::ensure_maildir(&maildir_path)?;
-        // A `new/` file has never carried a `:2,<flags>` view that
-        // the maildir crate's `set_flags` can find. Reaching it from
-        // the JMAP side -- typically the server flipping `$seen` --
-        // is the canonical "client first observes this message"
-        // moment, so the executor promotes it from `new/` to `cur/`
-        // and attaches the new flag set as the info suffix in the
-        // same rename. Steady-state cur/ flag updates take the
-        // existing path.
+        // Flag effects never provision a missing mailbox. A live partial
+        // source is readable; only an actual rename may create its target peer.
+        let maildir = maildir::Maildir::from(maildir_path.clone());
+        // Persist the generation before the filesystem effect, separately
+        // from its acknowledgement. Never overwrite a newer filename edit.
+        flag_sync::prepare_attempt(
+            conn,
+            &jmap_email_id,
+            FlagAttempt {
+                source_flags: expected_flags.clone(),
+                target_flags: keywords_to_flags(&keywords),
+                source_maildir_id: Some(maildir_id.clone()),
+                source_folder: Some(binding.maildir_folder.clone()),
+            },
+        )?;
         let was_in_new = store::message_is_in_new(&maildir, maildir_id.as_ref());
-        let store_result = if was_in_new {
-            store::promote_to_cur_with_flags(&maildir, maildir_id.as_ref(), &new_flags)
-        } else {
-            store::set_flags(&maildir, maildir_id.as_ref(), &new_flags)
-        };
+        let store_result = store::set_flags_if_unchanged(
+            &maildir,
+            maildir_id.as_ref(),
+            &expected_flags,
+            &new_flags,
+        );
         if let Err(e) = store_result {
             warn!(
                 "Failed to set flags for {} in {}: {}",
                 maildir_id, binding.maildir_folder, e
             );
+            flag_sync::failure(conn, &jmap_email_id, false, false, &e.to_string())?;
             continue;
         }
         // Predict the post-rename cur/ filename and feed it to the
@@ -1929,7 +2248,7 @@ fn apply_update_local_flags(
         queries::upsert_message(
             &txn,
             &MessageRecord {
-                jmap_email_id,
+                jmap_email_id: jmap_email_id.clone(),
                 jmap_blob_id: Some(jmap_blob_id),
                 jmap_thread_id: Some(jmap_thread_id),
                 jmap_mailbox_id: binding
@@ -1940,11 +2259,12 @@ fn apply_update_local_flags(
                     .clone(),
                 maildir_id: Some(maildir_id.clone()),
                 message_id,
-                flags: new_flags.clone(),
+                flags: keywords_to_flags(&keywords),
                 jmap_keywords: keywords_json,
             },
         )?;
         queries::upsert_local_state(&txn, &maildir_id, &binding.maildir_folder, &new_flags, None)?;
+        flag_sync::acknowledge(&txn, &jmap_email_id, &keywords_to_flags(&keywords))?;
         txn.commit()?;
         succeeded += 1;
         info!("Updated local flags for {}: '{}'", bound_for_log, new_flags);
@@ -1958,10 +2278,9 @@ fn apply_update_local_flags(
 /// `patch` is the keywords map we just sent via `Email/set`'s per-key
 /// `keywords/<name>` shape. Returns the merged HashMap.
 ///
-/// JMAP patch semantics under jmap-client's wire shape: a `true`
-/// value sets (or keeps) the key on the server; a `false` value
-/// serializes as `keywords/<name>: null` and clears the key. Keys
-/// not mentioned in the patch are untouched on the server.
+/// The explicit patch sets present keys and removes cleared keys. The
+/// Email/set encoder emits removals as JSON null; unmentioned keys are
+/// untouched on both the server and this cached observation.
 ///
 /// The mirror's whole point is to reflect that: non-standard server
 /// keywords ($imported, $hasattachment, $x-me-annot-2, user-defined
@@ -1975,11 +2294,8 @@ fn apply_update_local_flags(
 /// degrades to "start with an empty map and apply the patch" --
 /// equivalent to the pre-fix overwrite, but at least the patch
 /// itself lands cleanly. Better than panicking in the mirror.
-fn apply_keyword_patch(
-    existing_json: &str,
-    patch: &HashMap<String, bool>,
-) -> HashMap<String, bool> {
-    let mut merged: HashMap<String, bool> = match serde_json::from_str(existing_json) {
+fn apply_keyword_patch(existing_json: &str, patch: &KeywordPatch) -> HashMap<String, bool> {
+    let merged: HashMap<String, bool> = match serde_json::from_str(existing_json) {
         Ok(m) => m,
         Err(e) => {
             // Self-healing: the next full Email/get round-trip
@@ -1993,20 +2309,45 @@ fn apply_keyword_patch(
             HashMap::new()
         }
     };
-    for (k, v) in patch {
-        if *v {
-            merged.insert(k.clone(), true);
-        } else {
-            merged.remove(k);
-        }
-    }
-    merged
+    patch.apply_to(&merged)
 }
 
 /// DB writes for a single AdoptLocalMessage. Shared between the
 /// up-front adopt phase and the post-remote-set move-pair phase so
 /// both go through the same row-shape and ordering.
+fn commit_observation(conn: &Connection, action: SyncAction) -> Result<()> {
+    let SyncAction::ObserveMessage {
+        id,
+        binding,
+        keywords,
+        filename_flags,
+        jmap_blob_id,
+        jmap_thread_id,
+    } = action
+    else {
+        return Ok(());
+    };
+    commit_binding(
+        conn,
+        SyncAction::AdoptLocalMessage {
+            id,
+            binding,
+            keywords,
+            filename_flags,
+            jmap_blob_id,
+            jmap_thread_id,
+            old_maildir_id: None,
+            old_jmap_email_id: None,
+        },
+        false,
+    )
+}
+
 fn commit_adopt(conn: &Connection, action: SyncAction) -> Result<()> {
+    commit_binding(conn, action, true)
+}
+
+fn commit_binding(conn: &Connection, action: SyncAction, initialize_agreement: bool) -> Result<()> {
     let SyncAction::AdoptLocalMessage {
         id,
         binding,
@@ -2064,7 +2405,7 @@ fn commit_adopt(conn: &Connection, action: SyncAction) -> Result<()> {
                 .clone(),
             maildir_id: Some(maildir_id.clone()),
             message_id,
-            flags: server_flags,
+            flags: server_flags.clone(),
             jmap_keywords: keywords_json,
         },
     )?;
@@ -2075,6 +2416,13 @@ fn commit_adopt(conn: &Connection, action: SyncAction) -> Result<()> {
         &filename_flags,
         None,
     )?;
+    if initialize_agreement {
+        if flag_sync::mapped_flags(&filename_flags) == server_flags {
+            flag_sync::acknowledge(conn, &jmap_email_id, &filename_flags)?;
+        } else if flag_sync::get(conn, &jmap_email_id)?.is_none() {
+            flag_sync::store(conn, &jmap_email_id, &FlagSyncState::default())?;
+        }
+    }
     debug!(
         "Adopted {}/{} as {}",
         binding.maildir_folder,
@@ -2096,8 +2444,9 @@ struct UploadJob {
 
 /// Outcome of a single upload future. `Skipped` covers the
 /// non-fatal cases: oversize-cap, stat failure, read failure, and
-/// the server's `alreadyExists` (logged inside `upload_one`). Hard
-/// JMAP errors are returned as `Err` and propagated by the caller.
+/// permanent per-message import rejections such as `alreadyExists`
+/// and `invalidEmail` (logged inside `upload_one`). Hard account,
+/// transport, and protocol errors are returned as `Err` and propagated.
 /// `Uploaded` carries the Email/import response's
 /// `oldState`/`newState` pair so the cycle-level cursor ratchet can
 /// chain through all imports plus the trailing Email/set.
@@ -2121,6 +2470,7 @@ struct ApplyRemoteSetCounts {
     keyword_updates: usize,
     moves: usize,
     destroys: usize,
+    deferred: usize,
 }
 
 /// Aggregated result of `upload_messages`. Carries the per-import
@@ -2269,8 +2619,7 @@ async fn upload_one(client: &Client, job: UploadJob) -> Result<UploadOutcome> {
             chain_new: result.chain_new,
         }),
         Err(e) => {
-            let s = e.to_string();
-            if s.contains("alreadyExists") {
+            if is_already_exists(&e) {
                 // Reconcile's adopt path should have caught this —
                 // a same-Message-ID server email already exists in
                 // a folder we know about. Hitting this branch means
@@ -2285,6 +2634,20 @@ async fn upload_one(client: &Client, job: UploadJob) -> Result<UploadOutcome> {
                     id, binding.maildir_folder
                 );
                 Ok(UploadOutcome::Skipped)
+            } else if error_chain_contains(&e, "invalidEmail") {
+                // `invalidEmail` is a permanent rejection of this one
+                // RFC 5322 message, not a failure of the account or sync
+                // transaction. Retrying the unchanged file can never
+                // succeed, and aborting here strands every successful
+                // download plus the mailbox/cursor checkpoint behind one
+                // malformed local draft. Keep the file exactly where it
+                // is, do not record an upload, and let the user repair or
+                // remove it after the rest of the account has converged.
+                warn!(
+                    "Upload of {} from {} was rejected as invalidEmail; keeping the local file but skipping it so the sync checkpoint can complete. Repair or remove the malformed message before retrying it. Server error: {:#}",
+                    id, binding.maildir_folder, e
+                );
+                Ok(UploadOutcome::Skipped)
             } else {
                 Err(e)
             }
@@ -2292,9 +2655,62 @@ async fn upload_one(client: &Client, job: UploadJob) -> Result<UploadOutcome> {
     }
 }
 
+/// `import_email` deliberately adds actionable context at each layer
+/// (`Failed to import email` -> `Set failed: alreadyExists`). Anyhow's
+/// Display/to_string renders only the outermost layer, so checking
+/// `e.to_string().contains("alreadyExists")` can never see Fastmail's
+/// actual SetError and turns an explicitly non-fatal recovery branch
+/// into a hard cycle abort. Walk the complete source chain instead.
+///
+/// This matters most during initial bootstrap: hundreds of successful
+/// per-message commits may precede one already-existing import. Aborting
+/// there withholds mailbox_map and both JMAP cursors, making `jma status`
+/// report "never synced" even though the expensive transfer landed.
+fn is_already_exists(error: &anyhow::Error) -> bool {
+    error_chain_contains(error, "alreadyExists")
+}
+
+/// Search every anyhow context/source layer for a JMAP SetError token.
+/// The outer layer is normally just `Failed to import email`; the useful
+/// per-message rejection (`alreadyExists`, `invalidEmail`, ...) is emitted
+/// by jmap-client underneath it.
+fn error_chain_contains(error: &anyhow::Error, token: &str) -> bool {
+    error.chain().any(|cause| cause.to_string().contains(token))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn planning_guard_advances_only_through_verified_own_imports() {
+        let mut uploads = UploadResults {
+            chain_pairs: vec![("s0".into(), "s1".into()), ("s1".into(), "s2".into())],
+            chain_intact: true,
+            uploaded: 2,
+        };
+        assert_eq!(
+            guard_after_uploads(Some("s0"), &uploads).as_deref(),
+            Some("s2")
+        );
+        uploads.chain_intact = false;
+        assert_eq!(
+            guard_after_uploads(Some("s0"), &uploads).as_deref(),
+            Some("s0")
+        );
+        uploads.chain_intact = true;
+        uploads.chain_pairs.remove(0);
+        assert_eq!(
+            guard_after_uploads(Some("s0"), &uploads).as_deref(),
+            Some("s0"),
+            "an unrelated intervening write cannot authorize the old plan with a newer token"
+        );
+        assert!(
+            guard_after_uploads(None, &uploads).is_none(),
+            "own import state cannot invent a missing planning snapshot"
+        );
+    }
+
     use crate::domain::MaybeReference;
     use crate::ids::{JmapEmailId, MaildirId};
     use crate::state::db;
@@ -2353,10 +2769,11 @@ mod tests {
         let conn = db::open_in_memory().unwrap();
         seed_inbox_record(&conn);
 
-        let mut failed: HashSet<JmapEmailId> = HashSet::new();
-        failed.insert(JmapEmailId::from("E1"));
-
-        apply_move_pair_adopts(&conn, vec![move_pair_adopt()], &failed).unwrap();
+        let acknowledged = HashSet::new();
+        assert_eq!(
+            apply_move_pair_adopts(&conn, vec![move_pair_adopt()], &acknowledged).unwrap(),
+            0
+        );
 
         let rec = queries::get_message_by_jmap_id(&conn, &JmapEmailId::from("E1"))
             .unwrap()
@@ -2396,9 +2813,11 @@ mod tests {
         let conn = db::open_in_memory().unwrap();
         seed_inbox_record(&conn);
 
-        let failed: HashSet<JmapEmailId> = HashSet::new();
-
-        apply_move_pair_adopts(&conn, vec![move_pair_adopt()], &failed).unwrap();
+        let acknowledged = HashSet::from([JmapEmailId::from("E1")]);
+        assert_eq!(
+            apply_move_pair_adopts(&conn, vec![move_pair_adopt()], &acknowledged).unwrap(),
+            1
+        );
 
         let rec = queries::get_message_by_jmap_id(&conn, &JmapEmailId::from("E1"))
             .unwrap()
@@ -2511,7 +2930,7 @@ mod tests {
         // entries -- they must survive the round-trip.
         patch.insert("$seen".to_string(), true);
 
-        let merged = apply_keyword_patch(existing, &patch);
+        let merged = apply_keyword_patch(existing, &KeywordPatch::from(patch.clone()));
 
         assert_eq!(merged.get("$seen"), Some(&true), "new key must be set");
         assert_eq!(
@@ -2548,7 +2967,7 @@ mod tests {
         patch.insert("$answered".to_string(), false);
         patch.insert("$deleted".to_string(), false);
 
-        let merged = apply_keyword_patch(existing, &patch);
+        let merged = apply_keyword_patch(existing, &KeywordPatch::from(patch.clone()));
 
         assert_eq!(merged.get("$flagged"), Some(&true));
         assert_eq!(merged.get("$seen"), Some(&true));
@@ -2582,8 +3001,8 @@ mod tests {
 
         // "" is malformed JSON per serde_json (same branch as
         // "not json"), not "from_str of empty == empty map".
-        let from_empty = apply_keyword_patch("", &patch);
-        let from_garbage = apply_keyword_patch("not json", &patch);
+        let from_empty = apply_keyword_patch("", &KeywordPatch::from(patch.clone()));
+        let from_garbage = apply_keyword_patch("not json", &KeywordPatch::from(patch));
 
         for merged in [from_empty, from_garbage] {
             assert_eq!(merged.get("$seen"), Some(&true));
@@ -2778,6 +3197,7 @@ mod tests {
                 maildir_folder: "INBOX".to_string(),
                 remote_path: "INBOX".to_string(),
             }),
+            expected_flags: "".into(),
             new_flags: "S".into(),
             keywords,
             jmap_blob_id: "B1".into(),
@@ -2872,6 +3292,7 @@ mod tests {
                 maildir_folder: "INBOX".to_string(),
                 remote_path: "INBOX".to_string(),
             }),
+            expected_flags: "".into(),
             new_flags: "S".into(),
             keywords,
             jmap_blob_id: "B1".into(),
@@ -2983,5 +3404,48 @@ mod tests {
                 other => panic!("expected UploadMessage, got {:?}", other),
             }
         }
+    }
+
+    #[test]
+    fn already_exists_detection_walks_anyhow_context_chain() {
+        use anyhow::Context;
+
+        let error = Err::<(), _>(anyhow::anyhow!("Set failed: alreadyExists"))
+            .context("Failed to import email")
+            .unwrap_err();
+
+        // Pin the premise the chain walk rests on: Display renders only
+        // the outermost layer, so a to_string() search cannot see the
+        // token. If a future anyhow flattens the chain, this fails and
+        // the walk should be re-evaluated rather than left as folklore.
+        assert!(
+            !error.to_string().contains("alreadyExists"),
+            "anyhow Display now flattens the chain; the source-chain walk is no \
+             longer required and this test should be re-evaluated"
+        );
+        assert!(
+            is_already_exists(&error),
+            "source-chain walk must reach the token below the outer context"
+        );
+        assert!(!is_already_exists(&anyhow::anyhow!(
+            "Set failed: invalidProperties"
+        )));
+    }
+
+    #[test]
+    fn invalid_email_detection_walks_anyhow_context_chain() {
+        use anyhow::Context;
+
+        let error = Err::<(), _>(anyhow::anyhow!(
+            "Set failed: invalidEmail: Message contains invalid header"
+        ))
+        .context("Failed to import email")
+        .unwrap_err();
+
+        assert!(
+            error_chain_contains(&error, "invalidEmail"),
+            "a permanent per-message rejection must be visible below outer context"
+        );
+        assert!(!error_chain_contains(&error, "alreadyExists"));
     }
 }

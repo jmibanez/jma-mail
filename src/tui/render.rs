@@ -614,7 +614,11 @@ fn format_eta(eta: Duration) -> String {
 /// matches the status bar's phase widget ("(1.2s)"), so the two
 /// readouts of the same cycle agree at a glance.
 fn cycle_lines(cycle: CycleSummary) -> [Line<'static>; 2] {
-    let text = if cycle.in_sync {
+    let text = if cycle.blocked {
+        "pending / blocked".to_string()
+    } else if cycle.pending {
+        "pending".to_string()
+    } else if cycle.in_sync {
         "in sync".to_string()
     } else {
         format!("{} dn / {} up", cycle.downloaded, cycle.uploaded)
@@ -1235,6 +1239,8 @@ mod tests {
             downloaded: 0,
             uploaded: 0,
             in_sync: true,
+            pending: false,
+            blocked: false,
             wall: std::time::Duration::from_millis(300),
         });
         assert!(flat(&top).contains("in sync"));
@@ -1245,10 +1251,32 @@ mod tests {
             downloaded: 12,
             uploaded: 3,
             in_sync: false,
+            pending: false,
+            blocked: false,
             wall: std::time::Duration::from_millis(1_200),
         });
         assert!(flat(&top).contains("12 dn / 3 up"));
         assert!(flat(&bottom).contains("(1.2s)"));
+    }
+
+    #[test]
+    fn cycle_lines_show_pending_and_blocked_without_claiming_idle() {
+        for blocked in [false, true] {
+            let [top, _] = cycle_lines(CycleSummary {
+                at: chrono::Utc::now(),
+                downloaded: 0,
+                uploaded: 0,
+                in_sync: true,
+                pending: true,
+                blocked,
+                wall: Duration::ZERO,
+            });
+            let text = flat(&top);
+            assert!(text.contains("pending"));
+            assert_eq!(text.contains("blocked"), blocked);
+            assert!(!text.contains("in sync"));
+            assert!(text.len() <= (STATS_PANE_WIDTH - 2) as usize);
+        }
     }
 
     /// Both rows of the "last" item fit the Stats pane's fixed
@@ -1264,6 +1292,8 @@ mod tests {
             downloaded: 150_000,
             uploaded: 2_000,
             in_sync: false,
+            pending: false,
+            blocked: false,
             wall: std::time::Duration::from_secs(3_600),
         });
         let (top, bottom) = (flat(&top), flat(&bottom));

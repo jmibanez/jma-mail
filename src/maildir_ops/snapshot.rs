@@ -18,11 +18,14 @@ use std::time::SystemTime;
 
 use crate::state::queries::FolderCheckpoint;
 
-/// Take a fresh `FolderCheckpoint` for the folder rooted at
-/// `folder_path`. Expects `folder_path/cur/` and `folder_path/new/`
-/// to exist; callers that might race against a not-yet-created
-/// folder should call `store::ensure_maildir` first.
+/// Non-creating checkpoint for a full or partial Maildir. Missing peers use
+/// zero mtime/count; present unreadable sides remain errors, never empty.
 pub fn snapshot_folder(folder_path: &Path) -> Result<FolderCheckpoint> {
+    anyhow::ensure!(
+        crate::maildir_ops::store::is_maildir(folder_path),
+        "No visible Maildir peers at {}",
+        folder_path.display()
+    );
     let (cur_mtime_ns, cur_count) = stat_dir(&folder_path.join("cur"))?;
     let (new_mtime_ns, new_count) = stat_dir(&folder_path.join("new"))?;
     Ok(FolderCheckpoint {
@@ -34,8 +37,13 @@ pub fn snapshot_folder(folder_path: &Path) -> Result<FolderCheckpoint> {
 }
 
 fn stat_dir(path: &Path) -> Result<(i64, i64)> {
-    let meta =
-        std::fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to stat {}", path.display()));
+        }
+    };
     // Nanoseconds since UNIX_EPOCH packed into i64. APFS and modern
     // Linux filesystems carry nanosecond mtime resolution, which is
     // what makes count-stable rename-only churn (in-place flag
@@ -53,7 +61,10 @@ fn stat_dir(path: &Path) -> Result<(i64, i64)> {
         .unwrap_or(i64::MAX);
     let count = std::fs::read_dir(path)
         .with_context(|| format!("failed to readdir {}", path.display()))?
-        .count() as i64;
+        .try_fold(0, |count, entry| -> Result<i64> {
+            entry?;
+            Ok(count + 1)
+        })?;
     Ok((mtime_ns, count))
 }
 
@@ -122,12 +133,33 @@ mod tests {
     }
 
     #[test]
-    fn missing_subdir_errors_cleanly() {
+    fn partial_snapshot_missing_peer_is_empty_without_mkdir() {
+        for (present, missing) in [("cur", "new"), ("new", "cur")] {
+            let dir = tempdir().unwrap();
+            let folder = dir.path().join("INBOX");
+            fs::create_dir_all(folder.join(present)).unwrap();
+            fs::write(folder.join(present).join("id:2,F"), b"body").unwrap();
+            let before = snapshot_folder(&folder).unwrap();
+            assert_eq!(
+                (before.cur_count, before.new_count),
+                if present == "cur" { (1, 0) } else { (0, 1) }
+            );
+            assert!(!folder.join(missing).exists());
+            fs::create_dir(folder.join(missing)).unwrap();
+            assert_ne!(
+                snapshot_folder(&folder).unwrap(),
+                before,
+                "creating a missing peer must dirty the checkpoint"
+            );
+        }
+    }
+
+    #[test]
+    fn partial_snapshot_present_non_directory_still_errors() {
         let dir = tempdir().unwrap();
-        let folder = dir.path().join("INBOX");
-        // Only create cur/; new/ is missing.
-        fs::create_dir_all(folder.join("cur")).unwrap();
-        let err = snapshot_folder(&folder).expect_err("missing new/ should fail");
-        assert!(format!("{err:#}").contains("new"));
+        let folder = make_folder(dir.path(), "INBOX");
+        fs::remove_dir(folder.join("new")).unwrap();
+        fs::write(folder.join("new"), b"not a directory").unwrap();
+        assert!(snapshot_folder(&folder).is_err());
     }
 }

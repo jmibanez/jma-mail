@@ -13,6 +13,13 @@ pub struct EmailObject {
     pub keywords: HashMap<String, bool>,
     pub message_id: Option<Vec<MessageId>>,
     pub subject: Option<String>,
+    /// RFC 8621 `receivedAt`, as Unix seconds. jmap-client models the
+    /// property as `DateTime<Utc>`; its `received_at()` accessor
+    /// converts with `timestamp()`, dropping sub-second precision
+    /// that the wire format never carried anyway. Kept optional
+    /// because callers may construct a partial Email/get projection
+    /// in tests or future code.
+    pub received_at: Option<i64>,
     /// RFC 8621 §4.1.1 `size`: total octets of the RFC 5322
     /// message, as known to the server. Used by the remote-dedupe
     /// planner as a cheap pre-check before downloading blobs to

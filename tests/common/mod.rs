@@ -7,15 +7,13 @@
 //!
 //! We boot from a checked-in fixture because Stalwart v0.16's
 //! persisted config is a typed JSON blob with `@type` discriminators
-//! rather than the TOML shape its public docs imply, and its admin
-//! JMAP surface for credential creation is `x:ApiKey/set` (note the
-//! `x:` prefix) -- `AppPassword/set` and the unprefixed variants
-//! return `unknownMethod`. Bootstrapping a domain/account/credential
-//! set programmatically from an empty config runs into a catch-22:
-//! the admin calls only work once the server is in normal operation,
-//! which requires a populated config in the first place. Walking the
-//! install wizard once and committing the result sidesteps both
-//! issues.
+//! rather than TOML, and its admin credential surface is `x:ApiKey/set`
+//! (note the `x:` prefix). The Docker backend keeps the pre-seeded wizard
+//! snapshot. The optional native backend instead bootstraps fresh RocksDB
+//! through `x:Bootstrap/set` (update the singleton, not create), then restarts
+//! into the generated account and mints its own Bearer. It requires the
+//! isolated namespace runner in tools/test-stalwart-native.sh; never point
+//! it at an existing mail server or data directory.
 //!
 //! The fixture pair under `tests/fixtures/stalwart/` was produced by
 //! that wizard pass plus three follow-up admin tweaks via the JMAP
@@ -61,6 +59,8 @@ use testcontainers::{
     runners::AsyncRunner,
 };
 use tokio::net::{TcpListener, TcpStream};
+
+mod native;
 
 const STALWART_IMAGE: &str = "stalwartlabs/stalwart";
 const STALWART_TAG: &str = "v0.16";
@@ -112,8 +112,9 @@ pub struct JmapFixture {
     /// graceful-shutdown window), so this ordering only matters to
     /// keep Stalwart from being the one logging "MySQL gone" errors
     /// during the teardown race.
-    _container: ContainerAsync<GenericImage>,
-    _mysql: MysqlFixture,
+    _container: Option<ContainerAsync<GenericImage>>,
+    _mysql: Option<MysqlFixture>,
+    _native: Option<native::NativeProcess>,
 }
 
 pub struct SeedMessage {
@@ -151,6 +152,9 @@ impl SeedMessage {
 }
 
 pub async fn spawn_stalwart() -> Result<JmapFixture> {
+    if let Some(executable) = std::env::var_os("JMA_TEST_NATIVE_STALWART") {
+        return native::spawn(executable).await;
+    }
     // Bring up the MySQL sidecar first, with the wizard-seeded
     // dump applied via initdb. spawn_mysql blocks until the real
     // mysqld has bound TCP 3306 (see the wait condition there), so
@@ -218,8 +222,9 @@ pub async fn spawn_stalwart() -> Result<JmapFixture> {
         account_password: ACCOUNT_IMAP_PASSWORD.to_string(),
         imap_host: "127.0.0.1".to_string(),
         imap_port,
-        _container: container,
-        _mysql: mysql,
+        _container: Some(container),
+        _mysql: Some(mysql),
+        _native: None,
     })
 }
 
